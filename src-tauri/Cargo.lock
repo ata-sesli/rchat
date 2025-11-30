@@ -5210,6 +5210,7 @@ dependencies = [
 name = "rchat"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "directories",
  "ed25519-dalek",
  "fastcdc",
