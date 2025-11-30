@@ -34,6 +34,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 
+rvault-core = { path = "../../rvault/crates/rvault-core"}
 tauri = { version = "2", features = [] }
 
 tauri-plugin-opener = "2"
@@ -43,8 +44,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libp2p = { version = "0.56.0", features = ["full"] }
 futures = "0.3.31"
-rusqlite = "0.37.0"
+rusqlite = { version = "0.31.0", features = ["bundled"] }
 ed25519-dalek = "2.2.0"
 tokio = { version = "1.48.0", features = ["full"] }
 thiserror = "2.0.17"
 fastcdc = "3.2.1"
+directories = "6.0.0"

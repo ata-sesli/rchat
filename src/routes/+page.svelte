@@ -1,18 +1,13 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+  import { goto } from "$app/navigation";
 
-  let name = $state("");
-  let greetMsg = $state("");
-
-  async function greet(event: Event) {
-    event.preventDefault();
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsg = await invoke("greet", { name });
+  async function goToGettingStarted() {
+    await goto("/getting-started");
   }
 </script>
 
 <main class="container">
-  <h1>Welcome to Tauri + Svelte</h1>
+  <h1>Welcome to RChat!</h1>
 
   <div class="row">
     <a href="https://vite.dev" target="_blank">
@@ -25,13 +20,10 @@
       <img src="/svelte.svg" class="logo svelte-kit" alt="SvelteKit Logo" />
     </a>
   </div>
-  <p>Welcome to RCHAT!</p>
 
-  <form class="row" onsubmit={greet}>
-    <input id="greet-input" placeholder="Enter a name..." bind:value={name} />
-    <button type="submit">Greet</button>
-  </form>
-  <p>{greetMsg}</p>
+  <button onclick={goToGettingStarted} class="primary-button">
+    Getting Started
+  </button>
 </main>
 
 <style>
@@ -122,6 +114,16 @@ button:hover {
 button:active {
   border-color: #396cd8;
   background-color: #e8e8e8;
+}
+
+.primary-button {
+  margin-top: 2em;
+  padding: 0.8em 2em;
+  font-size: 1.1em;
+  font-weight: 600;
+  background-color: #396cd8;
+  color: #ffffff;
+  border-color: #396cd8;
 }
 
 input,
