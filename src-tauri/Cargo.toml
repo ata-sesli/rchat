@@ -31,11 +31,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 tauri-build = { version = "2", features = [] }
 
+[profile.dev.package."*"]
+debug = 0           # Turn off debug info for all dependencies
+opt-level = 3       # Maximize optimization for dependencies (makes app run faster too)
 
 [dependencies]
 
 rvault-core = { path = "../../rvault/crates/rvault-core"}
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 
 tauri-plugin-opener = "2"
 
@@ -51,3 +54,9 @@ thiserror = "2.0.17"
 fastcdc = "3.2.1"
 directories = "6.0.0"
 anyhow = "1.0.100"
+reqwest = { version = "0.12.24", features = ["json"] }
+base64 = "0.22.1"
+octocrab = "0.48.1"
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+flate2 = { version = "1.1.5", features = ["zlib"] }
+rand = "0.8.5"

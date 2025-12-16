@@ -1,5 +1,5 @@
-use rusqlite::{Connection, Result};
-use std::path::Path;
+use rusqlite::Connection;
+// use std::path::Path; // Unused
 use anyhow::Context;
 use serde::{Serialize, Deserialize};
 use directories::ProjectDirs;

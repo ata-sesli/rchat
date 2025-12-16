@@ -1,17 +1,207 @@
 mod network;
+mod storage;
+mod oauth; // New module
+
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-use tauri::{Manager, State, Runtime};
+use tauri::{Manager, State}; 
+// use tauri::Runtime; // Unused
 
+use crate::storage::config::ConfigManager;
 // This struct holds the Sender channel.
 // We wrap it in Mutex so multiple UI threads can use it safely.
 pub struct NetworkState {
     pub sender: Mutex<mpsc::Sender<String>>,
 }
+// Add State Management
+pub struct AppState {
+    pub config_manager: tokio::sync::Mutex<ConfigManager>,
+}
+
+#[tauri::command]
+async fn save_api_token(
+    token: String,
+    state: State<'_, AppState>
+) -> Result<(), String> {
+    let mgr = state.config_manager.lock().await;
+    let mut config = mgr.load().await.map_err(|e| e.to_string())?;
+    config.system.github_token = Some(token);
+    mgr.save(&config).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn check_auth_status(state: State<'_, AppState>) -> Result<AuthStatus, String> {
+    let mgr = state.config_manager.lock().await;
+    // Note: checking has_token requires reading the file, which is fine.
+    // It returns false if locked.
+    Ok(AuthStatus {
+        is_setup: mgr.exists(),
+        is_unlocked: mgr.is_unlocked(),
+        is_github_connected: mgr.has_token().await,
+    })
+}
+
+#[tauri::command]
+async fn init_vault(password: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut mgr = state.config_manager.lock().await;
+    mgr.init(password.trim()).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn unlock_vault(password: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut mgr = state.config_manager.lock().await;
+    mgr.unlock_with_password(password.trim()).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// OAuth Commands
+#[tauri::command]
+async fn start_github_auth() -> Result<oauth::AuthState, String> {
+    oauth::start_device_flow().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn poll_github_auth(device_code: String) -> Result<String, String> {
+    oauth::poll_for_token(&device_code).await.map_err(|e| e.to_string())
+}
+
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+#[derive(serde::Serialize)]
+struct AuthStatus {
+    is_setup: bool,
+    is_unlocked: bool,
+    is_github_connected: bool,
+}
+
+#[tauri::command]
+async fn reset_vault(state: State<'_, AppState>) -> Result<(), String> {
+    let mut mgr = state.config_manager.lock().await;
+    mgr.reset().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+use crate::storage::config::{FriendConfig, UserProfile};
+
+#[tauri::command]
+async fn get_friends(state: State<'_, AppState>) -> Result<Vec<FriendConfig>, String> {
+    let mgr = state.config_manager.lock().await;
+    match mgr.load().await {
+        Ok(config) => Ok(config.user.friends.clone()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn add_friend(
+    username: String,
+    x25519_key: Option<String>,
+    ed25519_key: Option<String>,
+    state: State<'_, AppState>
+) -> Result<(), String> {
+    let mgr = state.config_manager.lock().await;
+    match mgr.load().await {
+        Ok(mut config) => {
+            if !config.user.friends.iter().any(|f| f.username == username) {
+                config.user.friends.push(FriendConfig {
+                    username,
+                    x25519_pubkey: x25519_key,
+                    ed25519_pubkey: ed25519_key,
+                    leaf_index: 0, // Placeholder
+                    encrypted_leaf_key: None,
+                    nonce: None,
+                });
+                mgr.save(&config).await.map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        },
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+// Note: add_friend command is just adding to config. 
+// Ideally it should use HksTree::add_friend logic?
+// But HksTree state isn't in Config yet.
+// We need to persist HksTree in Config or File.
+// For now, let's just fix the method names.
+
+#[tauri::command]
+async fn remove_friend(username: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mgr = state.config_manager.lock().await;
+    match mgr.load().await {
+        Ok(mut config) => {
+            config.user.friends.retain(|f| f.username != username);
+            mgr.save(&config).await.map_err(|e| e.to_string())?;
+            Ok(())
+        },
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn get_user_profile(state: State<'_, AppState>) -> Result<UserProfile, String> {
+    let mgr = state.config_manager.lock().await;
+    match mgr.load().await {
+        Ok(config) => Ok(config.user.profile.clone()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn update_user_profile(
+    alias: Option<String>,
+    avatar_path: Option<String>,
+    state: State<'_, AppState>
+) -> Result<(), String> {
+    let mgr = state.config_manager.lock().await;
+    match mgr.load().await {
+        Ok(mut config) => {
+            if let Some(a) = alias {
+                config.user.profile.alias = Some(a);
+            }
+            if let Some(p) = avatar_path {
+                config.user.profile.avatar_path = Some(p);
+            }
+            mgr.save(&config).await.map_err(|e| e.to_string())?;
+            Ok(())
+        },
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn get_pinned_peers(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let mgr = state.config_manager.lock().await;
+    match mgr.load().await {
+        Ok(config) => Ok(config.user.pinned_peers.clone()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn toggle_pin_peer(username: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let mgr = state.config_manager.lock().await;
+    match mgr.load().await {
+        Ok(mut config) => {
+            let mut is_pinned = false;
+            // Check if exists
+            if let Some(pos) = config.user.pinned_peers.iter().position(|p| p == &username) {
+                config.user.pinned_peers.remove(pos);
+            } else {
+                config.user.pinned_peers.push(username);
+                is_pinned = true;
+            }
+            mgr.save(&config).await.map_err(|e| e.to_string())?;
+            Ok(is_pinned)
+        },
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -24,6 +214,22 @@ pub fn run() {
 
             // Get a handle to the app if you need it for events/windows later
             let app_handle = app.handle().clone();
+            
+            // Initialize ConfigManager
+            let app_dir = app.path().app_data_dir().expect("failed to get app data dir");
+            std::fs::create_dir_all(&app_dir).expect("failed to create app data dir");
+            let mut config_manager = ConfigManager::new(app_dir);
+            
+            // Try to restore session (auto-unlock)
+            if config_manager.try_restore_session() {
+                println!("Session restored successfully. Vault unlocked.");
+            } else {
+                println!("Session not restored. Vault locked.");
+            }
+            
+            app.manage(AppState {
+                config_manager: tokio::sync::Mutex::new(config_manager),
+            });
 
             // --- 2. Run Heavy Background Tasks ---
             // We spawn a separate async task so we don't freeze the UI startup
@@ -41,7 +247,24 @@ pub fn run() {
         })
         // --- End Setup Hook ---
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet,send_chat_message])
+        .invoke_handler(tauri::generate_handler![
+            greet, 
+            send_chat_message, 
+            save_api_token, 
+            check_auth_status,
+            init_vault,
+            unlock_vault,
+            start_github_auth,
+            poll_github_auth,
+            reset_vault,
+            get_friends,
+            add_friend,
+            remove_friend,
+            get_user_profile,
+            update_user_profile,
+            get_pinned_peers,
+            toggle_pin_peer,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

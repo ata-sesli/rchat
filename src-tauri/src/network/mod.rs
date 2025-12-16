@@ -1,15 +1,15 @@
 mod behaviour;
 mod manager;
-
+mod discovery;
+pub mod hks;
+pub mod gist;
 use libp2p::{PeerId, SwarmBuilder, identity};
-use tauri::{AppHandle, utils::acl::identifier,Manager};
-use libp2p::futures::StreamExt;
+use tauri::{AppHandle,Manager};
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
 use anyhow::Result;
 
 use crate::network::manager::NetworkManager;
-use crate::{NetworkState, network::{self, behaviour::RChatBehaviour}};
+use crate::network::behaviour::RChatBehaviour;
 
 fn configure_noise(keypair: &libp2p::identity::Keypair) -> Result<libp2p::noise::Config, libp2p::noise::Error> {
     libp2p::noise::Config::new(keypair)
@@ -44,11 +44,20 @@ pub async fn init (app_handle: AppHandle) -> Result<()> {
     };
     app_handle.manage(network_state);
     
+    // 1. Create Discovery Channel
+    let (disc_tx, disc_rx) = mpsc::channel(20);
+
+    // 2. Spawn Discovery Task
+    let discovery_handle = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        crate::network::discovery::discover_peers(disc_tx, discovery_handle).await;
+    });
+
     // Initialize the P2P Swarm
     // This starts the infinite loop in manager.rs
     tauri::async_runtime::spawn(async move {
         // Move the 'swarm' and 'app_handle' into this thread
-        let manager = NetworkManager::new(swarm, crx, app_handle);
+        let manager = NetworkManager::new(swarm, crx, disc_rx, app_handle);
         
         // Run the infinite loop
         manager.run().await;

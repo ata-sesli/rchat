@@ -1,9 +1,10 @@
 use futures::StreamExt;
-use libp2p::{Swarm, swarm::SwarmEvent};
+use libp2p::{Multiaddr, Swarm, swarm::SwarmEvent};
 use tauri::AppHandle;
 use tauri::async_runtime::Receiver;
 use crate::network::behaviour::{RChatBehaviour, RChatBehaviourEvent};
 use tauri::Emitter;
+
 pub struct NetworkManager {
     // The P2P Node itself
     swarm: Swarm<RChatBehaviour>,
@@ -11,25 +12,64 @@ pub struct NetworkManager {
     crx: Receiver<String>,
     // The handle to send events TO the UI
     app_handle: AppHandle,
+    disc_rx: Receiver<Multiaddr>,
 }
 impl NetworkManager {
-    pub fn new(swarm: Swarm<RChatBehaviour>,crx: Receiver<String>,app_handle: AppHandle)
+    pub fn new(swarm: Swarm<RChatBehaviour>,crx: Receiver<String>, disc_rx: Receiver<Multiaddr>, app_handle: AppHandle)
     -> Self {
         Self {
             swarm,
             crx,
+            disc_rx,
             app_handle
         }
     }
     pub async fn run(mut self: Self){
         println!("🛜 Network Manager: Running!");
+        
+        // Publish every 5 minutes
+        let mut publish_interval = tokio::time::interval(std::time::Duration::from_secs(300));
+
         loop {
             tokio::select! {
+                _ = publish_interval.tick() => {
+                    self.publish_listeners().await;
+                }
                 Some(cmd) = self.crx.recv() => {
                     self.handle_ui_command(cmd);
                 }
+                Some(addr) = self.disc_rx.recv() => {
+                    // Start dialing the peer found from Gist
+                    println!("Using Gist Peer: {}", addr);
+                    let _ = self.swarm.dial(addr);
+                }
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event).await;
+                }
+            }
+        }
+    }
+
+    async fn publish_listeners(&mut self) {
+        use tauri::Manager;
+        let listeners: Vec<String> = self.swarm.listeners().map(|l| l.to_string()).collect();
+        if listeners.is_empty() { return; }
+
+        let state = self.app_handle.state::<crate::AppState>();
+        let token = {
+            let mgr = state.config_manager.lock().await;
+            if let Ok(config) = mgr.load().await {
+                config.system.github_token.clone()
+            } else {
+                None
+            }
+        };
+
+        if let Some(token) = token {
+            println!("Publishing listeners to Gist...");
+            if !listeners.is_empty() {
+                if let Err(e) = crate::network::discovery::publish_peer_info(&token, listeners, self.app_handle.clone()).await {
+                    eprintln!("Failed to publish peer info: {}", e);
                 }
             }
         }
