@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onMount, tick } from "svelte";
+  import { fade } from "svelte/transition";
   import { goto } from "$app/navigation";
 
   import SettingsPanel from "../components/SettingsPanel.svelte";
@@ -17,11 +18,15 @@
     Me: [],
   };
   let activePeer = "General"; // "General" (Broadcast), "Me", or specific Username
+  let currentLogs: Conversation = []; // Helper for template
   let chatContainer: HTMLDivElement;
 
   // Sidebar State
   let showSettings = false;
   let isSidebarOpen = true;
+
+  // Attachments Menu State
+  let showAttachments = false;
 
   // Data State
   let peers: string[] = [];
@@ -38,6 +43,7 @@
       const status = await invoke<{ is_setup: boolean; is_unlocked: boolean }>(
         "check_auth_status"
       );
+      // console.log("[Frontend] Auth Status:", status);
       if (!status.is_setup || !status.is_unlocked) {
         goto("/login");
       }
@@ -49,41 +55,90 @@
   async function loadData() {
     try {
       peers = await invoke<string[]>("get_trusted_peers");
+
       pinnedPeers = await invoke<string[]>("get_pinned_peers");
+
       userProfile = await invoke("get_user_profile");
 
       // Initialize conversations for peers if not exists
       peers.forEach((p) => {
         if (!conversations[p]) conversations[p] = [];
       });
+
+      // Load 'Me' History
+      try {
+        console.log("Fetching self history...");
+        const selfHistory = await invoke<any[]>("get_chat_history", {
+          chatId: "self",
+        });
+        console.log("Self history fetched:", selfHistory);
+        conversations["Me"] = selfHistory.map((m) => ({
+          sender: "Me",
+          text: m.text_content || "",
+          timestamp: new Date(m.timestamp * 1000),
+        }));
+      } catch (e) {
+        console.error("Failed to load self history", e);
+      }
+
+      conversations = conversations; // Trigger Svelte Reactivity
     } catch (e) {
       console.error("Load data failed", e);
     }
   }
 
-  // Auto-scroll
-  $: if (conversations[activePeer] && chatContainer && !showSettings) {
-    tick().then(() => {
-      if (chatContainer) chatContainer.scrollTop = chatContainer.scrollHeight;
-    });
+  // Reactive Logs
+  $: currentLogs = conversations[activePeer] || [];
+
+  // Safe Auto-scroll
+  $: if (currentLogs && chatContainer && !showSettings) {
+    scrollToBottom();
   }
+
+  async function scrollToBottom() {
+    await tick();
+    if (chatContainer) {
+      chatContainer.scrollTo({
+        top: chatContainer.scrollHeight,
+        behavior: "smooth",
+      });
+    }
+  }
+
+  // Textarea ref
+  let textarea: HTMLTextAreaElement;
 
   async function sendMessage() {
     if (!message.trim()) return;
 
+    const textToSend = message;
+    // Clear Input Immediately (Optimistic)
+    message = "";
+    if (textarea) {
+      textarea.style.height = "auto";
+    }
+
     // UI Update
-    const newMsg = { sender: "Me", text: message, timestamp: new Date() };
+    const newMsg = { sender: "Me", text: textToSend, timestamp: new Date() };
     if (!conversations[activePeer]) conversations[activePeer] = [];
     conversations[activePeer] = [...conversations[activePeer], newMsg];
 
-    // Network Send (Only if not "Me")
-    if (activePeer !== "Me") {
-      // Note: Currently backend is broadcast-only or simple p2p.
-      // We send it out; backend handles routing if implemented, or broadcasts.
-      await invoke("send_chat_message", { message });
+    try {
+      // Network Send (Only if not "Me")
+      if (activePeer !== "Me") {
+        await invoke("send_chat_message", { message: textToSend });
+      } else {
+        // Save Note to Self
+        await invoke("save_note_to_self", { message: textToSend });
+      }
+    } catch (e) {
+      console.error("Failed to send message:", e);
+      // Optional: Show error state on message
     }
+  }
 
-    message = "";
+  function formatTime(date: Date) {
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   }
 
   listen("p2p-message", (event) => {
@@ -205,12 +260,15 @@
 
     <!-- User List -->
     <div
-      class="flex-1 overflow-y-auto px-2 space-y-1 pb-4 shrink-0 scrollbar-hide"
+      class="flex-1 overflow-y-auto overflow-x-hidden px-2 space-y-1 pb-4 shrink-0 scrollbar-hide"
     >
       <!-- ME (You) Item -->
       {#if isSidebarOpen}
         <button
-          on:click={() => (activePeer = "Me")}
+          on:click={() => {
+            activePeer = "Me";
+            showSettings = false;
+          }}
           class={`w-full flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-all group border border-transparent
               ${activePeer === "Me" ? "bg-slate-800/80 border-slate-700/50" : "hover:bg-slate-800/30"}`}
         >
@@ -243,7 +301,10 @@
 
         <!-- General / Broadcast -->
         <button
-          on:click={() => (activePeer = "General")}
+          on:click={() => {
+            activePeer = "General";
+            showSettings = false;
+          }}
           class={`w-full flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-all group border border-transparent
               ${activePeer === "General" ? "bg-slate-800/80 border-slate-700/50" : "hover:bg-slate-800/30"}`}
         >
@@ -264,21 +325,29 @@
         <div class="h-px bg-slate-800/50 my-2 mx-2"></div>
       {:else}
         <!-- Collapsed Me -->
-        <div
-          on:click={() => (activePeer = "Me")}
-          class="w-10 h-10 mx-auto rounded-full bg-teal-600 flex items-center justify-center text-xs font-bold text-white shadow-lg shadow-teal-500/20 cursor-pointer hover:scale-105 transition-transform mb-2"
+        <button
+          on:click={() => {
+            activePeer = "Me";
+            showSettings = false;
+          }}
+          class="w-10 h-10 mx-auto rounded-full bg-teal-600 flex items-center justify-center text-xs font-bold text-white shadow-lg shadow-teal-500/20 hover:scale-105 transition-transform mb-2 border-none cursor-pointer"
           title="Me (You)"
+          type="button"
         >
           ME
-        </div>
+        </button>
 
-        <div
-          on:click={() => (activePeer = "General")}
-          class="w-10 h-10 mx-auto rounded-full bg-slate-700 flex items-center justify-center text-slate-300 font-medium cursor-pointer hover:bg-slate-600 transition-colors mb-2"
+        <button
+          on:click={() => {
+            activePeer = "General";
+            showSettings = false;
+          }}
+          class="w-10 h-10 mx-auto rounded-full bg-slate-700 flex items-center justify-center text-slate-300 font-medium hover:bg-slate-600 transition-colors mb-2 border-none cursor-pointer"
           title="General"
+          type="button"
         >
           #
-        </div>
+        </button>
       {/if}
 
       <!-- Dynamic Peers -->
@@ -287,7 +356,10 @@
           {@const isPinned = pinnedPeers.includes(peer)}
           <div class="relative group/item">
             <button
-              on:click={() => (activePeer = peer)}
+              on:click={() => {
+                activePeer = peer;
+                showSettings = false;
+              }}
               class={`w-full flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-all border border-transparent
                   ${activePeer === peer ? "bg-slate-800/80 border-slate-700/50" : "hover:bg-slate-800/30"}`}
             >
@@ -297,12 +369,12 @@
                   alt={peer}
                   class="w-10 h-10 rounded-full bg-slate-800 shadow-md ring-2 ring-transparent group-hover:ring-slate-700 transition-all"
                   on:error={(e) =>
-                    (e.currentTarget.src =
+                    ((e.currentTarget as HTMLImageElement).src =
                       "https://github.com/github.png?size=40")}
                 />
                 {#if isPinned}
                   <div
-                    class="absolute -top-1 -right-1 bg-yellow-500/90 text-slate-950 p-[2px] rounded-full shadow-sm"
+                    class="absolute -top-1 -right-1 bg-yellow-500/90 text-slate-950 p-0.5 rounded-full shadow-sm"
                   >
                     <svg
                       xmlns="http://www.w3.org/2000/svg"
@@ -349,13 +421,23 @@
         <!-- Collapsed Peers -->
         <div class="flex flex-col gap-2 items-center">
           {#each sortedPeers as peer}
-            <img
-              src={`https://github.com/${peer}.png?size=40`}
-              alt={peer}
-              class={`w-10 h-10 rounded-full bg-slate-800 cursor-pointer hover:scale-105 transition-transform border-2 border-transparent ${activePeer === peer ? "border-teal-500" : ""}`}
-              on:click={() => (activePeer = peer)}
+            <button
+              on:click={() => {
+                activePeer = peer;
+                showSettings = false;
+              }}
+              class={`w-10 h-10 rounded-full bg-slate-800 overflow-hidden border-2 transition-transform hover:scale-105 ${activePeer === peer ? "border-teal-500" : "border-transparent"}`}
               title={peer}
-            />
+            >
+              <img
+                src={`https://github.com/${peer}.png?size=40`}
+                alt={peer}
+                class="w-full h-full object-cover"
+                on:error={(e) =>
+                  ((e.currentTarget as HTMLImageElement).src =
+                    "https://github.com/github.png?size=40")}
+              />
+            </button>
           {/each}
         </div>
       {/if}
@@ -370,7 +452,7 @@
       >
         <svg
           xmlns="http://www.w3.org/2000/svg"
-          class="h-6 w-6"
+          class="h-6 w-6 shrink-0"
           fill="none"
           viewBox="0 0 24 24"
           stroke="currentColor"
@@ -389,35 +471,14 @@
           />
         </svg>
         {#if isSidebarOpen}
-          <span>Settings</span>
+          <span
+            in:fade={{ duration: 150, delay: 200 }}
+            class="whitespace-nowrap"
+          >
+            Settings
+          </span>
         {/if}
       </button>
-      <!-- Mock Go Back to Chat button inside sidebar if settings is open (optional but helpful UX) -->
-      {#if showSettings}
-        <button
-          on:click={() => (showSettings = false)}
-          class="flex items-center justify-center gap-3 text-sm text-slate-400 hover:text-white transition-colors w-full p-2 rounded-lg hover:bg-slate-800 mt-1"
-          title="Chats"
-        >
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            class="h-6 w-6"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-          >
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              stroke-width="2"
-              d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"
-            />
-          </svg>
-          {#if isSidebarOpen}
-            <span>Chats</span>
-          {/if}
-        </button>
-      {/if}
     </div>
   </aside>
 
@@ -425,7 +486,7 @@
   <section class="flex-1 flex flex-col relative h-full overflow-hidden">
     <!-- Conditional View: Settings OR Chat -->
     {#if showSettings}
-      <SettingsPanel show={showSettings} />
+      <SettingsPanel />
     {:else}
       <!-- Chat Area Content -->
       <div
@@ -454,8 +515,6 @@
         bind:this={chatContainer}
         class="flex-1 overflow-y-auto px-6 py-6 space-y-6 scroll-smooth"
       >
-        {@const currentLogs = conversations[activePeer] || []}
-
         {#if currentLogs.length === 0}
           <div
             class="flex flex-col items-center justify-center h-full text-slate-500 space-y-4 opacity-0 animate-fade-in-up"
@@ -503,7 +562,7 @@
                     src={`https://github.com/${activePeer}.png?size=32`}
                     class="w-8 h-8 rounded-full bg-purple-500 shadow-lg shadow-purple-500/20 border-2 border-slate-950"
                     on:error={(e) =>
-                      (e.currentTarget.src =
+                      ((e.currentTarget as HTMLImageElement).src =
                         "https://github.com/github.png?size=32")}
                     alt="Peer"
                   />
@@ -512,14 +571,19 @@
 
               <!-- Bubble -->
               <div
-                class={`px-4 py-2.5 shadow-md text-sm leading-relaxed break-words
+                class={`px-4 py-2.5 shadow-md text-sm leading-relaxed break-words flex flex-col gap-1
                         ${
                           isMe
                             ? "bg-teal-600/90 text-white rounded-2xl rounded-tr-sm"
                             : "bg-slate-800 text-slate-200 rounded-2xl rounded-tl-sm border border-slate-700/50"
                         }`}
               >
-                {msg.text}
+                <span>{msg.text}</span>
+                <span
+                  class={`text-[10px] ${isMe ? "text-teal-200" : "text-slate-400"} self-end`}
+                >
+                  {formatTime(msg.timestamp)}
+                </span>
               </div>
             </div>
           </div>
@@ -529,15 +593,111 @@
       <!-- Floating Input Area -->
       <div class="p-6 w-full max-w-4xl mx-auto">
         <div
-          class="bg-slate-900/90 backdrop-blur-md border border-slate-700 rounded-2xl p-1.5 shadow-2xl flex items-center gap-2"
+          class="bg-slate-900/90 backdrop-blur-md border border-slate-700 rounded-2xl p-1.5 shadow-2xl flex items-center gap-2 relative"
         >
-          <input
+          <!-- Attachments Button -->
+          <div class="relative">
+            <button
+              on:click={() => (showAttachments = !showAttachments)}
+              class={`p-2 rounded-xl transition-all ${showAttachments ? "bg-slate-700 text-teal-400" : "text-slate-400 hover:text-white hover:bg-slate-800"}`}
+              title="Add Attachment"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                class="h-6 w-6"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                  d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"
+                />
+              </svg>
+            </button>
+
+            <!-- Attachments Menu -->
+            {#if showAttachments}
+              <div
+                class="absolute bottom-full left-0 mb-2 w-48 bg-slate-800 border border-slate-700 rounded-xl shadow-xl overflow-hidden z-50 animate-fade-in-up"
+              >
+                <button
+                  class="w-full text-left px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 hover:text-white flex items-center gap-3 transition-colors"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    class="h-5 w-5 text-purple-400"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      stroke-width="2"
+                      d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
+                    />
+                  </svg>
+                  Image / Video
+                </button>
+                <div class="h-px bg-slate-700/50"></div>
+                <button
+                  class="w-full text-left px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 hover:text-white flex items-center gap-3 transition-colors"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    class="h-5 w-5 text-blue-400"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      stroke-width="2"
+                      d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                    />
+                  </svg>
+                  Document
+                </button>
+                <div class="h-px bg-slate-700/50"></div>
+                <button
+                  class="w-full text-left px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 hover:text-white flex items-center gap-3 transition-colors"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    class="h-5 w-5 text-pink-400"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      stroke-width="2"
+                      d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
+                    />
+                  </svg>
+                  Audio
+                </button>
+              </div>
+            {/if}
+          </div>
+          <textarea
+            bind:this={textarea}
             bind:value={message}
             on:keydown={handleKeydown}
-            type="text"
+            on:input={(e) => {
+              const target = e.currentTarget;
+              target.style.height = "auto";
+              target.style.height = target.scrollHeight + "px";
+            }}
             placeholder={`Message ${activePeer}...`}
-            class="flex-1 bg-transparent text-slate-100 placeholder:text-slate-600 px-4 py-2.5 focus:outline-none min-w-0"
-          />
+            rows="1"
+            class="flex-1 bg-transparent text-slate-100 placeholder:text-slate-600 px-4 py-2.5 focus:outline-none min-w-0 resize-none overflow-hidden max-h-32 self-end mb-1"
+          ></textarea>
           <button
             on:click={sendMessage}
             class="bg-teal-500 hover:bg-teal-400 text-slate-950 p-2.5 rounded-xl font-semibold transition-all hover:scale-105 active:scale-95 shadow-lg shadow-teal-500/20 disabled:opacity-50 disabled:cursor-not-allowed"

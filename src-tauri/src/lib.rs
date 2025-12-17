@@ -51,8 +51,15 @@ async fn init_vault(password: String, state: State<'_, AppState>) -> Result<(), 
 
 #[tauri::command]
 async fn unlock_vault(password: String, state: State<'_, AppState>) -> Result<(), String> {
+    println!("[Backend] unlock_vault called. Password len: {}", password.len());
     let mut mgr = state.config_manager.lock().await;
-    mgr.unlock_with_password(password.trim()).await.map_err(|e| e.to_string())?;
+    // Note: Logging actual password is bad practice, but length/trim check is okay for debug
+    println!("[Backend] Password trimmed len: {}", password.trim().len());
+    mgr.unlock_with_password(password.trim()).await.map_err(|e| {
+        eprintln!("[Backend] Unlock failed: {}", e);
+        e.to_string()
+    })?;
+    println!("[Backend] Vault unlocked successfully.");
     Ok(())
 }
 
@@ -90,11 +97,24 @@ async fn reset_vault(state: State<'_, AppState>) -> Result<(), String> {
 use crate::storage::config::{FriendConfig, UserProfile};
 
 #[tauri::command]
+async fn get_trusted_peers(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let mgr = state.config_manager.lock().await;
+    match mgr.load().await {
+        Ok(config) => Ok(config.user.friends.into_iter().map(|f| f.username).collect()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
 async fn get_friends(state: State<'_, AppState>) -> Result<Vec<FriendConfig>, String> {
+    println!("[Backend] get_friends called");
     let mgr = state.config_manager.lock().await;
     match mgr.load().await {
         Ok(config) => Ok(config.user.friends.clone()),
-        Err(e) => Err(e.to_string()),
+        Err(e) => {
+            eprintln!("[Backend] Error loading friends: {}", e);
+            Err(e.to_string())
+        },
     }
 }
 
@@ -146,10 +166,18 @@ async fn remove_friend(username: String, state: State<'_, AppState>) -> Result<(
 
 #[tauri::command]
 async fn get_user_profile(state: State<'_, AppState>) -> Result<UserProfile, String> {
+    println!("[Backend] get_user_profile called");
     let mgr = state.config_manager.lock().await;
     match mgr.load().await {
-        Ok(config) => Ok(config.user.profile.clone()),
-        Err(e) => Err(e.to_string()),
+        Ok(config) => {
+             println!("[Backend] Returning profile: {:?}", config.user.profile);
+             Ok(config.user.profile.clone())
+        },
+        Err(e) => {
+            eprintln!("[Backend] Error loading config: {}", e);
+            // Return default profile to prevent frontend crash
+            Ok(UserProfile::default())
+        },
     }
 }
 
@@ -204,6 +232,53 @@ async fn toggle_pin_peer(username: String, state: State<'_, AppState>) -> Result
     }
 }
 
+// --- Persistence Commands ---
+
+#[tauri::command]
+async fn save_note_to_self(message: String) -> Result<(), String> {
+    println!("[Backend] save_note_to_self: {}", message);
+    let conn = storage::db::connect_to_db().map_err(|e| e.to_string())?;
+    
+    let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+    
+    // Generate simple ID
+    let id_suffix: u32 = rand::random();
+    let msg_id = format!("{}-{}", timestamp, id_suffix);
+
+    let msg = storage::db::Message {
+        id: msg_id,
+        chat_id: "self".to_string(),
+        peer_id: "Me".to_string(),
+        timestamp,
+        content_type: "text".to_string(),
+        text_content: Some(message),
+        file_hash: None,
+    };
+
+    match storage::db::insert_message(&conn, &msg) {
+        Ok(_) => {
+            println!("[Backend] Note saved successfully");
+            Ok(())
+        },
+        Err(e) => {
+            eprintln!("[Backend] Failed to save note: {}", e);
+            Err(e.to_string())
+        }
+    }
+}
+
+#[tauri::command]
+async fn get_chat_history(chat_id: String) -> Result<Vec<storage::db::Message>, String> {
+    println!("[Backend] get_chat_history for: {}", chat_id);
+    let conn = storage::db::connect_to_db().map_err(|e| e.to_string())?;
+    let messages = storage::db::get_messages(&conn, &chat_id).map_err(|e| e.to_string())?;
+    println!("[Backend] Found {} messages", messages.len());
+    Ok(messages)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -220,6 +295,9 @@ pub fn run() {
             std::fs::create_dir_all(&app_dir).expect("failed to create app data dir");
             let mut config_manager = ConfigManager::new(app_dir);
             
+            // Initialize Database (Schema in connect)
+            // storage::db::connect_to_db ensures schema exists
+            
             // Try to restore session (auto-unlock)
             if config_manager.try_restore_session() {
                 println!("Session restored successfully. Vault unlocked.");
@@ -234,15 +312,17 @@ pub fn run() {
             // --- 2. Run Heavy Background Tasks ---
             // We spawn a separate async task so we don't freeze the UI startup
             tauri::async_runtime::spawn(async move {
-                println!("Starting Background Services...");
+                println!("[Backend] Starting Background Services...");
                 
-                if let Err(e) = network::init(app_handle).await {
-                    eprintln!("Failed to start network: {}", e);
+                match network::init(app_handle).await {
+                    Ok(_) => println!("[Backend] network::init completed successfully"),
+                    Err(e) => eprintln!("[Backend] Failed to start network: {}", e),
                 }
                 
-                println!("Background Services Ready!");
+                println!("[Backend] Background Services Ready!");
             });
 
+            println!("[Backend] Setup hook returning Ok");
             Ok(())
         })
         // --- End Setup Hook ---
@@ -258,12 +338,15 @@ pub fn run() {
             poll_github_auth,
             reset_vault,
             get_friends,
+            get_trusted_peers,
             add_friend,
             remove_friend,
             get_user_profile,
             update_user_profile,
             get_pinned_peers,
             toggle_pin_peer,
+            save_note_to_self,
+            get_chat_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

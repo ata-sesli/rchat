@@ -69,19 +69,22 @@ pub fn connect_to_db() -> anyhow::Result<Connection> {
         let db_exists = final_path.exists();
         let connection = Connection::open(&final_path)
             .context("Failed to open database connection")?;
-        if db_exists {
-            println!("Successfully opened existing database!");
-        } else {
-            println!("Successfully created new database!");
+            
+        // Always ensure schema exists!
+        create_tables(&connection)?;
+        
+        if !db_exists {
+            // Only verify or notify if needed, but creates happened above
+            println!("Successfully initialized database schema!");
         }
         Ok(connection)
     } else {
         anyhow::bail!("Failed to determine project directories")
     }
 }
-pub fn init() -> anyhow::Result<Connection> {
-    let conn = connect_to_db()?;
 
+// Private helper to ensure tables exist
+fn create_tables(conn: &Connection) -> anyhow::Result<()> {
     // --- Critical Performance & Safety Settings ---
     // Enable Write-Ahead Logging for concurrency (Readers don't block Writers)
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -95,78 +98,78 @@ pub fn init() -> anyhow::Result<Connection> {
     // 1. Peers
     conn.execute(
         "CREATE TABLE IF NOT EXISTS peers (
-            id TEXT NOT NULL PRIMARY KEY,
-            alias TEXT NOT NULL,
-            last_seen INTEGER,
-            public_key BLOB NOT NULL
-        )",
+             id TEXT NOT NULL PRIMARY KEY,
+             alias TEXT NOT NULL,
+             last_seen INTEGER,
+             public_key BLOB NOT NULL
+         )",
         [],
     )?;
 
     // 2. Chats
     conn.execute(
         "CREATE TABLE IF NOT EXISTS chats (
-            id TEXT NOT NULL PRIMARY KEY,
-            name TEXT NOT NULL,
-            is_group INTEGER DEFAULT 0 NOT NULL,
-            encryption_key BLOB NOT NULL
-        )",
+             id TEXT NOT NULL PRIMARY KEY,
+             name TEXT NOT NULL,
+             is_group INTEGER DEFAULT 0 NOT NULL,
+             encryption_key BLOB NOT NULL
+         )",
         [],
     )?;
 
     // 3. Chat Peers (Junction Table)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS chat_peers (
-            chat_id TEXT NOT NULL,
-            peer_id TEXT NOT NULL,
-            role TEXT DEFAULT 'member' NOT NULL,
-            joined_at INTEGER NOT NULL,
-            PRIMARY KEY (chat_id, peer_id),
-            FOREIGN KEY (peer_id) REFERENCES peers(id),
-            FOREIGN KEY (chat_id) REFERENCES chats(id)
-        )",
+             chat_id TEXT NOT NULL,
+             peer_id TEXT NOT NULL,
+             role TEXT DEFAULT 'member' NOT NULL,
+             joined_at INTEGER NOT NULL,
+             PRIMARY KEY (chat_id, peer_id),
+             FOREIGN KEY (peer_id) REFERENCES peers(id),
+             FOREIGN KEY (chat_id) REFERENCES chats(id)
+         )",
         [],
     )?;
 
     // 4. Files
     conn.execute(
         "CREATE TABLE IF NOT EXISTS files (
-            file_hash TEXT PRIMARY KEY,
-            file_name TEXT,
-            mime_type TEXT,
-            size_bytes INTEGER,
-            is_complete BOOLEAN DEFAULT 0
-        )",
+             file_hash TEXT PRIMARY KEY,
+             file_name TEXT,
+             mime_type TEXT,
+             size_bytes INTEGER,
+             is_complete BOOLEAN DEFAULT 0
+         )",
         [],
     )?;
 
     // 5. File Chunks
     conn.execute(
         "CREATE TABLE IF NOT EXISTS file_chunks (
-            file_hash TEXT NOT NULL,
-            chunk_order INTEGER NOT NULL,
-            chunk_hash TEXT NOT NULL,
-            chunk_size INTEGER NOT NULL,
-            PRIMARY KEY (file_hash, chunk_order),
-            FOREIGN KEY (file_hash) REFERENCES files(file_hash)
-        )",
+             file_hash TEXT NOT NULL,
+             chunk_order INTEGER NOT NULL,
+             chunk_hash TEXT NOT NULL,
+             chunk_size INTEGER NOT NULL,
+             PRIMARY KEY (file_hash, chunk_order),
+             FOREIGN KEY (file_hash) REFERENCES files(file_hash)
+         )",
         [],
     )?;
 
     // 6. Messages
     conn.execute(
         "CREATE TABLE IF NOT EXISTS messages (
-            id TEXT NOT NULL PRIMARY KEY,
-            chat_id TEXT NOT NULL,
-            peer_id TEXT NOT NULL,
-            timestamp INTEGER NOT NULL,
-            content_type TEXT NOT NULL,
-            text_content TEXT,
-            file_hash TEXT,
-            FOREIGN KEY (chat_id) REFERENCES chats(id),
-            FOREIGN KEY (peer_id) REFERENCES peers(id),
-            FOREIGN KEY (file_hash) REFERENCES files(file_hash)
-        )",
+             id TEXT NOT NULL PRIMARY KEY,
+             chat_id TEXT NOT NULL,
+             peer_id TEXT NOT NULL,
+             timestamp INTEGER NOT NULL,
+             content_type TEXT NOT NULL,
+             text_content TEXT,
+             file_hash TEXT,
+             FOREIGN KEY (chat_id) REFERENCES chats(id),
+             FOREIGN KEY (peer_id) REFERENCES peers(id),
+             FOREIGN KEY (file_hash) REFERENCES files(file_hash)
+         )",
         [],
     )?;
 
@@ -190,5 +193,93 @@ pub fn init() -> anyhow::Result<Connection> {
         [],
     )?;
 
-    Ok(conn)
+    seed_defaults(conn)?;
+
+    Ok(())
+}
+
+fn seed_defaults(conn: &Connection) -> anyhow::Result<()> {
+    // 1. Ensure 'Me' Peer exists
+    conn.execute(
+        "INSERT OR IGNORE INTO peers (id, alias, last_seen, public_key) 
+         VALUES (?1, ?2, ?3, ?4)",
+        (
+            "Me", 
+            "Me (You)", 
+            0, 
+            Vec::new() // Dummy empty key for self
+        ),
+    )?;
+
+    // 2. Ensure 'self' Chat exists
+    conn.execute(
+        "INSERT OR IGNORE INTO chats (id, name, is_group, encryption_key) 
+         VALUES (?1, ?2, ?3, ?4)",
+        (
+            "self", 
+            "Note to Self", 
+            0, 
+            Vec::new() // Dummy empty key for self chat
+        ),
+    )?;
+
+    // 3. Ensure joined_at for 'Me' in 'self' chat
+    conn.execute(
+        "INSERT OR IGNORE INTO chat_peers (chat_id, peer_id, role, joined_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        (
+            "self",
+            "Me",
+            "admin",
+            0
+        )
+    )?;
+
+    Ok(())
+}
+
+// --- 3. Database Operations ---
+
+pub fn insert_message(conn: &Connection, msg: &Message) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO messages (id, chat_id, peer_id, timestamp, content_type, text_content, file_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        (
+            &msg.id,
+            &msg.chat_id,
+            &msg.peer_id,
+            &msg.timestamp,
+            &msg.content_type,
+            &msg.text_content,
+            &msg.file_hash,
+        ),
+    )?;
+    Ok(())
+}
+
+pub fn get_messages(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<Message>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, chat_id, peer_id, timestamp, content_type, text_content, file_hash 
+         FROM messages 
+         WHERE chat_id = ?1 
+         ORDER BY timestamp ASC"
+    )?;
+    
+    let msg_iter = stmt.query_map([chat_id], |row| {
+        Ok(Message {
+            id: row.get(0)?,
+            chat_id: row.get(1)?,
+            peer_id: row.get(2)?,
+            timestamp: row.get(3)?,
+            content_type: row.get(4)?,
+            text_content: row.get(5)?,
+            file_hash: row.get(6)?,
+        })
+    })?;
+
+    let mut messages = Vec::new();
+    for msg in msg_iter {
+        messages.push(msg?);
+    }
+    Ok(messages)
 }

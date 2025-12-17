@@ -22,16 +22,19 @@
   let isPolling = false;
 
   onMount(async () => {
+    console.log("[Login] mounted. Checking status...");
     await checkStatus();
   });
 
   async function checkStatus() {
+    console.log("[Login] checkStatus called");
     try {
       const status = await invoke<{
         is_setup: boolean;
         is_unlocked: boolean;
         is_github_connected: boolean;
       }>("check_auth_status");
+      console.log("[Login] Status received:", status);
 
       if (!status.is_setup) {
         view = "setup";

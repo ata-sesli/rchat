@@ -2,7 +2,6 @@
   import { invoke } from "@tauri-apps/api/core";
   import { onMount, createEventDispatcher } from "svelte";
 
-  export let show = false; // Kept for API compatibility
   const dispatch = createEventDispatcher();
 
   // Navigation State
@@ -257,6 +256,7 @@
       <button
         on:click={goBack}
         class="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition-colors"
+        aria-label="Go Back"
       >
         <svg
           xmlns="http://www.w3.org/2000/svg"
@@ -276,27 +276,31 @@
 
     <div class="space-y-6 animate-fade-in-up">
       <div class="space-y-2">
-        <label class="text-sm font-medium text-slate-400"
-          >Alias (Display Name)</label
-        >
-        <input
-          type="text"
-          bind:value={alias}
-          placeholder="Your visual name"
-          class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 text-slate-200 focus:outline-none focus:border-blue-500 transition-colors"
-        />
+        <label class="block">
+          <span class="text-sm font-medium text-slate-400"
+            >Alias (Display Name)</span
+          >
+          <input
+            type="text"
+            bind:value={alias}
+            placeholder="Your visual name"
+            class="mt-1 w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 text-slate-200 focus:outline-none focus:border-blue-500 transition-colors"
+          />
+        </label>
       </div>
 
       <div class="space-y-2">
-        <label class="text-sm font-medium text-slate-400"
-          >Avatar URL (Optional)</label
-        >
-        <input
-          type="text"
-          bind:value={avatarPath}
-          placeholder="https://..."
-          class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 text-slate-200 focus:outline-none focus:border-blue-500 transition-colors"
-        />
+        <label class="block">
+          <span class="text-sm font-medium text-slate-400"
+            >Avatar URL (Optional)</span
+          >
+          <input
+            type="text"
+            bind:value={avatarPath}
+            placeholder="https://..."
+            class="mt-1 w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 text-slate-200 focus:outline-none focus:border-blue-500 transition-colors"
+          />
+        </label>
         <p class="text-xs text-slate-500">
           Enter a URL for your profile picture.
         </p>
