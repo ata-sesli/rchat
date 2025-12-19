@@ -16,6 +16,7 @@ pub struct NetworkState {
 // Add State Management
 pub struct AppState {
     pub config_manager: tokio::sync::Mutex<ConfigManager>,
+    pub db_conn: std::sync::Mutex<rusqlite::Connection>,
 }
 
 #[tauri::command]
@@ -232,12 +233,36 @@ async fn toggle_pin_peer(username: String, state: State<'_, AppState>) -> Result
     }
 }
 
+
+
+#[tauri::command]
+async fn save_peer_order(order: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
+    let mgr = state.config_manager.lock().await;
+    match mgr.load().await {
+        Ok(mut config) => {
+            config.user.peer_order = order;
+            mgr.save(&config).await.map_err(|e| e.to_string())?;
+            Ok(())
+        },
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn get_peer_order(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let mgr = state.config_manager.lock().await;
+    match mgr.load().await {
+        Ok(config) => Ok(config.user.peer_order.clone()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 // --- Persistence Commands ---
 
 #[tauri::command]
-async fn save_note_to_self(message: String) -> Result<(), String> {
+async fn save_note_to_self(message: String, state: State<'_, AppState>) -> Result<(), String> {
     println!("[Backend] save_note_to_self: {}", message);
-    let conn = storage::db::connect_to_db().map_err(|e| e.to_string())?;
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
     
     let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -271,12 +296,64 @@ async fn save_note_to_self(message: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn get_chat_history(chat_id: String) -> Result<Vec<storage::db::Message>, String> {
+async fn get_chat_history(chat_id: String, state: State<'_, AppState>) -> Result<Vec<storage::db::Message>, String> {
     println!("[Backend] get_chat_history for: {}", chat_id);
-    let conn = storage::db::connect_to_db().map_err(|e| e.to_string())?;
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
     let messages = storage::db::get_messages(&conn, &chat_id).map_err(|e| e.to_string())?;
     println!("[Backend] Found {} messages", messages.len());
     Ok(messages)
+}
+
+// --- Envelope Commands ---
+
+// --- Envelope Commands ---
+
+#[tauri::command]
+async fn create_envelope(name: String, icon: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+    println!("[Backend] create_envelope call: {}, icon: {:?}", name, icon);
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+    
+    // Generate simple ID
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let id = format!("env_{}", timestamp);
+    
+    // Check for duplicate name? No, just create.
+    
+    storage::db::create_envelope(&conn, &id, &name, icon.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn update_envelope(id: String, name: String, icon: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+    storage::db::update_envelope(&conn, &id, &name, icon.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_envelope(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+    storage::db::delete_envelope(&conn, &id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_envelopes(state: State<'_, AppState>) -> Result<Vec<storage::db::Envelope>, String> {
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+    storage::db::get_envelopes(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn move_chat_to_envelope(chat_id: String, envelope_id: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+    println!("[Backend] move_chat_to_envelope: chat_id={}, envelope_id={:?}", chat_id, envelope_id);
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+    storage::db::assign_chat_to_envelope(&conn, &chat_id, envelope_id.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_envelope_assignments(state: State<'_, AppState>) -> Result<Vec<storage::db::ChatAssignment>, String> {
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+    storage::db::get_chat_assignments(&conn).map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -305,8 +382,12 @@ pub fn run() {
                 println!("Session not restored. Vault locked.");
             }
             
+            // Initialize DB Connection ONCE (Solving Race Conditions)
+            let db_connection = storage::db::connect_to_db().expect("Failed to initialize database");
+            
             app.manage(AppState {
                 config_manager: tokio::sync::Mutex::new(config_manager),
+                db_conn: std::sync::Mutex::new(db_connection),
             });
 
             // --- 2. Run Heavy Background Tasks ---
@@ -345,8 +426,16 @@ pub fn run() {
             update_user_profile,
             get_pinned_peers,
             toggle_pin_peer,
+            save_peer_order,
+            get_peer_order,
             save_note_to_self,
             get_chat_history,
+            create_envelope,
+            update_envelope,
+            delete_envelope,
+            get_envelopes,
+            move_chat_to_envelope,
+            get_envelope_assignments,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

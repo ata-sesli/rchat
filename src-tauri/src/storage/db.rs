@@ -58,6 +58,19 @@ pub struct FileChunk {
     pub chunk_size: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Envelope {
+    pub id: String,
+    pub name: String,
+    pub icon: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChatAssignment {
+    pub chat_id: String,
+    pub envelope_id: String,
+}
+
 // --- 2. Database Initialization ---
 pub fn connect_to_db() -> anyhow::Result<Connection> {
     if let Some(project_dirs) = ProjectDirs::from("io.github", "ata-sesli", "RChat") {
@@ -72,6 +85,14 @@ pub fn connect_to_db() -> anyhow::Result<Connection> {
             
         // Always ensure schema exists!
         create_tables(&connection)?;
+        
+        // Enable Foreign Keys explicitly (SQLite default is OFF)
+        connection.pragma_update(None, "foreign_keys", "ON")
+            .context("Failed to enable foreign keys")?;
+            
+        // Set busy timeout to 5 seconds to avoid 'database is locked' errors
+        connection.pragma_update(None, "busy_timeout", 5000)
+            .context("Failed to set busy timeout")?;
         
         if !db_exists {
             // Only verify or notify if needed, but creates happened above
@@ -173,6 +194,30 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
         [],
     )?;
 
+    // 7. Envelopes
+    // 7. Envelopes
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS envelopes (
+                id TEXT NOT NULL PRIMARY KEY,
+                name TEXT NOT NULL,
+                icon TEXT
+            )",
+        [],
+    )?;
+
+    // Attempt to add 'icon' column if it doesn't exist (Migration for existing DBs)
+    let _ = conn.execute("ALTER TABLE envelopes ADD COLUMN icon TEXT", []);
+
+    // 8. Chat Envelopes (Assignments)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS chat_envelopes (
+                chat_id TEXT NOT NULL PRIMARY KEY,
+                envelope_id TEXT NOT NULL,
+                FOREIGN KEY (envelope_id) REFERENCES envelopes(id) ON DELETE CASCADE
+            )",
+        [],
+    )?;
+
     // --- Indexes (Crucial for Speed) ---
     
     // Speed up loading chat history (WHERE chat_id = ?)
@@ -257,7 +302,10 @@ pub fn insert_message(conn: &Connection, msg: &Message) -> anyhow::Result<()> {
     Ok(())
 }
 
+
+
 pub fn get_messages(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<Message>> {
+    // ... existing implementation ...
     let mut stmt = conn.prepare(
         "SELECT id, chat_id, peer_id, timestamp, content_type, text_content, file_hash 
          FROM messages 
@@ -282,4 +330,84 @@ pub fn get_messages(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<Mess
         messages.push(msg?);
     }
     Ok(messages)
+}
+
+// --- Envelope Operations ---
+
+pub fn create_envelope(conn: &Connection, id: &str, name: &str, icon: Option<&str>) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO envelopes (id, name, icon) VALUES (?1, ?2, ?3)",
+        (id, name, icon),
+    )?;
+    Ok(())
+}
+
+pub fn update_envelope(conn: &Connection, id: &str, name: &str, icon: Option<&str>) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE envelopes SET name = ?1, icon = ?2 WHERE id = ?3",
+        (name, icon, id),
+    )?;
+    Ok(())
+}
+
+pub fn delete_envelope(conn: &Connection, id: &str) -> anyhow::Result<()> {
+    let count = conn.execute(
+        "DELETE FROM envelopes WHERE id = ?1",
+        (id,),
+    )?;
+    
+    if count == 0 {
+        return Err(anyhow::anyhow!("Envelope with id '{}' not found or not deleted", id));
+    }
+    
+    Ok(())
+}
+
+pub fn get_envelopes(conn: &Connection) -> anyhow::Result<Vec<Envelope>> {
+    let mut stmt = conn.prepare("SELECT id, name, icon FROM envelopes")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Envelope {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            icon: row.get(2)?,
+        })
+    })?;
+    
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+pub fn assign_chat_to_envelope(conn: &Connection, chat_id: &str, envelope_id: Option<&str>) -> anyhow::Result<()> {
+    // If envelope_id is None, remove assignment (move to root)
+    if let Some(env_id) = envelope_id {
+        conn.execute(
+            "INSERT OR REPLACE INTO chat_envelopes (chat_id, envelope_id) VALUES (?1, ?2)",
+            (chat_id, env_id),
+        )?;
+    } else {
+        conn.execute(
+            "DELETE FROM chat_envelopes WHERE chat_id = ?1",
+            (chat_id,),
+        )?;
+    }
+    Ok(())
+}
+
+pub fn get_chat_assignments(conn: &Connection) -> anyhow::Result<Vec<ChatAssignment>> {
+    let mut stmt = conn.prepare("SELECT chat_id, envelope_id FROM chat_envelopes")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ChatAssignment {
+            chat_id: row.get(0)?,
+            envelope_id: row.get(1)?,
+        })
+    })?;
+    
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
 }

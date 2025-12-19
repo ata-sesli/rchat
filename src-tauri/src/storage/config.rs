@@ -45,6 +45,7 @@ pub struct UserConfig {
     // New Features
     pub profile: UserProfile,
     pub pinned_peers: Vec<String>,
+    pub peer_order: Vec<String>, // Custom order for peers
 }
 
 impl Default for UserConfig {
@@ -59,6 +60,7 @@ impl Default for UserConfig {
             hks_nodes: vec![],
             profile: UserProfile::default(),
             pinned_peers: vec![],
+            peer_order: vec![],
         }
     }
 }
