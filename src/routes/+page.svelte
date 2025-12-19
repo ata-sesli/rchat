@@ -29,6 +29,10 @@
   // Attachments Menu State
   let showAttachments = false;
 
+  // Drag Performance State
+  let isDragging = false;
+  let pendingReorderIndex: number | null = null; // Deferred reorder target
+
   // Data State
   let peers: string[] = [];
   let pinnedPeers: string[] = [];
@@ -374,13 +378,43 @@
 
   // Cache for drag collision
   let envelopeRects: { id: string; rect: DOMRect }[] = [];
-  let peerItemRects: { id: string; rect: DOMRect }[] = []; // Cache peer items for swapping
+  let peerItemRects: { id: string; rect: DOMRect }[] = [];
+  let dragStartOrder: string[] = []; // Snapshot of order at drag start
+
+  // Track "current hover" purely in JS to avoid Svelte re-renders
+  let currentHoverEnvelopeId: string | null = null;
+
+  // Throttle helper for 60fps
+  function throttle<T extends (...args: any[]) => void>(
+    func: T,
+    limit: number
+  ): T {
+    let inThrottle = false;
+    return function (this: any, ...args: any[]) {
+      if (!inThrottle) {
+        func.apply(this, args);
+        inThrottle = true;
+        setTimeout(() => (inThrottle = false), limit);
+      }
+    } as T;
+  }
 
   function handleNeoDragStart(e: any) {
+    isDragging = true;
+    pendingReorderIndex = null;
+    document.body.classList.add("dragging");
+
     // 1. Cache Envelope positions
     envelopeRects = envelopes
       .map((env) => {
         const el = document.getElementById(`envelope-drop-zone-${env.id}`);
+        if (el)
+          el.classList.remove(
+            "border-green-500",
+            "bg-green-900/20",
+            "border-white",
+            "bg-slate-800"
+          );
         return {
           id: env.id,
           rect: el ? el.getBoundingClientRect() : new DOMRect(0, 0, 0, 0),
@@ -388,9 +422,8 @@
       })
       .filter((e) => e.rect.width > 0);
 
-    // 2. Cache Peer Item positions (for swapping)
-    // Initialize peerOrder from sortedPeers at the start of drag
-    peerOrder = [...sortedPeers];
+    // 2. Cache Peer Item positions (snapshot at drag start)
+    dragStartOrder = [...sortedPeers];
     peerItemRects = sortedPeers
       .map((p) => {
         const el = document.getElementById(`peer-item-${p}`);
@@ -405,6 +438,10 @@
   function handleNeoDrag(e: any, chatId: string) {
     const dragRect = e.detail.rootNode.getBoundingClientRect();
     const dragCenterX = dragRect.left + dragRect.width / 2;
+    // We strictly use the mouse/touch Y from event if available, or center of node
+    // Neodrag doesn't give mouse Y directly in 'move' detail usually, it renders transform.
+    // detail.y is the translate value.
+    // Let's use rect center.
     const dragCenterY = dragRect.top + dragRect.height / 2;
 
     // A. Check Envelope Collision
@@ -420,94 +457,118 @@
         break;
       }
     }
-    dragOverEnvelopeId = targetEnvId;
 
-    // B. Check Peer Reordering (Row Swapping)
-    // Only if NOT over an envelope
+    // Direct DOM manipulation for Hover State (No Reactivity!)
+    if (currentHoverEnvelopeId !== targetEnvId) {
+      // Un-highlight old
+      if (currentHoverEnvelopeId) {
+        const oldEl = document.getElementById(
+          `envelope-drop-zone-${currentHoverEnvelopeId}`
+        );
+        if (oldEl) {
+          oldEl.classList.remove("border-white", "bg-slate-800");
+          // Restore default colors? The class bindings in template handle 'default' state,
+          // but we are overriding. We rely on the template's dynamic classes for 'current' state
+          // which hasn't changed.
+          // We added classes manually, so we remove them manually.
+        }
+      }
+
+      // Highlight new
+      if (targetEnvId) {
+        const newEl = document.getElementById(
+          `envelope-drop-zone-${targetEnvId}`
+        );
+        if (newEl) newEl.classList.add("border-white", "bg-slate-800");
+      }
+
+      currentHoverEnvelopeId = targetEnvId;
+    }
+
+    // B. Check Peer Reordering - DEFERRED (no reactivity during drag!)
     if (!targetEnvId) {
-      // Find which peer we are determining to swap with
-      const draggingIndex = peerOrder.indexOf(chatId);
-      if (draggingIndex === -1) return; // Should not happen if in list
+      const draggingIndex = dragStartOrder.indexOf(chatId);
+      if (draggingIndex === -1) return;
 
-      // Find peer under cursor
+      // Find peer under cursor using CACHED rects (from drag start)
       const targetPeer = peerItemRects.find(
         (p) => dragCenterY >= p.rect.top && dragCenterY <= p.rect.bottom
       );
 
       if (targetPeer && targetPeer.id !== chatId) {
-        const targetIndex = peerOrder.indexOf(targetPeer.id);
+        const targetIndex = dragStartOrder.indexOf(targetPeer.id);
         if (targetIndex !== -1 && targetIndex !== draggingIndex) {
-          // Prevent swapping Pinned vs Unpinned if we want to enforce structure?
-          // For now, let's just swap in peerOrder list.
-          // Note: If one is pinned and other is not, visual order in 'sortedPeers' won't change
-          // because 'pinned' bucket is separate. Users will learn this limitations.
-
-          // Swap!
-          const newOrder = [...peerOrder];
-          const [removed] = newOrder.splice(draggingIndex, 1);
-          newOrder.splice(targetIndex, 0, removed);
-          peerOrder = newOrder; // Live update!
-
-          // Update Cache? No, items move visually via FLIP.
-          // But their Rects on screen change?
-          // Yes, after animation. But animation takes time.
-          // Using stale rects during animation causes flickering.
-
-          // Hack: We rely on the fact that we are moving the mouse specifically to a Y coord.
-          // If we swap, the 'target' moves away.
-          // Next frame we might be over 'new target'.
-
-          // NOTE: Swapping too fast causes jitter.
-          // A 'debounce' or 'cooldown' is simpler?
-          // Or just swapping peerOrder is enough if Svelte is fast.
+          // Store for later - DON'T update peerOrder here!
+          pendingReorderIndex = targetIndex;
         }
+      } else {
+        pendingReorderIndex = null; // Reset if not over a valid target
       }
     }
   }
 
   async function handleNeoDragEnd(e: any, chatId: string) {
-    // Reset position visually
+    isDragging = false;
+    document.body.classList.remove("dragging");
+
+    // Reset visually
     setTimeout(() => {
       e.detail.rootNode.style.transform = "none";
     }, 0);
 
+    // Clean up Envelope Hover
+    if (currentHoverEnvelopeId) {
+      const el = document.getElementById(
+        `envelope-drop-zone-${currentHoverEnvelopeId}`
+      );
+      if (el) el.classList.remove("border-white", "bg-slate-800");
+    }
+
     // 1. Drop into Envelope
-    if (dragOverEnvelopeId) {
-      const target = dragOverEnvelopeId;
-      dragOverEnvelopeId = null;
+    if (currentHoverEnvelopeId) {
+      const target = currentHoverEnvelopeId;
+      currentHoverEnvelopeId = null;
+      pendingReorderIndex = null; // Cancel any reorder
 
       const currentAssignment = chatAssignments[chatId] || null;
       if (currentAssignment === target) return;
 
-      // Optimistic Update
+      // Optimistic Update (ONLY NOW, after drag ends)
       chatAssignments[chatId] = target;
       chatAssignments = { ...chatAssignments };
 
-      // Play success animation logic?
-      // We can use a reactive variable like 'successEnvelopeId' to trigger CSS class
-      playSuccessFlash(target);
+      // Success Flash (Direct DOM)
+      const el = document.getElementById(`envelope-drop-zone-${target}`);
+      if (el) {
+        el.classList.add("border-green-500", "bg-green-900/20");
+        setTimeout(() => {
+          if (el) el.classList.remove("border-green-500", "bg-green-900/20");
+        }, 1000);
+      }
 
       try {
-        await invoke("move_chat_to_envelope", {
-          chatId: chatId,
-          envelopeId: target,
-        });
-        console.log("Move confirmed by backend");
+        await invoke("move_chat_to_envelope", { chatId, envelopeId: target });
       } catch (err) {
         console.error("Move failed:", err);
-        alert("Move failed: " + err);
-        // await loadEnvelopes(); // Or revert local state
       }
-    } else {
-      // 2. Drop in List (Reorder)
-      // Order is already updated live in 'peerOrder'
-      // Just persist it.
-      try {
-        await invoke("save_peer_order", { order: peerOrder });
-        console.log("Order saved");
-      } catch (err) {
-        console.error("Save order failed", err);
+    } else if (pendingReorderIndex !== null) {
+      // 2. Apply DEFERRED Reorder (only now!)
+      const draggingIndex = dragStartOrder.indexOf(chatId);
+      if (draggingIndex !== -1 && pendingReorderIndex !== draggingIndex) {
+        const newOrder = [...dragStartOrder];
+        const [removed] = newOrder.splice(draggingIndex, 1);
+        newOrder.splice(pendingReorderIndex, 0, removed);
+
+        // NOW update peerOrder (triggers FLIP animation ONCE)
+        peerOrder = newOrder;
+
+        try {
+          await invoke("save_peer_order", { order: peerOrder });
+        } catch (err) {
+          console.error("Save order failed", err);
+        }
       }
+      pendingReorderIndex = null;
     }
   }
 
@@ -790,7 +851,10 @@
       {#if isSidebarOpen}
         {#each sortedPeers as peer (peer)}
           {@const isPinned = pinnedPeers.includes(peer)}
-          <div animate:flip={{ duration: 200 }} class="relative group/item">
+          <div
+            animate:flip={{ duration: isDragging ? 0 : 200 }}
+            class="relative group/item"
+          >
             <!-- svelte-ignore a11y-interactive-supports-focus -->
             <!-- svelte-ignore a11y-click-events-have-key-events -->
             <!-- svelte-ignore a11y-no-static-element-interactions -->
@@ -1358,5 +1422,23 @@
 
   :global(html) {
     overflow: hidden;
+  }
+
+  /* Performance: Hardware acceleration for peer items */
+  :global([id^="peer-item-"]) {
+    contain: layout style paint;
+    backface-visibility: hidden;
+    will-change: transform;
+  }
+
+  /* During drag: Pause all animations to prevent interference */
+  :global(body.dragging *) {
+    animation-play-state: paused !important;
+    transition-duration: 0s !important;
+  }
+
+  /* Ensure dragged item is on top */
+  :global(body.dragging [id^="peer-item-"]:active) {
+    z-index: 9999 !important;
   }
 </style>

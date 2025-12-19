@@ -44,7 +44,9 @@ pub struct UserConfig {
     
     // New Features
     pub profile: UserProfile,
+    #[serde(default)]
     pub pinned_peers: Vec<String>,
+    #[serde(default)]
     pub peer_order: Vec<String>, // Custom order for peers
 }
 
