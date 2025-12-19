@@ -1,10 +1,10 @@
 mod network;
-mod storage;
-mod oauth; // New module
+mod oauth;
+mod storage; // New module
 
+use tauri::{Manager, State};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-use tauri::{Manager, State}; 
 // use tauri::Runtime; // Unused
 
 use crate::storage::config::ConfigManager;
@@ -20,10 +20,7 @@ pub struct AppState {
 }
 
 #[tauri::command]
-async fn save_api_token(
-    token: String,
-    state: State<'_, AppState>
-) -> Result<(), String> {
+async fn save_api_token(token: String, state: State<'_, AppState>) -> Result<(), String> {
     let mgr = state.config_manager.lock().await;
     let mut config = mgr.load().await.map_err(|e| e.to_string())?;
     config.system.github_token = Some(token);
@@ -52,14 +49,19 @@ async fn init_vault(password: String, state: State<'_, AppState>) -> Result<(), 
 
 #[tauri::command]
 async fn unlock_vault(password: String, state: State<'_, AppState>) -> Result<(), String> {
-    println!("[Backend] unlock_vault called. Password len: {}", password.len());
+    println!(
+        "[Backend] unlock_vault called. Password len: {}",
+        password.len()
+    );
     let mut mgr = state.config_manager.lock().await;
     // Note: Logging actual password is bad practice, but length/trim check is okay for debug
     println!("[Backend] Password trimmed len: {}", password.trim().len());
-    mgr.unlock_with_password(password.trim()).await.map_err(|e| {
-        eprintln!("[Backend] Unlock failed: {}", e);
-        e.to_string()
-    })?;
+    mgr.unlock_with_password(password.trim())
+        .await
+        .map_err(|e| {
+            eprintln!("[Backend] Unlock failed: {}", e);
+            e.to_string()
+        })?;
     println!("[Backend] Vault unlocked successfully.");
     Ok(())
 }
@@ -72,7 +74,9 @@ async fn start_github_auth() -> Result<oauth::AuthState, String> {
 
 #[tauri::command]
 async fn poll_github_auth(device_code: String) -> Result<String, String> {
-    oauth::poll_for_token(&device_code).await.map_err(|e| e.to_string())
+    oauth::poll_for_token(&device_code)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -101,7 +105,12 @@ use crate::storage::config::{FriendConfig, UserProfile};
 async fn get_trusted_peers(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let mgr = state.config_manager.lock().await;
     match mgr.load().await {
-        Ok(config) => Ok(config.user.friends.into_iter().map(|f| f.username).collect()),
+        Ok(config) => Ok(config
+            .user
+            .friends
+            .into_iter()
+            .map(|f| f.username)
+            .collect()),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -115,7 +124,7 @@ async fn get_friends(state: State<'_, AppState>) -> Result<Vec<FriendConfig>, St
         Err(e) => {
             eprintln!("[Backend] Error loading friends: {}", e);
             Err(e.to_string())
-        },
+        }
     }
 }
 
@@ -124,7 +133,7 @@ async fn add_friend(
     username: String,
     x25519_key: Option<String>,
     ed25519_key: Option<String>,
-    state: State<'_, AppState>
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mgr = state.config_manager.lock().await;
     match mgr.load().await {
@@ -141,12 +150,12 @@ async fn add_friend(
                 mgr.save(&config).await.map_err(|e| e.to_string())?;
             }
             Ok(())
-        },
+        }
         Err(e) => Err(e.to_string()),
     }
 }
 
-// Note: add_friend command is just adding to config. 
+// Note: add_friend command is just adding to config.
 // Ideally it should use HksTree::add_friend logic?
 // But HksTree state isn't in Config yet.
 // We need to persist HksTree in Config or File.
@@ -160,7 +169,7 @@ async fn remove_friend(username: String, state: State<'_, AppState>) -> Result<(
             config.user.friends.retain(|f| f.username != username);
             mgr.save(&config).await.map_err(|e| e.to_string())?;
             Ok(())
-        },
+        }
         Err(e) => Err(e.to_string()),
     }
 }
@@ -171,14 +180,14 @@ async fn get_user_profile(state: State<'_, AppState>) -> Result<UserProfile, Str
     let mgr = state.config_manager.lock().await;
     match mgr.load().await {
         Ok(config) => {
-             println!("[Backend] Returning profile: {:?}", config.user.profile);
-             Ok(config.user.profile.clone())
-        },
+            println!("[Backend] Returning profile: {:?}", config.user.profile);
+            Ok(config.user.profile.clone())
+        }
         Err(e) => {
             eprintln!("[Backend] Error loading config: {}", e);
             // Return default profile to prevent frontend crash
             Ok(UserProfile::default())
-        },
+        }
     }
 }
 
@@ -186,7 +195,7 @@ async fn get_user_profile(state: State<'_, AppState>) -> Result<UserProfile, Str
 async fn update_user_profile(
     alias: Option<String>,
     avatar_path: Option<String>,
-    state: State<'_, AppState>
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mgr = state.config_manager.lock().await;
     match mgr.load().await {
@@ -199,7 +208,7 @@ async fn update_user_profile(
             }
             mgr.save(&config).await.map_err(|e| e.to_string())?;
             Ok(())
-        },
+        }
         Err(e) => Err(e.to_string()),
     }
 }
@@ -228,12 +237,10 @@ async fn toggle_pin_peer(username: String, state: State<'_, AppState>) -> Result
             }
             mgr.save(&config).await.map_err(|e| e.to_string())?;
             Ok(is_pinned)
-        },
+        }
         Err(e) => Err(e.to_string()),
     }
 }
-
-
 
 #[tauri::command]
 async fn save_peer_order(order: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
@@ -243,7 +250,7 @@ async fn save_peer_order(order: Vec<String>, state: State<'_, AppState>) -> Resu
             config.user.peer_order = order;
             mgr.save(&config).await.map_err(|e| e.to_string())?;
             Ok(())
-        },
+        }
         Err(e) => Err(e.to_string()),
     }
 }
@@ -263,12 +270,12 @@ async fn get_peer_order(state: State<'_, AppState>) -> Result<Vec<String>, Strin
 async fn save_note_to_self(message: String, state: State<'_, AppState>) -> Result<(), String> {
     println!("[Backend] save_note_to_self: {}", message);
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
-    
+
     let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-    
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
     // Generate simple ID
     let id_suffix: u32 = rand::random();
     let msg_id = format!("{}-{}", timestamp, id_suffix);
@@ -287,7 +294,7 @@ async fn save_note_to_self(message: String, state: State<'_, AppState>) -> Resul
         Ok(_) => {
             println!("[Backend] Note saved successfully");
             Ok(())
-        },
+        }
         Err(e) => {
             eprintln!("[Backend] Failed to save note: {}", e);
             Err(e.to_string())
@@ -296,7 +303,10 @@ async fn save_note_to_self(message: String, state: State<'_, AppState>) -> Resul
 }
 
 #[tauri::command]
-async fn get_chat_history(chat_id: String, state: State<'_, AppState>) -> Result<Vec<storage::db::Message>, String> {
+async fn get_chat_history(
+    chat_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<storage::db::Message>, String> {
     println!("[Backend] get_chat_history for: {}", chat_id);
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
     let messages = storage::db::get_messages(&conn, &chat_id).map_err(|e| e.to_string())?;
@@ -309,24 +319,33 @@ async fn get_chat_history(chat_id: String, state: State<'_, AppState>) -> Result
 // --- Envelope Commands ---
 
 #[tauri::command]
-async fn create_envelope(name: String, icon: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+async fn create_envelope(
+    name: String,
+    icon: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     println!("[Backend] create_envelope call: {}, icon: {:?}", name, icon);
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
-    
+
     // Generate simple ID
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let id = format!("env_{}", timestamp);
-    
+
     // Check for duplicate name? No, just create.
-    
+
     storage::db::create_envelope(&conn, &id, &name, icon.as_deref()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn update_envelope(id: String, name: String, icon: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+async fn update_envelope(
+    id: String,
+    name: String,
+    icon: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
     storage::db::update_envelope(&conn, &id, &name, icon.as_deref()).map_err(|e| e.to_string())
 }
@@ -344,14 +363,24 @@ async fn get_envelopes(state: State<'_, AppState>) -> Result<Vec<storage::db::En
 }
 
 #[tauri::command]
-async fn move_chat_to_envelope(chat_id: String, envelope_id: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
-    println!("[Backend] move_chat_to_envelope: chat_id={}, envelope_id={:?}", chat_id, envelope_id);
+async fn move_chat_to_envelope(
+    chat_id: String,
+    envelope_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    println!(
+        "[Backend] move_chat_to_envelope: chat_id={}, envelope_id={:?}",
+        chat_id, envelope_id
+    );
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
-    storage::db::assign_chat_to_envelope(&conn, &chat_id, envelope_id.as_deref()).map_err(|e| e.to_string())
+    storage::db::assign_chat_to_envelope(&conn, &chat_id, envelope_id.as_deref())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn get_envelope_assignments(state: State<'_, AppState>) -> Result<Vec<storage::db::ChatAssignment>, String> {
+async fn get_envelope_assignments(
+    state: State<'_, AppState>,
+) -> Result<Vec<storage::db::ChatAssignment>, String> {
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
     storage::db::get_chat_assignments(&conn).map_err(|e| e.to_string())
 }
@@ -359,6 +388,7 @@ async fn get_envelope_assignments(state: State<'_, AppState>) -> Result<Vec<stor
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_fs::init())
         // --- 1. The Setup Hook ---
         .setup(|app| {
             // This runs BEFORE the window appears
@@ -366,25 +396,29 @@ pub fn run() {
 
             // Get a handle to the app if you need it for events/windows later
             let app_handle = app.handle().clone();
-            
+
             // Initialize ConfigManager
-            let app_dir = app.path().app_data_dir().expect("failed to get app data dir");
+            let app_dir = app
+                .path()
+                .app_data_dir()
+                .expect("failed to get app data dir");
             std::fs::create_dir_all(&app_dir).expect("failed to create app data dir");
             let mut config_manager = ConfigManager::new(app_dir);
-            
+
             // Initialize Database (Schema in connect)
             // storage::db::connect_to_db ensures schema exists
-            
+
             // Try to restore session (auto-unlock)
             if config_manager.try_restore_session() {
                 println!("Session restored successfully. Vault unlocked.");
             } else {
                 println!("Session not restored. Vault locked.");
             }
-            
+
             // Initialize DB Connection ONCE (Solving Race Conditions)
-            let db_connection = storage::db::connect_to_db().expect("Failed to initialize database");
-            
+            let db_connection =
+                storage::db::connect_to_db().expect("Failed to initialize database");
+
             app.manage(AppState {
                 config_manager: tokio::sync::Mutex::new(config_manager),
                 db_conn: std::sync::Mutex::new(db_connection),
@@ -394,12 +428,12 @@ pub fn run() {
             // We spawn a separate async task so we don't freeze the UI startup
             tauri::async_runtime::spawn(async move {
                 println!("[Backend] Starting Background Services...");
-                
+
                 match network::init(app_handle).await {
                     Ok(_) => println!("[Backend] network::init completed successfully"),
                     Err(e) => eprintln!("[Backend] Failed to start network: {}", e),
                 }
-                
+
                 println!("[Backend] Background Services Ready!");
             });
 
@@ -409,9 +443,9 @@ pub fn run() {
         // --- End Setup Hook ---
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            greet, 
-            send_chat_message, 
-            save_api_token, 
+            greet,
+            send_chat_message,
+            save_api_token,
             check_auth_status,
             init_vault,
             unlock_vault,
@@ -442,17 +476,12 @@ pub fn run() {
 }
 
 #[tauri::command]
-async fn send_chat_message(
-    message: String, 
-    state: State<'_, NetworkState>
-) -> Result<(), String> {
+async fn send_chat_message(message: String, state: State<'_, NetworkState>) -> Result<(), String> {
     // 1. Lock the sender
     let tx = state.sender.lock().await;
-    
+
     // 2. Send the message to the background Network Manager
-    tx.send(message)
-        .await
-        .map_err(|e| e.to_string())?;
-        
+    tx.send(message).await.map_err(|e| e.to_string())?;
+
     Ok(())
 }

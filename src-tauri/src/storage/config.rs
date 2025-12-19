@@ -1,9 +1,9 @@
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use tokio::fs;
 use anyhow::Result;
 use rvault_core;
 use rvault_core::session;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use tokio::fs;
 
 // System Configuration, can be modified only internally.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -18,18 +18,18 @@ pub struct SystemConfig {
 // User Configuration, can be modified via UI.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FriendConfig {
-    pub username: String, // Gist ID / Username
-    pub x25519_pubkey: Option<String>, // Base64
-    pub ed25519_pubkey: Option<String>, // Base64
-    pub leaf_index: usize, // HKS Leaf Index
+    pub username: String,                   // Gist ID / Username
+    pub x25519_pubkey: Option<String>,      // Base64
+    pub ed25519_pubkey: Option<String>,     // Base64
+    pub leaf_index: usize,                  // HKS Leaf Index
     pub encrypted_leaf_key: Option<String>, // Base64
-    pub nonce: Option<String>, // Base64
+    pub nonce: Option<String>,              // Base64
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct UserProfile {
     pub alias: Option<String>,
-    pub avatar_path: Option<String>, 
+    pub avatar_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -41,7 +41,7 @@ pub struct UserConfig {
     pub encryption_private_key: Option<String>, // X25519 Secret (Base64)
     pub friends: Vec<FriendConfig>,
     pub hks_nodes: Vec<String>, // Base64 encoded keys of the tree (Depth 12 = 8191 nodes)
-    
+
     // New Features
     pub profile: UserProfile,
     #[serde(default)]
@@ -95,11 +95,11 @@ impl ConfigManager {
     pub fn unlock(&mut self, key: [u8; 32]) {
         self.key = Some(key);
     }
-    
+
     pub fn is_unlocked(&self) -> bool {
         self.key.is_some()
     }
-    
+
     pub fn lock(&mut self) {
         self.key = None;
     }
@@ -111,22 +111,22 @@ impl ConfigManager {
     /// Initialize new config with password
     pub async fn init(&mut self, password: &str) -> Result<Config> {
         if self.file_path.exists() {
-             return Err(anyhow::anyhow!("Config already exists"));
+            return Err(anyhow::anyhow!("Config already exists"));
         }
 
         // Hash the password for storage
         let hashed = rvault_core::crypto::hash_data(password.as_bytes())
             .map_err(|e| anyhow::anyhow!("Hashing failed: {}", e))?;
-            
+
         // Create rchat's own keystore (not rvault's!)
         let keystore_path = rchat_keystore_path(&self.file_path.parent().unwrap().to_path_buf());
         rvault_core::keystore::create_key_vault(password, &keystore_path)
             .map_err(|e| anyhow::anyhow!("Keystore creation failed: {}", e))?;
-            
+
         // Load the MEK from our keystore
         let key = rvault_core::keystore::load_key_from_vault(password, &keystore_path)
             .map_err(|e| anyhow::anyhow!("Key derivation failed: {}", e))?;
-            
+
         let config = Config {
             system: SystemConfig {
                 master_hash: Some(hashed.hash),
@@ -134,31 +134,35 @@ impl ConfigManager {
             },
             user: UserConfig::default(),
         };
-        
+
         // Update state
         self.key = Some(key);
-        
+
         // Save using the derived key
         Self::save_internal(&config, &key, &self.file_path).await?;
-        
+
         // Start Session
         if let Ok(token) = session::start_session(&key) {
-             let _ = session::write_current(&token);
+            let _ = session::write_current(&token);
         }
 
         Ok(config)
     }
-    
+
     /// Unlock existing config with password
     pub async fn unlock_with_password(&mut self, password: &str) -> Result<Config> {
         if !self.file_path.exists() {
-             return Err(anyhow::anyhow!("Config file not found"));
+            return Err(anyhow::anyhow!("Config file not found"));
         }
-        
+
         let data = fs::read(&self.file_path).await?;
         let wrapper: ConfigWrapper = serde_json::from_slice(&data)?;
-        
-        println!("Unlock attempt: Password len={}, Stored Hash len={}", password.len(), wrapper.master_hash.len());
+
+        println!(
+            "Unlock attempt: Password len={}, Stored Hash len={}",
+            password.len(),
+            wrapper.master_hash.len()
+        );
 
         // Verify password against stored hash first (for better UX/error messages)
         if !rvault_core::crypto::verify_password(password.as_bytes(), &wrapper.master_hash) {
@@ -168,19 +172,20 @@ impl ConfigManager {
         // Load MEK from rchat's keystore
         let keystore_path = rchat_keystore_path(&self.file_path.parent().unwrap().to_path_buf());
         let key = rvault_core::keystore::load_key_from_vault(password, &keystore_path)
-             .map_err(|e| anyhow::anyhow!("Keystore unlock failed: {}", e))?;
-              
-        let decrypted_json = rvault_core::crypto::decrypt_with_key(&key, &wrapper.ciphertext, &wrapper.nonce)
-             .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
-             
+            .map_err(|e| anyhow::anyhow!("Keystore unlock failed: {}", e))?;
+
+        let decrypted_json =
+            rvault_core::crypto::decrypt_with_key(&key, &wrapper.ciphertext, &wrapper.nonce)
+                .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
+
         let config: Config = serde_json::from_str(&decrypted_json)?;
-        
+
         // Update state
         self.key = Some(key);
-        
+
         // Start Session
         if let Ok(token) = session::start_session(&key) {
-             let _ = session::write_current(&token);
+            let _ = session::write_current(&token);
         }
 
         Ok(config)
@@ -188,17 +193,18 @@ impl ConfigManager {
 
     pub async fn load(&self) -> Result<Config> {
         let key = self.key.ok_or_else(|| anyhow::anyhow!("Vault is locked"))?;
-        
+
         if !self.file_path.exists() {
-             return Err(anyhow::anyhow!("Config file not found"));
+            return Err(anyhow::anyhow!("Config file not found"));
         }
-        
+
         let data = fs::read(&self.file_path).await?;
         let wrapper: ConfigWrapper = serde_json::from_slice(&data)?;
-        
-        let decrypted_json = rvault_core::crypto::decrypt_with_key(&key, &wrapper.ciphertext, &wrapper.nonce)
-             .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
-             
+
+        let decrypted_json =
+            rvault_core::crypto::decrypt_with_key(&key, &wrapper.ciphertext, &wrapper.nonce)
+                .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
+
         let config: Config = serde_json::from_str(&decrypted_json)?;
         Ok(config)
     }
@@ -207,15 +213,18 @@ impl ConfigManager {
         let key = self.key.ok_or_else(|| anyhow::anyhow!("Vault is locked"))?;
         Self::save_internal(config, &key, &self.file_path).await
     }
-    
+
     // Internal static save to avoid borrowing issues or for use in init
     async fn save_internal(config: &Config, key: &[u8], path: &PathBuf) -> Result<()> {
         let plain_json = serde_json::to_string(config)?;
         let (ciphertext, nonce) = rvault_core::crypto::encrypt_with_key(key, plain_json.as_bytes())
-             .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
-        
+            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+
         // Ensure master_hash is present
-        let master_hash = config.system.master_hash.clone()
+        let master_hash = config
+            .system
+            .master_hash
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("System config missing master_hash"))?;
 
         let wrapper = ConfigWrapper {
@@ -223,7 +232,7 @@ impl ConfigManager {
             ciphertext,
             nonce,
         };
-        
+
         let file_data = serde_json::to_vec_pretty(&wrapper)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
@@ -233,15 +242,19 @@ impl ConfigManager {
     }
     pub async fn has_token(&self) -> bool {
         if let Some(key) = self.key {
-             if let Ok(data) = fs::read(&self.file_path).await {
-                 if let Ok(wrapper) = serde_json::from_slice::<ConfigWrapper>(&data) {
-                     if let Ok(decrypted) = rvault_core::crypto::decrypt_with_key(&key, &wrapper.ciphertext, &wrapper.nonce) {
+            if let Ok(data) = fs::read(&self.file_path).await {
+                if let Ok(wrapper) = serde_json::from_slice::<ConfigWrapper>(&data) {
+                    if let Ok(decrypted) = rvault_core::crypto::decrypt_with_key(
+                        &key,
+                        &wrapper.ciphertext,
+                        &wrapper.nonce,
+                    ) {
                         if let Ok(config) = serde_json::from_str::<Config>(&decrypted) {
                             return config.system.github_token.is_some();
                         }
-                     }
-                 }
-             }
+                    }
+                }
+            }
         }
         false
     }
@@ -251,16 +264,16 @@ impl ConfigManager {
             fs::remove_file(&self.file_path).await?;
         }
         self.key = None;
-         let _ = session::end_session();
+        let _ = session::end_session();
         Ok(())
     }
 
     pub fn try_restore_session(&mut self) -> bool {
         if let Ok(key_vec) = session::get_key_from_session() {
-             if let Ok(key) = key_vec.try_into() {
-                 self.key = Some(key);
-                 return true;
-             }
+            if let Ok(key) = key_vec.try_into() {
+                self.key = Some(key);
+                return true;
+            }
         }
         false
     }
@@ -281,14 +294,20 @@ mod tests {
         let password = "test_password";
         let hashed = rvault_core::crypto::hash_data(password.as_bytes()).expect("Hashing failed");
         println!("Hash: {}", hashed.hash);
-        assert!(rvault_core::crypto::verify_password(password.as_bytes(), &hashed.hash), "Verification failed");
-        
+        assert!(
+            rvault_core::crypto::verify_password(password.as_bytes(), &hashed.hash),
+            "Verification failed"
+        );
+
         // This step verifies if get_encryption_key works with the password.
         // It will fail if keystore.rvault is missing or password doesn't match the one in keystore.
         // We expect it to fail in CI/clean env, but we want to see the error message.
         match rvault_core::vault::Vault::get_encryption_key(password, &hashed.hash) {
             Ok(_) => println!("get_encryption_key success"),
-            Err(e) => println!("get_encryption_key failed as expected (if no keystore): {}", e),
+            Err(e) => println!(
+                "get_encryption_key failed as expected (if no keystore): {}",
+                e
+            ),
         }
     }
 }

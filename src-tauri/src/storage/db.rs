@@ -1,8 +1,8 @@
 use rusqlite::Connection;
 // use std::path::Path; // Unused
 use anyhow::Context;
-use serde::{Serialize, Deserialize};
 use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
 
 // --- 1. Rust Structs (Data Models) ---
 
@@ -76,24 +76,25 @@ pub fn connect_to_db() -> anyhow::Result<Connection> {
     if let Some(project_dirs) = ProjectDirs::from("io.github", "ata-sesli", "RChat") {
         let project_dirs = project_dirs.data_dir();
         let database_dir = project_dirs.join("databases");
-        std::fs::create_dir_all(&database_dir)
-            .context("Failed to create database directory")?;
+        std::fs::create_dir_all(&database_dir).context("Failed to create database directory")?;
         let final_path = database_dir.join("rchat.sqlite");
         let db_exists = final_path.exists();
-        let connection = Connection::open(&final_path)
-            .context("Failed to open database connection")?;
-            
+        let connection =
+            Connection::open(&final_path).context("Failed to open database connection")?;
+
         // Always ensure schema exists!
         create_tables(&connection)?;
-        
+
         // Enable Foreign Keys explicitly (SQLite default is OFF)
-        connection.pragma_update(None, "foreign_keys", "ON")
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
             .context("Failed to enable foreign keys")?;
-            
+
         // Set busy timeout to 5 seconds to avoid 'database is locked' errors
-        connection.pragma_update(None, "busy_timeout", 5000)
+        connection
+            .pragma_update(None, "busy_timeout", 5000)
             .context("Failed to set busy timeout")?;
-        
+
         if !db_exists {
             // Only verify or notify if needed, but creates happened above
             println!("Successfully initialized database schema!");
@@ -115,7 +116,7 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
     conn.execute("PRAGMA foreign_keys = ON;", [])?;
 
     // --- Schema Creation ---
-    
+
     // 1. Peers
     conn.execute(
         "CREATE TABLE IF NOT EXISTS peers (
@@ -219,7 +220,7 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
     )?;
 
     // --- Indexes (Crucial for Speed) ---
-    
+
     // Speed up loading chat history (WHERE chat_id = ?)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id)",
@@ -249,10 +250,10 @@ fn seed_defaults(conn: &Connection) -> anyhow::Result<()> {
         "INSERT OR IGNORE INTO peers (id, alias, last_seen, public_key) 
          VALUES (?1, ?2, ?3, ?4)",
         (
-            "Me", 
-            "Me (You)", 
-            0, 
-            Vec::new() // Dummy empty key for self
+            "Me",
+            "Me (You)",
+            0,
+            Vec::new(), // Dummy empty key for self
         ),
     )?;
 
@@ -261,10 +262,10 @@ fn seed_defaults(conn: &Connection) -> anyhow::Result<()> {
         "INSERT OR IGNORE INTO chats (id, name, is_group, encryption_key) 
          VALUES (?1, ?2, ?3, ?4)",
         (
-            "self", 
-            "Note to Self", 
-            0, 
-            Vec::new() // Dummy empty key for self chat
+            "self",
+            "Note to Self",
+            0,
+            Vec::new(), // Dummy empty key for self chat
         ),
     )?;
 
@@ -272,12 +273,7 @@ fn seed_defaults(conn: &Connection) -> anyhow::Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO chat_peers (chat_id, peer_id, role, joined_at)
          VALUES (?1, ?2, ?3, ?4)",
-        (
-            "self",
-            "Me",
-            "admin",
-            0
-        )
+        ("self", "Me", "admin", 0),
     )?;
 
     Ok(())
@@ -302,17 +298,15 @@ pub fn insert_message(conn: &Connection, msg: &Message) -> anyhow::Result<()> {
     Ok(())
 }
 
-
-
 pub fn get_messages(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<Message>> {
     // ... existing implementation ...
     let mut stmt = conn.prepare(
         "SELECT id, chat_id, peer_id, timestamp, content_type, text_content, file_hash 
          FROM messages 
          WHERE chat_id = ?1 
-         ORDER BY timestamp ASC"
+         ORDER BY timestamp ASC",
     )?;
-    
+
     let msg_iter = stmt.query_map([chat_id], |row| {
         Ok(Message {
             id: row.get(0)?,
@@ -334,7 +328,12 @@ pub fn get_messages(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<Mess
 
 // --- Envelope Operations ---
 
-pub fn create_envelope(conn: &Connection, id: &str, name: &str, icon: Option<&str>) -> anyhow::Result<()> {
+pub fn create_envelope(
+    conn: &Connection,
+    id: &str,
+    name: &str,
+    icon: Option<&str>,
+) -> anyhow::Result<()> {
     conn.execute(
         "INSERT INTO envelopes (id, name, icon) VALUES (?1, ?2, ?3)",
         (id, name, icon),
@@ -342,7 +341,12 @@ pub fn create_envelope(conn: &Connection, id: &str, name: &str, icon: Option<&st
     Ok(())
 }
 
-pub fn update_envelope(conn: &Connection, id: &str, name: &str, icon: Option<&str>) -> anyhow::Result<()> {
+pub fn update_envelope(
+    conn: &Connection,
+    id: &str,
+    name: &str,
+    icon: Option<&str>,
+) -> anyhow::Result<()> {
     conn.execute(
         "UPDATE envelopes SET name = ?1, icon = ?2 WHERE id = ?3",
         (name, icon, id),
@@ -351,15 +355,15 @@ pub fn update_envelope(conn: &Connection, id: &str, name: &str, icon: Option<&st
 }
 
 pub fn delete_envelope(conn: &Connection, id: &str) -> anyhow::Result<()> {
-    let count = conn.execute(
-        "DELETE FROM envelopes WHERE id = ?1",
-        (id,),
-    )?;
-    
+    let count = conn.execute("DELETE FROM envelopes WHERE id = ?1", (id,))?;
+
     if count == 0 {
-        return Err(anyhow::anyhow!("Envelope with id '{}' not found or not deleted", id));
+        return Err(anyhow::anyhow!(
+            "Envelope with id '{}' not found or not deleted",
+            id
+        ));
     }
-    
+
     Ok(())
 }
 
@@ -372,7 +376,7 @@ pub fn get_envelopes(conn: &Connection) -> anyhow::Result<Vec<Envelope>> {
             icon: row.get(2)?,
         })
     })?;
-    
+
     let mut result = Vec::new();
     for row in rows {
         result.push(row?);
@@ -380,7 +384,11 @@ pub fn get_envelopes(conn: &Connection) -> anyhow::Result<Vec<Envelope>> {
     Ok(result)
 }
 
-pub fn assign_chat_to_envelope(conn: &Connection, chat_id: &str, envelope_id: Option<&str>) -> anyhow::Result<()> {
+pub fn assign_chat_to_envelope(
+    conn: &Connection,
+    chat_id: &str,
+    envelope_id: Option<&str>,
+) -> anyhow::Result<()> {
     // If envelope_id is None, remove assignment (move to root)
     if let Some(env_id) = envelope_id {
         conn.execute(
@@ -388,10 +396,7 @@ pub fn assign_chat_to_envelope(conn: &Connection, chat_id: &str, envelope_id: Op
             (chat_id, env_id),
         )?;
     } else {
-        conn.execute(
-            "DELETE FROM chat_envelopes WHERE chat_id = ?1",
-            (chat_id,),
-        )?;
+        conn.execute("DELETE FROM chat_envelopes WHERE chat_id = ?1", (chat_id,))?;
     }
     Ok(())
 }
@@ -404,7 +409,7 @@ pub fn get_chat_assignments(conn: &Connection) -> anyhow::Result<Vec<ChatAssignm
             envelope_id: row.get(1)?,
         })
     })?;
-    
+
     let mut result = Vec::new();
     for row in rows {
         result.push(row?);

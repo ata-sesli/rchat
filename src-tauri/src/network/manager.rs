@@ -1,8 +1,8 @@
-use futures::StreamExt;
-use libp2p::{Multiaddr, Swarm, swarm::SwarmEvent};
-use tauri::AppHandle;
-use tauri::async_runtime::Receiver;
 use crate::network::behaviour::{RChatBehaviour, RChatBehaviourEvent};
+use futures::StreamExt;
+use libp2p::{swarm::SwarmEvent, Multiaddr, Swarm};
+use tauri::async_runtime::Receiver;
+use tauri::AppHandle;
 use tauri::Emitter;
 
 pub struct NetworkManager {
@@ -15,18 +15,22 @@ pub struct NetworkManager {
     disc_rx: Receiver<Multiaddr>,
 }
 impl NetworkManager {
-    pub fn new(swarm: Swarm<RChatBehaviour>,crx: Receiver<String>, disc_rx: Receiver<Multiaddr>, app_handle: AppHandle)
-    -> Self {
+    pub fn new(
+        swarm: Swarm<RChatBehaviour>,
+        crx: Receiver<String>,
+        disc_rx: Receiver<Multiaddr>,
+        app_handle: AppHandle,
+    ) -> Self {
         Self {
             swarm,
             crx,
             disc_rx,
-            app_handle
+            app_handle,
         }
     }
-    pub async fn run(mut self: Self){
+    pub async fn run(mut self: Self) {
         println!("🛜 Network Manager: Running!");
-        
+
         // Publish every 5 minutes
         let mut publish_interval = tokio::time::interval(std::time::Duration::from_secs(300));
 
@@ -53,7 +57,9 @@ impl NetworkManager {
     async fn publish_listeners(&mut self) {
         use tauri::Manager;
         let listeners: Vec<String> = self.swarm.listeners().map(|l| l.to_string()).collect();
-        if listeners.is_empty() { return; }
+        if listeners.is_empty() {
+            return;
+        }
 
         let state = self.app_handle.state::<crate::AppState>();
         let token = {
@@ -68,20 +74,27 @@ impl NetworkManager {
         if let Some(token) = token {
             println!("Publishing listeners to Gist...");
             if !listeners.is_empty() {
-                if let Err(e) = crate::network::discovery::publish_peer_info(&token, listeners, self.app_handle.clone()).await {
+                if let Err(e) = crate::network::discovery::publish_peer_info(
+                    &token,
+                    listeners,
+                    self.app_handle.clone(),
+                )
+                .await
+                {
                     eprintln!("Failed to publish peer info: {}", e);
                 }
             }
         }
     }
-    pub fn handle_ui_command(&mut self,msg_content: String){
+    pub fn handle_ui_command(&mut self, msg_content: String) {
         println!("UI Command Received: {}", msg_content);
         // 1. Define the Topic (Like a TV Channel)
         let topic = libp2p::gossipsub::IdentTopic::new("global-chat");
 
         // 2. Publish to the Swarm
         // We access the 'gossipsub' field we defined in behaviour.rs
-        let result = self.swarm
+        let result = self
+            .swarm
             .behaviour_mut()
             .gossipsub
             .publish(topic, msg_content.as_bytes());
@@ -91,17 +104,21 @@ impl NetworkManager {
             Err(e) => eprintln!("Publish Error: {:?}", e),
         }
     }
-    pub async fn handle_swarm_event(&mut self,event: SwarmEvent<RChatBehaviourEvent>){
+    pub async fn handle_swarm_event(&mut self, event: SwarmEvent<RChatBehaviourEvent>) {
         match event {
             // CASE A: One of our Behaviours (Gossip, mDNS) triggered an event
             SwarmEvent::Behaviour(behaviour_event) => {
                 match behaviour_event {
                     // 1. Gossipsub Event: We received a message!
                     RChatBehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message {
-                         message, .. 
+                        message,
+                        ..
                     }) => {
                         let text = String::from_utf8_lossy(&message.data).to_string();
-                        let sender = message.source.map(|p| p.to_string()).unwrap_or("Unknown".into());
+                        let sender = message
+                            .source
+                            .map(|p| p.to_string())
+                            .unwrap_or("Unknown".into());
 
                         println!("Network: Received '{}' from {}", text, sender);
 
@@ -114,14 +131,17 @@ impl NetworkManager {
                         for (peer_id, _multiaddr) in list {
                             println!("mDNS: Found peer {}", peer_id);
                             // Auto-connect for gossip
-                            self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            self.swarm
+                                .behaviour_mut()
+                                .gossipsub
+                                .add_explicit_peer(&peer_id);
                         }
                     }
                     _ => {}
                 }
             }
             // CASE B: Connection Status Changes
-            SwarmEvent::ConnectionEstablished { peer_id, ..} => {
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 print!("Connected to {}", peer_id);
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {

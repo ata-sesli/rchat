@@ -5,7 +5,6 @@
   import { fade } from "svelte/transition";
   import { flip } from "svelte/animate";
   import { goto } from "$app/navigation";
-  import { draggable } from "@neodrag/svelte";
   import SettingsPanel from "../components/SettingsPanel.svelte";
 
   // Data Models
@@ -15,10 +14,9 @@
   // UI State
   let message = "";
   let conversations: Record<string, Conversation> = {
-    General: [],
     Me: [],
   };
-  let activePeer = "General"; // "General" (Broadcast), "Me", or specific Username
+  let activePeer = "Me"; // "Me" or specific Username
   let currentLogs: Conversation = []; // Helper for template
   let chatContainer: HTMLDivElement;
 
@@ -28,6 +26,11 @@
 
   // Attachments Menu State
   let showAttachments = false;
+  let showCreateMenu = false; // + button dropdown
+
+  // Placeholder Modals
+  let showNewPersonModal = false;
+  let showNewGroupModal = false;
 
   // Drag Performance State
   let isDragging = false;
@@ -86,6 +89,23 @@
         userProfile = profile;
 
         await loadEnvelopes(); // Helper handles its own errors
+
+        // Load 'Me' Chat History
+        try {
+          console.log("Fetching self history...");
+          const selfHistory = await invoke<any[]>("get_chat_history", {
+            chatId: "self",
+          });
+          console.log("Self history fetched:", selfHistory.length, "messages");
+          conversations["Me"] = selfHistory.map((m) => ({
+            sender: "Me",
+            text: m.text_content || "",
+            timestamp: new Date(m.timestamp * 1000),
+          }));
+          conversations = conversations; // Trigger Svelte reactivity
+        } catch (e) {
+          console.error("Failed to load self history", e);
+        }
       }
     } catch (e) {
       console.error("Data refresh failed:", e);
@@ -374,37 +394,23 @@
     }
   }
 
-  // --- Neodrag Logic ---
+  // --- Slot-Based Drag Reorder ---
 
-  // Cache for drag collision
+  // State
+  let draggingPeer: string | null = null;
   let envelopeRects: { id: string; rect: DOMRect }[] = [];
-  let peerItemRects: { id: string; rect: DOMRect }[] = [];
-  let dragStartOrder: string[] = []; // Snapshot of order at drag start
-
-  // Track "current hover" purely in JS to avoid Svelte re-renders
+  let peerSlots: { id: string; top: number; bottom: number }[] = [];
   let currentHoverEnvelopeId: string | null = null;
 
-  // Throttle helper for 60fps
-  function throttle<T extends (...args: any[]) => void>(
-    func: T,
-    limit: number
-  ): T {
-    let inThrottle = false;
-    return function (this: any, ...args: any[]) {
-      if (!inThrottle) {
-        func.apply(this, args);
-        inThrottle = true;
-        setTimeout(() => (inThrottle = false), limit);
-      }
-    } as T;
-  }
-
-  function handleNeoDragStart(e: any) {
+  function handleDragStart(e: PointerEvent, peer: string) {
+    e.preventDefault();
+    draggingPeer = peer;
     isDragging = true;
-    pendingReorderIndex = null;
-    document.body.classList.add("dragging");
 
-    // 1. Cache Envelope positions
+    // Capture pointer for smooth tracking
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+
+    // Cache envelope positions
     envelopeRects = envelopes
       .map((env) => {
         const el = document.getElementById(`envelope-drop-zone-${env.id}`);
@@ -422,153 +428,160 @@
       })
       .filter((e) => e.rect.width > 0);
 
-    // 2. Cache Peer Item positions (snapshot at drag start)
-    dragStartOrder = [...sortedPeers];
-    peerItemRects = sortedPeers
-      .map((p) => {
-        const el = document.getElementById(`peer-item-${p}`);
-        return {
-          id: p,
-          rect: el ? el.getBoundingClientRect() : new DOMRect(0, 0, 0, 0),
-        };
-      })
-      .filter((p) => p.rect.height > 0);
+    // Cache peer slot positions (not the items, the slots)
+    peerSlots = sortedPeers.map((p) => {
+      const el = document.getElementById(`peer-item-${p}`);
+      const rect = el?.getBoundingClientRect();
+      return {
+        id: p,
+        top: rect?.top ?? 0,
+        bottom: rect?.bottom ?? 0,
+      };
+    });
   }
 
-  function handleNeoDrag(e: any, chatId: string) {
-    const dragRect = e.detail.rootNode.getBoundingClientRect();
-    const dragCenterX = dragRect.left + dragRect.width / 2;
-    // We strictly use the mouse/touch Y from event if available, or center of node
-    // Neodrag doesn't give mouse Y directly in 'move' detail usually, it renders transform.
-    // detail.y is the translate value.
-    // Let's use rect center.
-    const dragCenterY = dragRect.top + dragRect.height / 2;
+  function handleDragMove(e: PointerEvent) {
+    if (!draggingPeer) return;
+
+    const y = e.clientY;
+    const x = e.clientX;
 
     // A. Check Envelope Collision
     let targetEnvId: string | null = null;
     for (const { id, rect } of envelopeRects) {
       if (
-        dragCenterX >= rect.left &&
-        dragCenterX <= rect.right &&
-        dragCenterY >= rect.top &&
-        dragCenterY <= rect.bottom
+        x >= rect.left &&
+        x <= rect.right &&
+        y >= rect.top &&
+        y <= rect.bottom
       ) {
         targetEnvId = id;
         break;
       }
     }
 
-    // Direct DOM manipulation for Hover State (No Reactivity!)
+    // Envelope highlight (direct DOM)
     if (currentHoverEnvelopeId !== targetEnvId) {
-      // Un-highlight old
       if (currentHoverEnvelopeId) {
         const oldEl = document.getElementById(
           `envelope-drop-zone-${currentHoverEnvelopeId}`
         );
-        if (oldEl) {
-          oldEl.classList.remove("border-white", "bg-slate-800");
-          // Restore default colors? The class bindings in template handle 'default' state,
-          // but we are overriding. We rely on the template's dynamic classes for 'current' state
-          // which hasn't changed.
-          // We added classes manually, so we remove them manually.
-        }
+        if (oldEl) oldEl.classList.remove("border-white", "bg-slate-800");
       }
-
-      // Highlight new
       if (targetEnvId) {
         const newEl = document.getElementById(
           `envelope-drop-zone-${targetEnvId}`
         );
         if (newEl) newEl.classList.add("border-white", "bg-slate-800");
       }
-
       currentHoverEnvelopeId = targetEnvId;
     }
 
-    // B. Check Peer Reordering - DEFERRED (no reactivity during drag!)
+    // B. Slot-Based Reorder (if not over envelope)
     if (!targetEnvId) {
-      const draggingIndex = dragStartOrder.indexOf(chatId);
-      if (draggingIndex === -1) return;
+      const currentIndex = peerOrder.indexOf(draggingPeer);
+      if (currentIndex === -1) return;
 
-      // Find peer under cursor using CACHED rects (from drag start)
-      const targetPeer = peerItemRects.find(
-        (p) => dragCenterY >= p.rect.top && dragCenterY <= p.rect.bottom
-      );
+      // Find which slot the cursor is in
+      let targetIndex = currentIndex; // Default: stay in place
+      for (let i = 0; i < peerSlots.length; i++) {
+        const slot = peerSlots[i];
+        const slotCenter = (slot.top + slot.bottom) / 2;
 
-      if (targetPeer && targetPeer.id !== chatId) {
-        const targetIndex = dragStartOrder.indexOf(targetPeer.id);
-        if (targetIndex !== -1 && targetIndex !== draggingIndex) {
-          // Store for later - DON'T update peerOrder here!
-          pendingReorderIndex = targetIndex;
+        // If cursor is above center and we're moving up, or below center and moving down
+        if (y < slotCenter && i < currentIndex) {
+          targetIndex = i;
+          break;
+        } else if (y > slotCenter && i > currentIndex) {
+          targetIndex = i;
+          // Don't break - find the LAST slot we're past
         }
-      } else {
-        pendingReorderIndex = null; // Reset if not over a valid target
+      }
+
+      // If target changed, reorder!
+      if (targetIndex !== currentIndex) {
+        const newOrder = [...peerOrder];
+        const [removed] = newOrder.splice(currentIndex, 1);
+        newOrder.splice(targetIndex, 0, removed);
+        peerOrder = newOrder; // Triggers FLIP animation!
+
+        // Update slot cache after reorder (items have moved)
+        // Use requestAnimationFrame to get updated positions
+        requestAnimationFrame(() => {
+          peerSlots = sortedPeers.map((p) => {
+            const el = document.getElementById(`peer-item-${p}`);
+            const rect = el?.getBoundingClientRect();
+            return {
+              id: p,
+              top: rect?.top ?? 0,
+              bottom: rect?.bottom ?? 0,
+            };
+          });
+        });
       }
     }
   }
 
-  async function handleNeoDragEnd(e: any, chatId: string) {
+  async function handleDragEnd(e: PointerEvent) {
+    if (!draggingPeer) return;
+
+    const peer = draggingPeer;
+    draggingPeer = null;
     isDragging = false;
-    document.body.classList.remove("dragging");
+    (e.target as HTMLElement).releasePointerCapture(e.pointerId);
 
-    // Reset visually
-    setTimeout(() => {
-      e.detail.rootNode.style.transform = "none";
-    }, 0);
-
-    // Clean up Envelope Hover
+    // Clean up envelope hover
     if (currentHoverEnvelopeId) {
       const el = document.getElementById(
         `envelope-drop-zone-${currentHoverEnvelopeId}`
       );
-      if (el) el.classList.remove("border-white", "bg-slate-800");
-    }
 
-    // 1. Drop into Envelope
-    if (currentHoverEnvelopeId) {
+      // Drop into envelope
       const target = currentHoverEnvelopeId;
       currentHoverEnvelopeId = null;
-      pendingReorderIndex = null; // Cancel any reorder
 
-      const currentAssignment = chatAssignments[chatId] || null;
-      if (currentAssignment === target) return;
+      const currentAssignment = chatAssignments[peer] || null;
+      if (currentAssignment !== target) {
+        chatAssignments[peer] = target;
+        chatAssignments = { ...chatAssignments };
 
-      // Optimistic Update (ONLY NOW, after drag ends)
-      chatAssignments[chatId] = target;
-      chatAssignments = { ...chatAssignments };
+        // Success flash - solid light green border (use inline styles to override hover)
+        if (el) {
+          // Remove drag classes
+          el.classList.remove("border-white", "bg-slate-800", "border-dashed");
+          // Apply inline styles to override hover
+          el.style.borderStyle = "solid";
+          el.style.borderColor = "rgb(74, 222, 128)"; // green-400
+          el.style.backgroundColor = "rgba(34, 197, 94, 0.1)"; // green-500/10
 
-      // Success Flash (Direct DOM)
-      const el = document.getElementById(`envelope-drop-zone-${target}`);
-      if (el) {
-        el.classList.add("border-green-500", "bg-green-900/20");
-        setTimeout(() => {
-          if (el) el.classList.remove("border-green-500", "bg-green-900/20");
-        }, 1000);
-      }
-
-      try {
-        await invoke("move_chat_to_envelope", { chatId, envelopeId: target });
-      } catch (err) {
-        console.error("Move failed:", err);
-      }
-    } else if (pendingReorderIndex !== null) {
-      // 2. Apply DEFERRED Reorder (only now!)
-      const draggingIndex = dragStartOrder.indexOf(chatId);
-      if (draggingIndex !== -1 && pendingReorderIndex !== draggingIndex) {
-        const newOrder = [...dragStartOrder];
-        const [removed] = newOrder.splice(draggingIndex, 1);
-        newOrder.splice(pendingReorderIndex, 0, removed);
-
-        // NOW update peerOrder (triggers FLIP animation ONCE)
-        peerOrder = newOrder;
+          setTimeout(() => {
+            // Restore original state
+            el.style.borderStyle = "";
+            el.style.borderColor = "";
+            el.style.backgroundColor = "";
+            el?.classList.add("border-dashed");
+          }, 1000);
+        }
 
         try {
-          await invoke("save_peer_order", { order: peerOrder });
+          await invoke("move_chat_to_envelope", {
+            chatId: peer,
+            envelopeId: target,
+          });
         } catch (err) {
-          console.error("Save order failed", err);
+          console.error("Move failed:", err);
         }
+      } else {
+        // Same envelope, just clean up
+        if (el) el.classList.remove("border-white", "bg-slate-800");
       }
-      pendingReorderIndex = null;
+    } else {
+      // Persist reorder
+      try {
+        await invoke("save_peer_order", { order: peerOrder });
+      } catch (err) {
+        console.error("Save order failed", err);
+      }
     }
   }
 
@@ -620,8 +633,8 @@
   // Computed Peers for Sidebar (Filtered by Envelope)
   let sortedPeers: string[] = [];
   $: {
-    // 1. All Peers (System + Trusted)
-    const allPeers = ["Me", "General", ...peers];
+    // 1. All Peers (System + Trusted) - NO MORE "General"
+    const allPeers = ["Me", ...peers];
 
     // 2. Filter based on Current Envelope
     const filtered = allPeers.filter((p) => {
@@ -635,17 +648,20 @@
       }
     });
 
-    // 3. Sort (Pinned first, then Alphabetical/System)
+    // 3. Sort (Pinned first, then custom order)
     const pinned = filtered.filter((p) => pinnedPeers.includes(p));
     const others = filtered.filter((p) => !pinnedPeers.includes(p));
 
-    // Custom sort: Me first, then General, then Alphabetical
+    // Custom sort: Me first, then by peerOrder
     others.sort((a, b) => {
-      // System priority
       if (a === "Me") return -1;
       if (b === "Me") return 1;
-      if (a === "General") return -1;
-      if (b === "General") return 1;
+      // Check peerOrder
+      const aIdx = peerOrder.indexOf(a);
+      const bIdx = peerOrder.indexOf(b);
+      if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
+      if (aIdx !== -1) return -1;
+      if (bIdx !== -1) return 1;
       return a.localeCompare(b);
     });
 
@@ -727,24 +743,96 @@
               placeholder="Search..."
               class="flex-1 bg-slate-800 text-sm text-slate-300 rounded-lg pl-4 pr-4 py-2.5 border border-slate-700 focus:outline-none focus:border-slate-600 transition-colors placeholder:text-slate-600"
             />
-            <button
-              on:click={() => openEnvelopeModal()}
-              class="p-2 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white rounded-lg border border-slate-700 transition-colors"
-              title="New Envelope"
-            >
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                class="h-5 w-5"
-                viewBox="0 0 20 20"
-                fill="currentColor"
+            <div class="relative">
+              <button
+                on:click|stopPropagation={() =>
+                  (showCreateMenu = !showCreateMenu)}
+                class="p-2 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white rounded-lg border border-slate-700 transition-colors relative"
+                title="Create New"
               >
-                <path
-                  fill-rule="evenodd"
-                  d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-11a1 1 0 10-2 0v2H7a1 1 0 100 2h2v2a1 1 0 102 0v-2h2a1 1 0 100-2h-2V7z"
-                  clip-rule="evenodd"
-                />
-              </svg>
-            </button>
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  class="h-5 w-5"
+                  viewBox="0 0 20 20"
+                  fill="currentColor"
+                >
+                  <path
+                    fill-rule="evenodd"
+                    d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-11a1 1 0 10-2 0v2H7a1 1 0 100 2h2v2a1 1 0 102 0v-2h2a1 1 0 100-2h-2V7z"
+                    clip-rule="evenodd"
+                  />
+                </svg>
+              </button>
+
+              <!-- Create Menu Dropdown -->
+              {#if showCreateMenu}
+                <div
+                  class="absolute top-full right-0 mt-2 w-48 bg-slate-900 border border-slate-700 rounded-lg shadow-xl z-50 py-1"
+                  transition:fade={{ duration: 100 }}
+                >
+                  <button
+                    on:click={() => {
+                      showNewPersonModal = true;
+                      showCreateMenu = false;
+                    }}
+                    class="w-full text-left px-4 py-2 text-sm text-slate-300 hover:bg-slate-700 hover:text-white transition-colors flex items-center gap-3"
+                  >
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      class="h-4 w-4"
+                      viewBox="0 0 20 20"
+                      fill="currentColor"
+                    >
+                      <path
+                        fill-rule="evenodd"
+                        d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z"
+                        clip-rule="evenodd"
+                      />
+                    </svg>
+                    New Person
+                  </button>
+                  <button
+                    on:click={() => {
+                      showNewGroupModal = true;
+                      showCreateMenu = false;
+                    }}
+                    class="w-full text-left px-4 py-2 text-sm text-slate-300 hover:bg-slate-700 hover:text-white transition-colors flex items-center gap-3"
+                  >
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      class="h-4 w-4"
+                      viewBox="0 0 20 20"
+                      fill="currentColor"
+                    >
+                      <path
+                        d="M13 6a3 3 0 11-6 0 3 3 0 016 0zM18 8a2 2 0 11-4 0 2 2 0 014 0zM14 15a4 4 0 00-8 0v3h8v-3zM6 8a2 2 0 11-4 0 2 2 0 014 0zM16 18v-3a5.972 5.972 0 00-.75-2.906A3.005 3.005 0 0119 15v3h-3zM4.75 12.094A5.973 5.973 0 004 15v3H1v-3a3 3 0 013.75-2.906z"
+                      />
+                    </svg>
+                    New Group Chat
+                  </button>
+                  <div class="h-px bg-slate-700 my-1"></div>
+                  <button
+                    on:click={() => {
+                      openEnvelopeModal();
+                      showCreateMenu = false;
+                    }}
+                    class="w-full text-left px-4 py-2 text-sm text-slate-300 hover:bg-slate-700 hover:text-white transition-colors flex items-center gap-3"
+                  >
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      class="h-4 w-4"
+                      viewBox="0 0 20 20"
+                      fill="currentColor"
+                    >
+                      <path
+                        d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z"
+                      />
+                    </svg>
+                    New Envelope
+                  </button>
+                </div>
+              {/if}
+            </div>
           </div>
 
           <!-- Back from Envelope -->
@@ -851,26 +939,26 @@
       {#if isSidebarOpen}
         {#each sortedPeers as peer (peer)}
           {@const isPinned = pinnedPeers.includes(peer)}
-          <div
-            animate:flip={{ duration: isDragging ? 0 : 200 }}
-            class="relative group/item"
-          >
+          <div animate:flip={{ duration: 200 }} class="relative group/item">
             <!-- svelte-ignore a11y-interactive-supports-focus -->
             <!-- svelte-ignore a11y-click-events-have-key-events -->
             <!-- svelte-ignore a11y-no-static-element-interactions -->
             <div
-              use:draggable={{ axis: "y", position: { x: 0, y: 0 } }}
-              on:neodrag:start={handleNeoDragStart}
-              on:neodrag={(e) => handleNeoDrag(e, peer)}
-              on:neodrag:end={(e) => handleNeoDragEnd(e, peer)}
+              on:pointerdown={(e) => handleDragStart(e, peer)}
+              on:pointermove={handleDragMove}
+              on:pointerup={handleDragEnd}
+              on:pointercancel={handleDragEnd}
               role="button"
               id={`peer-item-${peer}`}
               on:click={() => {
-                activePeer = peer;
-                showSettings = false;
+                if (!isDragging) {
+                  activePeer = peer;
+                  showSettings = false;
+                }
               }}
-              class={`w-full flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-all border border-transparent touch-none relative z-10
-                  ${activePeer === peer ? "bg-slate-800/80 border-slate-700/50" : "hover:bg-slate-800/30"}`}
+              class={`w-full flex items-center gap-3 p-3 rounded-xl cursor-grab transition-all border border-transparent touch-none relative z-10
+                  ${activePeer === peer ? "bg-slate-800/80 border-slate-700/50" : "hover:bg-slate-800/30"}
+                  ${draggingPeer === peer ? "opacity-50 cursor-grabbing" : ""}`}
             >
               <div class="relative pointer-events-none">
                 {#if peer === "Me"}
@@ -1035,9 +1123,40 @@
 
   <!-- Main Area -->
   <section class="flex-1 flex flex-col relative h-full overflow-hidden">
-    <!-- Conditional View: Settings OR Chat -->
+    <!-- Conditional View: Settings, Envelope Settings, OR Chat -->
     {#if showSettings}
       <SettingsPanel />
+    {:else if showEnvelopeSettings}
+      <!-- Envelope Settings (Inline) -->
+      <div class="flex-1 flex flex-col bg-slate-950">
+        <!-- Header -->
+        <div
+          class="h-16 flex items-center px-6 border-b border-slate-800/50 bg-slate-900/10 backdrop-blur-sm gap-4"
+        >
+          <button
+            on:click={() => (showEnvelopeSettings = false)}
+            class="p-2 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-colors"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              class="h-5 w-5"
+              viewBox="0 0 20 20"
+              fill="currentColor"
+            >
+              <path
+                fill-rule="evenodd"
+                d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z"
+                clip-rule="evenodd"
+              />
+            </svg>
+          </button>
+          <h2 class="text-xl font-bold text-white">Envelope Settings</h2>
+        </div>
+        <!-- Content -->
+        <div class="flex-1 flex items-center justify-center text-slate-500">
+          <p>Settings for Envelope ID: {envelopeSettingsTargetId}</p>
+        </div>
+      </div>
     {:else}
       <!-- Chat Area Content -->
       <div
@@ -1327,36 +1446,52 @@
     </div>
   {/if}
 
-  <!-- Envelope Settings Screen (Full Page Overlay like Settings) -->
-  {#if showEnvelopeSettings}
-    <div class="fixed inset-0 z-50 bg-slate-950 flex flex-col animate-fade-in">
-      <!-- Header -->
+  <!-- New Person Modal (Placeholder) -->
+  {#if showNewPersonModal}
+    <div
+      class="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4 animate-fade-in-up"
+    >
       <div
-        class="h-16 border-b border-slate-800 flex items-center px-6 gap-4 bg-slate-900/50 backdrop-blur-md"
+        class="bg-slate-900 border border-slate-700 p-6 rounded-2xl w-full max-w-sm shadow-2xl space-y-4"
       >
-        <button
-          on:click={() => (showEnvelopeSettings = false)}
-          class="p-2 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-colors"
-        >
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            class="h-6 w-6"
-            viewBox="0 0 20 20"
-            fill="currentColor"
+        <h3 class="text-xl font-bold text-white">Add New Person</h3>
+        <p class="text-sm text-slate-400">
+          This feature is coming soon. You'll be able to add contacts by their
+          public key.
+        </p>
+        <div class="flex justify-end gap-2 pt-2">
+          <button
+            on:click={() => (showNewPersonModal = false)}
+            class="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors"
           >
-            <path
-              fill-rule="evenodd"
-              d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z"
-              clip-rule="evenodd"
-            />
-          </svg>
-        </button>
-        <h2 class="text-xl font-bold text-white">Envelope Settings</h2>
+            Close
+          </button>
+        </div>
       </div>
+    </div>
+  {/if}
 
-      <!-- Content -->
-      <div class="flex-1 flex items-center justify-center text-slate-500">
-        <p>Settings for Envelope ID: {envelopeSettingsTargetId}</p>
+  <!-- New Group Chat Modal (Placeholder) -->
+  {#if showNewGroupModal}
+    <div
+      class="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4 animate-fade-in-up"
+    >
+      <div
+        class="bg-slate-900 border border-slate-700 p-6 rounded-2xl w-full max-w-sm shadow-2xl space-y-4"
+      >
+        <h3 class="text-xl font-bold text-white">Create Group Chat</h3>
+        <p class="text-sm text-slate-400">
+          Group chat functionality is coming soon. You'll be able to create
+          encrypted group conversations.
+        </p>
+        <div class="flex justify-end gap-2 pt-2">
+          <button
+            on:click={() => (showNewGroupModal = false)}
+            class="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors"
+          >
+            Close
+          </button>
+        </div>
       </div>
     </div>
   {/if}
@@ -1424,21 +1559,8 @@
     overflow: hidden;
   }
 
-  /* Performance: Hardware acceleration for peer items */
+  /* Smooth FLIP animations for peer items */
   :global([id^="peer-item-"]) {
-    contain: layout style paint;
-    backface-visibility: hidden;
     will-change: transform;
-  }
-
-  /* During drag: Pause all animations to prevent interference */
-  :global(body.dragging *) {
-    animation-play-state: paused !important;
-    transition-duration: 0s !important;
-  }
-
-  /* Ensure dragged item is on top */
-  :global(body.dragging [id^="peer-item-"]:active) {
-    z-index: 9999 !important;
   }
 </style>
