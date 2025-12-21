@@ -30,7 +30,7 @@ pub struct ChatPeer {
     pub joined_at: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Message {
     pub id: String,
     pub chat_id: String,
@@ -138,6 +138,23 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
          )",
         [],
     )?;
+
+    // SEED: Ensure 'Me' user exists
+    let me_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM peers WHERE id = ?1)",
+            ["Me"],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !me_exists {
+        println!("Seeding default 'Me' user...");
+        conn.execute(
+            "INSERT INTO peers (id, alias, last_seen, public_key) VALUES (?1, ?2, ?3, ?4)",
+            ("Me", "Me", 0, vec![0u8; 32]), // Dummy key for now, real one managed by KeyStore
+        )?;
+    }
 
     // 3. Chat Peers (Junction Table)
     conn.execute(

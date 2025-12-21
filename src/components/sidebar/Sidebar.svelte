@@ -6,7 +6,6 @@
   // Props with callbacks
   let {
     isSidebarOpen = true,
-    showSettings = false,
     currentEnvelope = null as string | null,
     searchQuery = $bindable(""),
     showCreateMenu = false,
@@ -443,7 +442,7 @@
   <div class="p-4 border-t border-slate-800/50 shrink-0">
     <button
       onclick={openSettings}
-      class={`flex items-center justify-center gap-3 text-sm text-slate-400 hover:text-white transition-colors w-full p-2 rounded-lg hover:bg-slate-800 ${showSettings ? "bg-slate-800 text-white" : ""}`}
+      class="flex items-center justify-center gap-3 text-sm text-slate-400 hover:text-white transition-colors w-full p-2 rounded-lg hover:bg-slate-800"
       title="Settings"
     >
       <svg

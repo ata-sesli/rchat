@@ -1,40 +1,47 @@
 <script lang="ts">
-  import { createEventDispatcher } from "svelte";
   import { fade } from "svelte/transition";
 
-  export let peer: string;
-  export let isPinned = false;
-  export let isActive = false;
-  export let isDragging = false;
-  export let userProfile: { alias: string | null; avatar_path: string | null } =
-    { alias: null, avatar_path: null };
-
-  const dispatch = createEventDispatcher();
+  let {
+    peer,
+    isPinned = false,
+    isActive = false,
+    isDragging = false,
+    userProfile = { alias: null, avatar_path: null } as {
+      alias: string | null;
+      avatar_path: string | null;
+    },
+    onclick = () => {},
+    oncontextmenu = (e: MouseEvent) => {},
+    onpointerdown = (e: PointerEvent) => {},
+    onpointermove = (e: PointerEvent) => {},
+    onpointerup = (e: PointerEvent) => {},
+    onpointercancel = (e: PointerEvent) => {},
+  } = $props();
 
   function handleClick() {
     if (!isDragging) {
-      dispatch("click");
+      onclick();
     }
   }
 
   function handleContextMenu(e: MouseEvent) {
-    dispatch("contextmenu", e);
+    oncontextmenu(e);
   }
 
   function handlePointerDown(e: PointerEvent) {
-    dispatch("pointerdown", e);
+    onpointerdown(e);
   }
 
   function handlePointerMove(e: PointerEvent) {
-    dispatch("pointermove", e);
+    onpointermove(e);
   }
 
   function handlePointerUp(e: PointerEvent) {
-    dispatch("pointerup", e);
+    onpointerup(e);
   }
 
   function handlePointerCancel(e: PointerEvent) {
-    dispatch("pointercancel", e);
+    onpointercancel(e);
   }
 </script>
 

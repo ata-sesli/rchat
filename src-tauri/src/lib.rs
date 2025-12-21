@@ -105,12 +105,11 @@ use crate::storage::config::{FriendConfig, UserProfile};
 async fn get_trusted_peers(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let mgr = state.config_manager.lock().await;
     match mgr.load().await {
-        Ok(config) => Ok(config
-            .user
-            .friends
-            .into_iter()
-            .map(|f| f.username)
-            .collect()),
+        Ok(config) => {
+            let mut peers = vec!["Me".to_string()];
+            peers.extend(config.user.friends.into_iter().map(|f| f.username));
+            Ok(peers)
+        }
         Err(e) => Err(e.to_string()),
     }
 }

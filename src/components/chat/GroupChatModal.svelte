@@ -19,7 +19,7 @@
       </p>
       <div class="flex justify-end gap-2 pt-2">
         <button
-          onclick={onclose}
+          onclick={() => onclose()}
           class="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors"
         >
           Close

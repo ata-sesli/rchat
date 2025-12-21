@@ -1,15 +1,16 @@
 <script lang="ts">
-  import { createEventDispatcher } from "svelte";
-
-  export let show = false;
-  export let step: "select-network" | "local-scan" | "online" =
-    "select-network";
-  export let localPeers: { peer_id: string; addresses: string[] }[] = [];
-
-  const dispatch = createEventDispatcher();
+  let {
+    show = false,
+    step = $bindable(
+      "select-network" as "select-network" | "local-scan" | "online"
+    ),
+    localPeers = [] as { peer_id: string; addresses: string[] }[],
+    onclose = () => {},
+    onconnect = (peerId: string) => {},
+  } = $props();
 
   function handleClose() {
-    dispatch("close");
+    onclose();
   }
 
   function setStep(newStep: "select-network" | "local-scan" | "online") {
@@ -17,7 +18,7 @@
   }
 
   function handleConnect(peerId: string) {
-    dispatch("connect", peerId);
+    onconnect(peerId);
   }
 </script>
 
