@@ -1,7 +1,13 @@
-# Tauri + SvelteKit + TypeScript
 
-This template should help get you started developing with Tauri, SvelteKit and TypeScript in Vite.
 
-## Recommended IDE Setup
+## License
 
-[VS Code](https://code.visualstudio.com/) + [Svelte](https://marketplace.visualstudio.com/items?itemName=svelte.svelte-vscode) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer).
+RChat is licensed under the **GNU Affero General Public License v3.0**.
+
+This means:
+- ✅ Free to use for individuals and communities
+- ✅ Free to modify and distribute
+- ✅ If you offer RChat as a service, you must share your modifications
+- ❌ Cannot use in proprietary commercial products without a separate license
+
+For commercial licensing inquiries, contact [your email].

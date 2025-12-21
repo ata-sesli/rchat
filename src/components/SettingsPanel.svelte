@@ -5,7 +5,7 @@
   const dispatch = createEventDispatcher();
 
   // Navigation State
-  type SettingsView = "menu" | "add-peers" | "set-theme" | "profile";
+  type SettingsView = "menu" | "add-peers" | "set-theme" | "profile" | "about";
   let currentView: SettingsView = "menu";
 
   // Peer State
@@ -56,7 +56,8 @@
         alias: alias || null,
         avatarPath: avatarPath || null,
       });
-      // Notify success?
+      // Dispatch event to notify parent of profile change
+      dispatch("profileUpdated", { alias, avatarPath });
     } catch (e: any) {
       error = e.toString();
     } finally {
@@ -232,6 +233,52 @@
               >Set Theme</span
             >
             <span class="text-sm text-slate-500">Customize appearance</span>
+          </div>
+        </div>
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          class="h-5 w-5 text-slate-500 group-hover:translate-x-1 transition-transform"
+          viewBox="0 0 20 20"
+          fill="currentColor"
+        >
+          <path
+            fill-rule="evenodd"
+            d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z"
+            clip-rule="evenodd"
+          />
+        </svg>
+      </button>
+
+      <!-- About Button -->
+      <button
+        on:click={() => (currentView = "about")}
+        class="w-full flex items-center justify-between p-4 bg-slate-900 border border-slate-800 rounded-xl hover:bg-slate-800 transition-all group shadow-sm hover:shadow-md"
+      >
+        <div class="flex items-center gap-4">
+          <div
+            class="p-2.5 rounded-lg bg-orange-500/10 text-orange-400 group-hover:bg-orange-500/20 group-hover:text-orange-300 transition-colors"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              class="h-6 w-6"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+              />
+            </svg>
+          </div>
+          <div class="text-left">
+            <span
+              class="block text-lg font-medium text-slate-200 group-hover:text-white transition-colors"
+              >About RChat</span
+            >
+            <span class="text-sm text-slate-500">Version and info</span>
           </div>
         </div>
         <svg
@@ -534,6 +581,70 @@
         This feature is coming soon! You will be able to switch between Light,
         Dark, and System themes.
       </p>
+    </div>
+
+    <!-- VIEW: ABOUT -->
+  {:else if currentView === "about"}
+    <!-- Sub-view Header -->
+    <div class="mb-6 flex items-center gap-4 border-b border-slate-800/50 pb-4">
+      <button
+        on:click={goBack}
+        class="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition-colors"
+        aria-label="Go Back"
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          class="h-5 w-5"
+          viewBox="0 0 20 20"
+          fill="currentColor"
+        >
+          <path
+            fill-rule="evenodd"
+            d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z"
+            clip-rule="evenodd"
+          />
+        </svg>
+      </button>
+      <h2 class="text-xl font-bold text-white">About RChat</h2>
+    </div>
+
+    <div class="space-y-6 animate-fade-in-up">
+      <!-- Logo -->
+      <div class="flex flex-col items-center text-center py-6">
+        <img
+          src="/logo.svg"
+          alt="RChat"
+          class="w-20 h-20 rounded-2xl shadow-xl mb-4"
+        />
+        <h3 class="text-2xl font-bold text-white">RChat</h3>
+        <p class="text-slate-400 mt-1">Version 0.1.0</p>
+      </div>
+
+      <!-- Info Cards -->
+      <div class="space-y-3">
+        <div class="p-4 bg-slate-900 border border-slate-800 rounded-xl">
+          <h4 class="font-medium text-slate-200 mb-1">About</h4>
+          <p class="text-sm text-slate-400">
+            RChat is a decentralized, peer-to-peer chat application built with
+            privacy and security in mind. Your messages stay yours.
+          </p>
+        </div>
+
+        <div class="p-4 bg-slate-900 border border-slate-800 rounded-xl">
+          <h4 class="font-medium text-slate-200 mb-1">Technology</h4>
+          <p class="text-sm text-slate-400">
+            Built with Tauri, SvelteKit, Rust, and libp2p for secure
+            peer-to-peer communication.
+          </p>
+        </div>
+
+        <div class="p-4 bg-slate-900 border border-slate-800 rounded-xl">
+          <h4 class="font-medium text-slate-200 mb-1">License</h4>
+          <p class="text-sm text-slate-400">
+            Open source software. MIT License.
+          </p>
+        </div>
+      </div>
     </div>
   {/if}
 </div>

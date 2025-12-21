@@ -267,8 +267,8 @@ async fn get_peer_order(state: State<'_, AppState>) -> Result<Vec<String>, Strin
 // --- Persistence Commands ---
 
 #[tauri::command]
-async fn save_note_to_self(message: String, state: State<'_, AppState>) -> Result<(), String> {
-    println!("[Backend] save_note_to_self: {}", message);
+async fn send_message_to_self(message: String, state: State<'_, AppState>) -> Result<(), String> {
+    println!("[Backend] send_message_to_self: {}", message);
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
 
     let timestamp = std::time::SystemTime::now()
@@ -303,6 +303,50 @@ async fn save_note_to_self(message: String, state: State<'_, AppState>) -> Resul
 }
 
 #[tauri::command]
+async fn send_message(
+    peer_id: String,
+    message: String,
+    app_state: State<'_, AppState>,
+    net_state: State<'_, NetworkState>,
+) -> Result<(), String> {
+    println!("[Backend] send_message to {}: {}", peer_id, message);
+
+    // 1. Persist to DB
+    {
+        let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let id_suffix: u32 = rand::random();
+        let msg_id = format!("{}-{}", timestamp, id_suffix);
+
+        let msg = storage::db::Message {
+            id: msg_id,
+            chat_id: peer_id.clone(),  // User checks chat with this peer
+            peer_id: "Me".to_string(), // Sender is Me
+            timestamp,
+            content_type: "text".to_string(),
+            text_content: Some(message.clone()),
+            file_hash: None,
+        };
+
+        if let Err(e) = storage::db::insert_message(&conn, &msg) {
+            eprintln!("[Backend] Failed to save outgoing message: {}", e);
+            return Err(e.to_string());
+        }
+    }
+
+    // 2. Send to Network Manager
+    // We send just the content for now as it's a broadcast chat
+    let tx = net_state.sender.lock().await;
+    tx.send(message).await.map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_chat_history(
     chat_id: String,
     state: State<'_, AppState>,
@@ -320,21 +364,16 @@ async fn get_chat_history(
 
 #[tauri::command]
 async fn create_envelope(
+    id: String,
     name: String,
     icon: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    println!("[Backend] create_envelope call: {}, icon: {:?}", name, icon);
+    println!(
+        "[Backend] create_envelope call: {}, {}, icon: {:?}",
+        id, name, icon
+    );
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
-
-    // Generate simple ID
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let id = format!("env_{}", timestamp);
-
-    // Check for duplicate name? No, just create.
 
     storage::db::create_envelope(&conn, &id, &name, icon.as_deref()).map_err(|e| e.to_string())
 }
@@ -444,7 +483,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             greet,
-            send_chat_message,
             save_api_token,
             check_auth_status,
             init_vault,
@@ -462,7 +500,8 @@ pub fn run() {
             toggle_pin_peer,
             save_peer_order,
             get_peer_order,
-            save_note_to_self,
+            send_message_to_self,
+            send_message,
             get_chat_history,
             create_envelope,
             update_envelope,
@@ -473,15 +512,4 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-}
-
-#[tauri::command]
-async fn send_chat_message(message: String, state: State<'_, NetworkState>) -> Result<(), String> {
-    // 1. Lock the sender
-    let tx = state.sender.lock().await;
-
-    // 2. Send the message to the background Network Manager
-    tx.send(message).await.map_err(|e| e.to_string())?;
-
-    Ok(())
 }
