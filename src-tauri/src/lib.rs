@@ -54,7 +54,7 @@ async fn check_auth_status(state: State<'_, AppState>) -> Result<AuthStatus, Str
 
 #[tauri::command]
 async fn toggle_online_status(online: bool, state: State<'_, AppState>) -> Result<(), String> {
-    let mut mgr = state.config_manager.lock().await;
+    let mgr = state.config_manager.lock().await;
     let mut config = mgr.load().await.map_err(|e| e.to_string())?;
     config.user.is_online = online;
     mgr.save(&config).await.map_err(|e| e.to_string())?;
@@ -506,6 +506,7 @@ pub fn run() {
             greet,
             save_api_token,
             check_auth_status,
+            toggle_online_status,
             init_vault,
             unlock_vault,
             start_github_auth,

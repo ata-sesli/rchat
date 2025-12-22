@@ -73,14 +73,18 @@ impl NetworkManager {
         }
 
         let state = self.app_handle.state::<crate::AppState>();
-        let token = {
+        let (token, is_online) = {
             let mgr = state.config_manager.lock().await;
             if let Ok(config) = mgr.load().await {
-                config.system.github_token.clone()
+                (config.system.github_token.clone(), config.user.is_online)
             } else {
-                None
+                (None, false)
             }
         };
+
+        if !is_online {
+            return;
+        }
 
         if let Some(token) = token {
             println!("Publishing listeners to Gist...");
@@ -183,7 +187,7 @@ impl NetworkManager {
                     // 2. mDNS Event: We found a neighbour on Wi-Fi!
                     RChatBehaviourEvent::Mdns(libp2p::mdns::Event::Discovered(list)) => {
                         for (peer_id, multiaddr) in list {
-                            println!("mDNS: Found peer {} at {}", peer_id, multiaddr);
+                            eprintln!("[mDNS Debug] Discovered peer: {} at {}", peer_id, multiaddr);
 
                             // Track the peer
                             self.local_peers
@@ -206,13 +210,20 @@ impl NetworkManager {
                                     .map(|a| a.iter().map(|m| m.to_string()).collect())
                                     .unwrap_or_default(),
                             };
-                            let _ = self.app_handle.emit("local-peer-discovered", peer_info);
+                            if let Err(e) = self.app_handle.emit("local-peer-discovered", peer_info)
+                            {
+                                eprintln!("[mDNS Debug] Failed to emit event: {}", e);
+                            } else {
+                                eprintln!(
+                                    "[mDNS Debug] Emitted 'local-peer-discovered' to frontend"
+                                );
+                            }
                         }
                     }
                     // 3. mDNS Event: Peer left the network
                     RChatBehaviourEvent::Mdns(libp2p::mdns::Event::Expired(list)) => {
-                        for (peer_id, _multiaddr) in list {
-                            println!("mDNS: Peer {} left", peer_id);
+                        for (peer_id, multiaddr) in list {
+                            eprintln!("[mDNS Debug] Peer expired: {} at {}", peer_id, multiaddr);
 
                             // Remove from tracking
                             self.local_peers.remove(&peer_id);

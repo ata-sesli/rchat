@@ -176,10 +176,12 @@
   }
 
   async function handleToggleOnline() {
+    console.log("Layout: handleToggleOnline called. Current:", isOnline);
     try {
       const newState = !isOnline;
       await invoke("toggle_online_status", { online: newState });
       isOnline = newState;
+      console.log("Layout: Toggled to", newState);
     } catch (e) {
       console.error("Toggle online failed:", e);
     }

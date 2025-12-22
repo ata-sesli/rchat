@@ -174,12 +174,15 @@
             {isOnline ? "Online" : "Offline"}
           </span>
           <button
-            onclick={() => ontoggleOnline()}
-            class={`w-10 h-5 rounded-full relative transition-colors duration-300 ${isOnline ? "bg-teal-500" : "bg-slate-700"}`}
+            onclick={() => {
+              console.log("Sidebar: Toggle clicked");
+              ontoggleOnline();
+            }}
+            class={`w-10 h-5 rounded-full relative transition-colors duration-300 z-50 cursor-pointer ${isOnline ? "bg-teal-500" : "bg-slate-700"}`}
             title={isOnline ? "Go Offline" : "Go Online"}
           >
             <div
-              class={`absolute top-1 w-3 h-3 rounded-full bg-white transition-all duration-300 shadow-sm ${isOnline ? "left-6" : "left-1"}`}
+              class={`absolute top-1 w-3 h-3 rounded-full bg-white transition-all duration-300 shadow-sm pointer-events-none ${isOnline ? "left-6" : "left-1"}`}
             ></div>
           </button>
         </div>
