@@ -33,11 +33,32 @@ async fn check_auth_status(state: State<'_, AppState>) -> Result<AuthStatus, Str
     let mgr = state.config_manager.lock().await;
     // Note: checking has_token requires reading the file, which is fine.
     // It returns false if locked.
+
+    let is_online = if mgr.is_unlocked() {
+        if let Ok(config) = mgr.load().await {
+            config.user.is_online
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
     Ok(AuthStatus {
         is_setup: mgr.exists(),
         is_unlocked: mgr.is_unlocked(),
         is_github_connected: mgr.has_token().await,
+        is_online,
     })
+}
+
+#[tauri::command]
+async fn toggle_online_status(online: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let mut mgr = state.config_manager.lock().await;
+    let mut config = mgr.load().await.map_err(|e| e.to_string())?;
+    config.user.is_online = online;
+    mgr.save(&config).await.map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -90,6 +111,7 @@ struct AuthStatus {
     is_setup: bool,
     is_unlocked: bool,
     is_github_connected: bool,
+    is_online: bool,
 }
 
 #[tauri::command]

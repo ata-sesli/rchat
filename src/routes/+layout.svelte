@@ -7,7 +7,6 @@
   import "../app.css"; // Ensure global styles are loaded
 
   // Components
-  // Components
   import ContextMenu from "../components/sidebar/ContextMenu.svelte";
   import EnvelopeModal from "../components/sidebar/EnvelopeModal.svelte";
   import NewPersonModal from "../components/sidebar/NewPersonModal.svelte";
@@ -27,6 +26,7 @@
     avatar_path: null as string | null,
   };
   let searchQuery = "";
+  let isOnline = false;
 
   // Active peer is derived from route params
   $: activePeer = $page.params.id || "";
@@ -153,10 +153,14 @@
 
   async function refreshData() {
     try {
-      const auth = await invoke<{ is_setup: boolean; is_unlocked: boolean }>(
-        "check_auth_status"
-      );
+      const auth = await invoke<{
+        is_setup: boolean;
+        is_unlocked: boolean;
+        is_online: boolean;
+      }>("check_auth_status");
       if (!auth.is_setup || !auth.is_unlocked) return goto("/login");
+
+      isOnline = auth.is_online; // Sync state
 
       peers = await invoke<string[]>("get_trusted_peers");
       console.log("[Layout] Fetched peers:", peers);
@@ -168,6 +172,16 @@
       );
     } catch (e) {
       console.error("Refresh failed:", e);
+    }
+  }
+
+  async function handleToggleOnline() {
+    try {
+      const newState = !isOnline;
+      await invoke("toggle_online_status", { online: newState });
+      isOnline = newState;
+    } catch (e) {
+      console.error("Toggle online failed:", e);
     }
   }
 
@@ -376,6 +390,8 @@
     {dragOverEnvelopeId}
     {isDragging}
     {draggingPeer}
+    {isOnline}
+    ontoggleOnline={handleToggleOnline}
     ontoggleSidebar={() => (isSidebarOpen = !isSidebarOpen)}
     onopenSettings={() => goto("/settings")}
     onselectPeer={handleSelectPeer}

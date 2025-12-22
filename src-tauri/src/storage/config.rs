@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::fs;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
+use x25519_dalek::StaticSecret;
+
 // System Configuration, can be modified only internally.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SystemConfig {
@@ -48,6 +53,8 @@ pub struct UserConfig {
     pub pinned_peers: Vec<String>,
     #[serde(default)]
     pub peer_order: Vec<String>, // Custom order for peers
+    #[serde(default)]
+    pub is_online: bool, // Offline/Online switch
 }
 
 impl Default for UserConfig {
@@ -63,6 +70,7 @@ impl Default for UserConfig {
             profile: UserProfile::default(),
             pinned_peers: vec![],
             peer_order: vec![],
+            is_online: false,
         }
     }
 }
@@ -127,12 +135,32 @@ impl ConfigManager {
         let key = rvault_core::keystore::load_key_from_vault(password, &keystore_path)
             .map_err(|e| anyhow::anyhow!("Key derivation failed: {}", e))?;
 
+        // Generate Keys
+        let mut csprng = OsRng;
+
+        // 1. Identity Key (Ed25519)
+        let identity_sk = SigningKey::generate(&mut csprng);
+        let identity_pk = identity_sk.verifying_key();
+
+        // 2. Encryption Key (X25519)
+        let encryption_sk = StaticSecret::random_from_rng(&mut csprng);
+
+        // Encode to Base64
+        let identity_sk_b64 = BASE64.encode(identity_sk.to_bytes());
+        let identity_pk_b64 = BASE64.encode(identity_pk.to_bytes());
+        let encryption_sk_b64 = BASE64.encode(encryption_sk.to_bytes());
+
         let config = Config {
             system: SystemConfig {
                 master_hash: Some(hashed.hash),
                 ..Default::default()
             },
-            user: UserConfig::default(),
+            user: UserConfig {
+                identity_private_key: Some(identity_sk_b64),
+                identity_public_key: Some(identity_pk_b64),
+                encryption_private_key: Some(encryption_sk_b64),
+                ..UserConfig::default()
+            },
         };
 
         // Update state

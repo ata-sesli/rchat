@@ -20,7 +20,9 @@
     dragOverEnvelopeId = null as string | null,
     isDragging = false,
     draggingPeer = null as string | null,
+    isOnline = false,
     // Callbacks
+    ontoggleOnline = () => {},
     ontoggleSidebar = () => {},
     onopenSettings = () => {},
     onselectPeer = (peer: string) => {},
@@ -164,6 +166,24 @@
 
     {#if isSidebarOpen}
       <div class="relative animate-fade-in-up space-y-2">
+        <!-- Offline/Online Switch -->
+        <div class="flex items-center justify-between px-1 mb-2">
+          <span
+            class="text-xs font-semibold uppercase tracking-wider text-slate-500"
+          >
+            {isOnline ? "Online" : "Offline"}
+          </span>
+          <button
+            onclick={() => ontoggleOnline()}
+            class={`w-10 h-5 rounded-full relative transition-colors duration-300 ${isOnline ? "bg-teal-500" : "bg-slate-700"}`}
+            title={isOnline ? "Go Offline" : "Go Online"}
+          >
+            <div
+              class={`absolute top-1 w-3 h-3 rounded-full bg-white transition-all duration-300 shadow-sm ${isOnline ? "left-6" : "left-1"}`}
+            ></div>
+          </button>
+        </div>
+
         <div class="flex gap-2">
           <input
             type="text"
