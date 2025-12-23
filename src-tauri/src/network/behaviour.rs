@@ -1,4 +1,7 @@
-use libp2p::{gossipsub, identify, identity::Keypair, kad, mdns, ping, request_response, swarm::NetworkBehaviour};
+use libp2p::{
+    gossipsub, identify, identity::Keypair, kad, mdns, ping, request_response,
+    swarm::NetworkBehaviour,
+};
 #[derive(NetworkBehaviour)]
 pub struct RChatBehaviour {
     // The "Town Crier" - For live chat messages
@@ -25,18 +28,27 @@ impl RChatBehaviour {
         // 1. Gossipsub (Chat)
         let gossipsub_config = gossipsub::Config::default();
         let gossipsub = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::Signed(key.clone()), gossipsub_config)
-            .expect("Invalid gossipsub config");
+            gossipsub::MessageAuthenticity::Signed(key.clone()),
+            gossipsub_config,
+        )
+        .expect("Invalid gossipsub config");
         // 2. Kademlia (Discovery)
         let store = kad::store::MemoryStore::new(peer_id);
-        let kademlia = kad::Behaviour::new(peer_id,store);
+        let kademlia = kad::Behaviour::new(peer_id, store);
         // 3. MDNS (Local Discovery)
-        let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(),peer_id)
-            .expect("mDNS failed to start");
+        let mdns_config = mdns::Config {
+            ttl: std::time::Duration::from_secs(300),
+            query_interval: std::time::Duration::from_secs(5),
+            enable_ipv6: true,
+        };
+        let mdns = mdns::tokio::Behaviour::new(mdns_config, peer_id).expect("mDNS failed to start");
+        println!(
+            "[mDNS Debug] Service initialized successfully for peer {}",
+            peer_id
+        );
         // 4. Identify (Handshake)
-        let identify = identify::Behaviour::new(identify::Config::new(
-            "rchat/1.0.0".into(), key.public()
-        ));
+        let identify =
+            identify::Behaviour::new(identify::Config::new("rchat/1.0.0".into(), key.public()));
         // 5. Ping (Health)
         let ping = ping::Behaviour::default();
 
@@ -57,6 +69,5 @@ impl RChatBehaviour {
             ping,
             direct_message,
         }
-
     }
 }

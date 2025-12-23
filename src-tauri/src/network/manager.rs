@@ -45,11 +45,17 @@ impl NetworkManager {
 
         // Publish every 5 minutes
         let mut publish_interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        // Heartbeat every 60 seconds
+        let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(60));
 
         loop {
             tokio::select! {
                 _ = publish_interval.tick() => {
                     self.publish_listeners().await;
+                }
+                _ = heartbeat_interval.tick() => {
+                    let peer_count = self.local_peers.len();
+                    println!("[Network Debug] Heartbeat: Swarm active. Peer count: {}. Listening...", peer_count);
                 }
                 Some(cmd) = self.crx.recv() => {
                     self.handle_ui_command(cmd);
