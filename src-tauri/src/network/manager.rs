@@ -195,6 +195,12 @@ impl NetworkManager {
                         for (peer_id, multiaddr) in list {
                             eprintln!("[mDNS Debug] Discovered peer: {} at {}", peer_id, multiaddr);
 
+                            // 1. Explicitly Dial (Crucial for mDNS)
+                            eprintln!("[mDNS Debug] Dialing {}...", peer_id);
+                            if let Err(e) = self.swarm.dial(multiaddr.clone()) {
+                                eprintln!("[mDNS Debug] Dial failed: {}", e);
+                            }
+
                             // Track the peer
                             self.local_peers
                                 .entry(peer_id)
