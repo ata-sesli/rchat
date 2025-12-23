@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use tauri::async_runtime::Receiver;
 use tauri::AppHandle;
 use tauri::Emitter;
+use tauri::Manager;
 
 #[derive(Clone, Serialize)]
 pub struct LocalPeer {
@@ -23,6 +24,10 @@ pub struct NetworkManager {
     disc_rx: Receiver<Multiaddr>,
     // Channel for mDNS-SD discovery
     mdns_rx: Receiver<crate::network::mdns_sd::MdnsPeer>,
+    // Sender to pass to mDNS service when starting it
+    mdns_tx: tokio::sync::mpsc::Sender<crate::network::mdns_sd::MdnsPeer>,
+    // Flag to ensure we only start mDNS once
+    mdns_started: bool,
     // Track local peers discovered via mDNS
     local_peers: HashMap<PeerId, Vec<Multiaddr>>,
 }
@@ -33,6 +38,7 @@ impl NetworkManager {
         crx: Receiver<String>,
         disc_rx: Receiver<Multiaddr>,
         mdns_rx: Receiver<crate::network::mdns_sd::MdnsPeer>,
+        mdns_tx: tokio::sync::mpsc::Sender<crate::network::mdns_sd::MdnsPeer>,
         app_handle: AppHandle,
     ) -> Self {
         Self {
@@ -40,6 +46,8 @@ impl NetworkManager {
             crx,
             disc_rx,
             mdns_rx,
+            mdns_tx,
+            mdns_started: false,
             app_handle,
             local_peers: HashMap::new(),
         }
@@ -50,7 +58,8 @@ impl NetworkManager {
         // Publish every 5 minutes
         let mut publish_interval = tokio::time::interval(std::time::Duration::from_secs(300));
         // Heartbeat every 60 seconds
-        let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        // Heartbeat every 10 seconds (Checking connectivity)
+        let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
         loop {
             tokio::select! {
@@ -216,6 +225,37 @@ impl NetworkManager {
             // CASE C: New Listener Address (expected at startup)
             SwarmEvent::NewListenAddr { address, .. } => {
                 println!("[Swarm] Listening on: {}", address);
+
+                // If we haven't started mDNS yet, and this is a TCP address, start it!
+                // If we haven't started mDNS yet, and this is a TCP address, start it!
+                if !self.mdns_started {
+                    if let Some(port) = crate::network::get_port_from_multiaddr(&address) {
+                        if port != 0 {
+                            println!(
+                                "[NetworkManager] Found valid listen port: {}, starting mDNS...",
+                                port
+                            );
+                            let peer_id = *self.swarm.local_peer_id();
+
+                            // User requested to ignore is_online for now
+                            // let mgr = state.config_manager.blocking_lock();
+                            // is_online = cfg...
+                            let is_online = true;
+
+                            // We pass a clone of the sender
+                            if let Err(e) = crate::network::mdns_sd::start_mdns_service(
+                                peer_id,
+                                port,
+                                is_online,
+                                self.mdns_tx.clone(),
+                            ) {
+                                eprintln!("[NetworkManager] Failed to start mDNS: {}", e);
+                            } else {
+                                self.mdns_started = true;
+                            }
+                        }
+                    }
+                }
             }
             // CASE D: Incoming connection attempts
             SwarmEvent::IncomingConnection {
@@ -246,7 +286,7 @@ impl NetworkManager {
 
     fn handle_mdns_peer(&mut self, peer: crate::network::mdns_sd::MdnsPeer) {
         println!("[NetworkManager] Received mDNS peer: {}", peer.peer_id);
-        
+
         // Parse peer ID
         let peer_id_res = peer.peer_id.parse::<PeerId>();
         match peer_id_res {
@@ -254,27 +294,27 @@ impl NetworkManager {
                 // 1. Add to known peers
                 for addr_str in peer.addresses {
                     if let Ok(addr) = addr_str.parse::<Multiaddr>() {
-                         println!("[NetworkManager] Dialing mDNS peer {} at {}", peer_id, addr);
-                         
-                         // 2. Explicitly Dial
-                         if let Err(e) = self.swarm.dial(addr.clone()) {
-                             eprintln!("[NetworkManager] Dial failed: {}", e);
-                         }
-                         
-                         // 3. Track it
-                         self.local_peers
+                        println!("[NetworkManager] Dialing mDNS peer {} at {}", peer_id, addr);
+
+                        // 2. Explicitly Dial
+                        if let Err(e) = self.swarm.dial(addr.clone()) {
+                            eprintln!("[NetworkManager] Dial failed: {}", e);
+                        }
+
+                        // 3. Track it
+                        self.local_peers
                             .entry(peer_id)
                             .or_insert_with(Vec::new)
                             .push(addr);
-                            
-                         // 4. Add to Gossipsub
-                         self.swarm
+
+                        // 4. Add to Gossipsub
+                        self.swarm
                             .behaviour_mut()
                             .gossipsub
                             .add_explicit_peer(&peer_id);
                     }
                 }
-                
+
                 // 5. Emit event to UI
                 let peer_info = LocalPeer {
                     peer_id: peer.peer_id.clone(),

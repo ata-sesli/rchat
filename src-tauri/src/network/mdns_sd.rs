@@ -14,13 +14,15 @@ pub struct MdnsPeer {
 pub fn start_mdns_service(
     peer_id: PeerId,
     port: u16,
-    is_online: bool, // We can respect the online switch here
+    _is_online: bool, // We can respect the online switch here
     sender: mpsc::Sender<MdnsPeer>,
 ) -> Result<()> {
+    /*
     if !is_online {
         println!("[mDNS-SD] Offline mode: Not starting mDNS service.");
         return Ok(());
     }
+    */
 
     let mdns = ServiceDaemon::new()?;
     let service_type = "_rchat._tcp.local.";
