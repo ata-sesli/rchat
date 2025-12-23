@@ -21,6 +21,8 @@ pub struct NetworkManager {
     // The handle to send events TO the UI
     app_handle: AppHandle,
     disc_rx: Receiver<Multiaddr>,
+    // Channel for mDNS-SD discovery
+    mdns_rx: Receiver<crate::network::mdns_sd::MdnsPeer>,
     // Track local peers discovered via mDNS
     local_peers: HashMap<PeerId, Vec<Multiaddr>>,
 }
@@ -30,12 +32,14 @@ impl NetworkManager {
         swarm: Swarm<RChatBehaviour>,
         crx: Receiver<String>,
         disc_rx: Receiver<Multiaddr>,
+        mdns_rx: Receiver<crate::network::mdns_sd::MdnsPeer>,
         app_handle: AppHandle,
     ) -> Self {
         Self {
             swarm,
             crx,
             disc_rx,
+            mdns_rx,
             app_handle,
             local_peers: HashMap::new(),
         }
@@ -64,6 +68,9 @@ impl NetworkManager {
                     // Start dialing the peer found from Gist
                     println!("Using Gist Peer: {}", addr);
                     let _ = self.swarm.dial(addr);
+                }
+                Some(peer) = self.mdns_rx.recv() => {
+                    self.handle_mdns_peer(peer);
                 }
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event).await;
@@ -190,73 +197,96 @@ impl NetworkManager {
                         // We emit the same structure as DB Message so frontend can just use it
                         let _ = self.app_handle.emit("message-received", db_msg);
                     }
-                    // 2. mDNS Event: We found a neighbour on Wi-Fi!
-                    RChatBehaviourEvent::Mdns(libp2p::mdns::Event::Discovered(list)) => {
-                        for (peer_id, multiaddr) in list {
-                            eprintln!("[mDNS Debug] Discovered peer: {} at {}", peer_id, multiaddr);
 
-                            // 1. Explicitly Dial (Crucial for mDNS)
-                            eprintln!("[mDNS Debug] Dialing {}...", peer_id);
-                            if let Err(e) = self.swarm.dial(multiaddr.clone()) {
-                                eprintln!("[mDNS Debug] Dial failed: {}", e);
-                            }
-
-                            // Track the peer
-                            self.local_peers
-                                .entry(peer_id)
-                                .or_insert_with(Vec::new)
-                                .push(multiaddr);
-
-                            // Auto-connect for gossip
-                            self.swarm
-                                .behaviour_mut()
-                                .gossipsub
-                                .add_explicit_peer(&peer_id);
-
-                            // Emit to frontend
-                            let peer_info = LocalPeer {
-                                peer_id: peer_id.to_string(),
-                                addresses: self
-                                    .local_peers
-                                    .get(&peer_id)
-                                    .map(|a| a.iter().map(|m| m.to_string()).collect())
-                                    .unwrap_or_default(),
-                            };
-                            if let Err(e) = self.app_handle.emit("local-peer-discovered", peer_info)
-                            {
-                                eprintln!("[mDNS Debug] Failed to emit event: {}", e);
-                            } else {
-                                eprintln!(
-                                    "[mDNS Debug] Emitted 'local-peer-discovered' to frontend"
-                                );
-                            }
-                        }
+                    other => {
+                        eprintln!(
+                            "[Event Debug] Unhandled behaviour event: {:?}",
+                            std::any::type_name_of_val(&other)
+                        );
                     }
-                    // 3. mDNS Event: Peer left the network
-                    RChatBehaviourEvent::Mdns(libp2p::mdns::Event::Expired(list)) => {
-                        for (peer_id, multiaddr) in list {
-                            eprintln!("[mDNS Debug] Peer expired: {} at {}", peer_id, multiaddr);
-
-                            // Remove from tracking
-                            self.local_peers.remove(&peer_id);
-
-                            // Emit to frontend
-                            let _ = self
-                                .app_handle
-                                .emit("local-peer-expired", peer_id.to_string());
-                        }
-                    }
-                    _ => {}
                 }
             }
             // CASE B: Connection Status Changes
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                print!("Connected to {}", peer_id);
+                println!("[Swarm] Connected to {}", peer_id);
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                println!("Disconnected from {}", peer_id);
+                println!("[Swarm] Disconnected from {}", peer_id);
             }
-            _ => {}
+            // CASE C: New Listener Address (expected at startup)
+            SwarmEvent::NewListenAddr { address, .. } => {
+                println!("[Swarm] Listening on: {}", address);
+            }
+            // CASE D: Incoming connection attempts
+            SwarmEvent::IncomingConnection {
+                local_addr,
+                send_back_addr,
+                ..
+            } => {
+                println!(
+                    "[Swarm] Incoming connection from {} to {}",
+                    send_back_addr, local_addr
+                );
+            }
+            // CASE E: Dialing (outgoing connection attempt)
+            SwarmEvent::Dialing { peer_id, .. } => {
+                if let Some(peer) = peer_id {
+                    println!("[Swarm] Dialing peer: {}", peer);
+                }
+            }
+            // Catch-all for anything else
+            other => {
+                eprintln!(
+                    "[Swarm Debug] Other event: {:?}",
+                    std::any::type_name_of_val(&other)
+                );
+            }
         }
+    }
+
+    fn handle_mdns_peer(&mut self, peer: crate::network::mdns_sd::MdnsPeer) {
+        println!("[NetworkManager] Received mDNS peer: {}", peer.peer_id);
+        
+        // Parse peer ID
+        let peer_id_res = peer.peer_id.parse::<PeerId>();
+        match peer_id_res {
+            Ok(peer_id) => {
+                // 1. Add to known peers
+                for addr_str in peer.addresses {
+                    if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+                         println!("[NetworkManager] Dialing mDNS peer {} at {}", peer_id, addr);
+                         
+                         // 2. Explicitly Dial
+                         if let Err(e) = self.swarm.dial(addr.clone()) {
+                             eprintln!("[NetworkManager] Dial failed: {}", e);
+                         }
+                         
+                         // 3. Track it
+                         self.local_peers
+                            .entry(peer_id)
+                            .or_insert_with(Vec::new)
+                            .push(addr);
+                            
+                         // 4. Add to Gossipsub
+                         self.swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .add_explicit_peer(&peer_id);
+                    }
+                }
+                
+                // 5. Emit event to UI
+                let peer_info = LocalPeer {
+                    peer_id: peer.peer_id.clone(),
+                    addresses: self
+                        .local_peers
+                        .get(&peer_id)
+                        .map(|a| a.iter().map(|m| m.to_string()).collect())
+                        .unwrap_or_default(),
+                };
+                let _ = self.app_handle.emit("local-peer-discovered", peer_info);
+            }
+            Err(e) => {
+                eprintln!("[NetworkManager] Invalid Peer ID from mDNS: {}", e);
     }
 }

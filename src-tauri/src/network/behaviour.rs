@@ -1,6 +1,5 @@
 use libp2p::{
-    gossipsub, identify, identity::Keypair, kad, mdns, ping, request_response,
-    swarm::NetworkBehaviour,
+    gossipsub, identify, identity::Keypair, kad, ping, request_response, swarm::NetworkBehaviour,
 };
 #[derive(NetworkBehaviour)]
 pub struct RChatBehaviour {
@@ -9,9 +8,6 @@ pub struct RChatBehaviour {
 
     // The "Phone Book" - For finding peers and storing history logs
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
-
-    // The "Local Shout" - For finding peers on the same Wi-Fi
-    pub mdns: mdns::tokio::Behaviour,
 
     // The "ID Card" - Exchanges version/public key info on connect
     pub identify: identify::Behaviour,
@@ -35,17 +31,9 @@ impl RChatBehaviour {
         // 2. Kademlia (Discovery)
         let store = kad::store::MemoryStore::new(peer_id);
         let kademlia = kad::Behaviour::new(peer_id, store);
-        // 3. MDNS (Local Discovery)
-        let mdns_config = mdns::Config {
-            ttl: std::time::Duration::from_secs(300),
-            query_interval: std::time::Duration::from_secs(5),
-            enable_ipv6: true,
-        };
-        let mdns = mdns::tokio::Behaviour::new(mdns_config, peer_id).expect("mDNS failed to start");
-        println!(
-            "[mDNS Debug] Service initialized successfully for peer {}",
-            peer_id
-        );
+        // 3. MDNS (Local Discovery) - REPLACED by native mdns-sd (see network/mdns_sd.rs)
+        // We use native OS mDNS service to avoid UDP port 5353 conflicts and VPN routing issues.
+
         // 4. Identify (Handshake)
         let identify =
             identify::Behaviour::new(identify::Config::new("rchat/1.0.0".into(), key.public()));
@@ -64,7 +52,6 @@ impl RChatBehaviour {
         Self {
             gossipsub,
             kademlia,
-            mdns,
             identify,
             ping,
             direct_message,
