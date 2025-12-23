@@ -39,7 +39,7 @@ pub fn start_mdns_service(
         &host_name,
         ip,
         port,
-        &properties,
+        properties,
     )?
     .enable_addr_auto();
 

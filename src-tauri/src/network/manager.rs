@@ -288,5 +288,7 @@ impl NetworkManager {
             }
             Err(e) => {
                 eprintln!("[NetworkManager] Invalid Peer ID from mDNS: {}", e);
+            }
+        }
     }
 }
