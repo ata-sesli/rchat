@@ -41,11 +41,12 @@ pub fn start_mdns_service(
     properties.insert("peer_id".to_string(), instance_name.clone());
     properties.insert("protocol".to_string(), "rchat/1.0".to_string());
 
+    // Use peer_id as instance name for guaranteed uniqueness across network
     let service_info = ServiceInfo::new(
         service_type,
-        &hostname, // Use readable hostname, not peer ID
+        &instance_name, // Use PeerID as instance name for uniqueness
         &format!("{}.local.", hostname),
-        &local_ip, // ✅ REAL IP, not 0.0.0.0
+        &local_ip,
         port,
         properties,
     )?
@@ -70,9 +71,12 @@ pub fn start_mdns_service(
 
         while let Ok(event) = receiver.recv() {
             match event {
-                ServiceEvent::ServiceFound(_service, _) => {
-                    // println!("[mDNS-SD] 🔍 Found service: {:?}", service);
-                    // mdns-sd usually emits ServiceResolved after ServiceFound automatically.
+                ServiceEvent::ServiceFound(service, iface) => {
+                    println!(
+                        "[mDNS-SD] 🔍 ServiceFound: {} on interface {:?}",
+                        service, iface
+                    );
+                    // mdns-sd should auto-resolve, but log it to confirm events arrive
                 }
 
                 ServiceEvent::ServiceResolved(info) => {
@@ -152,7 +156,7 @@ pub fn start_mdns_service(
                     }
                 }
                 other_event => {
-                    // println!("[mDNS-SD Debug] Event: {:?}", other_event);
+                    println!("[mDNS-SD Debug] Event: {:?}", other_event);
                 }
             }
         }
