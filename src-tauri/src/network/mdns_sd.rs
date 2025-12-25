@@ -1,10 +1,13 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use libp2p::PeerId;
 use local_ip_address::local_ip;
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::any::Any;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use zeroconf::prelude::*;
+use zeroconf::{BrowserEvent, MdnsBrowser, MdnsService, ServiceType, TxtRecord};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MdnsPeer {
@@ -18,167 +21,190 @@ pub fn start_mdns_service(
     _is_online: bool,
     sender: mpsc::Sender<MdnsPeer>,
 ) -> Result<()> {
-    let mdns = ServiceDaemon::new().context("Failed to create mDNS daemon")?;
-    let service_type = "_rchat._tcp.local.";
     let instance_name = peer_id.to_string();
 
-    // 1. Advertise with REAL IP
-    let local_ip = local_ip().context("Failed to get local IP")?.to_string();
+    // Get local IP for logging
+    let local_ip = local_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
 
-    // Get hostname for proper DNS - but fall back to a PeerID-derived name if invalid
+    // Get hostname for proper DNS - fall back to a PeerID-derived name if invalid
     let raw_hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "rchat-host".to_string());
 
-    // DNS hostnames must start with a letter. If hostname starts with a digit (like an IP),
-    // use a PeerID-derived hostname instead. Also limit length for DNS compatibility.
+    // DNS hostnames must start with a letter
     let valid_hostname = if raw_hostname
         .chars()
         .next()
         .map(|c| c.is_ascii_digit())
         .unwrap_or(true)
     {
-        // Hostname is invalid (starts with digit or empty), use "rchat-" + first 12 chars of PeerID
         format!(
             "rchat-{}",
             &instance_name[..std::cmp::min(12, instance_name.len())]
         )
     } else {
-        // Hostname is valid, use it but limit length
         raw_hostname.chars().take(32).collect()
     };
 
     println!(
-        "[mDNS-SD] Advertising as: {} (hostname: {}, IP: {}) on port {}",
+        "[mDNS-Zeroconf] Advertising as: {} (hostname: {}, IP: {}) on port {}",
         instance_name, valid_hostname, local_ip, port
     );
 
-    let mut properties = HashMap::new();
-    properties.insert("version".to_string(), "1.0.0".to_string());
-    properties.insert("peer_id".to_string(), instance_name.clone());
-    properties.insert("protocol".to_string(), "rchat/1.0".to_string());
+    // Clone values for the registration thread
+    let instance_name_reg = instance_name.clone();
+    let valid_hostname_reg = valid_hostname.clone();
 
-    // Use peer_id as instance name for guaranteed uniqueness across network
-    let service_info = ServiceInfo::new(
-        service_type,
-        &instance_name, // Use PeerID as instance name for uniqueness
-        &format!("{}.local.", valid_hostname), // Use VALID hostname
-        &local_ip,
-        port,
-        properties,
-    )?
-    .enable_addr_auto();
-
-    mdns.register(service_info)
-        .context("Failed to register service")?;
-
-    println!("[mDNS-SD] ✅ Service registered: {}:{}", local_ip, port);
-
-    // 2. Browse for Peers
-    let receiver = mdns
-        .browse(service_type)
-        .context("Failed to start browsing")?;
-
-    // Clone for the thread
-    let thread_sender = sender.clone();
-    let my_peer_id = instance_name.clone();
-
+    // Spawn registration thread
     std::thread::spawn(move || {
-        println!("[mDNS-SD] Started browsing for {}...", service_type);
-
-        while let Ok(event) = receiver.recv() {
-            match event {
-                ServiceEvent::ServiceFound(service, iface) => {
-                    println!(
-                        "[mDNS-SD] 🔍 ServiceFound: {} on interface {:?}",
-                        service, iface
-                    );
-                    // mdns-sd should auto-resolve, but log it to confirm events arrive
-                }
-
-                ServiceEvent::ServiceResolved(info) => {
-                    // Extract peer ID from TXT records
-                    let txt_records: HashMap<String, String> = info
-                        .get_properties()
-                        .iter()
-                        .map(|p| {
-                            (
-                                p.key().to_string(),
-                                String::from_utf8_lossy(p.val().unwrap_or(&[])).to_string(),
-                            )
-                        })
-                        .collect();
-
-                    let discovered_peer_id =
-                        txt_records.get("peer_id").cloned().unwrap_or_else(|| {
-                            // Fallback: extract from instance name if no TXT record
-                            info.get_fullname()
-                                .split('.')
-                                .next()
-                                .unwrap_or("unknown")
-                                .to_string()
-                        });
-
-                    // Skip self
-                    if discovered_peer_id == my_peer_id {
-                        continue;
-                    }
-
-                    // Get ALL IP addresses (IPv4 and IPv6)
-                    let addresses: Vec<String> = info
-                        .get_addresses()
-                        .iter()
-                        .filter(|ip| !ip.is_loopback()) // Skip 127.0.0.1 if possible
-                        .flat_map(|ip| {
-                            // Create both TCP and potential QUIC addresses
-                            let mut addrs = vec![
-                                format!("/ip4/{}/tcp/{}", ip, info.get_port()),
-                                // format!("/ip6/{}/tcp/{}", ip, info.get_port()),
-                            ];
-                            // We focus on IPv4 for now as per previous config,
-                            // but mdns-sd returns IpAddr which can be V4 or V6.
-                            // The string format needs to match.
-
-                            // If this is V6, the format /ip4/ is wrong.
-                            if ip.is_ipv6() {
-                                // For now, we mainly support IPv4 in RChatBehaviour?
-                                // Let's just log it or add it as /ip6/
-                                vec![format!("/ip6/{}/tcp/{}", ip, info.get_port())]
-                            } else {
-                                addrs
-                            }
-                        })
-                        .collect();
-
-                    if addresses.is_empty() {
-                        // If only loopback was found, maybe we should use it if nothing else?
-                        // But usually we want real IPs.
-                        continue;
-                    }
-
-                    println!(
-                        "[mDNS-SD] ✅ Resolved {} at {:?}",
-                        discovered_peer_id, addresses
-                    );
-
-                    let peer = MdnsPeer {
-                        peer_id: discovered_peer_id,
-                        addresses,
-                    };
-
-                    // Send to manager
-                    if let Err(e) = thread_sender.blocking_send(peer) {
-                        eprintln!("[mDNS-SD] Failed to send peer to manager: {}", e);
-                        break;
-                    }
-                }
-                other_event => {
-                    println!("[mDNS-SD Debug] Event: {:?}", other_event);
-                }
-            }
+        if let Err(e) = run_service_registration(instance_name_reg, valid_hostname_reg, port) {
+            eprintln!("[mDNS-Zeroconf] Registration error: {}", e);
         }
-        println!("[mDNS-SD] Browsing thread exiting");
+    });
+
+    // Spawn browser thread
+    let my_peer_id = instance_name.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = run_service_browser(sender, my_peer_id) {
+            eprintln!("[mDNS-Zeroconf] Browser error: {}", e);
+        }
     });
 
     Ok(())
+}
+
+fn run_service_registration(instance_name: String, hostname: String, port: u16) -> Result<()> {
+    let service_type = ServiceType::new("rchat", "tcp")
+        .map_err(|e| anyhow::anyhow!("Invalid service type: {:?}", e))?;
+
+    let mut service = MdnsService::new(service_type, port);
+
+    // Create TXT record with peer_id
+    let mut txt_record = TxtRecord::new();
+    txt_record
+        .insert("peer_id", &instance_name)
+        .map_err(|e| anyhow::anyhow!("Failed to insert TXT record: {:?}", e))?;
+    txt_record
+        .insert("version", "1.0.0")
+        .map_err(|e| anyhow::anyhow!("Failed to insert TXT record: {:?}", e))?;
+    txt_record
+        .insert("protocol", "rchat/1.0")
+        .map_err(|e| anyhow::anyhow!("Failed to insert TXT record: {:?}", e))?;
+
+    service.set_name(&hostname);
+    service.set_txt_record(txt_record);
+    service.set_registered_callback(Box::new(on_service_registered));
+
+    let event_loop = service
+        .register()
+        .map_err(|e| anyhow::anyhow!("Failed to register service: {:?}", e))?;
+
+    println!("[mDNS-Zeroconf] ✅ Service registered, polling...");
+
+    // Keep polling to maintain the service
+    loop {
+        if let Err(e) = event_loop.poll(Duration::from_secs(1)) {
+            eprintln!("[mDNS-Zeroconf] Poll error: {:?}", e);
+        }
+    }
+}
+
+fn on_service_registered(
+    result: zeroconf::Result<zeroconf::ServiceRegistration>,
+    _context: Option<Arc<dyn Any + Send + Sync>>,
+) {
+    match result {
+        Ok(registration) => {
+            println!("[mDNS-Zeroconf] ✅ Registered: {}", registration.name());
+        }
+        Err(e) => {
+            eprintln!("[mDNS-Zeroconf] Registration failed: {:?}", e);
+        }
+    }
+}
+
+fn run_service_browser(sender: mpsc::Sender<MdnsPeer>, my_peer_id: String) -> Result<()> {
+    let service_type = ServiceType::new("rchat", "tcp")
+        .map_err(|e| anyhow::anyhow!("Invalid service type: {:?}", e))?;
+
+    let mut browser = MdnsBrowser::new(service_type);
+
+    // Wrap sender and my_peer_id in Arc for callback
+    let sender = Arc::new(std::sync::Mutex::new(sender));
+    let my_peer_id = Arc::new(my_peer_id);
+
+    let sender_clone = sender.clone();
+    let my_peer_id_clone = my_peer_id.clone();
+
+    browser.set_service_callback(Box::new(move |result, _context| {
+        handle_browser_event(result, &sender_clone, &my_peer_id_clone);
+    }));
+
+    let event_loop = browser
+        .browse_services()
+        .map_err(|e| anyhow::anyhow!("Failed to start browsing: {:?}", e))?;
+
+    println!("[mDNS-Zeroconf] Started browsing for _rchat._tcp...");
+
+    // Keep polling to receive events
+    loop {
+        if let Err(e) = event_loop.poll(Duration::from_secs(1)) {
+            eprintln!("[mDNS-Zeroconf] Browse poll error: {:?}", e);
+        }
+    }
+}
+
+fn handle_browser_event(
+    result: zeroconf::Result<BrowserEvent>,
+    sender: &Arc<std::sync::Mutex<mpsc::Sender<MdnsPeer>>>,
+    my_peer_id: &Arc<String>,
+) {
+    match result {
+        Ok(BrowserEvent::Add(discovery)) => {
+            let addr = discovery.address();
+            println!(
+                "[mDNS-Zeroconf] 🔍 Discovered: {} at {}:{}",
+                discovery.name(),
+                addr,
+                discovery.port()
+            );
+
+            // Extract peer_id from TXT record
+            let txt = discovery.txt();
+            let discovered_peer_id = txt
+                .as_ref()
+                .and_then(|t| t.get("peer_id"))
+                .unwrap_or_else(|| discovery.name().to_string());
+
+            // Skip self
+            if discovered_peer_id == **my_peer_id {
+                println!("[mDNS-Zeroconf] Skipping self");
+                return;
+            }
+
+            // Build address - address() returns &String directly
+            let port = discovery.port();
+            let multiaddr = format!("/ip4/{}/tcp/{}", addr, port);
+
+            let peer = MdnsPeer {
+                peer_id: discovered_peer_id,
+                addresses: vec![multiaddr],
+            };
+
+            // Send to manager
+            if let Ok(sender) = sender.lock() {
+                if let Err(e) = sender.blocking_send(peer) {
+                    eprintln!("[mDNS-Zeroconf] Failed to send peer: {}", e);
+                }
+            }
+        }
+        Ok(BrowserEvent::Remove(removal)) => {
+            println!("[mDNS-Zeroconf] ❌ Service removed: {}", removal.name());
+        }
+        Err(e) => {
+            eprintln!("[mDNS-Zeroconf] Browser event error: {:?}", e);
+        }
+    }
 }
