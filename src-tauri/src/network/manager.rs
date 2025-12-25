@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use tauri::async_runtime::Receiver;
 use tauri::AppHandle;
 use tauri::Emitter;
-use tauri::Manager;
 
 #[derive(Clone, Serialize)]
 pub struct LocalPeer {
