@@ -25,15 +25,32 @@ pub fn start_mdns_service(
     // 1. Advertise with REAL IP
     let local_ip = local_ip().context("Failed to get local IP")?.to_string();
 
-    // Get hostname for proper DNS
-    let hostname = hostname::get()
-        .context("Failed to get hostname")?
-        .to_string_lossy()
-        .to_string();
+    // Get hostname for proper DNS - but fall back to a PeerID-derived name if invalid
+    let raw_hostname = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "rchat-host".to_string());
+
+    // DNS hostnames must start with a letter. If hostname starts with a digit (like an IP),
+    // use a PeerID-derived hostname instead. Also limit length for DNS compatibility.
+    let valid_hostname = if raw_hostname
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(true)
+    {
+        // Hostname is invalid (starts with digit or empty), use "rchat-" + first 12 chars of PeerID
+        format!(
+            "rchat-{}",
+            &instance_name[..std::cmp::min(12, instance_name.len())]
+        )
+    } else {
+        // Hostname is valid, use it but limit length
+        raw_hostname.chars().take(32).collect()
+    };
 
     println!(
-        "[mDNS-SD] Advertising as: {} (IP: {}) on port {}",
-        hostname, local_ip, port
+        "[mDNS-SD] Advertising as: {} (hostname: {}, IP: {}) on port {}",
+        instance_name, valid_hostname, local_ip, port
     );
 
     let mut properties = HashMap::new();
@@ -45,7 +62,7 @@ pub fn start_mdns_service(
     let service_info = ServiceInfo::new(
         service_type,
         &instance_name, // Use PeerID as instance name for uniqueness
-        &format!("{}.local.", hostname),
+        &format!("{}.local.", valid_hostname), // Use VALID hostname
         &local_ip,
         port,
         properties,
