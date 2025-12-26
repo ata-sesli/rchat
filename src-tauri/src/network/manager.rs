@@ -22,9 +22,9 @@ pub struct NetworkManager {
     app_handle: AppHandle,
     disc_rx: Receiver<Multiaddr>,
     // Channel for mDNS-SD discovery
-    mdns_rx: Receiver<crate::network::mdns_sd::MdnsPeer>,
+    mdns_rx: Receiver<crate::network::mdns::MdnsPeer>,
     // Sender to pass to mDNS service when starting it
-    mdns_tx: tokio::sync::mpsc::Sender<crate::network::mdns_sd::MdnsPeer>,
+    mdns_tx: tokio::sync::mpsc::Sender<crate::network::mdns::MdnsPeer>,
     // Flag to ensure we only start mDNS once
     mdns_started: bool,
     // Track local peers discovered via mDNS
@@ -36,8 +36,8 @@ impl NetworkManager {
         swarm: Swarm<RChatBehaviour>,
         crx: Receiver<String>,
         disc_rx: Receiver<Multiaddr>,
-        mdns_rx: Receiver<crate::network::mdns_sd::MdnsPeer>,
-        mdns_tx: tokio::sync::mpsc::Sender<crate::network::mdns_sd::MdnsPeer>,
+        mdns_rx: Receiver<crate::network::mdns::MdnsPeer>,
+        mdns_tx: tokio::sync::mpsc::Sender<crate::network::mdns::MdnsPeer>,
         app_handle: AppHandle,
     ) -> Self {
         Self {
@@ -242,7 +242,7 @@ impl NetworkManager {
                             let is_online = true;
 
                             // We pass a clone of the sender
-                            if let Err(e) = crate::network::mdns_sd::start_mdns_service(
+                            if let Err(e) = crate::network::mdns::start_mdns_service(
                                 peer_id,
                                 port,
                                 is_online,
@@ -283,7 +283,7 @@ impl NetworkManager {
         }
     }
 
-    fn handle_mdns_peer(&mut self, peer: crate::network::mdns_sd::MdnsPeer) {
+    fn handle_mdns_peer(&mut self, peer: crate::network::mdns::MdnsPeer) {
         println!("[NetworkManager] Received mDNS peer: {}", peer.peer_id);
 
         // Parse peer ID

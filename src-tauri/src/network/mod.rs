@@ -3,7 +3,7 @@ mod discovery;
 pub mod gist;
 pub mod hks;
 mod manager;
-pub mod mdns_sd; // New module
+pub mod mdns; // New module
 use anyhow::Result;
 use libp2p::{identity, PeerId, SwarmBuilder};
 use tauri::{AppHandle, Manager};
