@@ -40,6 +40,7 @@ pub struct MdnsPeer {
     pub peer_id: String,
     pub addresses: Vec<String>,
     pub device_name: Option<String>,
+    pub alias: Option<String>, // User's display name from TXT record
 }
 
 /// Start mDNS service - always advertises and browses at startup
@@ -47,6 +48,7 @@ pub fn start_mdns_service(
     peer_id: PeerId,
     port: u16,
     sender: mpsc::Sender<MdnsPeer>,
+    user_alias: Option<String>, // User's alias from settings
 ) -> Result<()> {
     if MDNS_INITIALIZED.swap(true, Ordering::SeqCst) {
         println!("[mDNS] Already initialized");
@@ -85,8 +87,11 @@ pub fn start_mdns_service(
     // Spawn registration thread (advertising)
     let instance_name_reg = instance_name.clone();
     let valid_hostname_reg = valid_hostname.clone();
+    let alias_reg = user_alias.clone();
     std::thread::spawn(move || {
-        if let Err(e) = run_service_registration(instance_name_reg, valid_hostname_reg, port) {
+        if let Err(e) =
+            run_service_registration(instance_name_reg, valid_hostname_reg, port, alias_reg)
+        {
             eprintln!("[mDNS] Registration error: {}", e);
         }
     });
@@ -102,7 +107,12 @@ pub fn start_mdns_service(
     Ok(())
 }
 
-fn run_service_registration(instance_name: String, hostname: String, port: u16) -> Result<()> {
+fn run_service_registration(
+    instance_name: String,
+    hostname: String,
+    port: u16,
+    user_alias: Option<String>,
+) -> Result<()> {
     let service_type = ServiceType::new("rchat", "tcp")
         .map_err(|e| anyhow::anyhow!("Invalid service type: {:?}", e))?;
 
@@ -118,6 +128,13 @@ fn run_service_registration(instance_name: String, hostname: String, port: u16) 
     txt_record
         .insert("protocol", "rchat/1.0")
         .map_err(|e| anyhow::anyhow!("Failed to insert TXT record: {:?}", e))?;
+
+    // Add user alias if set
+    if let Some(alias) = &user_alias {
+        txt_record
+            .insert("alias", alias)
+            .map_err(|e| anyhow::anyhow!("Failed to insert alias TXT record: {:?}", e))?;
+    }
 
     service.set_name(&hostname);
     service.set_txt_record(txt_record);
@@ -224,12 +241,14 @@ fn handle_browser_event(
 
             println!("[mDNS] 🔍 Discovered: {} at {}:{}", device_name, addr, port);
 
-            // Extract peer_id from TXT record
+            // Extract peer_id and alias from TXT record
             let txt = discovery.txt();
             let discovered_peer_id = txt
                 .as_ref()
                 .and_then(|t| t.get("peer_id"))
                 .unwrap_or_else(|| device_name.clone());
+
+            let discovered_alias = txt.as_ref().and_then(|t| t.get("alias"));
 
             // Skip self
             if discovered_peer_id == **my_peer_id {
@@ -242,6 +261,7 @@ fn handle_browser_event(
                 peer_id: discovered_peer_id,
                 addresses: vec![multiaddr],
                 device_name: Some(device_name),
+                alias: discovered_alias,
             };
 
             if let Ok(sender) = sender.lock() {

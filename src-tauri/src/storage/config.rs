@@ -234,6 +234,25 @@ impl ConfigManager {
         Ok(config)
     }
 
+    /// Synchronous version of load for use in sync contexts
+    pub fn load_sync(&self) -> Result<Config> {
+        let key = self.key.ok_or_else(|| anyhow::anyhow!("Vault is locked"))?;
+
+        if !self.file_path.exists() {
+            return Err(anyhow::anyhow!("Config file not found"));
+        }
+
+        let data = std::fs::read(&self.file_path)?;
+        let wrapper: ConfigWrapper = serde_json::from_slice(&data)?;
+
+        let decrypted_json =
+            rvault_core::crypto::decrypt_with_key(&key, &wrapper.ciphertext, &wrapper.nonce)
+                .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
+
+        let config: Config = serde_json::from_str(&decrypted_json)?;
+        Ok(config)
+    }
+
     pub async fn save(&self, config: &Config) -> Result<()> {
         let key = self.key.ok_or_else(|| anyhow::anyhow!("Vault is locked"))?;
         Self::save_internal(config, &key, &self.file_path).await

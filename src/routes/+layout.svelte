@@ -490,7 +490,11 @@
         showNewPersonModal = false;
         newPersonStep = "select-network";
       }}
-      onconnect={(peerId: string) => console.log("Connect to:", peerId)}
+      onconnect={async (peerId: string) => {
+        console.log("Peer connected:", peerId);
+        // Refresh data to show the new peer (already in known_devices from backend)
+        await refreshData();
+      }}
     />
 
     <GroupChatModal

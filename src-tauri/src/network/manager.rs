@@ -253,18 +253,20 @@ impl NetworkManager {
         self.pending_requests.remove(&peer_id);
         self.incoming_requests.remove(&peer_id);
 
-        // Add to known_devices database
+        // Add to peers database (source of truth for friends)
         use tauri::Manager;
         let state = self.app_handle.state::<crate::AppState>();
         if let Ok(conn) = state.db_conn.lock() {
-            if let Err(e) = crate::storage::db::save_known_device(
+            if let Err(e) = crate::storage::db::add_peer(
                 &conn,
                 &peer_id.to_string(),
-                None, // device_name - can be updated later
+                None,    // alias - can be updated later
+                None,    // public_key - can be updated later
+                "local", // method - discovered via mDNS
             ) {
-                eprintln!("[Handshake] Failed to save known device: {}", e);
+                eprintln!("[Handshake] Failed to save peer: {}", e);
             } else {
-                println!("[Handshake] ✅ {} saved to known_devices!", peer_id);
+                println!("[Handshake] ✅ {} saved to peers table!", peer_id);
             }
         }
 
@@ -375,10 +377,7 @@ impl NetworkManager {
                             use tauri::Manager;
                             let state = self.app_handle.state::<crate::AppState>();
                             let is_known = if let Ok(conn) = state.db_conn.lock() {
-                                crate::storage::db::is_known_device(
-                                    &conn,
-                                    &sender_peer_id.to_string(),
-                                )
+                                crate::storage::db::is_peer(&conn, &sender_peer_id.to_string())
                             } else {
                                 false
                             };
@@ -573,11 +572,22 @@ impl NetworkManager {
                             );
                             let peer_id = *self.swarm.local_peer_id();
 
+                            // Get user alias from config
+                            let user_alias = {
+                                use tauri::Manager;
+                                let state = self.app_handle.state::<crate::AppState>();
+                                let mgr = state.config_manager.blocking_lock();
+                                mgr.load_sync()
+                                    .ok()
+                                    .and_then(|c| c.user.profile.alias.clone())
+                            };
+
                             // Always advertise + browse at startup
                             if let Err(e) = crate::network::mdns::start_mdns_service(
                                 peer_id,
                                 port,
                                 self.mdns_tx.clone(),
+                                user_alias,
                             ) {
                                 eprintln!("[NetworkManager] Failed to start mDNS: {}", e);
                             } else {

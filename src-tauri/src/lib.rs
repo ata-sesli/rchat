@@ -125,15 +125,13 @@ use crate::storage::config::{FriendConfig, UserProfile};
 
 #[tauri::command]
 async fn get_trusted_peers(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let mgr = state.config_manager.lock().await;
-    match mgr.load().await {
-        Ok(config) => {
-            let mut peers = vec!["Me".to_string()];
-            peers.extend(config.user.friends.into_iter().map(|f| f.username));
-            Ok(peers)
-        }
-        Err(e) => Err(e.to_string()),
-    }
+    // Read from peers table (source of truth for friends)
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+    let peers = crate::storage::db::get_all_peers(&conn).map_err(|e| e.to_string())?;
+
+    // Return peer IDs (aliases could be used for display names)
+    let peer_ids: Vec<String> = peers.into_iter().map(|p| p.id).collect();
+    Ok(peer_ids)
 }
 
 #[tauri::command]
@@ -600,6 +598,8 @@ pub fn run() {
             // Initialize DB Connection ONCE (Solving Race Conditions)
             let db_connection =
                 storage::db::connect_to_db().expect("Failed to initialize database");
+
+            // Note: "Me" entry is automatically seeded in peers table by run_migrations()
 
             app.manage(AppState {
                 config_manager: tokio::sync::Mutex::new(config_manager),
