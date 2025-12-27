@@ -66,6 +66,14 @@ impl NetworkManager {
     pub async fn run(mut self: Self) {
         println!("🛜 Network Manager: Running!");
 
+        // Subscribe to the global-chat topic to receive messages
+        let topic = libp2p::gossipsub::IdentTopic::new("global-chat");
+        if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
+            eprintln!("[Gossipsub] Failed to subscribe to global-chat: {:?}", e);
+        } else {
+            println!("[Gossipsub] ✅ Subscribed to global-chat topic");
+        }
+
         // Publish every 5 minutes
         let mut publish_interval = tokio::time::interval(std::time::Duration::from_secs(300));
         // Heartbeat every 60 seconds
