@@ -196,20 +196,20 @@ impl NetworkManager {
         };
 
         // Check if this peer already sent us a request (mutual handshake!)
-        if self.incoming_requests.contains(&peer_id) {
+        let already_requested_us = self.incoming_requests.contains(&peer_id);
+        if already_requested_us {
             println!("[Handshake] 🤝 Mutual handshake complete with {}!", peer_id);
             self.complete_handshake(peer_id);
-            return;
+            // Don't return - still send our request so THEY can complete too
+        } else {
+            // Add to our pending requests
+            self.pending_requests.insert(peer_id);
+            println!("[Handshake] ⏳ Waiting for {} to accept...", peer_id);
+            // Emit waiting state to frontend
+            let _ = self.app_handle.emit("connection-waiting", peer_id_str);
         }
 
-        // Otherwise, add to our pending requests and send request message
-        self.pending_requests.insert(peer_id);
-        println!("[Handshake] ⏳ Waiting for {} to accept...", peer_id);
-
-        // Emit waiting state to frontend
-        let _ = self.app_handle.emit("connection-waiting", peer_id_str);
-
-        // Send connection request to peer via gossipsub
+        // Always send connection request to peer via gossipsub
         let my_peer_id = self.swarm.local_peer_id().to_string();
         let request_msg = format!("__CONNECTION_REQUEST__:{}", my_peer_id);
 
