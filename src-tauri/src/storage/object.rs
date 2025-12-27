@@ -7,7 +7,6 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use fastcdc::v2020::FastCDC;
 
-
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -27,7 +26,7 @@ fn get_chunks_dir(root_dir: Option<PathBuf>) -> Result<PathBuf> {
             .context("Failed to determine project directories")?;
         project_dirs.data_dir().to_path_buf()
     };
-    
+
     let chunks_dir = base_dir.join("chunks");
     fs::create_dir_all(&chunks_dir).context("Failed to create chunks directory")?;
     Ok(chunks_dir)
@@ -44,7 +43,13 @@ fn sha256_hex(data: &[u8]) -> String {
 /// Store an object (file) using content-defined chunking.
 ///
 /// Returns the file hash (SHA256 of the complete file).
-pub fn create(conn: &Connection, data: &[u8], file_name: Option<&str>, mime_type: Option<&str>, root_dir: Option<PathBuf>) -> Result<String> {
+pub fn create(
+    conn: &Connection,
+    data: &[u8],
+    file_name: Option<&str>,
+    mime_type: Option<&str>,
+    root_dir: Option<PathBuf>,
+) -> Result<String> {
     let file_hash = sha256_hex(data);
     let size_bytes = data.len() as i64;
 
@@ -155,16 +160,10 @@ pub fn delete(conn: &Connection, file_hash: &str) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
 
     // Delete from file_chunks first (foreign key constraint)
-    tx.execute(
-        "DELETE FROM file_chunks WHERE file_hash = ?1",
-        [file_hash],
-    )?;
+    tx.execute("DELETE FROM file_chunks WHERE file_hash = ?1", [file_hash])?;
 
     // Delete from files
-    let rows_deleted = tx.execute(
-        "DELETE FROM files WHERE file_hash = ?1",
-        [file_hash],
-    )?;
+    let rows_deleted = tx.execute("DELETE FROM files WHERE file_hash = ?1", [file_hash])?;
 
     tx.commit()?;
 
@@ -183,7 +182,7 @@ mod tests {
 
     fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        
+
         // Create tables
         conn.execute(
             "CREATE TABLE files (
@@ -194,7 +193,8 @@ mod tests {
                 is_complete BOOLEAN DEFAULT 0
             )",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         conn.execute(
             "CREATE TABLE file_chunks (
@@ -206,7 +206,8 @@ mod tests {
                 FOREIGN KEY (file_hash) REFERENCES files(file_hash)
             )",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         conn
     }
@@ -216,17 +217,23 @@ mod tests {
         let conn = setup_test_db();
         let temp = tempdir().unwrap();
         let root = Some(temp.path().to_path_buf());
-        
+
         // Create test data (larger than chunk size to ensure multiple chunks)
         let test_data: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
-        
+
         // Create object
-        let file_hash = create(&conn, &test_data, Some("test.bin"), Some("application/octet-stream"), root.clone())
-            .expect("Failed to create object");
-        
+        let file_hash = create(
+            &conn,
+            &test_data,
+            Some("test.bin"),
+            Some("application/octet-stream"),
+            root.clone(),
+        )
+        .expect("Failed to create object");
+
         // Load object
         let loaded_data = load(&conn, &file_hash, root).expect("Failed to load object");
-        
+
         // Verify
         assert_eq!(test_data, loaded_data);
     }
@@ -236,23 +243,21 @@ mod tests {
         let conn = setup_test_db();
         let temp = tempdir().unwrap();
         let root = Some(temp.path().to_path_buf());
-        
+
         let test_data = b"Hello, World! This is a test file.".to_vec();
-        
+
         // Create same object twice
         let hash1 = create(&conn, &test_data, Some("file1.txt"), None, root.clone()).unwrap();
         let hash2 = create(&conn, &test_data, Some("file2.txt"), None, root).unwrap();
-        
+
         // Hashes should be identical
         assert_eq!(hash1, hash2);
-        
+
         // Only one file record should exist
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM files",
-            [],
-            |row| row.get(0),
-        ).unwrap();
-        
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+
         assert_eq!(count, 1);
     }
 
@@ -261,17 +266,17 @@ mod tests {
         let conn = setup_test_db();
         let temp = tempdir().unwrap();
         let root = Some(temp.path().to_path_buf());
-        
+
         let test_data = b"Data to be deleted".to_vec();
-        
+
         let file_hash = create(&conn, &test_data, None, None, root.clone()).unwrap();
-        
+
         // Verify exists
         assert!(load(&conn, &file_hash, root.clone()).is_ok());
-        
+
         // Delete
         delete(&conn, &file_hash).unwrap();
-        
+
         // Verify load fails
         assert!(load(&conn, &file_hash, root).is_err());
     }
@@ -279,7 +284,7 @@ mod tests {
     #[test]
     fn test_delete_nonexistent() {
         let conn = setup_test_db();
-        
+
         // Deleting non-existent file should error
         assert!(delete(&conn, "nonexistent_hash").is_err());
     }

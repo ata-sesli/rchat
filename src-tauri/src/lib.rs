@@ -264,25 +264,11 @@ async fn toggle_pin_peer(username: String, state: State<'_, AppState>) -> Result
 }
 
 #[tauri::command]
-async fn save_peer_order(order: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
-    let mgr = state.config_manager.lock().await;
-    match mgr.load().await {
-        Ok(mut config) => {
-            config.user.peer_order = order;
-            mgr.save(&config).await.map_err(|e| e.to_string())?;
-            Ok(())
-        }
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-#[tauri::command]
-async fn get_peer_order(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let mgr = state.config_manager.lock().await;
-    match mgr.load().await {
-        Ok(config) => Ok(config.user.peer_order.clone()),
-        Err(e) => Err(e.to_string()),
-    }
+async fn get_chat_latest_times(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, i64>, String> {
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+    storage::db::get_chat_latest_times(&conn).map_err(|e| e.to_string())
 }
 
 // --- Persistence Commands ---
@@ -365,6 +351,114 @@ async fn send_message(
     tx.send(message).await.map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+#[tauri::command]
+async fn send_image_message(
+    peer_id: String,
+    file_path: String,
+    app_state: State<'_, AppState>,
+    net_state: State<'_, NetworkState>,
+) -> Result<String, String> {
+    println!(
+        "[Backend] send_image_message: to {} from {}",
+        peer_id, file_path
+    );
+
+    // 1. Read the image file
+    let file_data = std::fs::read(&file_path).map_err(|e| format!("Failed to read file: {}", e))?;
+
+    // Determine mime type from extension
+    let mime_type = match std::path::Path::new(&file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+    {
+        Some(ext) if ext == "jpg" || ext == "jpeg" => "image/jpeg",
+        Some(ext) if ext == "png" => "image/png",
+        Some(ext) if ext == "gif" => "image/gif",
+        Some(ext) if ext == "webp" => "image/webp",
+        _ => "image/png", // default
+    };
+
+    let file_name = std::path::Path::new(&file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string());
+
+    // 2. Store with FastCDC chunking
+    let file_hash = {
+        let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
+        storage::object::create(
+            &conn,
+            &file_data,
+            file_name.as_deref(),
+            Some(mime_type),
+            None,
+        )
+        .map_err(|e| format!("Failed to store image: {}", e))?
+    };
+
+    // 3. Persist message to DB
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let id_suffix: u32 = rand::random();
+    let msg_id = format!("{}-{}", timestamp, id_suffix);
+
+    {
+        let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
+        let msg = storage::db::Message {
+            id: msg_id.clone(),
+            chat_id: peer_id.clone(),
+            peer_id: "Me".to_string(),
+            timestamp,
+            content_type: "image".to_string(),
+            text_content: None,
+            file_hash: Some(file_hash.clone()),
+        };
+
+        if let Err(e) = storage::db::insert_message(&conn, &msg) {
+            eprintln!("[Backend] Failed to save image message: {}", e);
+            return Err(e.to_string());
+        }
+    }
+
+    // 4. Broadcast via network
+    // Format: __IMAGE_MSG__:<file_hash>:<from_peer>
+    let broadcast_msg = format!("__IMAGE_MSG__:{}:{}", file_hash, peer_id);
+    let tx = net_state.sender.lock().await;
+    tx.send(broadcast_msg).await.map_err(|e| e.to_string())?;
+
+    println!("[Backend] Image message sent: hash={}", file_hash);
+    Ok(file_hash)
+}
+
+#[tauri::command]
+async fn get_image_data(file_hash: String, state: State<'_, AppState>) -> Result<String, String> {
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+
+    // Load image data from chunks
+    let data = storage::object::load(&conn, &file_hash, None)
+        .map_err(|e| format!("Failed to load image: {}", e))?;
+
+    // Get mime type from files table
+    let mime_type: String = conn
+        .query_row(
+            "SELECT COALESCE(mime_type, 'image/png') FROM files WHERE file_hash = ?1",
+            [&file_hash],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "image/png".to_string());
+
+    // Return as base64 data URL
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let b64 = STANDARD.encode(&data);
+    let data_url = format!("data:{};base64,{}", mime_type, b64);
+
+    Ok(data_url)
 }
 
 #[tauri::command]
@@ -475,6 +569,7 @@ fn set_fast_discovery(enabled: bool) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         // --- 1. The Setup Hook ---
         .setup(|app| {
@@ -547,8 +642,6 @@ pub fn run() {
             update_user_profile,
             get_pinned_peers,
             toggle_pin_peer,
-            save_peer_order,
-            get_peer_order,
             send_message_to_self,
             send_message,
             get_chat_history,
@@ -560,6 +653,9 @@ pub fn run() {
             get_envelope_assignments,
             request_connection,
             set_fast_discovery,
+            get_chat_latest_times,
+            send_image_message,
+            get_image_data,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

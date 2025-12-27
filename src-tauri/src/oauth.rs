@@ -1,10 +1,10 @@
-use serde::{Deserialize, Serialize};
+use anyhow::{anyhow, Result};
 use reqwest::Client;
-use anyhow::{Result, anyhow};
+use serde::{Deserialize, Serialize};
 
 // You should replace this with your actual Client ID for the production app.
 // For now, these are often public for CLIs/Desktop apps using Device Flow.
-pub const CLIENT_ID: &str = "Ov23liXhUOLJ0WxMkpDL"; 
+pub const CLIENT_ID: &str = "Ov23liXhUOLJ0WxMkpDL";
 const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 
@@ -39,7 +39,8 @@ pub async fn start_device_flow() -> Result<AuthState> {
         ("scope", "gist"), // Standard gist scope
     ];
 
-    let res = client.post(GITHUB_DEVICE_CODE_URL)
+    let res = client
+        .post(GITHUB_DEVICE_CODE_URL)
         .header("Accept", "application/json")
         .header("User-Agent", "rchat-app")
         .form(&params)
@@ -68,7 +69,8 @@ pub async fn poll_for_token(device_code: &str) -> Result<String> {
         ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
     ];
 
-    let res = client.post(GITHUB_TOKEN_URL)
+    let res = client
+        .post(GITHUB_TOKEN_URL)
         .header("Accept", "application/json")
         .header("User-Agent", "rchat-app")
         .form(&params)

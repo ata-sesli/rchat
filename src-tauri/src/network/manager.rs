@@ -292,6 +292,75 @@ impl NetworkManager {
                             return; // Don't process as regular message
                         }
 
+                        // Check for image message: __IMAGE_MSG__:<file_hash>:<from_peer_id>
+                        if text.starts_with("__IMAGE_MSG__:") {
+                            let parts: Vec<&str> = text
+                                .strip_prefix("__IMAGE_MSG__:")
+                                .unwrap()
+                                .split(':')
+                                .collect();
+                            if parts.len() >= 2 {
+                                let file_hash = parts[0];
+                                // Note: For now, we just store the message reference
+                                // The actual image data would need to be transferred via a separate protocol
+
+                                use tauri::Manager;
+                                let state = self.app_handle.state::<crate::AppState>();
+
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs()
+                                    as i64;
+
+                                let id_suffix: u32 = rand::random();
+                                let msg_id = format!("{}-{}", timestamp, id_suffix);
+
+                                let db_msg = crate::storage::db::Message {
+                                    id: msg_id.clone(),
+                                    chat_id: sender.clone(),
+                                    peer_id: sender.clone(),
+                                    timestamp,
+                                    content_type: "image".to_string(),
+                                    text_content: None,
+                                    file_hash: Some(file_hash.to_string()),
+                                };
+
+                                if let Ok(conn) = state.db_conn.lock() {
+                                    if let Err(e) =
+                                        crate::storage::db::insert_message(&conn, &db_msg)
+                                    {
+                                        eprintln!("Failed to save incoming image message: {}", e);
+                                    } else {
+                                        println!(
+                                            "[Image] 📷 Received image message from {}: {}",
+                                            sender, file_hash
+                                        );
+                                    }
+                                }
+
+                                // Request the actual image data from the sender
+                                if let Some(sender_peer_id) = message.source {
+                                    // Build request: 0x01 + file_hash bytes
+                                    let mut request = vec![0x01u8];
+                                    request.extend_from_slice(file_hash.as_bytes());
+
+                                    println!(
+                                        "[File Transfer] 📡 Requesting image {} from {}",
+                                        file_hash, sender_peer_id
+                                    );
+                                    self.swarm
+                                        .behaviour_mut()
+                                        .direct_message
+                                        .send_request(&sender_peer_id, request);
+                                }
+
+                                // Emit event to frontend
+                                let _ = self.app_handle.emit("message-received", db_msg);
+                            }
+                            return; // Don't process as regular message
+                        }
+
                         // Check if sender is a known peer
                         // Block messages from unknown peers
                         if let Some(sender_peer_id) = message.source {
@@ -352,6 +421,107 @@ impl NetworkManager {
                         // 2. Emit event to Frontend
                         // We emit the same structure as DB Message so frontend can just use it
                         let _ = self.app_handle.emit("message-received", db_msg);
+                    }
+
+                    // Handle request-response for file transfer
+                    RChatBehaviourEvent::DirectMessage(event) => {
+                        use libp2p::request_response::{Event, Message};
+                        match event {
+                            Event::Message { peer, message, .. } => {
+                                match message {
+                                    Message::Request {
+                                        request, channel, ..
+                                    } => {
+                                        // Request is Vec<u8> - first byte is command, rest is payload
+                                        if request.len() > 1 && request[0] == 0x01 {
+                                            // 0x01 = Request image by hash
+                                            let file_hash =
+                                                String::from_utf8_lossy(&request[1..]).to_string();
+                                            println!("[File Transfer] 📥 Received request for image: {} from {}", file_hash, peer);
+
+                                            use tauri::Manager;
+                                            let state = self.app_handle.state::<crate::AppState>();
+
+                                            let response = if let Ok(conn) = state.db_conn.lock() {
+                                                match crate::storage::object::load(
+                                                    &conn, &file_hash, None,
+                                                ) {
+                                                    Ok(data) => {
+                                                        println!("[File Transfer] 📤 Sending {} bytes to {}", data.len(), peer);
+                                                        data
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("[File Transfer] Failed to load image: {}", e);
+                                                        vec![]
+                                                    }
+                                                }
+                                            } else {
+                                                vec![]
+                                            };
+
+                                            let _ = self
+                                                .swarm
+                                                .behaviour_mut()
+                                                .direct_message
+                                                .send_response(channel, response);
+                                        }
+                                    }
+                                    Message::Response {
+                                        request_id,
+                                        response,
+                                    } => {
+                                        println!("[File Transfer] 📦 Received response for request {:?}: {} bytes", request_id, response.len());
+
+                                        if !response.is_empty() {
+                                            use tauri::Manager;
+                                            let state = self.app_handle.state::<crate::AppState>();
+
+                                            let result = {
+                                                let conn = state.db_conn.lock().ok();
+                                                if let Some(conn) = conn {
+                                                    crate::storage::object::create(
+                                                        &conn,
+                                                        &response,
+                                                        None,
+                                                        Some("image/png"),
+                                                        None,
+                                                    )
+                                                    .ok()
+                                                } else {
+                                                    None
+                                                }
+                                            };
+
+                                            if let Some(file_hash) = result {
+                                                println!(
+                                                    "[File Transfer] ✅ Stored received image: {}",
+                                                    file_hash
+                                                );
+                                                let _ = self.app_handle.emit(
+                                                    "image-received",
+                                                    serde_json::json!({
+                                                        "file_hash": file_hash,
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Event::OutboundFailure { peer, error, .. } => {
+                                eprintln!(
+                                    "[File Transfer] Outbound failure to {}: {:?}",
+                                    peer, error
+                                );
+                            }
+                            Event::InboundFailure { peer, error, .. } => {
+                                eprintln!(
+                                    "[File Transfer] Inbound failure from {}: {:?}",
+                                    peer, error
+                                );
+                            }
+                            _ => {}
+                        }
                     }
 
                     other => {

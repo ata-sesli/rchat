@@ -52,8 +52,6 @@ pub struct UserConfig {
     #[serde(default)]
     pub pinned_peers: Vec<String>,
     #[serde(default)]
-    pub peer_order: Vec<String>, // Custom order for peers
-    #[serde(default)]
     pub is_online: bool, // Offline/Online switch
 }
 
@@ -69,7 +67,6 @@ impl Default for UserConfig {
             hks_nodes: vec![],
             profile: UserProfile::default(),
             pinned_peers: vec![],
-            peer_order: vec![],
             is_online: false,
         }
     }

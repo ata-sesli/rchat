@@ -363,6 +363,29 @@ pub fn get_messages(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<Mess
     Ok(messages)
 }
 
+/// Get latest message timestamp for each chat (for sorting by recency)
+pub fn get_chat_latest_times(
+    conn: &Connection,
+) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT chat_id, MAX(timestamp) as latest_time
+         FROM messages
+         GROUP BY chat_id",
+    )?;
+
+    let mut result = std::collections::HashMap::new();
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+
+    for row in rows {
+        let (chat_id, latest_time) = row?;
+        result.insert(chat_id, latest_time);
+    }
+
+    Ok(result)
+}
+
 // --- Envelope Operations ---
 
 pub fn create_envelope(

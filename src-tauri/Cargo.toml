@@ -75,6 +75,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 hostname = "0.4.2"
 local-ip-address = "0.6.8"
 zeroconf = "0.17.0"
+tauri-plugin-dialog = "2"
 
 [patch."https://github.com/ata-sesli/rvault"]
 rvault-core = { path = "../../rvault/crates/rvault-core" }

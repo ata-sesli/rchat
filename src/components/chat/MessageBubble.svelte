@@ -1,9 +1,40 @@
 <script lang="ts">
-  export let msg: { sender: string; text: string; timestamp: Date };
+  import { invoke } from "@tauri-apps/api/core";
+  import { onMount } from "svelte";
+
+  export let msg: {
+    sender: string;
+    text: string;
+    timestamp: Date;
+    content_type?: string;
+    file_hash?: string;
+  };
   export let userProfile: { alias: string | null; avatar_path: string | null };
   export let activePeer: string;
 
   $: isMe = msg.sender === "Me";
+  $: isImage = msg.content_type === "image" && msg.file_hash;
+
+  let imageDataUrl: string | null = null;
+  let loadingImage = false;
+
+  // Load image when this is an image message
+  $: if (isImage && msg.file_hash && !imageDataUrl) {
+    loadImage(msg.file_hash);
+  }
+
+  async function loadImage(fileHash: string) {
+    if (loadingImage || imageDataUrl) return;
+    loadingImage = true;
+    try {
+      const dataUrl = await invoke<string>("get_image_data", { fileHash });
+      imageDataUrl = dataUrl;
+    } catch (e) {
+      console.error("Failed to load image:", e);
+    } finally {
+      loadingImage = false;
+    }
+  }
 
   function formatTime(date: Date): string {
     return new Date(date).toLocaleTimeString([], {
@@ -50,7 +81,30 @@
       class={`px-4 py-2.5 shadow-md text-sm leading-relaxed break-words flex flex-col gap-1
         ${isMe ? "bg-teal-600/90 text-white rounded-2xl rounded-tr-sm" : "bg-slate-800 text-slate-200 rounded-2xl rounded-tl-sm border border-slate-700/50"}`}
     >
-      <span>{msg.text}</span>
+      {#if isImage}
+        <!-- Image content -->
+        {#if loadingImage}
+          <div
+            class="w-48 h-32 bg-slate-700 rounded-lg flex items-center justify-center"
+          >
+            <div
+              class="animate-spin w-6 h-6 border-2 border-white border-t-transparent rounded-full"
+            ></div>
+          </div>
+        {:else if imageDataUrl}
+          <img
+            src={imageDataUrl}
+            alt="Sent image"
+            class="max-w-[300px] max-h-[300px] rounded-lg cursor-pointer hover:opacity-90 transition-opacity"
+            on:click={() => window.open(imageDataUrl!, "_blank")}
+          />
+        {:else}
+          <div class="text-slate-400 italic">Failed to load image</div>
+        {/if}
+      {:else}
+        <!-- Text content -->
+        <span>{msg.text}</span>
+      {/if}
       <span
         class={`text-[10px] ${isMe ? "text-teal-200" : "text-slate-400"} self-end`}
       >

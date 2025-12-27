@@ -20,7 +20,6 @@
   // State
   let peers: string[] = [];
   let pinnedPeers: string[] = [];
-  let peerOrder: string[] = [];
   let userProfile = {
     alias: "Me" as string | null,
     avatar_path: null as string | null,
@@ -72,11 +71,13 @@
   let draggingPeer: string | null = null;
   let dragStartY = 0;
 
-  // Sorted peers (reactive)
+  // Sorted peers (reactive) - sorted by latest message time
+  let latestMessageTimes: Record<string, number> = {};
+
   $: sortedPeers = computeSortedPeers(
     peers,
     pinnedPeers,
-    peerOrder,
+    latestMessageTimes,
     searchQuery,
     currentEnvelope,
     chatAssignments
@@ -85,7 +86,7 @@
   function computeSortedPeers(
     peers: string[],
     pinnedPeers: string[],
-    peerOrder: string[],
+    latestMessageTimes: Record<string, number>,
     searchQuery: string,
     currentEnvelope: string | null,
     chatAssignments: Record<string, string>
@@ -116,15 +117,20 @@
     const pinned = allPeers.filter((p) => pinnedPeers.includes(p));
     const others = allPeers.filter((p) => !pinnedPeers.includes(p));
 
+    // Sort pinned by latest message time (most recent first)
+    pinned.sort((a, b) => {
+      const aTime = latestMessageTimes[a] || 0;
+      const bTime = latestMessageTimes[b] || 0;
+      return bTime - aTime; // Most recent first
+    });
+
+    // Sort others by latest message time (most recent first)
     others.sort((a, b) => {
       if (a === "Me") return -1;
       if (b === "Me") return 1;
-      const aIdx = peerOrder.indexOf(a);
-      const bIdx = peerOrder.indexOf(b);
-      if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
-      if (aIdx !== -1) return -1;
-      if (bIdx !== -1) return 1;
-      return a.localeCompare(b);
+      const aTime = latestMessageTimes[a] || 0;
+      const bTime = latestMessageTimes[b] || 0;
+      return bTime - aTime; // Most recent first
     });
 
     return [...pinned, ...others];
@@ -143,7 +149,14 @@
       await listen("local-peer-expired", (event: any) => {
         localPeers = localPeers.filter((p) => p.peer_id !== event.payload);
       });
-      // NOTE: message-received listener is now in page or we can handle notification here
+      // Update chat order when new message arrives
+      await listen("message-received", (event: any) => {
+        const chatId = event.payload?.chat_id;
+        if (chatId) {
+          const now = Math.floor(Date.now() / 1000);
+          latestMessageTimes = { ...latestMessageTimes, [chatId]: now };
+        }
+      });
 
       await refreshData();
     } catch (e) {
@@ -169,6 +182,10 @@
       envelopes = await invoke<Envelope[]>("get_envelopes");
       chatAssignments = await invoke<Record<string, string>>(
         "get_chat_assignments"
+      );
+      // Load latest message times for sorting
+      latestMessageTimes = await invoke<Record<string, number>>(
+        "get_chat_latest_times"
       );
     } catch (e) {
       console.error("Refresh failed:", e);

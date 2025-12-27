@@ -1,9 +1,17 @@
 <script lang="ts">
   import { tick } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
+  import { open } from "@tauri-apps/plugin-dialog";
   import MessageBubble from "./MessageBubble.svelte";
 
   // Types
-  type Message = { sender: string; text: string; timestamp: Date };
+  type Message = {
+    sender: string;
+    text: string;
+    timestamp: Date;
+    content_type?: string;
+    file_hash?: string;
+  };
 
   // Props
   export let activePeer = "Me";
@@ -16,6 +24,7 @@
   // Callback props
   export let onsend = (msg: string) => {};
   export let ontoggleAttachments = (show: boolean) => {};
+  export let onImageSent = (fileHash: string) => {};
 
   // Refs
   let chatContainer: HTMLElement;
@@ -57,6 +66,43 @@
     const target = e.currentTarget as HTMLTextAreaElement;
     target.style.height = "auto";
     target.style.height = target.scrollHeight + "px";
+  }
+
+  let isSendingImage = false;
+
+  async function pickAndSendImage() {
+    if (isSendingImage) return;
+
+    try {
+      const filePath = await open({
+        filters: [
+          {
+            name: "Images",
+            extensions: ["png", "jpg", "jpeg", "gif", "webp"],
+          },
+        ],
+        multiple: false,
+        directory: false,
+      });
+
+      if (!filePath) return; // User cancelled
+
+      isSendingImage = true;
+      showAttachments = false;
+
+      console.log("Sending image:", filePath);
+      const fileHash = await invoke<string>("send_image_message", {
+        peerId: activePeer,
+        filePath: filePath,
+      });
+
+      console.log("Image sent with hash:", fileHash);
+      onImageSent(fileHash);
+    } catch (e) {
+      console.error("Failed to send image:", e);
+    } finally {
+      isSendingImage = false;
+    }
   }
 
   // Auto-scroll when messages change
@@ -150,7 +196,9 @@
           class="absolute bottom-full left-0 mb-2 w-48 bg-slate-800 border border-slate-700 rounded-xl shadow-xl overflow-hidden z-50 animate-fade-in-up"
         >
           <button
+            on:click={pickAndSendImage}
             class="w-full text-left px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 hover:text-white flex items-center gap-3 transition-colors"
+            disabled={isSendingImage}
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -166,7 +214,11 @@
                 d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
               />
             </svg>
-            Image / Video
+            {#if isSendingImage}
+              Sending...
+            {:else}
+              Image / Video
+            {/if}
           </button>
           <div class="h-px bg-slate-700/50"></div>
           <button
