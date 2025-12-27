@@ -524,6 +524,17 @@ impl NetworkManager {
                         }
                     }
 
+                    // Handle expected events silently (no action needed)
+                    RChatBehaviourEvent::Identify(_) => {
+                        // Identify events are expected, no logging needed
+                    }
+                    RChatBehaviourEvent::Ping(_) => {
+                        // Ping events are expected, no logging needed
+                    }
+                    RChatBehaviourEvent::Kademlia(_) => {
+                        // Kademlia events are expected, no logging needed
+                    }
+
                     other => {
                         eprintln!(
                             "[Event Debug] Unhandled behaviour event: {:?}",
@@ -605,6 +616,12 @@ impl NetworkManager {
             Ok(peer_id) => {
                 // 1. Add to known peers
                 for addr_str in peer.addresses {
+                    // Filter out invalid 0.0.0.0 addresses
+                    if addr_str.contains("0.0.0.0") {
+                        println!("[NetworkManager] ⚠️ Skipping invalid address: {}", addr_str);
+                        continue;
+                    }
+
                     if let Ok(addr) = addr_str.parse::<Multiaddr>() {
                         println!("[NetworkManager] Dialing mDNS peer {} at {}", peer_id, addr);
 

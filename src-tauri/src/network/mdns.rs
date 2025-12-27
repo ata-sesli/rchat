@@ -199,15 +199,30 @@ fn handle_browser_event(
 ) {
     match result {
         Ok(BrowserEvent::Add(discovery)) => {
-            let addr = discovery.address();
+            let mut addr = discovery.address().to_string();
             let device_name = discovery.name().to_string();
+            let port = discovery.port();
 
-            println!(
-                "[mDNS] 🔍 Discovered: {} at {}:{}",
-                device_name,
-                addr,
-                discovery.port()
-            );
+            // If address is 0.0.0.0, try to resolve hostname
+            if addr == "0.0.0.0" {
+                let hostname = discovery.host_name();
+                if !hostname.is_empty() {
+                    // Try DNS resolution of the hostname
+                    if let Ok(ips) =
+                        std::net::ToSocketAddrs::to_socket_addrs(&format!("{}:{}", hostname, port))
+                    {
+                        for socket_addr in ips {
+                            if socket_addr.ip().is_ipv4() && !socket_addr.ip().is_loopback() {
+                                addr = socket_addr.ip().to_string();
+                                println!("[mDNS] 🔍 Resolved {} -> {}", hostname, addr);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            println!("[mDNS] 🔍 Discovered: {} at {}:{}", device_name, addr, port);
 
             // Extract peer_id from TXT record
             let txt = discovery.txt();
@@ -221,7 +236,6 @@ fn handle_browser_event(
                 return;
             }
 
-            let port = discovery.port();
             let multiaddr = format!("/ip4/{}/tcp/{}", addr, port);
 
             let peer = MdnsPeer {
