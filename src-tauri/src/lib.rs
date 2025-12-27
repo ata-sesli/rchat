@@ -445,6 +445,33 @@ async fn get_envelope_assignments(
     storage::db::get_chat_assignments(&conn).map_err(|e| e.to_string())
 }
 
+// --- Connection Request Command ---
+
+/// Request connection to a local peer (triggers mutual handshake)
+#[tauri::command]
+async fn request_connection(peer_id: String, state: State<'_, NetworkState>) -> Result<(), String> {
+    println!("[Backend] request_connection called for: {}", peer_id);
+
+    // Send command to NetworkManager
+    let sender = state.sender.lock().await;
+    sender
+        .send(format!("REQUEST_CONNECTION:{}", peer_id))
+        .await
+        .map_err(|e| format!("Failed to send request: {}", e))?;
+
+    Ok(())
+}
+
+/// Enable/disable fast mDNS discovery mode
+#[tauri::command]
+fn set_fast_discovery(enabled: bool) {
+    if enabled {
+        network::mdns::enable_fast_discovery();
+    } else {
+        network::mdns::disable_fast_discovery();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -531,6 +558,8 @@ pub fn run() {
             get_envelopes,
             move_chat_to_envelope,
             get_envelope_assignments,
+            request_connection,
+            set_fast_discovery,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

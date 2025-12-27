@@ -1,8 +1,8 @@
 use crate::network::behaviour::{RChatBehaviour, RChatBehaviourEvent};
 use futures::StreamExt;
 use libp2p::{swarm::SwarmEvent, Multiaddr, PeerId, Swarm};
-use serde::Serialize;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use tauri::async_runtime::Receiver;
 use tauri::AppHandle;
 use tauri::Emitter;
@@ -11,6 +11,12 @@ use tauri::Emitter;
 pub struct LocalPeer {
     pub peer_id: String,
     pub addresses: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConnectionRequest {
+    pub from_peer_id: String,
+    pub device_name: Option<String>,
 }
 
 pub struct NetworkManager {
@@ -29,6 +35,10 @@ pub struct NetworkManager {
     mdns_started: bool,
     // Track local peers discovered via mDNS
     local_peers: HashMap<PeerId, Vec<Multiaddr>>,
+    // Track our outgoing connection requests (peers we pressed Connect on)
+    pending_requests: HashSet<PeerId>,
+    // Track incoming connection requests from others
+    incoming_requests: HashSet<PeerId>,
 }
 
 impl NetworkManager {
@@ -49,6 +59,8 @@ impl NetworkManager {
             mdns_started: false,
             app_handle,
             local_peers: HashMap::new(),
+            pending_requests: HashSet::new(),
+            incoming_requests: HashSet::new(),
         }
     }
     pub async fn run(mut self: Self) {
@@ -125,6 +137,15 @@ impl NetworkManager {
 
     pub fn handle_ui_command(&mut self, msg_content: String) {
         println!("UI Command Received: {}", msg_content);
+
+        // Handle connection request command
+        if msg_content.starts_with("REQUEST_CONNECTION:") {
+            if let Some(peer_id_str) = msg_content.strip_prefix("REQUEST_CONNECTION:") {
+                self.handle_connection_request(peer_id_str);
+                return;
+            }
+        }
+
         // 1. Define the Topic (Like a TV Channel)
         let topic = libp2p::gossipsub::IdentTopic::new("global-chat");
 
@@ -153,6 +174,96 @@ impl NetworkManager {
             .collect()
     }
 
+    /// Handle a connection request from UI (user pressed Connect on a peer)
+    fn handle_connection_request(&mut self, peer_id_str: &str) {
+        println!("[Handshake] User requested connection to: {}", peer_id_str);
+
+        // Parse peer_id
+        let peer_id = match peer_id_str.parse::<PeerId>() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[Handshake] Invalid peer_id: {}", e);
+                return;
+            }
+        };
+
+        // Check if this peer already sent us a request (mutual handshake!)
+        if self.incoming_requests.contains(&peer_id) {
+            println!("[Handshake] 🤝 Mutual handshake complete with {}!", peer_id);
+            self.complete_handshake(peer_id);
+            return;
+        }
+
+        // Otherwise, add to our pending requests and send request message
+        self.pending_requests.insert(peer_id);
+        println!("[Handshake] ⏳ Waiting for {} to accept...", peer_id);
+
+        // Emit waiting state to frontend
+        let _ = self.app_handle.emit("connection-waiting", peer_id_str);
+
+        // Send connection request to peer via gossipsub
+        let my_peer_id = self.swarm.local_peer_id().to_string();
+        let request_msg = format!("__CONNECTION_REQUEST__:{}", my_peer_id);
+
+        let topic = libp2p::gossipsub::IdentTopic::new("global-chat");
+        let _ = self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic, request_msg.as_bytes());
+    }
+
+    /// Handle incoming connection request from another peer
+    fn handle_incoming_connection_request(&mut self, from_peer_id: PeerId) {
+        println!(
+            "[Handshake] Received connection request from: {}",
+            from_peer_id
+        );
+
+        // Check if we already requested this peer (mutual handshake!)
+        if self.pending_requests.contains(&from_peer_id) {
+            println!(
+                "[Handshake] 🤝 Mutual handshake complete with {}!",
+                from_peer_id
+            );
+            self.complete_handshake(from_peer_id);
+            return;
+        }
+
+        // Otherwise, store as incoming request
+        self.incoming_requests.insert(from_peer_id);
+
+        // Emit to frontend so they can see who's waiting
+        let _ = self
+            .app_handle
+            .emit("connection-request-received", from_peer_id.to_string());
+    }
+
+    /// Complete the handshake - both sides have agreed
+    fn complete_handshake(&mut self, peer_id: PeerId) {
+        // Remove from both sets
+        self.pending_requests.remove(&peer_id);
+        self.incoming_requests.remove(&peer_id);
+
+        // Add to known_devices database
+        use tauri::Manager;
+        let state = self.app_handle.state::<crate::AppState>();
+        if let Ok(conn) = state.db_conn.lock() {
+            if let Err(e) = crate::storage::db::save_known_device(
+                &conn,
+                &peer_id.to_string(),
+                None, // device_name - can be updated later
+            ) {
+                eprintln!("[Handshake] Failed to save known device: {}", e);
+            } else {
+                println!("[Handshake] ✅ {} saved to known_devices!", peer_id);
+            }
+        }
+
+        // Emit success to frontend
+        let _ = self.app_handle.emit("peer-connected", peer_id.to_string());
+    }
+
     pub async fn handle_swarm_event(&mut self, event: SwarmEvent<RChatBehaviourEvent>) {
         match event {
             // CASE A: One of our Behaviours (Gossip, mDNS) triggered an event
@@ -168,6 +279,43 @@ impl NetworkManager {
                             .source
                             .map(|p| p.to_string())
                             .unwrap_or("Unknown".into());
+
+                        // Check for connection request message
+                        if text.starts_with("__CONNECTION_REQUEST__:") {
+                            if let Some(from_peer_str) =
+                                text.strip_prefix("__CONNECTION_REQUEST__:")
+                            {
+                                if let Ok(from_peer) = from_peer_str.parse::<PeerId>() {
+                                    self.handle_incoming_connection_request(from_peer);
+                                }
+                            }
+                            return; // Don't process as regular message
+                        }
+
+                        // Check if sender is a known peer
+                        // Block messages from unknown peers
+                        if let Some(sender_peer_id) = message.source {
+                            use tauri::Manager;
+                            let state = self.app_handle.state::<crate::AppState>();
+                            let is_known = if let Ok(conn) = state.db_conn.lock() {
+                                crate::storage::db::is_known_device(
+                                    &conn,
+                                    &sender_peer_id.to_string(),
+                                )
+                            } else {
+                                false
+                            };
+
+                            if !is_known {
+                                println!(
+                                    "[Security] ⛔ Blocked message from unknown peer: {}",
+                                    sender_peer_id
+                                );
+                                // Disconnect from unknown peer
+                                let _ = self.swarm.disconnect_peer_id(sender_peer_id);
+                                return;
+                            }
+                        }
 
                         println!("Network: Received '{}' from {}", text, sender);
 
@@ -236,21 +384,16 @@ impl NetworkManager {
                             );
                             let peer_id = *self.swarm.local_peer_id();
 
-                            // User requested to ignore is_online for now
-                            // let mgr = state.config_manager.blocking_lock();
-                            // is_online = cfg...
-                            let is_online = true;
-
-                            // We pass a clone of the sender
+                            // Always advertise + browse at startup
                             if let Err(e) = crate::network::mdns::start_mdns_service(
                                 peer_id,
                                 port,
-                                is_online,
                                 self.mdns_tx.clone(),
                             ) {
                                 eprintln!("[NetworkManager] Failed to start mDNS: {}", e);
                             } else {
                                 self.mdns_started = true;
+                                println!("[NetworkManager] mDNS started (advertising + browsing)");
                             }
                         }
                     }

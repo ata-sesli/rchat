@@ -236,6 +236,20 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
         [],
     )?;
 
+    // 9. Known Devices (for local peer recognition)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS known_devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                peer_id TEXT NOT NULL UNIQUE,
+                device_name TEXT,
+                first_seen INTEGER DEFAULT (strftime('%s', 'now')),
+                last_seen INTEGER DEFAULT (strftime('%s', 'now')),
+                connection_count INTEGER DEFAULT 1,
+                is_favorite INTEGER DEFAULT 0
+            )",
+        [],
+    )?;
+
     // --- Indexes (Crucial for Speed) ---
 
     // Speed up loading chat history (WHERE chat_id = ?)
@@ -253,6 +267,12 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
     // Speed up finding chunks for a file (WHERE file_hash = ?)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_file_chunks_file_hash ON file_chunks(file_hash)",
+        [],
+    )?;
+
+    // Speed up known device lookups (WHERE peer_id = ?)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_known_devices_peer_id ON known_devices(peer_id)",
         [],
     )?;
 
@@ -432,4 +452,103 @@ pub fn get_chat_assignments(conn: &Connection) -> anyhow::Result<Vec<ChatAssignm
         result.push(row?);
     }
     Ok(result)
+}
+
+// --- Known Devices Functions (Local Peer Recognition) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnownDevice {
+    pub id: i64,
+    pub peer_id: String,
+    pub device_name: Option<String>,
+    pub first_seen: i64,
+    pub last_seen: i64,
+    pub connection_count: i64,
+    pub is_favorite: bool,
+}
+
+/// Save a newly discovered local device or update if exists
+pub fn save_known_device(
+    conn: &Connection,
+    peer_id: &str,
+    device_name: Option<&str>,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO known_devices (peer_id, device_name)
+         VALUES (?1, ?2)
+         ON CONFLICT(peer_id) DO UPDATE SET
+             last_seen = strftime('%s', 'now'),
+             connection_count = connection_count + 1,
+             device_name = COALESCE(?2, device_name)",
+        (peer_id, device_name),
+    )?;
+    Ok(())
+}
+
+/// Get a known device by peer_id
+pub fn get_known_device(conn: &Connection, peer_id: &str) -> anyhow::Result<Option<KnownDevice>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, peer_id, device_name, first_seen, last_seen, connection_count, is_favorite
+         FROM known_devices WHERE peer_id = ?1",
+    )?;
+
+    let mut rows = stmt.query([peer_id])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(KnownDevice {
+            id: row.get(0)?,
+            peer_id: row.get(1)?,
+            device_name: row.get(2)?,
+            first_seen: row.get(3)?,
+            last_seen: row.get(4)?,
+            connection_count: row.get(5)?,
+            is_favorite: row.get::<_, i64>(6)? != 0,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Update last_seen timestamp for a device
+pub fn update_device_last_seen(conn: &Connection, peer_id: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE known_devices SET last_seen = strftime('%s', 'now') WHERE peer_id = ?1",
+        [peer_id],
+    )?;
+    Ok(())
+}
+
+/// Get all known devices ordered by last_seen
+pub fn get_all_known_devices(conn: &Connection) -> anyhow::Result<Vec<KnownDevice>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, peer_id, device_name, first_seen, last_seen, connection_count, is_favorite
+         FROM known_devices ORDER BY last_seen DESC",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok(KnownDevice {
+            id: row.get(0)?,
+            peer_id: row.get(1)?,
+            device_name: row.get(2)?,
+            first_seen: row.get(3)?,
+            last_seen: row.get(4)?,
+            connection_count: row.get(5)?,
+            is_favorite: row.get::<_, i64>(6)? != 0,
+        })
+    })?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// Check if a peer_id is known
+pub fn is_known_device(conn: &Connection, peer_id: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM known_devices WHERE peer_id = ?1",
+        [peer_id],
+        |_| Ok(()),
+    )
+    .is_ok()
 }

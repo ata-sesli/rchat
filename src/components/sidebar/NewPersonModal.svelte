@@ -1,4 +1,8 @@
 <script lang="ts">
+  import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
+  import { onMount, onDestroy } from "svelte";
+
   let {
     show = false,
     step = $bindable(
@@ -9,16 +13,51 @@
     onconnect = (peerId: string) => {},
   } = $props();
 
+  // Track which peer we're waiting for
+  let waitingForPeer = $state<string | null>(null);
+  let unlistenConnected: (() => void) | null = null;
+
+  onMount(async () => {
+    // Listen for successful connection event
+    unlistenConnected = await listen<string>("peer-connected", (event) => {
+      console.log("Peer connected:", event.payload);
+      waitingForPeer = null;
+      onconnect(event.payload);
+      handleClose();
+    });
+  });
+
+  onDestroy(() => {
+    if (unlistenConnected) unlistenConnected();
+  });
+
   function handleClose() {
+    // Disable fast discovery when closing
+    invoke("set_fast_discovery", { enabled: false }).catch(console.error);
+    waitingForPeer = null;
     onclose();
   }
 
   function setStep(newStep: "select-network" | "local-scan" | "online") {
+    // Toggle fast discovery mode based on step
+    if (newStep === "local-scan" && step !== "local-scan") {
+      invoke("set_fast_discovery", { enabled: true }).catch(console.error);
+    } else if (step === "local-scan" && newStep !== "local-scan") {
+      invoke("set_fast_discovery", { enabled: false }).catch(console.error);
+    }
     step = newStep;
   }
 
-  function handleConnect(peerId: string) {
-    onconnect(peerId);
+  async function handleConnect(peerId: string) {
+    console.log("Requesting connection to:", peerId);
+    waitingForPeer = peerId;
+
+    try {
+      await invoke("request_connection", { peerId });
+    } catch (e) {
+      console.error("Failed to request connection:", e);
+      waitingForPeer = null;
+    }
   }
 </script>
 
@@ -207,12 +246,36 @@
                       {peer.addresses[0] || "No address"}
                     </div>
                   </div>
-                  <button
-                    on:click={() => handleConnect(peer.peer_id)}
-                    class="px-3 py-1.5 bg-teal-600 hover:bg-teal-500 text-white text-sm rounded-lg font-medium transition-colors"
-                  >
-                    Connect
-                  </button>
+                  {#if waitingForPeer === peer.peer_id}
+                    <div
+                      class="px-3 py-1.5 bg-amber-600 text-white text-sm rounded-lg font-medium flex items-center gap-2"
+                    >
+                      <svg class="animate-spin h-4 w-4" viewBox="0 0 24 24">
+                        <circle
+                          class="opacity-25"
+                          cx="12"
+                          cy="12"
+                          r="10"
+                          stroke="currentColor"
+                          stroke-width="4"
+                          fill="none"
+                        ></circle>
+                        <path
+                          class="opacity-75"
+                          fill="currentColor"
+                          d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+                        ></path>
+                      </svg>
+                      Waiting...
+                    </div>
+                  {:else}
+                    <button
+                      on:click={() => handleConnect(peer.peer_id)}
+                      class="px-3 py-1.5 bg-teal-600 hover:bg-teal-500 text-white text-sm rounded-lg font-medium transition-colors"
+                    >
+                      Connect
+                    </button>
+                  {/if}
                 </div>
               {/each}
             {/if}
