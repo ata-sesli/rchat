@@ -572,13 +572,15 @@ impl NetworkManager {
                             );
                             let peer_id = *self.swarm.local_peer_id();
 
-                            // Get user alias from config
+                            // Get user alias from config (try_lock to avoid blocking in async context)
                             let user_alias = {
                                 use tauri::Manager;
                                 let state = self.app_handle.state::<crate::AppState>();
-                                let mgr = state.config_manager.blocking_lock();
-                                mgr.load_sync()
+                                state
+                                    .config_manager
+                                    .try_lock()
                                     .ok()
+                                    .and_then(|mgr| mgr.load_sync().ok())
                                     .and_then(|c| c.user.profile.alias.clone())
                             };
 

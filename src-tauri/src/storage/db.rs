@@ -332,8 +332,10 @@ pub fn add_peer(
 
 /// Get all peers from database
 pub fn get_all_peers(conn: &Connection) -> anyhow::Result<Vec<Peer>> {
+    // Put "Me" first (method='self'), then sort others by last_seen DESC
     let mut stmt = conn.prepare(
-        "SELECT id, alias, last_seen, public_key, method FROM peers ORDER BY last_seen DESC",
+        "SELECT id, alias, last_seen, public_key, method FROM peers 
+         ORDER BY CASE WHEN id = 'Me' THEN 0 ELSE 1 END, last_seen DESC",
     )?;
 
     let rows = stmt.query_map([], |row| {
