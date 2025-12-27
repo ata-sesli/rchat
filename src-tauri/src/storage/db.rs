@@ -361,6 +361,27 @@ pub fn is_peer(conn: &Connection, peer_id: &str) -> bool {
         .is_ok()
 }
 
+/// Check if a chat exists for a given chat_id
+pub fn chat_exists(conn: &Connection, chat_id: &str) -> bool {
+    conn.query_row("SELECT 1 FROM chats WHERE id = ?1", [chat_id], |_| Ok(()))
+        .is_ok()
+}
+
+/// Create a new chat
+pub fn create_chat(
+    conn: &Connection,
+    chat_id: &str,
+    name: &str,
+    is_group: bool,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO chats (id, name, is_group, encryption_key) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO NOTHING",
+        (chat_id, name, if is_group { 1 } else { 0 }, vec![0u8; 32]),
+    )?;
+    Ok(())
+}
+
 // --- 3. Database Operations ---
 
 pub fn insert_message(conn: &Connection, msg: &Message) -> anyhow::Result<()> {

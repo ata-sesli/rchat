@@ -319,6 +319,21 @@ async fn send_message(
     // 1. Persist to DB
     {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
+
+        // Ensure peer exists in database (auto-add if not)
+        if !storage::db::is_peer(&conn, &peer_id) {
+            if let Err(e) = storage::db::add_peer(&conn, &peer_id, None, None, "local") {
+                eprintln!("[Backend] Failed to auto-add peer: {}", e);
+            }
+        }
+
+        // Ensure chat exists for this peer (create if not)
+        if !storage::db::chat_exists(&conn, &peer_id) {
+            if let Err(e) = storage::db::create_chat(&conn, &peer_id, &peer_id, false) {
+                eprintln!("[Backend] Failed to auto-create chat: {}", e);
+            }
+        }
+
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
