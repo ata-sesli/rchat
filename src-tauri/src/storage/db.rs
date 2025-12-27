@@ -382,6 +382,20 @@ pub fn create_chat(
     Ok(())
 }
 
+/// Delete a peer and their related chat/messages
+pub fn delete_peer(conn: &Connection, peer_id: &str) -> anyhow::Result<()> {
+    // 1. Delete Messages
+    conn.execute(
+        "DELETE FROM messages WHERE peer_id = ?1 OR chat_id = ?1",
+        [peer_id],
+    )?;
+    // 2. Delete Chat (if 1:1)
+    conn.execute("DELETE FROM chats WHERE id = ?1", [peer_id])?;
+    // 3. Delete Peer
+    conn.execute("DELETE FROM peers WHERE id = ?1", [peer_id])?;
+    Ok(())
+}
+
 // --- 3. Database Operations ---
 
 pub fn insert_message(conn: &Connection, msg: &Message) -> anyhow::Result<()> {

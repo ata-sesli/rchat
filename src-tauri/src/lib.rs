@@ -135,6 +135,14 @@ async fn get_trusted_peers(state: State<'_, AppState>) -> Result<Vec<String>, St
 }
 
 #[tauri::command]
+async fn delete_peer(peer_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+    crate::storage::db::delete_peer(&conn, &peer_id).map_err(|e| e.to_string())?;
+    println!("[Backend] Deleted peer: {}", peer_id);
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_friends(state: State<'_, AppState>) -> Result<Vec<FriendConfig>, String> {
     println!("[Backend] get_friends called");
     let mgr = state.config_manager.lock().await;

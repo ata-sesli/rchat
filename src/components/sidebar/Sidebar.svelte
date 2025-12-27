@@ -21,6 +21,7 @@
     isDragging = false,
     draggingPeer = null as string | null,
     isOnline = false,
+    localPeers = [] as { peer_id: string; address: string }[],
     // Callbacks
     ontoggleOnline = () => {},
     ontoggleSidebar = () => {},
@@ -104,6 +105,13 @@
 
   function handleDragEnd(e: PointerEvent) {
     ondragEnd(e);
+  }
+
+  // Helper to check if a peer is online
+  function isPeerOnline(peerId: string) {
+    if (peerId === "Me") return true;
+    if (peerId === "General") return true; // General is always "available"
+    return localPeers.some((p) => p.peer_id === peerId);
   }
 </script>
 

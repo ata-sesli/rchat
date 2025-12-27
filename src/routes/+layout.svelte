@@ -240,7 +240,7 @@
             : [...pinnedPeers, id];
         }
         if (action === "delete-peer") {
-          await invoke("remove_friend", { peerId: id });
+          await invoke("delete_peer", { peerId: id });
           peers = peers.filter((p) => p !== id);
           if (activePeer === id) {
             goto("/");
@@ -406,10 +406,9 @@
     {pinnedPeers}
     {activePeer}
     {userProfile}
-    {dragOverEnvelopeId}
-    {isDragging}
     {draggingPeer}
     {isOnline}
+    {localPeers}
     ontoggleOnline={handleToggleOnline}
     ontoggleSidebar={() => (isSidebarOpen = !isSidebarOpen)}
     onopenSettings={() => goto("/settings")}

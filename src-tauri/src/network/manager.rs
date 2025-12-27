@@ -157,6 +157,16 @@ impl NetworkManager {
         // 1. Define the Topic (Like a TV Channel)
         let topic = libp2p::gossipsub::IdentTopic::new("global-chat");
 
+        // Check if we have any connected peers subscribed to this topic
+        let mesh_peer_count = self
+            .swarm
+            .behaviour()
+            .gossipsub
+            .mesh_peers(&topic.hash())
+            .count();
+
+        println!("[Gossipsub] Mesh peers for topic: {}", mesh_peer_count);
+
         // 2. Publish to the Swarm
         // We access the 'gossipsub' field we defined in behaviour.rs
         let result = self
@@ -166,8 +176,11 @@ impl NetworkManager {
             .publish(topic, msg_content.as_bytes());
 
         match result {
-            Ok(msg_id) => println!("Published Message ID: {:?}", msg_id),
-            Err(e) => eprintln!("Publish Error: {:?}", e),
+            Ok(msg_id) => println!("[Gossipsub] ✅ Published Message ID: {:?}", msg_id),
+            Err(e) => eprintln!(
+                "[Gossipsub] ❌ Publish Error: {:?}. Mesh peers count was: {}",
+                e, mesh_peer_count
+            ),
         }
     }
 
