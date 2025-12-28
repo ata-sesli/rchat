@@ -660,6 +660,7 @@ pub fn run() {
             get_friends,
             get_trusted_peers,
             add_friend,
+            delete_peer,
             remove_friend,
             get_user_profile,
             update_user_profile,

@@ -380,15 +380,12 @@
                   #
                 </div>
               {:else}
-                <img
-                  src={`https://github.com/${peer}.png?size=40`}
-                  alt={peer}
-                  class="w-10 h-10 rounded-full bg-slate-800 shadow-md ring-2 ring-transparent group-hover:ring-slate-700 transition-all"
-                  draggable="false"
-                  onerror={(e) =>
-                    ((e.currentTarget as HTMLImageElement).src =
-                      "https://github.com/github.png?size=40")}
-                />
+                <!-- Default avatar with initials -->
+                <div
+                  class="w-10 h-10 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white font-bold shadow-md ring-2 ring-transparent group-hover:ring-slate-700 transition-all"
+                >
+                  {peer.slice(0, 2).toUpperCase()}
+                </div>
               {/if}
 
               {#if isPinned}

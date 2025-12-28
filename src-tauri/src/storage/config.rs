@@ -53,6 +53,8 @@ pub struct UserConfig {
     pub pinned_peers: Vec<String>,
     #[serde(default)]
     pub is_online: bool, // Offline/Online switch
+    #[serde(default)]
+    pub libp2p_keypair: Option<String>, // Base64-encoded protobuf keypair for persistent peer ID
 }
 
 impl Default for UserConfig {
@@ -68,6 +70,7 @@ impl Default for UserConfig {
             profile: UserProfile::default(),
             pinned_peers: vec![],
             is_online: false,
+            libp2p_keypair: None,
         }
     }
 }
