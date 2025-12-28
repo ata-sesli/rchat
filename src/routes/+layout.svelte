@@ -406,6 +406,8 @@
     {pinnedPeers}
     {activePeer}
     {userProfile}
+    {dragOverEnvelopeId}
+    {isDragging}
     {draggingPeer}
     {isOnline}
     {localPeers}
