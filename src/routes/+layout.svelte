@@ -158,6 +158,12 @@
         }
       });
 
+      // Listen for profile updates from settings
+      window.addEventListener("profile-updated", () => {
+        console.log("[Layout] Profile updated, refreshing...");
+        refreshData();
+      });
+
       await refreshData();
     } catch (e) {
       console.error("Setup failed:", e);

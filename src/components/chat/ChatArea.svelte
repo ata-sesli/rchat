@@ -11,6 +11,7 @@
     timestamp: Date;
     content_type?: string;
     file_hash?: string;
+    status?: string;
   };
 
   // Props

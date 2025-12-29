@@ -68,6 +68,12 @@
     error = "";
     try {
       await invoke("init_vault", { password });
+
+      // Start P2P network AFTER vault is created (so we can save keypair)
+      console.log("[Login] Starting network...");
+      await invoke("start_network");
+      console.log("[Login] Network started");
+
       await checkStatus(); // Should move to 'login'
     } catch (e: any) {
       error = e.toString();
@@ -81,6 +87,12 @@
     error = "";
     try {
       await invoke("unlock_vault", { password });
+
+      // Start P2P network AFTER vault is unlocked (so we can load persisted keypair)
+      console.log("[Login] Starting network...");
+      await invoke("start_network");
+      console.log("[Login] Network started");
+
       await checkStatus(); // Should move to 'login'
     } catch (e: any) {
       error = "Invalid password";

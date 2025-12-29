@@ -21,7 +21,8 @@
     isDragging = false,
     draggingPeer = null as string | null,
     isOnline = false,
-    localPeers = [] as { peer_id: string; address: string }[],
+    localPeers = [] as { peer_id: string; addresses: string[] }[],
+    unreadCounts = {} as Record<string, number>,
     // Callbacks
     ontoggleOnline = () => {},
     ontoggleSidebar = () => {},
@@ -386,6 +387,12 @@
                 >
                   {peer.slice(0, 2).toUpperCase()}
                 </div>
+                <!-- Status indicator dot -->
+                <div
+                  class={`absolute bottom-0 right-0 w-3 h-3 border-2 border-slate-800 rounded-full ${
+                    isPeerOnline(peer) ? "bg-green-500" : "bg-slate-500"
+                  }`}
+                ></div>
               {/if}
 
               {#if isPinned}
@@ -417,7 +424,20 @@
               {:else if peer === "General"}
                 <p class="text-xs text-slate-500 truncate">Public Broadcast</p>
               {:else}
-                <p class="text-xs text-slate-400 truncate">Connected</p>
+                <p
+                  class={`text-xs truncate ${isPeerOnline(peer) ? "text-green-400" : "text-slate-500"}`}
+                >
+                  {isPeerOnline(peer) ? "Online" : "Offline"}
+                </p>
+              {/if}
+
+              <!-- Unread Badge -->
+              {#if unreadCounts[peer] && unreadCounts[peer] > 0}
+                <div
+                  class="absolute top-2 right-10 min-w-5 h-5 px-1.5 bg-red-500 text-white text-xs font-bold rounded-full flex items-center justify-center"
+                >
+                  {unreadCounts[peer] > 99 ? "99+" : unreadCounts[peer]}
+                </div>
               {/if}
             </div>
 

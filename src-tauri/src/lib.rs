@@ -87,6 +87,35 @@ async fn unlock_vault(password: String, state: State<'_, AppState>) -> Result<()
     Ok(())
 }
 
+/// Start the P2P network - call this AFTER vault is unlocked
+/// This ensures the persisted keypair can be loaded from the encrypted config
+#[tauri::command]
+async fn start_network(app_handle: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Emitter;
+    println!("[Backend] start_network called (post-unlock)");
+
+    // Check if network is already running
+    if app_handle.try_state::<NetworkState>().is_some() {
+        println!("[Backend] Network already initialized, skipping...");
+        // Still emit auth-status so frontend refreshes
+        let _ = app_handle.emit("auth-status", serde_json::json!({"unlocked": true}));
+        return Ok(());
+    }
+
+    match network::init(app_handle.clone()).await {
+        Ok(_) => {
+            println!("[Backend] Network started successfully!");
+            // Emit auth-status event to trigger frontend refresh
+            let _ = app_handle.emit("auth-status", serde_json::json!({"unlocked": true}));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[Backend] Failed to start network: {}", e);
+            Err(e.to_string())
+        }
+    }
+}
+
 // OAuth Commands
 #[tauri::command]
 async fn start_github_auth() -> Result<oauth::AuthState, String> {
@@ -301,6 +330,7 @@ async fn send_message_to_self(message: String, state: State<'_, AppState>) -> Re
         content_type: "text".to_string(),
         text_content: Some(message),
         file_hash: None,
+        status: "read".to_string(), // Self messages are always read
     };
 
     match storage::db::insert_message(&conn, &msg) {
@@ -325,7 +355,7 @@ async fn send_message(
     println!("[Backend] send_message to {}: {}", peer_id, message);
 
     // 1. Persist to DB
-    {
+    let msg_id_for_dm = {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
 
         // Ensure peer exists in database (auto-add if not)
@@ -351,25 +381,39 @@ async fn send_message(
         let msg_id = format!("{}-{}", timestamp, id_suffix);
 
         let msg = storage::db::Message {
-            id: msg_id,
+            id: msg_id.clone(),
             chat_id: peer_id.clone(),  // User checks chat with this peer
             peer_id: "Me".to_string(), // Sender is Me
             timestamp,
             content_type: "text".to_string(),
             text_content: Some(message.clone()),
             file_hash: None,
+            status: "pending".to_string(), // Outgoing = pending until delivered
         };
 
         if let Err(e) = storage::db::insert_message(&conn, &msg) {
             eprintln!("[Backend] Failed to save outgoing message: {}", e);
             return Err(e.to_string());
         }
-    }
+
+        msg_id // Return msg_id for use in network message
+    };
 
     // 2. Send to Network Manager
-    // We send just the content for now as it's a broadcast chat
     let tx = net_state.sender.lock().await;
-    tx.send(message).await.map_err(|e| e.to_string())?;
+
+    if peer_id == "General" {
+        // Group chat: use gossipsub
+        tx.send(message).await.map_err(|e| e.to_string())?;
+    } else {
+        // 1v1 chat: use direct message format (DM:peer_id:msg_id:timestamp:content)
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let dm_command = format!("DM:{}:{}:{}:{}", peer_id, msg_id_for_dm, timestamp, message);
+        tx.send(dm_command).await.map_err(|e| e.to_string())?;
+    }
 
     Ok(())
 }
@@ -439,6 +483,7 @@ async fn send_image_message(
             content_type: "image".to_string(),
             text_content: None,
             file_hash: Some(file_hash.clone()),
+            status: "pending".to_string(), // Outgoing = pending until delivered
         };
 
         if let Err(e) = storage::db::insert_message(&conn, &msg) {
@@ -492,6 +537,33 @@ async fn get_chat_history(
     let messages = storage::db::get_messages(&conn, &chat_id).map_err(|e| e.to_string())?;
     println!("[Backend] Found {} messages", messages.len());
     Ok(messages)
+}
+
+#[tauri::command]
+async fn mark_messages_read(
+    chat_id: String,
+    sender_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    println!(
+        "[Backend] mark_messages_read for chat: {}, sender: {}",
+        chat_id, sender_id
+    );
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+    let marked_ids =
+        storage::db::mark_messages_read(&conn, &chat_id, &sender_id).map_err(|e| e.to_string())?;
+    println!("[Backend] Marked {} messages as read", marked_ids.len());
+    Ok(marked_ids)
+}
+
+#[tauri::command]
+async fn get_unread_counts(
+    my_peer_id: String,
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, i64>, String> {
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+    let counts = storage::db::get_unread_counts(&conn, &my_peer_id).map_err(|e| e.to_string())?;
+    Ok(counts)
 }
 
 // --- Envelope Commands ---
@@ -629,19 +701,9 @@ pub fn run() {
                 db_conn: std::sync::Mutex::new(db_connection),
             });
 
-            // --- 2. Run Heavy Background Tasks ---
-            // We spawn a separate async task so we don't freeze the UI startup
-            tauri::async_runtime::spawn(async move {
-                println!("[Backend] Starting Background Services...");
-
-                match network::init(app_handle).await {
-                    Ok(_) => println!("[Backend] network::init completed successfully"),
-                    Err(e) => eprintln!("[Backend] Failed to start network: {}", e),
-                }
-
-                println!("[Backend] Background Services Ready!");
-            });
-
+            // --- 2. Network is now initialized after vault unlock ---
+            // The frontend calls start_network after successful unlock_vault
+            // This ensures we can load the persisted keypair from the encrypted config
             println!("[Backend] Setup hook returning Ok");
             Ok(())
         })
@@ -654,6 +716,7 @@ pub fn run() {
             toggle_online_status,
             init_vault,
             unlock_vault,
+            start_network,
             start_github_auth,
             poll_github_auth,
             reset_vault,
@@ -680,6 +743,8 @@ pub fn run() {
             get_chat_latest_times,
             send_image_message,
             get_image_data,
+            mark_messages_read,
+            get_unread_counts,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

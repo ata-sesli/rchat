@@ -1,4 +1,5 @@
 mod behaviour;
+pub mod direct_message;
 mod discovery;
 pub mod gist;
 pub mod hks;
@@ -31,18 +32,18 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
         let mut config = config_manager.load().await.unwrap_or_default();
 
         if let Some(ref key_b64) = config.user.libp2p_keypair {
-            // Load existing keypair
+            // Load existing keypair (saved as protobuf-encoded)
             if let Ok(key_bytes) = BASE64.decode(key_b64) {
-                if let Ok(keypair) = identity::Keypair::ed25519_from_bytes(key_bytes.clone()) {
+                if let Ok(keypair) = identity::Keypair::from_protobuf_encoding(&key_bytes) {
                     println!("[Backend] Loaded existing keypair from config");
                     keypair
                 } else {
-                    // Invalid keypair, generate new one
+                    // Invalid keypair format, generate new one
                     let new_key = identity::Keypair::generate_ed25519();
                     let key_bytes = new_key.to_protobuf_encoding().expect("keypair encoding");
                     config.user.libp2p_keypair = Some(BASE64.encode(&key_bytes));
                     let _ = config_manager.save(&config).await;
-                    println!("[Backend] Generated new keypair (old was invalid)");
+                    println!("[Backend] Generated new keypair (old format invalid)");
                     new_key
                 }
             } else {

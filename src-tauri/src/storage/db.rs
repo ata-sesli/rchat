@@ -40,6 +40,7 @@ pub struct Message {
     pub content_type: String, // 'text', 'file'
     pub text_content: Option<String>,
     pub file_hash: Option<String>,
+    pub status: String, // 'pending', 'delivered', 'read'
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -207,12 +208,19 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
              content_type TEXT NOT NULL,
              text_content TEXT,
              file_hash TEXT,
+             status TEXT NOT NULL DEFAULT 'pending',
              FOREIGN KEY (chat_id) REFERENCES chats(id),
              FOREIGN KEY (peer_id) REFERENCES peers(id),
              FOREIGN KEY (file_hash) REFERENCES files(file_hash)
          )",
         [],
     )?;
+
+    // Migration: Add status column if it doesn't exist
+    let _ = conn.execute(
+        "ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'",
+        [],
+    );
 
     // 7. Envelopes
     // 7. Envelopes
@@ -400,8 +408,8 @@ pub fn delete_peer(conn: &Connection, peer_id: &str) -> anyhow::Result<()> {
 
 pub fn insert_message(conn: &Connection, msg: &Message) -> anyhow::Result<()> {
     conn.execute(
-        "INSERT INTO messages (id, chat_id, peer_id, timestamp, content_type, text_content, file_hash)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO messages (id, chat_id, peer_id, timestamp, content_type, text_content, file_hash, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         (
             &msg.id,
             &msg.chat_id,
@@ -410,15 +418,15 @@ pub fn insert_message(conn: &Connection, msg: &Message) -> anyhow::Result<()> {
             &msg.content_type,
             &msg.text_content,
             &msg.file_hash,
+            &msg.status,
         ),
     )?;
     Ok(())
 }
 
 pub fn get_messages(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<Message>> {
-    // ... existing implementation ...
     let mut stmt = conn.prepare(
-        "SELECT id, chat_id, peer_id, timestamp, content_type, text_content, file_hash 
+        "SELECT id, chat_id, peer_id, timestamp, content_type, text_content, file_hash, COALESCE(status, 'delivered') as status
          FROM messages 
          WHERE chat_id = ?1 
          ORDER BY timestamp ASC",
@@ -433,6 +441,7 @@ pub fn get_messages(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<Mess
             content_type: row.get(4)?,
             text_content: row.get(5)?,
             file_hash: row.get(6)?,
+            status: row.get(7)?,
         })
     })?;
 
@@ -441,6 +450,62 @@ pub fn get_messages(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<Mess
         messages.push(msg?);
     }
     Ok(messages)
+}
+
+/// Update message status (pending -> delivered -> read)
+pub fn update_message_status(conn: &Connection, msg_id: &str, status: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE messages SET status = ?1 WHERE id = ?2",
+        [status, msg_id],
+    )?;
+    Ok(())
+}
+
+/// Mark all messages in a chat as read for a given sender
+pub fn mark_messages_read(
+    conn: &Connection,
+    chat_id: &str,
+    sender_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    // Get IDs of messages that will be marked as read
+    let mut stmt = conn.prepare(
+        "SELECT id FROM messages WHERE chat_id = ?1 AND peer_id = ?2 AND status != 'read'",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map([chat_id, sender_id], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Update them
+    conn.execute(
+        "UPDATE messages SET status = 'read' WHERE chat_id = ?1 AND peer_id = ?2 AND status != 'read'",
+        [chat_id, sender_id],
+    )?;
+    Ok(ids)
+}
+
+/// Get unread message count for each chat
+pub fn get_unread_counts(
+    conn: &Connection,
+    my_peer_id: &str,
+) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT chat_id, COUNT(*) as count
+         FROM messages 
+         WHERE peer_id != ?1 AND status != 'read'
+         GROUP BY chat_id",
+    )?;
+
+    let mut counts = std::collections::HashMap::new();
+    let rows = stmt.query_map([my_peer_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+
+    for row in rows {
+        let (chat_id, count) = row?;
+        counts.insert(chat_id, count);
+    }
+    Ok(counts)
 }
 
 /// Get latest message timestamp for each chat (for sorting by recency)

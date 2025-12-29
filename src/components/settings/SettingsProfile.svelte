@@ -35,6 +35,8 @@
         avatarPath: avatarPath || null,
       });
       onprofileUpdated({ alias, avatarPath });
+      // Dispatch a custom event so the layout can refresh data
+      window.dispatchEvent(new CustomEvent("profile-updated"));
     } catch (e: any) {
       error = e.toString();
     } finally {

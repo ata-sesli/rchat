@@ -154,6 +154,44 @@ impl NetworkManager {
             }
         }
 
+        // Handle direct messages (DM:peer_id:msg_id:timestamp:content)
+        if msg_content.starts_with("DM:") {
+            let parts: Vec<&str> = msg_content.splitn(5, ':').collect();
+            if parts.len() >= 5 {
+                let target_peer_id = parts[1];
+                let msg_id = parts[2];
+                let timestamp: i64 = parts[3].parse().unwrap_or(0);
+                let content = parts[4];
+
+                println!(
+                    "[DM] 📤 Sending direct message to {}: {}",
+                    target_peer_id, content
+                );
+
+                // Find the peer in connected peers
+                if let Ok(peer_id) = target_peer_id.parse::<PeerId>() {
+                    use crate::network::direct_message::DirectMessageRequest;
+                    let request = DirectMessageRequest {
+                        id: msg_id.to_string(),
+                        sender_id: self.swarm.local_peer_id().to_string(),
+                        msg_type: "text".to_string(),
+                        text_content: Some(content.to_string()),
+                        file_hash: None,
+                        timestamp,
+                    };
+
+                    self.swarm
+                        .behaviour_mut()
+                        .direct_message
+                        .send_request(&peer_id, request);
+                    println!("[DM] ✅ Request sent to {}", peer_id);
+                } else {
+                    eprintln!("[DM] ❌ Invalid peer_id: {}", target_peer_id);
+                }
+                return;
+            }
+        }
+
         // 1. Define the Topic (Like a TV Channel)
         let topic = libp2p::gossipsub::IdentTopic::new("global-chat");
 
@@ -347,6 +385,7 @@ impl NetworkManager {
                                     content_type: "image".to_string(),
                                     text_content: None,
                                     file_hash: Some(file_hash.to_string()),
+                                    status: "delivered".to_string(), // Received = delivered
                                 };
 
                                 if let Ok(conn) = state.db_conn.lock() {
@@ -364,9 +403,22 @@ impl NetworkManager {
 
                                 // Request the actual image data from the sender
                                 if let Some(sender_peer_id) = message.source {
-                                    // Build request: 0x01 + file_hash bytes
-                                    let mut request = vec![0x01u8];
-                                    request.extend_from_slice(file_hash.as_bytes());
+                                    // Build file request using DirectMessageRequest
+                                    use crate::network::direct_message::DirectMessageRequest;
+                                    let timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs()
+                                        as i64;
+                                    let id_suffix: u32 = rand::random();
+                                    let request = DirectMessageRequest {
+                                        id: format!("{}-{}", timestamp, id_suffix),
+                                        sender_id: self.swarm.local_peer_id().to_string(),
+                                        msg_type: "file_request".to_string(),
+                                        text_content: None,
+                                        file_hash: Some(file_hash.to_string()),
+                                        timestamp,
+                                    };
 
                                     println!(
                                         "[File Transfer] 📡 Requesting image {} from {}",
@@ -428,6 +480,7 @@ impl NetworkManager {
                             content_type: "text".to_string(),
                             text_content: Some(text.clone()),
                             file_hash: None,
+                            status: "delivered".to_string(), // Received = delivered
                         };
 
                         if let Ok(conn) = state.db_conn.lock() {
@@ -445,100 +498,211 @@ impl NetworkManager {
 
                     // Handle request-response for file transfer
                     RChatBehaviourEvent::DirectMessage(event) => {
+                        use crate::network::direct_message::{
+                            DirectMessageRequest, DirectMessageResponse,
+                        };
                         use libp2p::request_response::{Event, Message};
+
                         match event {
                             Event::Message { peer, message, .. } => {
                                 match message {
                                     Message::Request {
                                         request, channel, ..
                                     } => {
-                                        // Request is Vec<u8> - first byte is command, rest is payload
-                                        if request.len() > 1 && request[0] == 0x01 {
-                                            // 0x01 = Request image by hash
-                                            let file_hash =
-                                                String::from_utf8_lossy(&request[1..]).to_string();
-                                            println!("[File Transfer] 📥 Received request for image: {} from {}", file_hash, peer);
+                                        println!(
+                                            "[DM] 📥 Received {} from {}",
+                                            request.msg_type, peer
+                                        );
 
-                                            use tauri::Manager;
-                                            let state = self.app_handle.state::<crate::AppState>();
+                                        match request.msg_type.as_str() {
+                                            "text" | "image" => {
+                                                // Save incoming message to database
+                                                use tauri::Manager;
+                                                let state =
+                                                    self.app_handle.state::<crate::AppState>();
 
-                                            let response = if let Ok(conn) = state.db_conn.lock() {
-                                                match crate::storage::object::load(
-                                                    &conn, &file_hash, None,
-                                                ) {
-                                                    Ok(data) => {
-                                                        println!("[File Transfer] 📤 Sending {} bytes to {}", data.len(), peer);
-                                                        data
+                                                let db_msg = crate::storage::db::Message {
+                                                    id: request.id.clone(),
+                                                    chat_id: request.sender_id.clone(),
+                                                    peer_id: request.sender_id.clone(),
+                                                    timestamp: request.timestamp,
+                                                    content_type: request.msg_type.clone(),
+                                                    text_content: request.text_content.clone(),
+                                                    file_hash: request.file_hash.clone(),
+                                                    status: "delivered".to_string(),
+                                                };
+
+                                                if let Ok(conn) = state.db_conn.lock() {
+                                                    // Ensure peer and chat exist
+                                                    if !crate::storage::db::is_peer(
+                                                        &conn,
+                                                        &request.sender_id,
+                                                    ) {
+                                                        let _ = crate::storage::db::add_peer(
+                                                            &conn,
+                                                            &request.sender_id,
+                                                            None,
+                                                            None,
+                                                            "direct",
+                                                        );
                                                     }
-                                                    Err(e) => {
-                                                        eprintln!("[File Transfer] Failed to load image: {}", e);
-                                                        vec![]
+                                                    if !crate::storage::db::chat_exists(
+                                                        &conn,
+                                                        &request.sender_id,
+                                                    ) {
+                                                        let _ = crate::storage::db::create_chat(
+                                                            &conn,
+                                                            &request.sender_id,
+                                                            &request.sender_id, // name = sender_id for 1:1 chats
+                                                            false,
+                                                        );
+                                                    }
+
+                                                    if let Err(e) =
+                                                        crate::storage::db::insert_message(
+                                                            &conn, &db_msg,
+                                                        )
+                                                    {
+                                                        eprintln!(
+                                                            "[DM] Failed to save message: {}",
+                                                            e
+                                                        );
+                                                    } else {
+                                                        println!("[DM] ✅ Message saved");
                                                     }
                                                 }
-                                            } else {
-                                                vec![]
-                                            };
 
-                                            let _ = self
-                                                .swarm
-                                                .behaviour_mut()
-                                                .direct_message
-                                                .send_response(channel, response);
+                                                // Emit event to frontend
+                                                let _ = self.app_handle.emit(
+                                                    "message-received",
+                                                    serde_json::json!({
+                                                        "chat_id": request.sender_id,
+                                                        "msg_id": request.id,
+                                                        "text": request.text_content,
+                                                        "file_hash": request.file_hash,
+                                                    }),
+                                                );
+
+                                                // Send "delivered" response
+                                                let response = DirectMessageResponse {
+                                                    msg_id: request.id.clone(),
+                                                    status: "delivered".to_string(),
+                                                    error: None,
+                                                };
+                                                let _ = self
+                                                    .swarm
+                                                    .behaviour_mut()
+                                                    .direct_message
+                                                    .send_response(channel, response);
+                                            }
+                                            "read_receipt" => {
+                                                // Update message status to "read"
+                                                if let Some(ref msg_id) = request.text_content {
+                                                    use tauri::Manager;
+                                                    let state =
+                                                        self.app_handle.state::<crate::AppState>();
+                                                    if let Ok(conn) = state.db_conn.lock() {
+                                                        let _ = crate::storage::db::update_message_status(&conn, msg_id, "read");
+                                                    }
+                                                    // Notify frontend
+                                                    let _ = self.app_handle.emit(
+                                                        "message-status-updated",
+                                                        serde_json::json!({
+                                                            "msg_id": msg_id,
+                                                            "status": "read",
+                                                        }),
+                                                    );
+                                                }
+                                                // Send ack response
+                                                let response = DirectMessageResponse {
+                                                    msg_id: request.id.clone(),
+                                                    status: "delivered".to_string(),
+                                                    error: None,
+                                                };
+                                                let _ = self
+                                                    .swarm
+                                                    .behaviour_mut()
+                                                    .direct_message
+                                                    .send_response(channel, response);
+                                            }
+                                            "file_request" => {
+                                                // Legacy file transfer support
+                                                if let Some(ref file_hash) = request.file_hash {
+                                                    println!(
+                                                        "[DM] 📥 File request for: {}",
+                                                        file_hash
+                                                    );
+                                                    // Note: File transfer via request-response needs separate handling
+                                                    // For now just acknowledge
+                                                    let response = DirectMessageResponse {
+                                                        msg_id: request.id.clone(),
+                                                        status: "error".to_string(),
+                                                        error: Some(
+                                                            "File transfer not yet implemented"
+                                                                .to_string(),
+                                                        ),
+                                                    };
+                                                    let _ = self
+                                                        .swarm
+                                                        .behaviour_mut()
+                                                        .direct_message
+                                                        .send_response(channel, response);
+                                                }
+                                            }
+                                            _ => {
+                                                println!(
+                                                    "[DM] Unknown message type: {}",
+                                                    request.msg_type
+                                                );
+                                            }
                                         }
                                     }
                                     Message::Response {
                                         request_id,
                                         response,
                                     } => {
-                                        println!("[File Transfer] 📦 Received response for request {:?}: {} bytes", request_id, response.len());
+                                        println!(
+                                            "[DM] 📦 Response for {:?}: {} for msg {}",
+                                            request_id, response.status, response.msg_id
+                                        );
 
-                                        if !response.is_empty() {
+                                        if response.status == "delivered" {
+                                            // Update outgoing message status from "pending" to "delivered"
                                             use tauri::Manager;
                                             let state = self.app_handle.state::<crate::AppState>();
-
-                                            let result = {
-                                                let conn = state.db_conn.lock().ok();
-                                                if let Some(conn) = conn {
-                                                    crate::storage::object::create(
-                                                        &conn,
-                                                        &response,
-                                                        None,
-                                                        Some("image/png"),
-                                                        None,
-                                                    )
-                                                    .ok()
-                                                } else {
-                                                    None
-                                                }
-                                            };
-
-                                            if let Some(file_hash) = result {
-                                                println!(
-                                                    "[File Transfer] ✅ Stored received image: {}",
-                                                    file_hash
-                                                );
-                                                let _ = self.app_handle.emit(
-                                                    "image-received",
-                                                    serde_json::json!({
-                                                        "file_hash": file_hash,
-                                                    }),
+                                            if let Ok(conn) = state.db_conn.lock() {
+                                                let _ = crate::storage::db::update_message_status(
+                                                    &conn,
+                                                    &response.msg_id,
+                                                    "delivered",
                                                 );
                                             }
+
+                                            // Notify frontend
+                                            let _ = self.app_handle.emit(
+                                                "message-status-updated",
+                                                serde_json::json!({
+                                                    "msg_id": response.msg_id,
+                                                    "status": "delivered",
+                                                }),
+                                            );
                                         }
                                     }
                                 }
                             }
-                            Event::OutboundFailure { peer, error, .. } => {
+                            Event::OutboundFailure {
+                                peer,
+                                request_id,
+                                error,
+                                ..
+                            } => {
                                 eprintln!(
-                                    "[File Transfer] Outbound failure to {}: {:?}",
-                                    peer, error
+                                    "[DM] Outbound failure to {} for {:?}: {:?}",
+                                    peer, request_id, error
                                 );
                             }
                             Event::InboundFailure { peer, error, .. } => {
-                                eprintln!(
-                                    "[File Transfer] Inbound failure from {}: {:?}",
-                                    peer, error
-                                );
+                                eprintln!("[DM] Inbound failure from {}: {:?}", peer, error);
                             }
                             _ => {}
                         }
