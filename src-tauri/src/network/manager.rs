@@ -642,29 +642,60 @@ impl NetworkManager {
                                                 };
 
                                                 if let Ok(conn) = state.db_conn.lock() {
-                                                    // Ensure peer and chat exist
-                                                    if !crate::storage::db::is_peer(
+                                                    // Ensure peer and chat exist (with detailed logging)
+                                                    let peer_exists = crate::storage::db::is_peer(
                                                         &conn,
                                                         &request.sender_id,
-                                                    ) {
-                                                        let _ = crate::storage::db::add_peer(
+                                                    );
+                                                    if !peer_exists {
+                                                        println!("[DM] Adding peer {} to database", request.sender_id);
+                                                        if let Err(e) = crate::storage::db::add_peer(
                                                             &conn,
                                                             &request.sender_id,
                                                             None,
                                                             None,
                                                             "direct",
-                                                        );
+                                                        ) {
+                                                            eprintln!("[DM] ❌ Failed to add peer: {}", e);
+                                                        }
                                                     }
-                                                    if !crate::storage::db::chat_exists(
+                                                    
+                                                    let chat_exists = crate::storage::db::chat_exists(
                                                         &conn,
                                                         &request.sender_id,
-                                                    ) {
-                                                        let _ = crate::storage::db::create_chat(
+                                                    );
+                                                    if !chat_exists {
+                                                        println!("[DM] Creating chat for {}", request.sender_id);
+                                                        if let Err(e) = crate::storage::db::create_chat(
                                                             &conn,
                                                             &request.sender_id,
-                                                            &request.sender_id, // name = sender_id for 1:1 chats
+                                                            &request.sender_id,
                                                             false,
-                                                        );
+                                                        ) {
+                                                            eprintln!("[DM] ❌ Failed to create chat: {}", e);
+                                                        }
+                                                    }
+
+                                                    // For image messages, ensure file record exists (FK constraint)
+                                                    if request.msg_type == "image" {
+                                                        if let Some(ref file_hash) = request.file_hash {
+                                                            // Insert placeholder if file doesn't exist yet
+                                                            let file_exists: bool = conn.query_row(
+                                                                "SELECT 1 FROM files WHERE file_hash = ?1",
+                                                                [file_hash],
+                                                                |_| Ok(true),
+                                                            ).unwrap_or(false);
+                                                            
+                                                            if !file_exists {
+                                                                println!("[DM] Creating file placeholder for {}", file_hash);
+                                                                if let Err(e) = conn.execute(
+                                                                    "INSERT INTO files (file_hash, file_name, mime_type, size_bytes, is_complete) VALUES (?1, NULL, 'image/unknown', 0, 0)",
+                                                                    [file_hash],
+                                                                ) {
+                                                                    eprintln!("[DM] ❌ Failed to create file placeholder: {}", e);
+                                                                }
+                                                            }
+                                                        }
                                                     }
 
                                                     if let Err(e) =
@@ -673,7 +704,12 @@ impl NetworkManager {
                                                         )
                                                     {
                                                         eprintln!(
-                                                            "[DM] Failed to save message: {}",
+                                                            "[DM] ❌ Failed to save {} message (id={}, chat_id={}, peer_id={}, file_hash={:?}): {}",
+                                                            request.msg_type,
+                                                            request.id,
+                                                            request.sender_id,
+                                                            request.sender_id,
+                                                            request.file_hash,
                                                             e
                                                         );
                                                     } else {
