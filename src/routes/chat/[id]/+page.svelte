@@ -6,7 +6,12 @@
   import ChatArea from "../../../components/chat/ChatArea.svelte";
 
   // Types
-  type Message = { sender: string; text: string; timestamp: Date };
+  type Message = {
+    sender: string;
+    text: string;
+    timestamp: Date;
+    status?: string;
+  };
 
   // Props/State
   let activePeer: string = "";
@@ -35,6 +40,7 @@
         sender: m.peer_id === "Me" ? "Me" : m.peer_id,
         text: m.text_content || "",
         timestamp: new Date(m.timestamp * 1000),
+        status: m.status || "delivered",
       }));
     } catch (e) {
       console.error("Failed to load history for", peerId, e);
@@ -66,6 +72,7 @@
           sender: msg.peer_id === "Me" ? "Me" : msg.peer_id,
           text: msg.text_content || "",
           timestamp: new Date(msg.timestamp * 1000),
+          status: "delivered", // Incoming messages are "delivered"
         };
         messages = [...messages, newMsg];
       }
@@ -80,7 +87,12 @@
     if (!text.trim()) return;
 
     // Optimistic update
-    const newMsg: Message = { sender: "Me", text, timestamp: new Date() };
+    const newMsg: Message = {
+      sender: "Me",
+      text,
+      timestamp: new Date(),
+      status: "pending",
+    };
     messages = [...messages, newMsg];
 
     try {

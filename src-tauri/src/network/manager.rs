@@ -733,8 +733,24 @@ impl NetworkManager {
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 println!("[Swarm] Connected to {}", peer_id);
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established,
+                ..
+            } => {
                 println!("[Swarm] Disconnected from {}", peer_id);
+
+                // Only remove peer when ALL connections are closed
+                if num_established == 0 {
+                    // Remove from local_peers
+                    if self.local_peers.remove(&peer_id).is_some() {
+                        println!("[Swarm] Peer {} fully disconnected, notifying UI", peer_id);
+                        // Emit event to frontend
+                        let _ = self
+                            .app_handle
+                            .emit("local-peer-expired", peer_id.to_string());
+                    }
+                }
             }
             // CASE C: New Listener Address (expected at startup)
             SwarmEvent::NewListenAddr { address, .. } => {
