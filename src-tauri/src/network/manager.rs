@@ -192,6 +192,50 @@ impl NetworkManager {
             }
         }
 
+        // Handle read receipts (READ_RECEIPT:peer_id:msg_id1,msg_id2,...)
+        if msg_content.starts_with("READ_RECEIPT:") {
+            let parts: Vec<&str> = msg_content.splitn(3, ':').collect();
+            if parts.len() >= 3 {
+                let target_peer_id = parts[1];
+                let msg_ids = parts[2];
+
+                println!(
+                    "[READ_RECEIPT] 📤 Sending read receipt to {}",
+                    target_peer_id
+                );
+
+                if let Ok(peer_id) = target_peer_id.parse::<PeerId>() {
+                    use crate::network::direct_message::DirectMessageRequest;
+                    let request = DirectMessageRequest {
+                        id: format!(
+                            "read-receipt-{}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs()
+                        ),
+                        sender_id: self.swarm.local_peer_id().to_string(),
+                        msg_type: "read_receipt".to_string(),
+                        text_content: Some(msg_ids.to_string()), // Message IDs that were read
+                        file_hash: None,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() as i64,
+                    };
+
+                    self.swarm
+                        .behaviour_mut()
+                        .direct_message
+                        .send_request(&peer_id, request);
+                    println!("[READ_RECEIPT] ✅ Sent to {}", peer_id);
+                } else {
+                    eprintln!("[READ_RECEIPT] ❌ Invalid peer_id: {}", target_peer_id);
+                }
+                return;
+            }
+        }
+
         // 1. Define the Topic (Like a TV Channel)
         let topic = libp2p::gossipsub::IdentTopic::new("global-chat");
 
@@ -598,22 +642,43 @@ impl NetworkManager {
                                                     .send_response(channel, response);
                                             }
                                             "read_receipt" => {
-                                                // Update message status to "read"
-                                                if let Some(ref msg_id) = request.text_content {
+                                                // text_content contains comma-separated message IDs
+                                                if let Some(ref msg_ids_str) = request.text_content
+                                                {
                                                     use tauri::Manager;
-                                                    let state =
-                                                        self.app_handle.state::<crate::AppState>();
-                                                    if let Ok(conn) = state.db_conn.lock() {
-                                                        let _ = crate::storage::db::update_message_status(&conn, msg_id, "read");
+
+                                                    // Collect message IDs to update (as owned Strings)
+                                                    let msg_ids: Vec<String> = msg_ids_str
+                                                        .split(',')
+                                                        .map(|s| s.trim().to_string())
+                                                        .filter(|s| !s.is_empty())
+                                                        .collect();
+
+                                                    // Update DB (separate scope to release lock)
+                                                    {
+                                                        let state = self
+                                                            .app_handle
+                                                            .state::<crate::AppState>();
+                                                        let lock_result = state.db_conn.lock();
+                                                        if let Ok(conn) = lock_result {
+                                                            for msg_id in &msg_ids {
+                                                                let _ = crate::storage::db::update_message_status(&conn, msg_id, "read");
+                                                                println!("[READ_RECEIPT] 📥 Marked {} as read", msg_id);
+                                                            }
+                                                            drop(conn); // Explicitly drop to release lock
+                                                        }
                                                     }
-                                                    // Notify frontend
-                                                    let _ = self.app_handle.emit(
-                                                        "message-status-updated",
-                                                        serde_json::json!({
-                                                            "msg_id": msg_id,
-                                                            "status": "read",
-                                                        }),
-                                                    );
+
+                                                    // Emit events to frontend (after DB lock is released)
+                                                    for msg_id in &msg_ids {
+                                                        let _ = self.app_handle.emit(
+                                                            "message-status-updated",
+                                                            serde_json::json!({
+                                                                "msg_id": msg_id,
+                                                                "status": "read",
+                                                            }),
+                                                        );
+                                                    }
                                                 }
                                                 // Send ack response
                                                 let response = DirectMessageResponse {

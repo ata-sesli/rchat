@@ -424,19 +424,20 @@
               {:else if peer === "General"}
                 <p class="text-xs text-slate-500 truncate">Public Broadcast</p>
               {:else}
-                <p
-                  class={`text-xs truncate ${isPeerOnline(peer) ? "text-green-400" : "text-slate-500"}`}
-                >
-                  {isPeerOnline(peer) ? "Online" : "Offline"}
-                </p>
-              {/if}
-
-              <!-- Unread Badge -->
-              {#if unreadCounts[peer] && unreadCounts[peer] > 0}
-                <div
-                  class="absolute top-2 right-10 min-w-5 h-5 px-1.5 bg-red-500 text-white text-xs font-bold rounded-full flex items-center justify-center"
-                >
-                  {unreadCounts[peer] > 99 ? "99+" : unreadCounts[peer]}
+                <div class="flex items-center gap-2">
+                  <p
+                    class={`text-xs truncate ${isPeerOnline(peer) ? "text-green-400" : "text-slate-500"}`}
+                  >
+                    {isPeerOnline(peer) ? "Online" : "Offline"}
+                  </p>
+                  <!-- Unread Badge (inline with status) -->
+                  {#if unreadCounts[peer] && unreadCounts[peer] > 0}
+                    <div
+                      class="min-w-5 h-5 px-1.5 bg-red-500 text-white text-xs font-bold rounded-full flex items-center justify-center"
+                    >
+                      {unreadCounts[peer] > 99 ? "99+" : unreadCounts[peer]}
+                    </div>
+                  {/if}
                 </div>
               {/if}
             </div>

@@ -541,17 +541,39 @@ async fn get_chat_history(
 #[tauri::command]
 async fn mark_messages_read(
     chat_id: String,
-    sender_id: String,
     state: State<'_, AppState>,
+    net_state: State<'_, NetworkState>,
 ) -> Result<Vec<String>, String> {
-    println!(
-        "[Backend] mark_messages_read for chat: {}, sender: {}",
-        chat_id, sender_id
-    );
-    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
-    let marked_ids =
-        storage::db::mark_messages_read(&conn, &chat_id, &sender_id).map_err(|e| e.to_string())?;
+    println!("[Backend] mark_messages_read for chat: {}", chat_id);
+
+    // For 1v1 chats, chat_id = peer_id, so messages FROM that peer are the ones to mark as read
+    let sender_id = chat_id.clone();
+
+    let marked_ids = {
+        let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+        storage::db::mark_messages_read(&conn, &chat_id, &sender_id).map_err(|e| e.to_string())?
+    };
+
     println!("[Backend] Marked {} messages as read", marked_ids.len());
+
+    // Send read receipts to the peer via network so their UI updates
+    if !marked_ids.is_empty() && chat_id != "General" && chat_id != "self" {
+        // Send a read receipt for each message (or batch them)
+        // Format: READ_RECEIPT:peer_id:msg_id1,msg_id2,...
+        let msg_ids_str = marked_ids.join(",");
+        let read_receipt_cmd = format!("READ_RECEIPT:{}:{}", chat_id, msg_ids_str);
+
+        let tx = net_state.sender.lock().await;
+        if let Err(e) = tx.send(read_receipt_cmd).await {
+            eprintln!("[Backend] Failed to send read receipt: {}", e);
+        } else {
+            println!(
+                "[Backend] Read receipt sent for {} messages",
+                marked_ids.len()
+            );
+        }
+    }
+
     Ok(marked_ids)
 }
 

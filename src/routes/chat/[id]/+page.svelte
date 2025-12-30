@@ -7,6 +7,7 @@
 
   // Types
   type Message = {
+    id?: string;
     sender: string;
     text: string;
     timestamp: Date;
@@ -25,6 +26,7 @@
   let messageInput = "";
   let showAttachments = false;
   let unlisten: () => void;
+  let unlistenStatus: () => void;
 
   // Reactive loading
   $: loadChatHistory(activePeer);
@@ -37,6 +39,7 @@
       const history = await invoke<any[]>("get_chat_history", { chatId });
 
       messages = history.map((m) => ({
+        id: m.id,
         sender: m.peer_id === "Me" ? "Me" : m.peer_id,
         text: m.text_content || "",
         timestamp: new Date(m.timestamp * 1000),
@@ -69,6 +72,7 @@
 
       if (relatedPeer === activePeer) {
         const newMsg = {
+          id: msg.msg_id,
           sender: msg.peer_id === "Me" ? "Me" : msg.peer_id,
           text: msg.text_content || "",
           timestamp: new Date(msg.timestamp * 1000),
@@ -77,10 +81,19 @@
         messages = [...messages, newMsg];
       }
     });
+
+    // Listen for message status updates (e.g., delivered -> read)
+    unlistenStatus = await listen("message-status-updated", (event: any) => {
+      const { msg_id, status } = event.payload;
+      console.log("[Chat] Message status update:", msg_id, "->", status);
+      // Update the message in the list
+      messages = messages.map((m) => (m.id === msg_id ? { ...m, status } : m));
+    });
   });
 
   onDestroy(() => {
     if (unlisten) unlisten();
+    if (unlistenStatus) unlistenStatus();
   });
 
   async function handleSendMessage(text: string) {
