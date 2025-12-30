@@ -350,7 +350,7 @@ async fn send_message(
     message: String,
     app_state: State<'_, AppState>,
     net_state: State<'_, NetworkState>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     println!("[Backend] send_message to {}: {}", peer_id, message);
 
     // 1. Persist to DB
@@ -414,7 +414,7 @@ async fn send_message(
         tx.send(dm_command).await.map_err(|e| e.to_string())?;
     }
 
-    Ok(())
+    Ok(msg_id_for_dm)
 }
 
 #[tauri::command]

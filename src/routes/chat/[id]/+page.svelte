@@ -99,20 +99,29 @@
   async function handleSendMessage(text: string) {
     if (!text.trim()) return;
 
-    // Optimistic update
-    const newMsg: Message = {
+    // Optimistic update (will be replaced with actual id)
+    const tempMsg: Message = {
       sender: "Me",
       text,
       timestamp: new Date(),
       status: "pending",
     };
-    messages = [...messages, newMsg];
+    messages = [...messages, tempMsg];
 
     try {
       if (activePeer === "Me") {
         await invoke("send_message_to_self", { message: text });
       } else {
-        await invoke("send_message", { peerId: activePeer, message: text });
+        // Get the msg_id from backend
+        const msgId = await invoke<string>("send_message", {
+          peerId: activePeer,
+          message: text,
+        });
+
+        // Update the optimistic message with the actual id
+        messages = messages.map((m) =>
+          m === tempMsg ? { ...m, id: msgId } : m
+        );
       }
     } catch (e) {
       console.error("Send failed:", e);
