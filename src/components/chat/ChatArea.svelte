@@ -50,11 +50,18 @@
   }
 
   function sendMessage() {
-    if (!message.trim()) return;
-    onsend(message);
-    message = "";
-    if (textarea) {
-      textarea.style.height = "auto";
+    // Send pending images first if any
+    if (pendingImages.length > 0) {
+      sendPendingImages();
+    }
+
+    // Then send text message if any
+    if (message.trim()) {
+      onsend(message);
+      message = "";
+      if (textarea) {
+        textarea.style.height = "auto";
+      }
     }
   }
 
@@ -69,11 +76,12 @@
     target.style.height = target.scrollHeight + "px";
   }
 
+  // Pending images to preview before sending
+  type PendingImage = { path: string; name: string };
+  let pendingImages: PendingImage[] = [];
   let isSendingImage = false;
 
-  async function pickAndSendImage() {
-    if (isSendingImage) return;
-
+  async function pickImage() {
     try {
       const filePath = await open({
         filters: [
@@ -88,17 +96,39 @@
 
       if (!filePath) return; // User cancelled
 
-      isSendingImage = true;
+      // Add to pending images for preview
+      const fileName = (filePath as string).split("/").pop() || "image";
+      pendingImages = [
+        ...pendingImages,
+        { path: filePath as string, name: fileName },
+      ];
       showAttachments = false;
+      console.log("Image queued for preview:", filePath);
+    } catch (e) {
+      console.error("Failed to pick image:", e);
+    }
+  }
 
-      console.log("Sending image:", filePath);
-      const fileHash = await invoke<string>("send_image_message", {
-        peerId: activePeer,
-        filePath: filePath,
-      });
+  function removeImage(index: number) {
+    pendingImages = pendingImages.filter((_, i) => i !== index);
+  }
 
-      console.log("Image sent with hash:", fileHash);
-      onImageSent(fileHash);
+  async function sendPendingImages() {
+    if (pendingImages.length === 0) return;
+    if (isSendingImage) return;
+
+    isSendingImage = true;
+    try {
+      for (const img of pendingImages) {
+        console.log("Sending image:", img.path);
+        const fileHash = await invoke<string>("send_image_message", {
+          peerId: activePeer,
+          filePath: img.path,
+        });
+        console.log("Image sent with hash:", fileHash);
+        onImageSent(fileHash);
+      }
+      pendingImages = [];
     } catch (e) {
       console.error("Failed to send image:", e);
     } finally {
@@ -166,6 +196,45 @@
 
 <!-- Input Area -->
 <div class="p-6 w-full max-w-4xl mx-auto">
+  <!-- Pending Images Preview -->
+  {#if pendingImages.length > 0}
+    <div
+      class="mb-3 flex gap-2 flex-wrap bg-slate-900/60 border border-slate-700/50 rounded-xl p-3"
+    >
+      {#each pendingImages as img, index}
+        <div class="relative group">
+          <div
+            class="w-16 h-16 bg-slate-800 rounded-lg flex items-center justify-center overflow-hidden border border-slate-600"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              class="h-8 w-8 text-purple-400"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
+              />
+            </svg>
+          </div>
+          <button
+            on:click={() => removeImage(index)}
+            class="absolute -top-2 -right-2 w-5 h-5 bg-red-500 hover:bg-red-400 text-white rounded-full flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+          >
+            ×
+          </button>
+          <p class="text-xs text-slate-400 mt-1 truncate w-16 text-center">
+            {img.name}
+          </p>
+        </div>
+      {/each}
+    </div>
+  {/if}
+
   <div
     class="bg-slate-900/90 backdrop-blur-md border border-slate-700 rounded-2xl p-1.5 shadow-2xl flex items-center gap-2 relative"
   >
@@ -197,7 +266,7 @@
           class="absolute bottom-full left-0 mb-2 w-48 bg-slate-800 border border-slate-700 rounded-xl shadow-xl overflow-hidden z-50 animate-fade-in-up"
         >
           <button
-            on:click={pickAndSendImage}
+            on:click={pickImage}
             class="w-full text-left px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 hover:text-white flex items-center gap-3 transition-colors"
             disabled={isSendingImage}
           >
@@ -278,7 +347,7 @@
     <button
       on:click={sendMessage}
       class="bg-teal-500 hover:bg-teal-400 text-slate-950 p-2.5 rounded-xl font-semibold transition-all hover:scale-105 active:scale-95 shadow-lg shadow-teal-500/20 disabled:opacity-50 disabled:cursor-not-allowed"
-      disabled={!message.trim()}
+      disabled={!message.trim() && pendingImages.length === 0}
     >
       <svg
         xmlns="http://www.w3.org/2000/svg"

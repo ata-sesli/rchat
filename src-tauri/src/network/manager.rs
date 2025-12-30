@@ -433,6 +433,25 @@ impl NetworkManager {
                                 };
 
                                 if let Ok(conn) = state.db_conn.lock() {
+                                    // Ensure peer and chat exist (prevents FOREIGN KEY error)
+                                    if !crate::storage::db::is_peer(&conn, &sender) {
+                                        let _ = crate::storage::db::add_peer(
+                                            &conn,
+                                            &sender,
+                                            None,
+                                            None,
+                                            "direct",
+                                        );
+                                    }
+                                    if !crate::storage::db::chat_exists(&conn, &sender) {
+                                        let _ = crate::storage::db::create_chat(
+                                            &conn,
+                                            &sender,
+                                            &sender,
+                                            false,
+                                        );
+                                    }
+                                    
                                     if let Err(e) =
                                         crate::storage::db::insert_message(&conn, &db_msg)
                                     {
