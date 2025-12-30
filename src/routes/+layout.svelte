@@ -74,6 +74,9 @@
   // Sorted peers (reactive) - sorted by latest message time
   let latestMessageTimes: Record<string, number> = {};
 
+  // Unread message counts per chat
+  let unreadCounts: Record<string, number> = {};
+
   $: sortedPeers = computeSortedPeers(
     peers,
     pinnedPeers,
@@ -149,12 +152,20 @@
       await listen("local-peer-expired", (event: any) => {
         localPeers = localPeers.filter((p) => p.peer_id !== event.payload);
       });
-      // Update chat order when new message arrives
+      // Update chat order and unread counts when new message arrives
       await listen("message-received", (event: any) => {
         const chatId = event.payload?.chat_id;
         if (chatId) {
           const now = Math.floor(Date.now() / 1000);
           latestMessageTimes = { ...latestMessageTimes, [chatId]: now };
+
+          // Increment unread count if user is NOT viewing this chat
+          if (chatId !== activePeer) {
+            unreadCounts = {
+              ...unreadCounts,
+              [chatId]: (unreadCounts[chatId] || 0) + 1,
+            };
+          }
         }
       });
 
@@ -179,6 +190,10 @@
       }>("check_auth_status");
       if (!auth.is_setup || !auth.is_unlocked) return goto("/login");
 
+      // Ensure network is started (handles session restore case)
+      console.log("[Layout] Ensuring network is started...");
+      await invoke("start_network");
+
       isOnline = auth.is_online; // Sync state
 
       peers = await invoke<string[]>("get_trusted_peers");
@@ -193,6 +208,8 @@
       latestMessageTimes = await invoke<Record<string, number>>(
         "get_chat_latest_times"
       );
+      // Load unread message counts for badges
+      unreadCounts = await invoke<Record<string, number>>("get_unread_counts");
     } catch (e) {
       console.error("Refresh failed:", e);
     }
@@ -393,6 +410,18 @@
   function handleSelectPeer(peer: string) {
     // Use routing for navigation
     const target = peer === "Me" ? "Me" : peer;
+
+    // Clear unread count for this chat
+    if (unreadCounts[peer]) {
+      const { [peer]: _, ...rest } = unreadCounts;
+      unreadCounts = rest;
+
+      // Mark messages as read in backend
+      invoke("mark_messages_read", { chatId: peer }).catch((e) => {
+        console.error("Failed to mark messages as read:", e);
+      });
+    }
+
     goto(`/chat/${target}`);
   }
 </script>
@@ -417,6 +446,7 @@
     {draggingPeer}
     {isOnline}
     {localPeers}
+    {unreadCounts}
     ontoggleOnline={handleToggleOnline}
     ontoggleSidebar={() => (isSidebarOpen = !isSidebarOpen)}
     onopenSettings={() => goto("/settings")}

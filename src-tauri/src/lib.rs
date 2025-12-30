@@ -97,8 +97,7 @@ async fn start_network(app_handle: tauri::AppHandle) -> Result<(), String> {
     // Check if network is already running
     if app_handle.try_state::<NetworkState>().is_some() {
         println!("[Backend] Network already initialized, skipping...");
-        // Still emit auth-status so frontend refreshes
-        let _ = app_handle.emit("auth-status", serde_json::json!({"unlocked": true}));
+        // Don't emit auth-status here - would cause infinite loop with frontend's refreshData
         return Ok(());
     }
 
