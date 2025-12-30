@@ -577,9 +577,11 @@ impl NetworkManager {
                                                     "message-received",
                                                     serde_json::json!({
                                                         "chat_id": request.sender_id,
+                                                        "peer_id": request.sender_id,
                                                         "msg_id": request.id,
-                                                        "text": request.text_content,
+                                                        "text_content": request.text_content,
                                                         "file_hash": request.file_hash,
+                                                        "timestamp": request.timestamp,
                                                     }),
                                                 );
 
