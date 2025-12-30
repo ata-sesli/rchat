@@ -236,6 +236,52 @@ impl NetworkManager {
             }
         }
 
+        // Handle image messages (__IMAGE_MSG__:file_hash:target_peer_id)
+        if msg_content.starts_with("__IMAGE_MSG__:") {
+            let parts: Vec<&str> = msg_content.splitn(3, ':').collect();
+            if parts.len() >= 3 {
+                let file_hash = parts[1];
+                let target_peer_id = parts[2];
+
+                if target_peer_id != "General" {
+                    // 1v1 Chat: Use Request-Response (Direct Message)
+                    println!("[Image] 📤 Sending image {} to {}", file_hash, target_peer_id);
+                    
+                    if let Ok(peer_id) = target_peer_id.parse::<PeerId>() {
+                        use crate::network::direct_message::DirectMessageRequest;
+                        let request = DirectMessageRequest {
+                            id: format!(
+                                "img-{}",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs()
+                            ),
+                            sender_id: self.swarm.local_peer_id().to_string(),
+                            msg_type: "image".to_string(),
+                            text_content: None,
+                            file_hash: Some(file_hash.to_string()),
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs() as i64,
+                        };
+
+                        self.swarm
+                            .behaviour_mut()
+                            .direct_message
+                            .send_request(&peer_id, request);
+                        println!("[Image] ✅ Direct request sent to {}", peer_id);
+                        return; // Done
+                    } else {
+                        eprintln!("[Image] ❌ Invalid peer_id: {}", target_peer_id);
+                        return;
+                    }
+                }
+                // If "General", fall through to Gossipsub below
+            }
+        }
+
         // 1. Define the Topic (Like a TV Channel)
         let topic = libp2p::gossipsub::IdentTopic::new("global-chat");
 
