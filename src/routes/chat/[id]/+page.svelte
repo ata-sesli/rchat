@@ -28,6 +28,9 @@
   let unlisten: () => void;
   let unlistenStatus: () => void;
 
+  // Cache for status updates that arrive before we've swapped tempId → msgId
+  let pendingStatusCache: Record<string, string> = {};
+
   // Reactive loading
   $: loadChatHistory(activePeer);
 
@@ -86,8 +89,20 @@
     unlistenStatus = await listen("message-status-updated", (event: any) => {
       const { msg_id, status } = event.payload;
       console.log("[Chat] Message status update:", msg_id, "->", status);
-      // Update the message in the list
-      messages = messages.map((m) => (m.id === msg_id ? { ...m, status } : m));
+
+      // Check if message exists in our list
+      const msgExists = messages.some((m) => m.id === msg_id);
+
+      if (msgExists) {
+        // Update the message in the list
+        messages = messages.map((m) =>
+          m.id === msg_id ? { ...m, status } : m
+        );
+      } else {
+        // Cache for later - message id swap might not have happened yet
+        pendingStatusCache[msg_id] = status;
+        console.log("[Chat] Cached status for", msg_id, "->", status);
+      }
     });
   });
 
@@ -99,8 +114,12 @@
   async function handleSendMessage(text: string) {
     if (!text.trim()) return;
 
-    // Optimistic update (will be replaced with actual id)
+    // Generate a temporary id for tracking
+    const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    // Optimistic update with temp id
     const tempMsg: Message = {
+      id: tempId,
       sender: "Me",
       text,
       timestamp: new Date(),
@@ -111,6 +130,10 @@
     try {
       if (activePeer === "Me") {
         await invoke("send_message_to_self", { message: text });
+        // Self messages are always "read"
+        messages = messages.map((m) =>
+          m.id === tempId ? { ...m, status: "read" } : m
+        );
       } else {
         // Get the msg_id from backend
         const msgId = await invoke<string>("send_message", {
@@ -118,14 +141,31 @@
           message: text,
         });
 
-        // Update the optimistic message with the actual id
+        // Check if we have a cached status update for this msg_id (race condition fix)
+        const cachedStatus = pendingStatusCache[msgId];
+        if (cachedStatus) {
+          console.log(
+            "[Chat] Applying cached status for",
+            msgId,
+            "->",
+            cachedStatus
+          );
+          delete pendingStatusCache[msgId];
+        }
+
+        // Replace temp id with real id and apply cached status if any
         messages = messages.map((m) =>
-          m === tempMsg ? { ...m, id: msgId } : m
+          m.id === tempId
+            ? { ...m, id: msgId, status: cachedStatus || m.status }
+            : m
         );
       }
     } catch (e) {
       console.error("Send failed:", e);
-      // TODO: Show error state?
+      // Mark message as failed
+      messages = messages.map((m) =>
+        m.id === tempId ? { ...m, status: "failed" } : m
+      );
     }
   }
 </script>
