@@ -79,9 +79,16 @@
           sender: msg.peer_id === "Me" ? "Me" : msg.peer_id,
           text: msg.text_content || "",
           timestamp: new Date(msg.timestamp * 1000),
-          status: "delivered", // Incoming messages are "delivered"
+          status: "read", // We're viewing this chat, so mark as read immediately
         };
         messages = [...messages, newMsg];
+
+        // Send read receipt since we're actively viewing this chat
+        if (msg.peer_id !== "Me") {
+          invoke("mark_messages_read", { chatId: msg.chat_id }).catch((e) => {
+            console.error("Failed to send read receipt:", e);
+          });
+        }
       }
     });
 
