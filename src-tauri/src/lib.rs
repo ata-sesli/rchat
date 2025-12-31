@@ -527,6 +527,33 @@ async fn get_image_data(file_hash: String, state: State<'_, AppState>) -> Result
 }
 
 #[tauri::command]
+async fn get_image_from_path(file_path: String) -> Result<String, String> {
+    // Read image file from disk
+    let data = std::fs::read(&file_path)
+        .map_err(|e| format!("Failed to read image file: {}", e))?;
+
+    // Determine mime type from extension
+    let mime_type = if file_path.ends_with(".png") {
+        "image/png"
+    } else if file_path.ends_with(".jpg") || file_path.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if file_path.ends_with(".gif") {
+        "image/gif"
+    } else if file_path.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/png"
+    };
+
+    // Return as base64 data URL
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let b64 = STANDARD.encode(&data);
+    let data_url = format!("data:{};base64,{}", mime_type, b64);
+
+    Ok(data_url)
+}
+
+#[tauri::command]
 async fn save_image_to_file(
     file_hash: String,
     target_path: String,
@@ -784,6 +811,7 @@ pub fn run() {
             get_chat_latest_times,
             send_image_message,
             get_image_data,
+            get_image_from_path,
             save_image_to_file,
             mark_messages_read,
             get_unread_counts,
