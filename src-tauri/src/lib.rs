@@ -527,6 +527,26 @@ async fn get_image_data(file_hash: String, state: State<'_, AppState>) -> Result
 }
 
 #[tauri::command]
+async fn save_image_to_file(
+    file_hash: String,
+    target_path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+
+    // Load image data from chunks
+    let data = storage::object::load(&conn, &file_hash, None)
+        .map_err(|e| format!("Failed to load image: {}", e))?;
+
+    // Write to target path
+    std::fs::write(&target_path, &data)
+        .map_err(|e| format!("Failed to save image: {}", e))?;
+
+    println!("[Backend] Image saved to: {}", target_path);
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_chat_history(
     chat_id: String,
     state: State<'_, AppState>,
@@ -764,6 +784,7 @@ pub fn run() {
             get_chat_latest_times,
             send_image_message,
             get_image_data,
+            save_image_to_file,
             mark_messages_read,
             get_unread_counts,
         ])

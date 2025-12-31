@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onMount, onDestroy } from "svelte";
+  import ImageViewer from "./ImageViewer.svelte";
 
   export let msg: {
     sender: string;
@@ -22,6 +23,7 @@
   let downloadingImage = false; // File transfer in progress
   let loadError = false;
   let unlistenTransfer: (() => void) | null = null;
+  let showViewer = false;
 
   // Load image when this is an image message
   $: if (isImage && msg.file_hash && !imageDataUrl && !loadingImage) {
@@ -160,7 +162,7 @@
             src={imageDataUrl}
             alt="Sent image"
             class="max-w-[300px] max-h-[300px] rounded-lg cursor-pointer hover:opacity-90 transition-opacity"
-            on:click={() => window.open(imageDataUrl!, "_blank")}
+            on:click={() => (showViewer = true)}
           />
         {:else}
           <div
@@ -237,6 +239,15 @@
     </div>
   </div>
 </div>
+
+<!-- Fullscreen image viewer -->
+{#if showViewer && imageDataUrl && msg.file_hash}
+  <ImageViewer
+    {imageDataUrl}
+    fileHash={msg.file_hash}
+    on:close={() => (showViewer = false)}
+  />
+{/if}
 
 <style>
   @keyframes fade-in-up {
