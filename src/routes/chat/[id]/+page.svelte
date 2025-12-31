@@ -191,5 +191,18 @@
     bind:message={messageInput}
     bind:showAttachments
     onsend={handleSendMessage}
+    onImageSent={(fileHash) => {
+      // Add sent image to messages list
+      const newMsg: Message = {
+        id: `img-${Date.now()}`,
+        sender: "Me",
+        text: "",
+        timestamp: new Date(),
+        status: "delivered",
+        content_type: "image",
+        file_hash: fileHash,
+      };
+      messages = [...messages, newMsg];
+    }}
   />
 </div>

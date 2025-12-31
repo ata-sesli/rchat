@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
+  import { onMount, onDestroy } from "svelte";
 
   export let msg: {
     sender: string;
@@ -18,20 +19,56 @@
 
   let imageDataUrl: string | null = null;
   let loadingImage = false;
+  let downloadingImage = false; // File transfer in progress
+  let loadError = false;
+  let unlistenTransfer: (() => void) | null = null;
 
   // Load image when this is an image message
-  $: if (isImage && msg.file_hash && !imageDataUrl) {
+  $: if (isImage && msg.file_hash && !imageDataUrl && !loadingImage) {
     loadImage(msg.file_hash);
   }
 
+  onMount(async () => {
+    // Listen for file transfer completion to reload image
+    if (isImage && msg.file_hash) {
+      unlistenTransfer = await listen<{ file_hash: string }>(
+        "file-transfer-complete",
+        (event) => {
+          if (event.payload.file_hash === msg.file_hash) {
+            console.log("[MessageBubble] Transfer complete for", msg.file_hash);
+            downloadingImage = false;
+            imageDataUrl = null; // Reset to trigger reload
+            loadImage(msg.file_hash!);
+          }
+        }
+      );
+    }
+  });
+
+  onDestroy(() => {
+    if (unlistenTransfer) unlistenTransfer();
+  });
+
   async function loadImage(fileHash: string) {
-    if (loadingImage || imageDataUrl) return;
+    if (loadingImage) return;
     loadingImage = true;
+    loadError = false;
     try {
       const dataUrl = await invoke<string>("get_image_data", { fileHash });
-      imageDataUrl = dataUrl;
+      // Check if we got valid data (not empty)
+      if (dataUrl && dataUrl.startsWith("data:image")) {
+        imageDataUrl = dataUrl;
+        downloadingImage = false;
+      } else {
+        // File exists but no data - still downloading
+        downloadingImage = true;
+        imageDataUrl = null;
+      }
     } catch (e) {
       console.error("Failed to load image:", e);
+      // Could be still downloading
+      downloadingImage = true;
+      loadError = true;
     } finally {
       loadingImage = false;
     }
@@ -92,6 +129,32 @@
               class="animate-spin w-6 h-6 border-2 border-white border-t-transparent rounded-full"
             ></div>
           </div>
+        {:else if downloadingImage}
+          <!-- Downloading from peer -->
+          <div
+            class="w-48 h-32 bg-slate-700/50 rounded-lg flex flex-col items-center justify-center gap-2 border border-slate-600"
+          >
+            <svg
+              class="w-8 h-8 text-slate-400"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
+              />
+            </svg>
+            <span class="text-xs text-slate-400">Downloading...</span>
+            <div class="w-24 h-1 bg-slate-600 rounded-full overflow-hidden">
+              <div
+                class="h-full bg-purple-500 animate-pulse"
+                style="width: 60%"
+              ></div>
+            </div>
+          </div>
         {:else if imageDataUrl}
           <img
             src={imageDataUrl}
@@ -100,7 +163,24 @@
             on:click={() => window.open(imageDataUrl!, "_blank")}
           />
         {:else}
-          <div class="text-slate-400 italic">Failed to load image</div>
+          <div
+            class="w-48 h-32 bg-slate-700/50 rounded-lg flex flex-col items-center justify-center gap-1 border border-slate-600"
+          >
+            <svg
+              class="w-6 h-6 text-slate-500"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
+              />
+            </svg>
+            <span class="text-xs text-slate-400">Image not available</span>
+          </div>
         {/if}
       {:else}
         <!-- Text content -->
