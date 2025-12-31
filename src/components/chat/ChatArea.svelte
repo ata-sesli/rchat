@@ -27,6 +27,7 @@
   export let ontoggleAttachments = (show: boolean) => {};
   export let onImageSent = (fileHash: string) => {};
   export let onDocumentSent = (fileHash: string, fileName: string) => {};
+  export let onVideoSent = (fileHash: string, fileName: string) => {};
 
   // Refs
   let chatContainer: HTMLElement;
@@ -58,6 +59,10 @@
     // Send pending documents
     if (pendingDocuments.length > 0) {
       sendPendingDocuments();
+    }
+    // Send pending videos
+    if (pendingVideos.length > 0) {
+      sendPendingVideos();
     }
 
     // Then send text message if any
@@ -222,6 +227,68 @@
     }
   }
 
+  // Pending videos to preview before sending
+  type PendingVideo = { path: string; name: string; dataUrl?: string };
+  let pendingVideos: PendingVideo[] = [];
+  let isSendingVideo = false;
+
+  async function pickVideo() {
+    try {
+      const filePath = await open({
+        filters: [
+          {
+            name: "Videos",
+            extensions: ["mp4", "webm", "mov", "avi", "mkv"],
+          },
+        ],
+        multiple: false,
+        directory: false,
+      });
+
+      if (!filePath) return; // User cancelled
+
+      const fileName = (filePath as string).split("/").pop() || "video.mp4";
+      // Create object URL for preview (uses file:// protocol in Tauri)
+      const newVid: PendingVideo = {
+        path: filePath as string,
+        name: fileName,
+        dataUrl: `file://${filePath}`, // Tauri allows file:// URLs
+      };
+      pendingVideos = [...pendingVideos, newVid];
+      showAttachments = false;
+      console.log("Video queued:", filePath);
+    } catch (e) {
+      console.error("Failed to pick video:", e);
+    }
+  }
+
+  function removeVideo(index: number) {
+    pendingVideos = pendingVideos.filter((_, i) => i !== index);
+  }
+
+  async function sendPendingVideos() {
+    if (pendingVideos.length === 0) return;
+    if (isSendingVideo) return;
+
+    isSendingVideo = true;
+    try {
+      for (const vid of pendingVideos) {
+        console.log("Sending video:", vid.path);
+        const fileHash = await invoke<string>("send_video_message", {
+          peerId: activePeer,
+          filePath: vid.path,
+        });
+        console.log("Video sent with hash:", fileHash);
+        onVideoSent(fileHash, vid.name);
+      }
+      pendingVideos = [];
+    } catch (e) {
+      console.error("Failed to send video:", e);
+    } finally {
+      isSendingVideo = false;
+    }
+  }
+
   // Auto-scroll when messages change
   $: if (messages.length > 0 && chatContainer) {
     scrollToBottom();
@@ -361,6 +428,70 @@
     </div>
   {/if}
 
+  <!-- Pending Videos Preview -->
+  {#if pendingVideos.length > 0}
+    <div
+      class="mb-3 flex gap-2 flex-wrap bg-slate-900/60 border border-slate-700/50 rounded-xl p-3"
+    >
+      {#each pendingVideos as vid, index}
+        <div class="relative group">
+          <div
+            class="w-20 h-14 bg-slate-800 rounded-lg flex items-center justify-center overflow-hidden border border-slate-600 relative"
+          >
+            {#if vid.dataUrl}
+              <!-- svelte-ignore a11y_media_has_caption -->
+              <video src={vid.dataUrl} class="w-full h-full object-cover" muted
+              ></video>
+              <!-- Play icon overlay -->
+              <div
+                class="absolute inset-0 flex items-center justify-center bg-black/30"
+              >
+                <svg
+                  class="w-6 h-6 text-white"
+                  fill="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path d="M8 5v14l11-7z" />
+                </svg>
+              </div>
+            {:else}
+              <!-- Fallback icon -->
+              <svg
+                class="w-8 h-8 text-purple-400"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                  d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"
+                />
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                  d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                />
+              </svg>
+            {/if}
+          </div>
+          <button
+            on:click={() => removeVideo(index)}
+            class="absolute -top-2 -right-2 w-5 h-5 bg-red-500 hover:bg-red-400 text-white rounded-full flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+            title="Remove video"
+          >
+            ×
+          </button>
+          <p class="text-xs text-slate-400 mt-1 truncate w-20 text-center">
+            {vid.name}
+          </p>
+        </div>
+      {/each}
+    </div>
+  {/if}
+
   <div
     class="bg-slate-900/90 backdrop-blur-md border border-slate-700 rounded-2xl p-1.5 shadow-2xl flex items-center gap-2 relative"
   >
@@ -413,7 +544,39 @@
             {#if isSendingImage}
               Sending...
             {:else}
-              Image / Video
+              Image
+            {/if}
+          </button>
+          <div class="h-px bg-slate-700/50"></div>
+          <button
+            on:click={pickVideo}
+            class="w-full text-left px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 hover:text-white flex items-center gap-3 transition-colors"
+            disabled={isSendingVideo}
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              class="h-5 w-5 text-pink-400"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"
+              />
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+              />
+            </svg>
+            {#if isSendingVideo}
+              Sending...
+            {:else}
+              Video
             {/if}
           </button>
           <div class="h-px bg-slate-700/50"></div>

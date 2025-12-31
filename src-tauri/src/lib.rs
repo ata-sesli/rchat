@@ -691,6 +691,117 @@ async fn save_document_to_file(
 }
 
 #[tauri::command]
+async fn send_video_message(
+    peer_id: String,
+    file_path: String,
+    app_state: State<'_, AppState>,
+    net_state: State<'_, NetworkState>,
+) -> Result<String, String> {
+    println!("[Backend] Sending video to {}: {}", peer_id, file_path);
+
+    // 1. Read file and get original filename
+    let file_data = std::fs::read(&file_path)
+        .map_err(|e| format!("Failed to read video: {}", e))?;
+
+    let file_name = std::path::Path::new(&file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "video.mp4".to_string());
+
+    // Determine mime type from extension
+    let mime_type = match file_path.rsplit('.').next() {
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mov") => "video/quicktime",
+        Some("avi") => "video/x-msvideo",
+        Some("mkv") => "video/x-matroska",
+        _ => "video/mp4",
+    };
+
+    // 2. Store with FastCDC chunking
+    let file_hash = {
+        let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
+        storage::object::create(
+            &conn,
+            &file_data,
+            Some(&file_name),
+            Some(mime_type),
+            None,
+        )
+        .map_err(|e| format!("Failed to store video: {}", e))?
+    };
+
+    // 3. Persist message to DB
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let id_suffix: u32 = rand::random();
+    let msg_id = format!("{}-{}", timestamp, id_suffix);
+
+    {
+        let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
+        // For self chat, use 'self' as chat_id
+        let chat_id = if peer_id == "Me" { "self".to_string() } else { peer_id.clone() };
+        let msg = storage::db::Message {
+            id: msg_id.clone(),
+            chat_id,
+            peer_id: "Me".to_string(),
+            timestamp,
+            content_type: "video".to_string(),
+            text_content: Some(file_name.clone()), // Store filename in text_content
+            file_hash: Some(file_hash.clone()),
+            status: if peer_id == "Me" { "read".to_string() } else { "pending".to_string() },
+            content_metadata: Some(format!("{{\"size_bytes\":{}}}", file_data.len())),
+        };
+
+        if let Err(e) = storage::db::insert_message(&conn, &msg) {
+            eprintln!("[Backend] Failed to save video message: {}", e);
+            return Err(e.to_string());
+        }
+    }
+
+    // 4. Broadcast via network (skip for self messages)
+    if peer_id != "Me" {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let filename_b64 = STANDARD.encode(&file_name);
+        let broadcast_msg = format!("__VIDEO_MSG__:{}:{}:{}", file_hash, peer_id, filename_b64);
+        let tx = net_state.sender.lock().await;
+        tx.send(broadcast_msg).await.map_err(|e| e.to_string())?;
+    }
+
+    println!("[Backend] Video message sent: hash={}, name={}", file_hash, file_name);
+    Ok(file_hash)
+}
+
+#[tauri::command]
+async fn get_video_data(file_hash: String, state: State<'_, AppState>) -> Result<String, String> {
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+
+    // Load video data from chunks
+    let data = storage::object::load(&conn, &file_hash, None)
+        .map_err(|e| format!("Failed to load video: {}", e))?;
+
+    // Get mime type from files table
+    let mime_type: String = conn
+        .query_row(
+            "SELECT COALESCE(mime_type, 'video/mp4') FROM files WHERE file_hash = ?1",
+            [&file_hash],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "video/mp4".to_string());
+
+    // Return as base64 data URL
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let b64 = STANDARD.encode(&data);
+    let data_url = format!("data:{};base64,{}", mime_type, b64);
+
+    Ok(data_url)
+}
+
+#[tauri::command]
 async fn get_chat_history(
     chat_id: String,
     state: State<'_, AppState>,
@@ -952,6 +1063,8 @@ pub fn run() {
             get_unread_counts,
             send_document_message,
             save_document_to_file,
+            send_video_message,
+            get_video_data,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -217,5 +217,18 @@
       };
       messages = [...messages, newMsg];
     }}
+    onVideoSent={(fileHash, fileName) => {
+      // Add sent video to messages list
+      const newMsg: Message = {
+        id: `vid-${Date.now()}`,
+        sender: "Me",
+        text: fileName,
+        timestamp: new Date(),
+        status: "delivered",
+        content_type: "video",
+        file_hash: fileHash,
+      };
+      messages = [...messages, newMsg];
+    }}
   />
 </div>

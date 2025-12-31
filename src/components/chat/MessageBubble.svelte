@@ -4,6 +4,7 @@
   import { save } from "@tauri-apps/plugin-dialog";
   import { onMount, onDestroy } from "svelte";
   import ImageViewer from "./ImageViewer.svelte";
+  import VideoViewer from "./VideoViewer.svelte";
 
   export let msg: {
     sender: string;
@@ -19,6 +20,7 @@
   $: isMe = msg.sender === "Me";
   $: isImage = msg.content_type === "image" && msg.file_hash;
   $: isDocument = msg.content_type === "document" && msg.file_hash;
+  $: isVideo = msg.content_type === "video" && msg.file_hash;
 
   let imageDataUrl: string | null = null;
   let loadingImage = false;
@@ -26,6 +28,7 @@
   let loadError = false;
   let unlistenTransfer: (() => void) | null = null;
   let showViewer = false;
+  let showVideoViewer = false;
 
   // Load image when this is an image message
   $: if (isImage && msg.file_hash && !imageDataUrl && !loadingImage) {
@@ -282,6 +285,35 @@
             </svg>
           {/if}
         </button>
+      {:else if isVideo}
+        <!-- Video content -->
+        <button
+          on:click={() => (showVideoViewer = true)}
+          class="relative w-48 h-32 bg-slate-800 rounded-lg overflow-hidden cursor-pointer hover:opacity-90 transition-opacity border border-slate-600"
+        >
+          <!-- Video icon/thumbnail -->
+          <div
+            class="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-pink-500/20 to-purple-500/20"
+          >
+            <div
+              class="w-12 h-12 rounded-full bg-white/20 flex items-center justify-center backdrop-blur-sm"
+            >
+              <svg
+                class="w-6 h-6 text-white ml-1"
+                fill="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path d="M8 5v14l11-7z" />
+              </svg>
+            </div>
+          </div>
+          <!-- Filename label -->
+          <div class="absolute bottom-0 left-0 right-0 bg-black/60 px-2 py-1">
+            <span class="text-xs text-white truncate block"
+              >{msg.text || "Video"}</span
+            >
+          </div>
+        </button>
       {:else}
         <!-- Text content -->
         <span>{msg.text}</span>
@@ -344,6 +376,14 @@
     {imageDataUrl}
     fileHash={msg.file_hash}
     on:close={() => (showViewer = false)}
+  />
+{/if}
+
+<!-- Fullscreen video viewer -->
+{#if showVideoViewer && msg.file_hash}
+  <VideoViewer
+    fileHash={msg.file_hash}
+    on:close={() => (showVideoViewer = false)}
   />
 {/if}
 

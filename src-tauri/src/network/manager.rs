@@ -346,6 +346,61 @@ impl NetworkManager {
             }
         }
 
+        // Handle video messages (__VIDEO_MSG__:file_hash:target_peer_id:filename_b64)
+        if msg_content.starts_with("__VIDEO_MSG__:") {
+            let parts: Vec<&str> = msg_content.splitn(4, ':').collect();
+            if parts.len() >= 4 {
+                let file_hash = parts[1];
+                let target_peer_id = parts[2];
+                let filename_b64 = parts[3];
+
+                // Decode filename from base64
+                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                let file_name = STANDARD.decode(filename_b64)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .unwrap_or_else(|| "video.mp4".to_string());
+
+                if target_peer_id != "General" {
+                    println!("[Video] 📤 Sending video {} ({}) to {}", file_hash, file_name, target_peer_id);
+                    
+                    if let Ok(peer_id) = target_peer_id.parse::<PeerId>() {
+                        use crate::network::direct_message::DirectMessageRequest;
+                        let request = DirectMessageRequest {
+                            id: format!(
+                                "vid-{}",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs()
+                            ),
+                            sender_id: self.swarm.local_peer_id().to_string(),
+                            msg_type: "video".to_string(),
+                            text_content: Some(file_name), // Filename in text_content
+                            file_hash: Some(file_hash.to_string()),
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs() as i64,
+                            chunk_hash: None,
+                            chunk_data: None,
+                            chunk_list: None,
+                        };
+
+                        self.swarm
+                            .behaviour_mut()
+                            .direct_message
+                            .send_request(&peer_id, request);
+                        println!("[Video] ✅ Direct request sent to {}", peer_id);
+                        return;
+                    } else {
+                        eprintln!("[Video] ❌ Invalid peer_id: {}", target_peer_id);
+                        return;
+                    }
+                }
+            }
+        }
+
         // 1. Define the Topic (Like a TV Channel)
         let topic = libp2p::gossipsub::IdentTopic::new("global-chat");
 
