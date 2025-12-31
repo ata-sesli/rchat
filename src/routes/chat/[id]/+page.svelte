@@ -12,6 +12,8 @@
     text: string;
     timestamp: Date;
     status?: string;
+    content_type?: string;
+    file_hash?: string;
   };
 
   // Props/State
@@ -47,6 +49,8 @@
         text: m.text_content || "",
         timestamp: new Date(m.timestamp * 1000),
         status: m.status || "delivered",
+        content_type: m.content_type,
+        file_hash: m.file_hash,
       }));
     } catch (e) {
       console.error("Failed to load history for", peerId, e);
@@ -74,12 +78,14 @@
       if (relatedPeer === "self") relatedPeer = "Me";
 
       if (relatedPeer === activePeer) {
-        const newMsg = {
+        const newMsg: Message = {
           id: msg.msg_id,
           sender: msg.peer_id === "Me" ? "Me" : msg.peer_id,
           text: msg.text_content || "",
           timestamp: new Date(msg.timestamp * 1000),
-          status: "read", // We're viewing this chat, so mark as read immediately
+          status: "read",
+          content_type: msg.file_hash ? "image" : "text",
+          file_hash: msg.file_hash,
         };
         messages = [...messages, newMsg];
 

@@ -178,6 +178,9 @@ impl NetworkManager {
                         text_content: Some(content.to_string()),
                         file_hash: None,
                         timestamp,
+                        chunk_hash: None,
+                        chunk_data: None,
+                        chunk_list: None,
                     };
 
                     self.swarm
@@ -216,12 +219,15 @@ impl NetworkManager {
                         ),
                         sender_id: self.swarm.local_peer_id().to_string(),
                         msg_type: "read_receipt".to_string(),
-                        text_content: Some(msg_ids.to_string()), // Message IDs that were read
+                        text_content: Some(msg_ids.to_string()),
                         file_hash: None,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
                             .as_secs() as i64,
+                        chunk_hash: None,
+                        chunk_data: None,
+                        chunk_list: None,
                     };
 
                     self.swarm
@@ -265,6 +271,9 @@ impl NetworkManager {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap()
                                 .as_secs() as i64,
+                            chunk_hash: None,
+                            chunk_data: None,
+                            chunk_list: None,
                         };
 
                         self.swarm
@@ -523,10 +532,13 @@ impl NetworkManager {
                                     let request = DirectMessageRequest {
                                         id: format!("{}-{}", timestamp, id_suffix),
                                         sender_id: self.swarm.local_peer_id().to_string(),
-                                        msg_type: "file_request".to_string(),
+                                        msg_type: "file_metadata_request".to_string(),
                                         text_content: None,
                                         file_hash: Some(file_hash.to_string()),
                                         timestamp,
+                                        chunk_hash: None,
+                                        chunk_data: None,
+                                        chunk_list: None,
                                     };
 
                                     println!(
@@ -717,6 +729,33 @@ impl NetworkManager {
                                                     }
                                                 }
 
+                                                // For image messages, request the file chunks from sender
+                                                if request.msg_type == "image" {
+                                                    if let Some(ref file_hash) = request.file_hash {
+                                                        println!("[ChunkTransfer] 📤 Requesting metadata for {}", file_hash);
+                                                        
+                                                        let metadata_req = DirectMessageRequest {
+                                                            id: format!("meta-req-{}", file_hash),
+                                                            sender_id: self.swarm.local_peer_id().to_string(),
+                                                            msg_type: "file_metadata_request".to_string(),
+                                                            text_content: None,
+                                                            file_hash: Some(file_hash.clone()),
+                                                            timestamp: std::time::SystemTime::now()
+                                                                .duration_since(std::time::UNIX_EPOCH)
+                                                                .unwrap()
+                                                                .as_secs() as i64,
+                                                            chunk_hash: None,
+                                                            chunk_data: None,
+                                                            chunk_list: None,
+                                                        };
+                                                        
+                                                        self.swarm
+                                                            .behaviour_mut()
+                                                            .direct_message
+                                                            .send_request(&peer, metadata_req);
+                                                    }
+                                                }
+
                                                 // Emit event to frontend
                                                 let _ = self.app_handle.emit(
                                                     "message-received",
@@ -793,22 +832,67 @@ impl NetworkManager {
                                                     .direct_message
                                                     .send_response(channel, response);
                                             }
-                                            "file_request" => {
-                                                // Legacy file transfer support
+                                            "file_metadata_request" => {
+                                                // Return list of chunks for requested file
                                                 if let Some(ref file_hash) = request.file_hash {
                                                     println!(
-                                                        "[DM] 📥 File request for: {}",
+                                                        "[ChunkTransfer] 📋 Metadata request for: {}",
                                                         file_hash
                                                     );
-                                                    // Note: File transfer via request-response needs separate handling
-                                                    // For now just acknowledge
+                                                    
+                                                    use tauri::Manager;
+                                                    let state = self.app_handle.state::<crate::AppState>();
+                                                    
+                                                    if let Ok(conn) = state.db_conn.lock() {
+                                                        // Query chunks from database
+                                                        let mut stmt = conn.prepare(
+                                                            "SELECT chunk_hash, chunk_order, chunk_size FROM file_chunks WHERE file_hash = ?1 ORDER BY chunk_order"
+                                                        ).ok();
+                                                        
+                                                        let chunks: Vec<crate::network::direct_message::ChunkInfo> = if let Some(ref mut s) = stmt {
+                                                            s.query_map([file_hash], |row| {
+                                                                Ok(crate::network::direct_message::ChunkInfo {
+                                                                    chunk_hash: row.get(0)?,
+                                                                    chunk_order: row.get(1)?,
+                                                                    chunk_size: row.get(2)?,
+                                                                })
+                                                            }).ok()
+                                                            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                                                            .unwrap_or_default()
+                                                        } else {
+                                                            Vec::new()
+                                                        };
+                                                        
+                                                        println!("[ChunkTransfer] 📋 Returning {} chunks", chunks.len());
+                                                        
+                                                        // Send metadata response via DirectMessageRequest
+                                                        let response_req = DirectMessageRequest {
+                                                            id: format!("meta-resp-{}", request.id),
+                                                            sender_id: self.swarm.local_peer_id().to_string(),
+                                                            msg_type: "file_metadata_response".to_string(),
+                                                            text_content: None,
+                                                            file_hash: Some(file_hash.clone()),
+                                                            timestamp: std::time::SystemTime::now()
+                                                                .duration_since(std::time::UNIX_EPOCH)
+                                                                .unwrap()
+                                                                .as_secs() as i64,
+                                                            chunk_hash: None,
+                                                            chunk_data: None,
+                                                            chunk_list: Some(chunks),
+                                                        };
+                                                        
+                                                        // Send as new request back to peer
+                                                        self.swarm
+                                                            .behaviour_mut()
+                                                            .direct_message
+                                                            .send_request(&peer, response_req);
+                                                    }
+                                                    
+                                                    // Acknowledge original request
                                                     let response = DirectMessageResponse {
                                                         msg_id: request.id.clone(),
-                                                        status: "error".to_string(),
-                                                        error: Some(
-                                                            "File transfer not yet implemented"
-                                                                .to_string(),
-                                                        ),
+                                                        status: "delivered".to_string(),
+                                                        error: None,
                                                     };
                                                     let _ = self
                                                         .swarm
@@ -816,6 +900,224 @@ impl NetworkManager {
                                                         .direct_message
                                                         .send_response(channel, response);
                                                 }
+                                            }
+                                            "chunk_request" => {
+                                                // Return chunk data for requested chunk_hash
+                                                if let Some(ref chunk_hash) = request.chunk_hash {
+                                                    println!(
+                                                        "[ChunkTransfer] 📦 Chunk request for: {}",
+                                                        chunk_hash
+                                                    );
+                                                    
+                                                    // Load chunk from disk
+                                                    let chunks_dir = directories::ProjectDirs::from("io.github", "ata-sesli", "RChat")
+                                                        .map(|p| p.data_dir().join("chunks"))
+                                                        .unwrap_or_else(|| std::path::PathBuf::from("chunks"));
+                                                    
+                                                    let chunk_path = chunks_dir.join(chunk_hash);
+                                                    
+                                                    if let Ok(chunk_data) = std::fs::read(&chunk_path) {
+                                                        let chunk_b64 = base64::Engine::encode(
+                                                            &base64::engine::general_purpose::STANDARD,
+                                                            &chunk_data
+                                                        );
+                                                        
+                                                        println!("[ChunkTransfer] 📦 Sending chunk {} ({} bytes)", chunk_hash, chunk_data.len());
+                                                        
+                                                        // Send chunk data as new request
+                                                        let response_req = DirectMessageRequest {
+                                                            id: format!("chunk-resp-{}", request.id),
+                                                            sender_id: self.swarm.local_peer_id().to_string(),
+                                                            msg_type: "chunk_response".to_string(),
+                                                            text_content: None,
+                                                            file_hash: request.file_hash.clone(),
+                                                            timestamp: std::time::SystemTime::now()
+                                                                .duration_since(std::time::UNIX_EPOCH)
+                                                                .unwrap()
+                                                                .as_secs() as i64,
+                                                            chunk_hash: Some(chunk_hash.clone()),
+                                                            chunk_data: Some(chunk_b64),
+                                                            chunk_list: None,
+                                                        };
+                                                        
+                                                        self.swarm
+                                                            .behaviour_mut()
+                                                            .direct_message
+                                                            .send_request(&peer, response_req);
+                                                    } else {
+                                                        eprintln!("[ChunkTransfer] ❌ Chunk not found: {}", chunk_hash);
+                                                    }
+                                                    
+                                                    // Acknowledge
+                                                    let response = DirectMessageResponse {
+                                                        msg_id: request.id.clone(),
+                                                        status: "delivered".to_string(),
+                                                        error: None,
+                                                    };
+                                                    let _ = self
+                                                        .swarm
+                                                        .behaviour_mut()
+                                                        .direct_message
+                                                        .send_response(channel, response);
+                                                }
+                                            }
+                                            "file_metadata_response" => {
+                                                // Received chunk list - request each chunk
+                                                if let (Some(ref file_hash), Some(ref chunks)) = (&request.file_hash, &request.chunk_list) {
+                                                    println!(
+                                                        "[ChunkTransfer] 📋 Received {} chunks for {}",
+                                                        chunks.len(), file_hash
+                                                    );
+                                                    
+                                                    // Request each chunk
+                                                    for chunk_info in chunks {
+                                                        let chunk_req = DirectMessageRequest {
+                                                            id: format!("chunk-req-{}-{}", file_hash, chunk_info.chunk_order),
+                                                            sender_id: self.swarm.local_peer_id().to_string(),
+                                                            msg_type: "chunk_request".to_string(),
+                                                            text_content: None,
+                                                            file_hash: Some(file_hash.clone()),
+                                                            timestamp: std::time::SystemTime::now()
+                                                                .duration_since(std::time::UNIX_EPOCH)
+                                                                .unwrap()
+                                                                .as_secs() as i64,
+                                                            chunk_hash: Some(chunk_info.chunk_hash.clone()),
+                                                            chunk_data: None,
+                                                            chunk_list: None,
+                                                        };
+                                                        
+                                                        self.swarm
+                                                            .behaviour_mut()
+                                                            .direct_message
+                                                            .send_request(&peer, chunk_req);
+                                                        
+                                                        println!("[ChunkTransfer] 📤 Requested chunk {}/{}", 
+                                                            chunk_info.chunk_order + 1, chunks.len());
+                                                    }
+                                                    
+                                                    // Store expected chunk count in DB for completion tracking
+                                                    {
+                                                        use tauri::Manager;
+                                                        let state = self.app_handle.state::<crate::AppState>();
+                                                        let lock_result = state.db_conn.lock();
+                                                        if let Ok(conn) = lock_result {
+                                                            // Insert chunk metadata records
+                                                            for chunk_info in chunks {
+                                                                let _ = conn.execute(
+                                                                    "INSERT OR IGNORE INTO file_chunks (file_hash, chunk_order, chunk_hash, chunk_size) VALUES (?1, ?2, ?3, ?4)",
+                                                                    rusqlite::params![
+                                                                        file_hash,
+                                                                        chunk_info.chunk_order,
+                                                                        chunk_info.chunk_hash,
+                                                                        chunk_info.chunk_size
+                                                                    ]
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                // Acknowledge
+                                                let response = DirectMessageResponse {
+                                                    msg_id: request.id.clone(),
+                                                    status: "delivered".to_string(),
+                                                    error: None,
+                                                };
+                                                let _ = self
+                                                    .swarm
+                                                    .behaviour_mut()
+                                                    .direct_message
+                                                    .send_response(channel, response);
+                                            }
+                                            "chunk_response" => {
+                                                // Received chunk data - save to disk
+                                                if let (Some(ref file_hash), Some(ref chunk_hash), Some(ref chunk_b64)) = 
+                                                    (&request.file_hash, &request.chunk_hash, &request.chunk_data) 
+                                                {
+                                                    use base64::Engine;
+                                                    
+                                                    if let Ok(chunk_data) = base64::engine::general_purpose::STANDARD.decode(chunk_b64) {
+                                                        // Save chunk to disk
+                                                        let chunks_dir = directories::ProjectDirs::from("io.github", "ata-sesli", "RChat")
+                                                            .map(|p| p.data_dir().join("chunks"))
+                                                            .unwrap_or_else(|| std::path::PathBuf::from("chunks"));
+                                                        
+                                                        let _ = std::fs::create_dir_all(&chunks_dir);
+                                                        let chunk_path = chunks_dir.join(chunk_hash);
+                                                        
+                                                        if let Err(e) = std::fs::write(&chunk_path, &chunk_data) {
+                                                            eprintln!("[ChunkTransfer] ❌ Failed to save chunk {}: {}", chunk_hash, e);
+                                                        } else {
+                                                            println!("[ChunkTransfer] 💾 Saved chunk {} ({} bytes)", chunk_hash, chunk_data.len());
+                                                        }
+                                                        
+                                                        // Check if all chunks received
+                                                        let file_complete = {
+                                                            use tauri::Manager;
+                                                            let state = self.app_handle.state::<crate::AppState>();
+                                                            let mut is_complete = false;
+                                                            if let Ok(conn) = state.db_conn.lock() {
+                                                                // Count expected vs received chunks
+                                                                let expected: i64 = conn.query_row(
+                                                                    "SELECT COUNT(*) FROM file_chunks WHERE file_hash = ?1",
+                                                                    [file_hash],
+                                                                    |row| row.get(0)
+                                                                ).unwrap_or(0);
+                                                                
+                                                                // Count chunks actually on disk
+                                                                let mut received = 0i64;
+                                                                if let Ok(mut stmt) = conn.prepare(
+                                                                    "SELECT chunk_hash FROM file_chunks WHERE file_hash = ?1"
+                                                                ) {
+                                                                    if let Ok(rows) = stmt.query_map([file_hash], |row| row.get::<_, String>(0)) {
+                                                                        for hash_result in rows {
+                                                                            if let Ok(hash) = hash_result {
+                                                                                if chunks_dir.join(&hash).exists() {
+                                                                                    received += 1;
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                
+                                                                println!("[ChunkTransfer] Progress: {}/{} chunks", received, expected);
+                                                                
+                                                                if received == expected && expected > 0 {
+                                                                    // All chunks received! Mark file as complete
+                                                                    let _ = conn.execute(
+                                                                        "UPDATE files SET is_complete = 1 WHERE file_hash = ?1",
+                                                                        [file_hash]
+                                                                    );
+                                                                    println!("[ChunkTransfer] ✅ File {} complete!", file_hash);
+                                                                    is_complete = true;
+                                                                }
+                                                            }
+                                                            is_complete
+                                                        };
+                                                        
+                                                        if file_complete {
+                                                            // Emit event to frontend (outside DB scope)
+                                                            let _ = self.app_handle.emit(
+                                                                "file-transfer-complete",
+                                                                serde_json::json!({ "file_hash": file_hash })
+                                                            );
+                                                        }
+                                                    } else {
+                                                        eprintln!("[ChunkTransfer] ❌ Failed to decode chunk data");
+                                                    }
+                                                }
+                                                
+                                                // Acknowledge
+                                                let response = DirectMessageResponse {
+                                                    msg_id: request.id.clone(),
+                                                    status: "delivered".to_string(),
+                                                    error: None,
+                                                };
+                                                let _ = self
+                                                    .swarm
+                                                    .behaviour_mut()
+                                                    .direct_message
+                                                    .send_response(channel, response);
                                             }
                                             _ => {
                                                 println!(
