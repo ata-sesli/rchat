@@ -26,6 +26,7 @@
   export let onsend = (msg: string) => {};
   export let ontoggleAttachments = (show: boolean) => {};
   export let onImageSent = (fileHash: string) => {};
+  export let onDocumentSent = (fileHash: string, fileName: string) => {};
 
   // Refs
   let chatContainer: HTMLElement;
@@ -53,6 +54,10 @@
     // Send pending images first if any
     if (pendingImages.length > 0) {
       sendPendingImages();
+    }
+    // Send pending documents
+    if (pendingDocuments.length > 0) {
+      sendPendingDocuments();
     }
 
     // Then send text message if any
@@ -142,6 +147,78 @@
       console.error("Failed to send image:", e);
     } finally {
       isSendingImage = false;
+    }
+  }
+
+  // Pending documents to preview before sending
+  type PendingDocument = { path: string; name: string; size: number };
+  let pendingDocuments: PendingDocument[] = [];
+  let isSendingDocument = false;
+
+  async function pickDocument() {
+    try {
+      const filePath = await open({
+        filters: [
+          {
+            name: "Documents",
+            extensions: [
+              "pdf",
+              "doc",
+              "docx",
+              "txt",
+              "xls",
+              "xlsx",
+              "ppt",
+              "pptx",
+              "csv",
+            ],
+          },
+        ],
+        multiple: false,
+        directory: false,
+      });
+
+      if (!filePath) return; // User cancelled
+
+      const fileName = (filePath as string).split("/").pop() || "document";
+      // Get file size via metadata (approximate for now)
+      const newDoc: PendingDocument = {
+        path: filePath as string,
+        name: fileName,
+        size: 0,
+      };
+      pendingDocuments = [...pendingDocuments, newDoc];
+      showAttachments = false;
+      console.log("Document queued:", filePath);
+    } catch (e) {
+      console.error("Failed to pick document:", e);
+    }
+  }
+
+  function removeDocument(index: number) {
+    pendingDocuments = pendingDocuments.filter((_, i) => i !== index);
+  }
+
+  async function sendPendingDocuments() {
+    if (pendingDocuments.length === 0) return;
+    if (isSendingDocument) return;
+
+    isSendingDocument = true;
+    try {
+      for (const doc of pendingDocuments) {
+        console.log("Sending document:", doc.path);
+        const fileHash = await invoke<string>("send_document_message", {
+          peerId: activePeer,
+          filePath: doc.path,
+        });
+        console.log("Document sent with hash:", fileHash);
+        onDocumentSent(fileHash, doc.name);
+      }
+      pendingDocuments = [];
+    } catch (e) {
+      console.error("Failed to send document:", e);
+    } finally {
+      isSendingDocument = false;
     }
   }
 
@@ -253,6 +330,37 @@
     </div>
   {/if}
 
+  <!-- Pending Documents Preview -->
+  {#if pendingDocuments.length > 0}
+    <div
+      class="mb-3 flex gap-2 flex-wrap bg-slate-900/60 border border-slate-700/50 rounded-xl p-3"
+    >
+      {#each pendingDocuments as doc, index}
+        <div
+          class="relative group flex items-center gap-2 bg-slate-800 rounded-lg p-2 pr-8 border border-slate-600"
+        >
+          <span class="text-xl">
+            {#if doc.name.endsWith(".pdf")}📕
+            {:else if doc.name.endsWith(".doc") || doc.name.endsWith(".docx")}📘
+            {:else if doc.name.endsWith(".xls") || doc.name.endsWith(".xlsx")}📗
+            {:else if doc.name.endsWith(".ppt") || doc.name.endsWith(".pptx")}📙
+            {:else}📄
+            {/if}
+          </span>
+          <span class="text-xs text-slate-300 truncate max-w-[120px]"
+            >{doc.name}</span
+          >
+          <button
+            on:click={() => removeDocument(index)}
+            class="absolute top-1 right-1 w-5 h-5 bg-red-500 hover:bg-red-400 text-white rounded-full flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+          >
+            ×
+          </button>
+        </div>
+      {/each}
+    </div>
+  {/if}
+
   <div
     class="bg-slate-900/90 backdrop-blur-md border border-slate-700 rounded-2xl p-1.5 shadow-2xl flex items-center gap-2 relative"
   >
@@ -310,7 +418,9 @@
           </button>
           <div class="h-px bg-slate-700/50"></div>
           <button
+            on:click={pickDocument}
             class="w-full text-left px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 hover:text-white flex items-center gap-3 transition-colors"
+            disabled={isSendingDocument}
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -326,7 +436,11 @@
                 d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
               />
             </svg>
-            Document
+            {#if isSendingDocument}
+              Sending...
+            {:else}
+              Document
+            {/if}
           </button>
           <div class="h-px bg-slate-700/50"></div>
           <button

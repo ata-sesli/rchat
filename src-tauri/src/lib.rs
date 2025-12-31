@@ -1,3 +1,4 @@
+mod chat;
 mod network;
 mod oauth;
 mod storage; // New module
@@ -330,6 +331,7 @@ async fn send_message_to_self(message: String, state: State<'_, AppState>) -> Re
         text_content: Some(message),
         file_hash: None,
         status: "read".to_string(), // Self messages are always read
+        content_metadata: None,
     };
 
     match storage::db::insert_message(&conn, &msg) {
@@ -388,6 +390,7 @@ async fn send_message(
             text_content: Some(message.clone()),
             file_hash: None,
             status: "pending".to_string(), // Outgoing = pending until delivered
+            content_metadata: None,
         };
 
         if let Err(e) = storage::db::insert_message(&conn, &msg) {
@@ -474,15 +477,18 @@ async fn send_image_message(
 
     {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
+        // For self chat, use 'self' as chat_id
+        let chat_id = if peer_id == "Me" { "self".to_string() } else { peer_id.clone() };
         let msg = storage::db::Message {
             id: msg_id.clone(),
-            chat_id: peer_id.clone(),
+            chat_id,
             peer_id: "Me".to_string(),
             timestamp,
             content_type: "image".to_string(),
             text_content: None,
             file_hash: Some(file_hash.clone()),
-            status: "pending".to_string(), // Outgoing = pending until delivered
+            status: if peer_id == "Me" { "read".to_string() } else { "pending".to_string() },
+            content_metadata: None,
         };
 
         if let Err(e) = storage::db::insert_message(&conn, &msg) {
@@ -491,11 +497,12 @@ async fn send_image_message(
         }
     }
 
-    // 4. Broadcast via network
-    // Format: __IMAGE_MSG__:<file_hash>:<from_peer>
-    let broadcast_msg = format!("__IMAGE_MSG__:{}:{}", file_hash, peer_id);
-    let tx = net_state.sender.lock().await;
-    tx.send(broadcast_msg).await.map_err(|e| e.to_string())?;
+    // 4. Broadcast via network (skip for self messages)
+    if peer_id != "Me" {
+        let broadcast_msg = format!("__IMAGE_MSG__:{}:{}", file_hash, peer_id);
+        let tx = net_state.sender.lock().await;
+        tx.send(broadcast_msg).await.map_err(|e| e.to_string())?;
+    }
 
     println!("[Backend] Image message sent: hash={}", file_hash);
     Ok(file_hash)
@@ -574,13 +581,141 @@ async fn save_image_to_file(
 }
 
 #[tauri::command]
+async fn send_document_message(
+    peer_id: String,
+    file_path: String,
+    app_state: State<'_, AppState>,
+    net_state: State<'_, NetworkState>,
+) -> Result<String, String> {
+    println!("[Backend] Sending document to {}: {}", peer_id, file_path);
+
+    // 1. Read file and get original filename
+    let file_data = std::fs::read(&file_path)
+        .map_err(|e| format!("Failed to read document: {}", e))?;
+
+    let file_name = std::path::Path::new(&file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "document".to_string());
+
+    // Determine mime type from extension
+    let mime_type = match file_path.rsplit('.').next() {
+        Some("pdf") => "application/pdf",
+        Some("doc") => "application/msword",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("txt") => "text/plain",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("ppt") => "application/vnd.ms-powerpoint",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("csv") => "text/csv",
+        _ => "application/octet-stream",
+    };
+
+    // 2. Store with FastCDC chunking
+    let file_hash = {
+        let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
+        storage::object::create(
+            &conn,
+            &file_data,
+            Some(&file_name),
+            Some(mime_type),
+            None,
+        )
+        .map_err(|e| format!("Failed to store document: {}", e))?
+    };
+
+    // 3. Persist message to DB
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let id_suffix: u32 = rand::random();
+    let msg_id = format!("{}-{}", timestamp, id_suffix);
+
+    {
+        let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
+        // For self chat, use 'self' as chat_id
+        let chat_id = if peer_id == "Me" { "self".to_string() } else { peer_id.clone() };
+        let msg = storage::db::Message {
+            id: msg_id.clone(),
+            chat_id,
+            peer_id: "Me".to_string(),
+            timestamp,
+            content_type: "document".to_string(),
+            text_content: Some(file_name.clone()), // Store filename in text_content
+            file_hash: Some(file_hash.clone()),
+            status: if peer_id == "Me" { "read".to_string() } else { "pending".to_string() },
+            content_metadata: Some(format!("{{\"size_bytes\":{}}}", file_data.len())),
+        };
+
+        if let Err(e) = storage::db::insert_message(&conn, &msg) {
+            eprintln!("[Backend] Failed to save document message: {}", e);
+            return Err(e.to_string());
+        }
+    }
+
+    // 4. Broadcast via network (skip for self messages)
+    if peer_id != "Me" {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let filename_b64 = STANDARD.encode(&file_name);
+        let broadcast_msg = format!("__DOCUMENT_MSG__:{}:{}:{}", file_hash, peer_id, filename_b64);
+        let tx = net_state.sender.lock().await;
+        tx.send(broadcast_msg).await.map_err(|e| e.to_string())?;
+    }
+
+    println!("[Backend] Document message sent: hash={}, name={}", file_hash, file_name);
+    Ok(file_hash)
+}
+
+#[tauri::command]
+async fn save_document_to_file(
+    file_hash: String,
+    target_path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+
+    // Load document data from chunks
+    let data = storage::object::load(&conn, &file_hash, None)
+        .map_err(|e| format!("Failed to load document: {}", e))?;
+
+    // Write to target path
+    std::fs::write(&target_path, &data)
+        .map_err(|e| format!("Failed to save document: {}", e))?;
+
+    println!("[Backend] Document saved to: {}", target_path);
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_chat_history(
     chat_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<storage::db::Message>, String> {
     println!("[Backend] get_chat_history for: {}", chat_id);
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
-    let messages = storage::db::get_messages(&conn, &chat_id).map_err(|e| e.to_string())?;
+    let mut messages = storage::db::get_messages(&conn, &chat_id).map_err(|e| e.to_string())?;
+    
+    // Hydrate photo messages that don't have cached metadata
+    for db_msg in &mut messages {
+        // Only hydrate photos/images that are missing metadata
+        if (db_msg.content_type == "photo" || db_msg.content_type == "image") 
+           && db_msg.content_metadata.is_none() 
+           && db_msg.file_hash.is_some() 
+        {
+            // Convert to rich type, hydrate, then update db_msg
+            let mut rich_msg = chat::message::Message::from_db_row(db_msg);
+            if rich_msg.hydrate(&conn) {
+                // Update the db_msg with cached metadata for return
+                let updated = rich_msg.to_db_row();
+                db_msg.content_metadata = updated.content_metadata;
+            }
+        }
+    }
+    
     println!("[Backend] Found {} messages", messages.len());
     Ok(messages)
 }
@@ -815,6 +950,8 @@ pub fn run() {
             save_image_to_file,
             mark_messages_read,
             get_unread_counts,
+            send_document_message,
+            save_document_to_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

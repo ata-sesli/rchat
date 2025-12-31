@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
+  import { save } from "@tauri-apps/plugin-dialog";
   import { onMount, onDestroy } from "svelte";
   import ImageViewer from "./ImageViewer.svelte";
 
@@ -17,6 +18,7 @@
 
   $: isMe = msg.sender === "Me";
   $: isImage = msg.content_type === "image" && msg.file_hash;
+  $: isDocument = msg.content_type === "document" && msg.file_hash;
 
   let imageDataUrl: string | null = null;
   let loadingImage = false;
@@ -81,6 +83,61 @@
       hour: "2-digit",
       minute: "2-digit",
     });
+  }
+
+  // Document download
+  let downloadingDocument = false;
+
+  async function downloadDocument() {
+    if (!msg.file_hash) return;
+    downloadingDocument = true;
+    try {
+      const fileName = msg.text || "document";
+      const targetPath = await save({
+        defaultPath: fileName,
+        filters: [{ name: "All Files", extensions: ["*"] }],
+      });
+      if (!targetPath) {
+        downloadingDocument = false;
+        return; // User cancelled
+      }
+      await invoke("save_document_to_file", {
+        fileHash: msg.file_hash,
+        targetPath,
+      });
+      console.log("Document saved to:", targetPath);
+    } catch (e) {
+      console.error("Failed to download document:", e);
+    } finally {
+      downloadingDocument = false;
+    }
+  }
+
+  function getDocumentIcon(fileName: string): string {
+    const ext = fileName.split(".").pop()?.toLowerCase() || "";
+    switch (ext) {
+      case "pdf":
+        return "📕";
+      case "doc":
+      case "docx":
+        return "📘";
+      case "xls":
+      case "xlsx":
+        return "📗";
+      case "ppt":
+      case "pptx":
+        return "📙";
+      case "txt":
+        return "📄";
+      default:
+        return "📄";
+    }
+  }
+
+  function formatFileSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 </script>
 
@@ -184,6 +241,47 @@
             <span class="text-xs text-slate-400">Image not available</span>
           </div>
         {/if}
+      {:else if isDocument}
+        <!-- Document content -->
+        <button
+          on:click={downloadDocument}
+          disabled={downloadingDocument}
+          class="flex items-center gap-3 p-3 bg-slate-700/50 rounded-lg hover:bg-slate-600/50 transition-colors cursor-pointer border border-slate-600 min-w-[200px]"
+        >
+          <span class="text-2xl">{getDocumentIcon(msg.text || "document")}</span
+          >
+          <div class="flex flex-col items-start flex-1 min-w-0">
+            <span class="text-sm font-medium text-white truncate max-w-[180px]"
+              >{msg.text || "Document"}</span
+            >
+            <span class="text-xs text-slate-400">
+              {#if downloadingDocument}
+                Downloading...
+              {:else}
+                Click to download
+              {/if}
+            </span>
+          </div>
+          {#if downloadingDocument}
+            <div
+              class="animate-spin w-5 h-5 border-2 border-white border-t-transparent rounded-full"
+            ></div>
+          {:else}
+            <svg
+              class="w-5 h-5 text-slate-400"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
+              />
+            </svg>
+          {/if}
+        </button>
       {:else}
         <!-- Text content -->
         <span>{msg.text}</span>

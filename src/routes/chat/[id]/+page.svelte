@@ -204,5 +204,18 @@
       };
       messages = [...messages, newMsg];
     }}
+    onDocumentSent={(fileHash, fileName) => {
+      // Add sent document to messages list
+      const newMsg: Message = {
+        id: `doc-${Date.now()}`,
+        sender: "Me",
+        text: fileName,
+        timestamp: new Date(),
+        status: "delivered",
+        content_type: "document",
+        file_hash: fileHash,
+      };
+      messages = [...messages, newMsg];
+    }}
   />
 </div>

@@ -37,10 +37,11 @@ pub struct Message {
     pub chat_id: String,
     pub peer_id: String,
     pub timestamp: i64,
-    pub content_type: String, // 'text', 'file'
+    pub content_type: String, // 'text', 'photo', 'video', 'document', 'voice'
     pub text_content: Option<String>,
     pub file_hash: Option<String>,
     pub status: String, // 'pending', 'delivered', 'read'
+    pub content_metadata: Option<String>, // JSON: {"width": 1920, "height": 1080, ...}
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -219,6 +220,12 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
     // Migration: Add status column if it doesn't exist
     let _ = conn.execute(
         "ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'",
+        [],
+    );
+
+    // Migration: Add content_metadata column for cached computed attributes (width, height, duration, etc.)
+    let _ = conn.execute(
+        "ALTER TABLE messages ADD COLUMN content_metadata TEXT",
         [],
     );
 
@@ -408,8 +415,8 @@ pub fn delete_peer(conn: &Connection, peer_id: &str) -> anyhow::Result<()> {
 
 pub fn insert_message(conn: &Connection, msg: &Message) -> anyhow::Result<()> {
     conn.execute(
-        "INSERT INTO messages (id, chat_id, peer_id, timestamp, content_type, text_content, file_hash, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO messages (id, chat_id, peer_id, timestamp, content_type, text_content, file_hash, status, content_metadata)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         (
             &msg.id,
             &msg.chat_id,
@@ -419,14 +426,24 @@ pub fn insert_message(conn: &Connection, msg: &Message) -> anyhow::Result<()> {
             &msg.text_content,
             &msg.file_hash,
             &msg.status,
+            &msg.content_metadata,
         ),
+    )?;
+    Ok(())
+}
+
+/// Update the cached content_metadata for a message (computed attributes like width, height, duration)
+pub fn update_content_metadata(conn: &Connection, msg_id: &str, metadata_json: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE messages SET content_metadata = ?1 WHERE id = ?2",
+        [metadata_json, msg_id],
     )?;
     Ok(())
 }
 
 pub fn get_messages(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<Message>> {
     let mut stmt = conn.prepare(
-        "SELECT id, chat_id, peer_id, timestamp, content_type, text_content, file_hash, COALESCE(status, 'delivered') as status
+        "SELECT id, chat_id, peer_id, timestamp, content_type, text_content, file_hash, COALESCE(status, 'delivered') as status, content_metadata
          FROM messages 
          WHERE chat_id = ?1 
          ORDER BY timestamp ASC",
@@ -442,6 +459,7 @@ pub fn get_messages(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<Mess
             text_content: row.get(5)?,
             file_hash: row.get(6)?,
             status: row.get(7)?,
+            content_metadata: row.get(8)?,
         })
     })?;
 
