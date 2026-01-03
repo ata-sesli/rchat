@@ -26,6 +26,19 @@ pub struct FriendEntry {
     pub leaf_index: usize,
 }
 
+/// Invitation blob with TTL tracking (2-minute lifetime)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackedInvite {
+    /// Salt for Argon2 key derivation (Base64)
+    pub salt: String,
+    /// XChaCha20 nonce (Base64)
+    pub nonce: String,
+    /// Encrypted payload (Base64)
+    pub ciphertext: String,
+    /// Unix timestamp when invite was created
+    pub created_at: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HksTree {
     // We persist the raw keys for all nodes.
@@ -46,6 +59,9 @@ pub struct PublishedBlob {
     pub roster: HashMap<String, FriendEntry>,
     pub signature: String, // Signed by Ed25519
     pub sender_x25519_pubkey: String,
+    /// Encrypted invitations with 2-minute TTL
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invitations: Vec<TrackedInvite>,
 }
 
 impl HksTree {
@@ -192,6 +208,7 @@ impl HksTree {
             roster: self.roster.clone(),
             signature: String::new(),
             sender_x25519_pubkey: BASE64.encode(encryption_pubkey.as_bytes()),
+            invitations: vec![],
         };
 
         // 4. Serialize & Sign
