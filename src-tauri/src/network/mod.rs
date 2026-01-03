@@ -3,6 +3,7 @@ pub mod direct_message;
 mod discovery;
 pub mod gist;
 pub mod hks;
+pub mod invite;
 mod manager;
 pub mod mdns; // New module
 use anyhow::Result;

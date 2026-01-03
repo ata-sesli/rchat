@@ -77,6 +77,7 @@ local-ip-address = "0.6.8"
 zeroconf = "0.17.0"
 tauri-plugin-dialog = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+zeroize = { version = "1.8.2", features = ["derive"] }
 
 [patch."https://github.com/ata-sesli/rvault"]
 rvault-core = { path = "../../rvault/crates/rvault-core" }

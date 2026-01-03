@@ -5545,6 +5545,7 @@ dependencies = [
  "tracing-subscriber",
  "x25519-dalek",
  "zeroconf",
+ "zeroize",
 ]
 
 [[package]]
