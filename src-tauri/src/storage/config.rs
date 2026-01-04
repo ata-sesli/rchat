@@ -55,6 +55,8 @@ pub struct UserConfig {
     pub is_online: bool, // Offline/Online switch
     #[serde(default)]
     pub libp2p_keypair: Option<String>, // Base64-encoded protobuf keypair for persistent peer ID
+    #[serde(default)]
+    pub pending_invitations: Option<Vec<String>>, // JSON-encoded TrackedInvite objects
 }
 
 impl Default for UserConfig {
@@ -71,6 +73,7 @@ impl Default for UserConfig {
             pinned_peers: vec![],
             is_online: false,
             libp2p_keypair: None,
+            pending_invitations: None,
         }
     }
 }

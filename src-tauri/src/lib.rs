@@ -801,6 +801,232 @@ async fn get_video_data(file_hash: String, state: State<'_, AppState>) -> Result
     Ok(data_url)
 }
 
+// ============================================================================
+// Invitation Commands
+// ============================================================================
+
+/// Generate a 14-character password for invitations
+#[tauri::command]
+async fn generate_invite_password() -> Result<String, String> {
+    Ok(rvault_core::crypto::generate_password(14, false))
+}
+
+/// Create an invitation for a friend
+#[tauri::command]
+async fn create_invite(
+    invitee: String,
+    password: String,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    use crate::network::invite;
+    use crate::network::gist;
+    
+    // 1. Get my username from config
+    let my_username = {
+        let mgr = app_state.config_manager.lock().await;
+        let config = mgr.load().await.map_err(|e| e.to_string())?;
+        config.system.github_username.clone().ok_or("GitHub username not set")?
+    };
+    
+    // 2. Get my multiaddress or IP (placeholder - use display name for now)
+    let my_address = my_username.clone();
+    
+    // 3. Generate the encrypted invite
+    let encrypted_invite = invite::generate_invite(
+        &password,
+        &my_username,
+        &invitee,
+        &my_address,
+        120, // 2-minute TTL
+    ).map_err(|e| format!("Failed to generate invite: {}", e))?;
+    
+    // 4. Track it for Gist upload
+    let tracked = gist::track_invite(encrypted_invite);
+    
+    // 5. Store in config for next publish_peer_info call
+    {
+        let mgr = app_state.config_manager.lock().await;
+        let mut config = mgr.load().await.map_err(|e| e.to_string())?;
+        
+        // Add to pending invitations list
+        if config.user.pending_invitations.is_none() {
+            config.user.pending_invitations = Some(Vec::new());
+        }
+        
+        if let Some(ref mut invites) = config.user.pending_invitations {
+            let invite_json = serde_json::to_string(&tracked)
+                .map_err(|e| format!("Failed to serialize invite: {}", e))?;
+            invites.push(invite_json);
+        }
+        
+        mgr.save(&config).await.map_err(|e| e.to_string())?;
+    }
+    
+    println!("[Backend] Created invite for {} with password len {}", invitee, password.len());
+    Ok(())
+}
+
+/// Redeem an invitation from a friend
+#[tauri::command]
+async fn redeem_invite(
+    inviter: String,
+    password: String,
+    app_state: State<'_, AppState>,
+) -> Result<String, String> {
+    use crate::network::invite;
+    use crate::network::gist;
+    
+    // 1. Get my username from config
+    let my_username = {
+        let mgr = app_state.config_manager.lock().await;
+        let config = mgr.load().await.map_err(|e| e.to_string())?;
+        config.system.github_username.clone().ok_or("GitHub username not set")?
+    };
+    
+    // 2. Fetch inviter's invitations from their Gist
+    let encrypted_invites = gist::get_friend_invitations(&inviter)
+        .await
+        .map_err(|e| format!("Failed to fetch invitations: {}", e))?;
+    
+    if encrypted_invites.is_empty() {
+        return Err("No invitations found from this user".to_string());
+    }
+    
+    // 3. Try to find and decrypt our invitation
+    let result = invite::process_invites(
+        &encrypted_invites,
+        &password,
+        &inviter,
+        &my_username,
+    ).map_err(|e| format!("Failed to process invites: {}", e))?;
+    
+    match result {
+        Some((payload, _index)) => {
+            println!("[Backend] Successfully redeemed invite from {}", inviter);
+            Ok(payload.ip_address.clone())
+        }
+        None => {
+            Err("No valid invitation found for you. Check password and usernames.".to_string())
+        }
+    }
+}
+
+/// Complete invitation redemption with friend persistence and auto-message
+#[tauri::command]
+async fn redeem_and_connect(
+    inviter: String,
+    password: String,
+    app_state: State<'_, AppState>,
+    net_state: State<'_, NetworkState>,
+) -> Result<String, String> {
+    use crate::network::invite;
+    use crate::network::gist;
+    use crate::storage::config::FriendConfig;
+    
+    // 1. Get my username
+    let my_username = {
+        let mgr = app_state.config_manager.lock().await;
+        let config = mgr.load().await.map_err(|e| e.to_string())?;
+        config.system.github_username.clone().ok_or("GitHub username not set")?
+    };
+    
+    // 2. Fetch and decrypt invite
+    let encrypted_invites = gist::get_friend_invitations(&inviter)
+        .await
+        .map_err(|e| format!("Failed to fetch invitations: {}", e))?;
+    
+    if encrypted_invites.is_empty() {
+        return Err("No invitations found from this user".to_string());
+    }
+    
+    let result = invite::process_invites(
+        &encrypted_invites,
+        &password,
+        &inviter,
+        &my_username,
+    ).map_err(|e| format!("Failed to process invites: {}", e))?;
+    
+    match result {
+        Some((payload, _index)) => {
+            let peer_id = inviter.clone();
+            
+            // 3. Add as friend to config.json
+            {
+                let mgr = app_state.config_manager.lock().await;
+                let mut config = mgr.load().await.map_err(|e| e.to_string())?;
+                
+                if !config.user.friends.iter().any(|f| f.username == peer_id) {
+                    config.user.friends.push(FriendConfig {
+                        username: peer_id.clone(),
+                        x25519_pubkey: None,
+                        ed25519_pubkey: None,
+                        leaf_index: 0,
+                        encrypted_leaf_key: None,
+                        nonce: None,
+                    });
+                    mgr.save(&config).await.map_err(|e| e.to_string())?;
+                }
+            }
+            
+            // 4. Add to SQLite database
+            {
+                let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
+                
+                // Add peer if not exists
+                if !storage::db::is_peer(&conn, &peer_id) {
+                    storage::db::add_peer(&conn, &peer_id, None, None, "gist")
+                        .map_err(|e| e.to_string())?;
+                }
+                
+                // Create chat if not exists
+                if !storage::db::chat_exists(&conn, &peer_id) {
+                    storage::db::create_chat(&conn, &peer_id, &peer_id, false)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            
+            // 5. Send automatic "Hi!" message
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            
+            // Save message to database first
+            let msg_id = {
+                let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
+                let id_suffix: u32 = rand::random();
+                let msg_id = format!("{}-{}", timestamp, id_suffix);
+                
+                let msg = storage::db::Message {
+                    id: msg_id.clone(),
+                    chat_id: peer_id.clone(),
+                    peer_id: "Me".to_string(),
+                    timestamp,
+                    content_type: "text".to_string(),
+                    text_content: Some("Hi!".to_string()),
+                    file_hash: None,
+                    status: "pending".to_string(),
+                    content_metadata: None,
+                };
+                
+                storage::db::insert_message(&conn, &msg).map_err(|e| e.to_string())?;
+                msg_id
+            };
+            
+            // Send via network
+            let tx = net_state.sender.lock().await;
+            let dm_command = format!("DM:{}:{}:{}:Hi!", peer_id, msg_id, timestamp);
+            tx.send(dm_command).await.map_err(|e| e.to_string())?;
+            
+            println!("[Backend] Successfully connected with {} and sent Hi! (ip: {})", inviter, payload.ip_address.clone());
+            Ok(peer_id) // Return peer_id for frontend navigation
+        }
+        None => {
+            Err("No valid invitation found for you. Check password and usernames.".to_string())
+        }
+    }
+}
+
 #[tauri::command]
 async fn get_chat_history(
     chat_id: String,
@@ -1065,6 +1291,11 @@ pub fn run() {
             save_document_to_file,
             send_video_message,
             get_video_data,
+            // Invitation commands
+            generate_invite_password,
+            create_invite,
+            redeem_invite,
+            redeem_and_connect,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
