@@ -16,11 +16,18 @@
 
   // Props
   export let activePeer = "Me";
+  export let peerAlias: string | null = null; // Display alias for activePeer
   export let messages: Message[] = [];
   export let userProfile: { alias: string | null; avatar_path: string | null } =
     { alias: null, avatar_path: null };
   export let message = "";
   export let showAttachments = false;
+
+  // Helper to truncate ID
+  function truncateId(id: string, maxLen = 15): string {
+    if (id.length <= maxLen) return id;
+    return id.substring(0, maxLen) + "...";
+  }
 
   // Callback props
   export let onsend = (msg: string) => {};
@@ -306,9 +313,13 @@
       {:else if activePeer === "General"}
         # General
       {:else}
-        @ {activePeer}
+        {peerAlias || activePeer}
       {/if}
     </span>
+    {#if activePeer !== "Me" && activePeer !== "General"}
+      <span class="text-xs text-slate-500 ml-2">@ {truncateId(activePeer)}</span
+      >
+    {/if}
     {#if activePeer !== "Me" && activePeer !== "General"}
       <div
         class="w-2 h-2 rounded-full bg-green-500 shadow-lg shadow-green-500/50"

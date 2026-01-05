@@ -36,6 +36,9 @@ pub struct DirectMessageRequest {
     pub chunk_data: Option<String>,
     /// List of chunks (for file_metadata_response)
     pub chunk_list: Option<Vec<ChunkInfo>>,
+    /// Sender's display name/alias
+    #[serde(default)]
+    pub sender_alias: Option<String>,
 }
 
 /// Direct message response - sent back to sender

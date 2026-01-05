@@ -11,6 +11,7 @@
     showCreateMenu = false,
     envelopes = [] as { id: string; name: string; icon?: string }[],
     sortedPeers = [] as string[],
+    peerAliases = {} as Record<string, string | null>,
     pinnedPeers = [] as string[],
     activePeer = "Me",
     userProfile = {
@@ -416,7 +417,9 @@
               <div class="flex justify-between items-baseline mb-0.5">
                 <span
                   class="font-medium text-slate-200 truncate group-hover:text-white transition-colors"
-                  >{peer === "Me" ? "Me (You)" : peer}</span
+                  >{peer === "Me"
+                    ? "Me (You)"
+                    : peerAliases[peer] || peer}</span
                 >
               </div>
               {#if peer === "Me"}

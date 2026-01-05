@@ -185,6 +185,13 @@ async fn get_friends(state: State<'_, AppState>) -> Result<Vec<FriendConfig>, St
 }
 
 #[tauri::command]
+async fn get_peer_aliases(state: State<'_, AppState>) -> Result<std::collections::HashMap<String, String>, String> {
+    println!("[Backend] get_peer_aliases called");
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+    storage::db::get_peer_aliases(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn add_friend(
     username: String,
     x25519_key: Option<String>,
@@ -197,6 +204,7 @@ async fn add_friend(
             if !config.user.friends.iter().any(|f| f.username == username) {
                 config.user.friends.push(FriendConfig {
                     username,
+                    alias: None,
                     x25519_pubkey: x25519_key,
                     ed25519_pubkey: ed25519_key,
                     leaf_index: 0, // Placeholder
@@ -332,6 +340,7 @@ async fn send_message_to_self(message: String, state: State<'_, AppState>) -> Re
         file_hash: None,
         status: "read".to_string(), // Self messages are always read
         content_metadata: None,
+        sender_alias: None, // Self messages don't need alias
     };
 
     match storage::db::insert_message(&conn, &msg) {
@@ -354,6 +363,13 @@ async fn send_message(
     net_state: State<'_, NetworkState>,
 ) -> Result<String, String> {
     println!("[Backend] send_message to {}: {}", peer_id, message);
+
+    // Get my alias from config
+    let my_alias = {
+        let mgr = app_state.config_manager.lock().await;
+        let config = mgr.load().await.map_err(|e| e.to_string())?;
+        config.user.profile.alias.clone()
+    };
 
     // 1. Persist to DB
     let msg_id_for_dm = {
@@ -391,6 +407,7 @@ async fn send_message(
             file_hash: None,
             status: "pending".to_string(), // Outgoing = pending until delivered
             content_metadata: None,
+            sender_alias: my_alias.clone(),
         };
 
         if let Err(e) = storage::db::insert_message(&conn, &msg) {
@@ -408,14 +425,16 @@ async fn send_message(
         // Group chat: use gossipsub
         tx.send(message).await.map_err(|e| e.to_string())?;
     } else {
-        // 1v1 chat: use direct message format (DM:peer_id:msg_id:timestamp:content)
+        // 1v1 chat: use direct message format (DM:peer_id:msg_id:timestamp:alias:content)
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        let dm_command = format!("DM:{}:{}:{}:{}", peer_id, msg_id_for_dm, timestamp, message);
+        let alias_str = my_alias.unwrap_or_default();
+        let dm_command = format!("DM:{}:{}:{}:{}:{}", peer_id, msg_id_for_dm, timestamp, alias_str, message);
         tx.send(dm_command).await.map_err(|e| e.to_string())?;
     }
+
 
     Ok(msg_id_for_dm)
 }
@@ -489,6 +508,7 @@ async fn send_image_message(
             file_hash: Some(file_hash.clone()),
             status: if peer_id == "Me" { "read".to_string() } else { "pending".to_string() },
             content_metadata: None,
+            sender_alias: None,
         };
 
         if let Err(e) = storage::db::insert_message(&conn, &msg) {
@@ -649,6 +669,7 @@ async fn send_document_message(
             file_hash: Some(file_hash.clone()),
             status: if peer_id == "Me" { "read".to_string() } else { "pending".to_string() },
             content_metadata: Some(format!("{{\"size_bytes\":{}}}", file_data.len())),
+            sender_alias: None,
         };
 
         if let Err(e) = storage::db::insert_message(&conn, &msg) {
@@ -755,6 +776,7 @@ async fn send_video_message(
             file_hash: Some(file_hash.clone()),
             status: if peer_id == "Me" { "read".to_string() } else { "pending".to_string() },
             content_metadata: Some(format!("{{\"size_bytes\":{}}}", file_data.len())),
+            sender_alias: None,
         };
 
         if let Err(e) = storage::db::insert_message(&conn, &msg) {
@@ -958,6 +980,7 @@ async fn redeem_and_connect(
                 if !config.user.friends.iter().any(|f| f.username == peer_id) {
                     config.user.friends.push(FriendConfig {
                         username: peer_id.clone(),
+                        alias: None,
                         x25519_pubkey: None,
                         ed25519_pubkey: None,
                         leaf_index: 0,
@@ -1007,6 +1030,7 @@ async fn redeem_and_connect(
                     file_hash: None,
                     status: "pending".to_string(),
                     content_metadata: None,
+                    sender_alias: None, // Will send alias in DM
                 };
                 
                 storage::db::insert_message(&conn, &msg).map_err(|e| e.to_string())?;
@@ -1261,6 +1285,7 @@ pub fn run() {
             poll_github_auth,
             reset_vault,
             get_friends,
+            get_peer_aliases,
             get_trusted_peers,
             add_friend,
             delete_peer,

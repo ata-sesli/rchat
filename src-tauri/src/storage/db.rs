@@ -42,6 +42,7 @@ pub struct Message {
     pub file_hash: Option<String>,
     pub status: String, // 'pending', 'delivered', 'read'
     pub content_metadata: Option<String>, // JSON: {"width": 1920, "height": 1080, ...}
+    pub sender_alias: Option<String>, // Sender's display name
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -226,6 +227,12 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
     // Migration: Add content_metadata column for cached computed attributes (width, height, duration, etc.)
     let _ = conn.execute(
         "ALTER TABLE messages ADD COLUMN content_metadata TEXT",
+        [],
+    );
+
+    // Migration: Add sender_alias column for display name from messages
+    let _ = conn.execute(
+        "ALTER TABLE messages ADD COLUMN sender_alias TEXT",
         [],
     );
 
@@ -415,8 +422,8 @@ pub fn delete_peer(conn: &Connection, peer_id: &str) -> anyhow::Result<()> {
 
 pub fn insert_message(conn: &Connection, msg: &Message) -> anyhow::Result<()> {
     conn.execute(
-        "INSERT INTO messages (id, chat_id, peer_id, timestamp, content_type, text_content, file_hash, status, content_metadata)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO messages (id, chat_id, peer_id, timestamp, content_type, text_content, file_hash, status, content_metadata, sender_alias)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         (
             &msg.id,
             &msg.chat_id,
@@ -427,6 +434,7 @@ pub fn insert_message(conn: &Connection, msg: &Message) -> anyhow::Result<()> {
             &msg.file_hash,
             &msg.status,
             &msg.content_metadata,
+            &msg.sender_alias,
         ),
     )?;
     Ok(())
@@ -443,7 +451,7 @@ pub fn update_content_metadata(conn: &Connection, msg_id: &str, metadata_json: &
 
 pub fn get_messages(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<Message>> {
     let mut stmt = conn.prepare(
-        "SELECT id, chat_id, peer_id, timestamp, content_type, text_content, file_hash, COALESCE(status, 'delivered') as status, content_metadata
+        "SELECT id, chat_id, peer_id, timestamp, content_type, text_content, file_hash, COALESCE(status, 'delivered') as status, content_metadata, sender_alias
          FROM messages 
          WHERE chat_id = ?1 
          ORDER BY timestamp ASC",
@@ -460,6 +468,7 @@ pub fn get_messages(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<Mess
             file_hash: row.get(6)?,
             status: row.get(7)?,
             content_metadata: row.get(8)?,
+            sender_alias: row.get(9)?,
         })
     })?;
 
@@ -468,6 +477,30 @@ pub fn get_messages(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<Mess
         messages.push(msg?);
     }
     Ok(messages)
+}
+
+/// Get the latest sender_alias for each peer from their messages
+pub fn get_peer_aliases(conn: &Connection) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT chat_id, sender_alias
+         FROM messages
+         WHERE sender_alias IS NOT NULL AND sender_alias != ''
+           AND peer_id != 'Me'
+         GROUP BY chat_id
+         HAVING MAX(timestamp)"
+    )?;
+
+    let mut aliases = std::collections::HashMap::new();
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    for row in rows {
+        if let Ok((chat_id, alias)) = row {
+            aliases.insert(chat_id, alias);
+        }
+    }
+    Ok(aliases)
 }
 
 /// Update message status (pending -> delivered -> read)

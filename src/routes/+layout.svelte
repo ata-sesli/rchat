@@ -16,9 +16,11 @@
   // Types
   type Message = { sender: string; text: string; timestamp: Date };
   type Envelope = { id: string; name: string; icon?: string };
+  type FriendConfig = { username: string; alias: string | null };
 
   // State
   let peers: string[] = [];
+  let peerAliases: Record<string, string | null> = {}; // username -> alias
   let pinnedPeers: string[] = [];
   let userProfile = {
     alias: "Me" as string | null,
@@ -198,6 +200,10 @@
 
       peers = await invoke<string[]>("get_trusted_peers");
       console.log("[Layout] Fetched peers:", peers);
+
+      // Fetch peer aliases from messages (last received alias per chat)
+      peerAliases = await invoke<Record<string, string>>("get_peer_aliases");
+
       pinnedPeers = await invoke<string[]>("get_pinned_peers");
       userProfile = await invoke("get_user_profile");
       envelopes = await invoke<Envelope[]>("get_envelopes");
@@ -438,6 +444,7 @@
     {showCreateMenu}
     {envelopes}
     {sortedPeers}
+    {peerAliases}
     {pinnedPeers}
     {activePeer}
     {userProfile}

@@ -21,6 +21,7 @@
   $: activePeer = $page.params.id || "";
 
   let messages: Message[] = [];
+  let peerAlias: string | null = null;
   let userProfile = {
     alias: "Me" as string | null,
     avatar_path: null as string | null,
@@ -35,6 +36,8 @@
 
   // Reactive loading
   $: loadChatHistory(activePeer);
+
+  type FriendConfig = { username: string; alias: string | null };
 
   async function loadChatHistory(peerId: string) {
     if (!peerId) return;
@@ -52,6 +55,15 @@
         content_type: m.content_type,
         file_hash: m.file_hash,
       }));
+
+      // Fetch alias for this peer from messages
+      if (peerId !== "Me" && peerId !== "General") {
+        const aliases =
+          await invoke<Record<string, string>>("get_peer_aliases");
+        peerAlias = aliases[peerId] || null;
+      } else {
+        peerAlias = null;
+      }
     } catch (e) {
       console.error("Failed to load history for", peerId, e);
       messages = [];
@@ -186,6 +198,7 @@
 <div class="h-full flex flex-col bg-slate-950">
   <ChatArea
     {activePeer}
+    {peerAlias}
     {messages}
     {userProfile}
     bind:message={messageInput}

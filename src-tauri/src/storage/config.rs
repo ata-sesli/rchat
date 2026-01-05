@@ -23,7 +23,9 @@ pub struct SystemConfig {
 // User Configuration, can be modified via UI.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FriendConfig {
-    pub username: String,                   // Gist ID / Username
+    pub username: String,                   // Gist ID / Username (unique ID)
+    #[serde(default)]
+    pub alias: Option<String>,              // Display name / alias
     pub x25519_pubkey: Option<String>,      // Base64
     pub ed25519_pubkey: Option<String>,     // Base64
     pub leaf_index: usize,                  // HKS Leaf Index

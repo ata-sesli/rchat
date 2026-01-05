@@ -267,6 +267,7 @@ impl Message {
             file_hash,
             status: self.status.as_str().to_string(),
             content_metadata,
+            sender_alias: None, // TODO: add sender_alias field to ChatMessage
         }
     }
 

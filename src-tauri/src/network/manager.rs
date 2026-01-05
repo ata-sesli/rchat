@@ -154,18 +154,19 @@ impl NetworkManager {
             }
         }
 
-        // Handle direct messages (DM:peer_id:msg_id:timestamp:content)
+        // Handle direct messages (DM:peer_id:msg_id:timestamp:alias:content)
         if msg_content.starts_with("DM:") {
-            let parts: Vec<&str> = msg_content.splitn(5, ':').collect();
-            if parts.len() >= 5 {
+            let parts: Vec<&str> = msg_content.splitn(6, ':').collect();
+            if parts.len() >= 6 {
                 let target_peer_id = parts[1];
                 let msg_id = parts[2];
                 let timestamp: i64 = parts[3].parse().unwrap_or(0);
-                let content = parts[4];
+                let sender_alias = parts[4];
+                let content = parts[5];
 
                 println!(
-                    "[DM] 📤 Sending direct message to {}: {}",
-                    target_peer_id, content
+                    "[DM] 📤 Sending direct message to {} (alias: {}): {}",
+                    target_peer_id, sender_alias, content
                 );
 
                 // Find the peer in connected peers
@@ -181,6 +182,7 @@ impl NetworkManager {
                         chunk_hash: None,
                         chunk_data: None,
                         chunk_list: None,
+                        sender_alias: if sender_alias.is_empty() { None } else { Some(sender_alias.to_string()) },
                     };
 
                     self.swarm
@@ -228,6 +230,7 @@ impl NetworkManager {
                         chunk_hash: None,
                         chunk_data: None,
                         chunk_list: None,
+                        sender_alias: None,
                     };
 
                     self.swarm
@@ -274,6 +277,7 @@ impl NetworkManager {
                             chunk_hash: None,
                             chunk_data: None,
                             chunk_list: None,
+                            sender_alias: None,
                         };
 
                         self.swarm
@@ -330,6 +334,7 @@ impl NetworkManager {
                             chunk_hash: None,
                             chunk_data: None,
                             chunk_list: None,
+                            sender_alias: None,
                         };
 
                         self.swarm
@@ -385,6 +390,7 @@ impl NetworkManager {
                             chunk_hash: None,
                             chunk_data: None,
                             chunk_list: None,
+                            sender_alias: None,
                         };
 
                         self.swarm
@@ -596,6 +602,7 @@ impl NetworkManager {
                                     file_hash: Some(file_hash.to_string()),
                                     status: "delivered".to_string(), // Received = delivered
                                     content_metadata: None,
+                                    sender_alias: None,
                                 };
 
                                 if let Ok(conn) = state.db_conn.lock() {
@@ -650,6 +657,7 @@ impl NetworkManager {
                                         chunk_hash: None,
                                         chunk_data: None,
                                         chunk_list: None,
+                                        sender_alias: None,
                                     };
 
                                     println!(
@@ -714,6 +722,7 @@ impl NetworkManager {
                             file_hash: None,
                             status: "delivered".to_string(), // Received = delivered
                             content_metadata: None,
+                            sender_alias: None, // TODO: extract from DM format
                         };
 
                         if let Ok(conn) = state.db_conn.lock() {
@@ -764,6 +773,7 @@ impl NetworkManager {
                                                     file_hash: request.file_hash.clone(),
                                                     status: "delivered".to_string(),
                                                     content_metadata: None,
+                                                    sender_alias: request.sender_alias.clone(),
                                                 };
 
                                                 if let Ok(conn) = state.db_conn.lock() {
@@ -860,6 +870,7 @@ impl NetworkManager {
                                                             chunk_hash: None,
                                                             chunk_data: None,
                                                             chunk_list: None,
+                                                            sender_alias: None,
                                                         };
                                                         
                                                         self.swarm
@@ -992,6 +1003,7 @@ impl NetworkManager {
                                                             chunk_hash: None,
                                                             chunk_data: None,
                                                             chunk_list: Some(chunks),
+                                                            sender_alias: None,
                                                         };
                                                         
                                                         // Send as new request back to peer
@@ -1051,6 +1063,7 @@ impl NetworkManager {
                                                             chunk_hash: Some(chunk_hash.clone()),
                                                             chunk_data: Some(chunk_b64),
                                                             chunk_list: None,
+                                                            sender_alias: None,
                                                         };
                                                         
                                                         self.swarm
@@ -1097,6 +1110,7 @@ impl NetworkManager {
                                                             chunk_hash: Some(chunk_info.chunk_hash.clone()),
                                                             chunk_data: None,
                                                             chunk_list: None,
+                                                            sender_alias: None,
                                                         };
                                                         
                                                         self.swarm
