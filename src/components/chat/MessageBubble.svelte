@@ -156,18 +156,18 @@
         {#if userProfile.avatar_path}
           <img
             src={userProfile.avatar_path}
-            class="w-8 h-8 rounded-full bg-teal-500 border-2 border-slate-950 object-cover"
+            class="w-8 h-8 rounded-full bg-theme-primary-500 border-2 border-theme-base-950 object-cover"
             alt="Me"
           />
         {:else}
           <div
-            class="w-8 h-8 rounded-full bg-teal-500 shadow-lg shadow-teal-500/20 border-2 border-slate-950"
+            class="w-8 h-8 rounded-full bg-theme-primary-500 shadow-lg shadow-teal-500/20 border-2 border-theme-base-950"
           ></div>
         {/if}
       {:else}
         <img
           src={`https://github.com/${activePeer}.png?size=32`}
-          class="w-8 h-8 rounded-full bg-purple-500 shadow-lg shadow-purple-500/20 border-2 border-slate-950"
+          class="w-8 h-8 rounded-full bg-theme-secondary-500 shadow-lg shadow-purple-500/20 border-2 border-theme-base-950"
           on:error={(e) =>
             ((e.currentTarget as HTMLImageElement).src =
               "https://github.com/github.png?size=32")}
@@ -179,13 +179,13 @@
     <!-- Bubble -->
     <div
       class={`px-4 py-2.5 shadow-md text-sm leading-relaxed break-words flex flex-col gap-1
-        ${isMe ? "bg-teal-600/90 text-white rounded-2xl rounded-tr-sm" : "bg-slate-800 text-slate-200 rounded-2xl rounded-tl-sm border border-slate-700/50"}`}
+        ${isMe ? "bg-theme-primary-600 text-[var(--color-on-primary)] rounded-2xl rounded-tr-sm" : "bg-theme-base-800 text-theme-base-200 rounded-2xl rounded-tl-sm border border-theme-base-700"}`}
     >
       {#if isImage}
         <!-- Image content -->
         {#if loadingImage}
           <div
-            class="w-48 h-32 bg-slate-700 rounded-lg flex items-center justify-center"
+            class="w-48 h-32 bg-theme-base-700 rounded-lg flex items-center justify-center"
           >
             <div
               class="animate-spin w-6 h-6 border-2 border-white border-t-transparent rounded-full"
@@ -194,10 +194,10 @@
         {:else if downloadingImage}
           <!-- Downloading from peer -->
           <div
-            class="w-48 h-32 bg-slate-700/50 rounded-lg flex flex-col items-center justify-center gap-2 border border-slate-600"
+            class="w-48 h-32 bg-slate-700/50 rounded-lg flex flex-col items-center justify-center gap-2 border border-theme-base-600"
           >
             <svg
-              class="w-8 h-8 text-slate-400"
+              class="w-8 h-8 text-theme-base-400"
               fill="none"
               viewBox="0 0 24 24"
               stroke="currentColor"
@@ -209,10 +209,12 @@
                 d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
               />
             </svg>
-            <span class="text-xs text-slate-400">Downloading...</span>
-            <div class="w-24 h-1 bg-slate-600 rounded-full overflow-hidden">
+            <span class="text-xs text-theme-base-400">Downloading...</span>
+            <div
+              class="w-24 h-1 bg-theme-base-600 rounded-full overflow-hidden"
+            >
               <div
-                class="h-full bg-purple-500 animate-pulse"
+                class="h-full bg-theme-secondary-500 animate-pulse"
                 style="width: 60%"
               ></div>
             </div>
@@ -226,10 +228,10 @@
           />
         {:else}
           <div
-            class="w-48 h-32 bg-slate-700/50 rounded-lg flex flex-col items-center justify-center gap-1 border border-slate-600"
+            class="w-48 h-32 bg-slate-700/50 rounded-lg flex flex-col items-center justify-center gap-1 border border-theme-base-600"
           >
             <svg
-              class="w-6 h-6 text-slate-500"
+              class="w-6 h-6 text-theme-base-500"
               fill="none"
               viewBox="0 0 24 24"
               stroke="currentColor"
@@ -241,7 +243,7 @@
                 d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
               />
             </svg>
-            <span class="text-xs text-slate-400">Image not available</span>
+            <span class="text-xs text-theme-base-400">Image not available</span>
           </div>
         {/if}
       {:else if isDocument}
@@ -249,7 +251,7 @@
         <button
           on:click={downloadDocument}
           disabled={downloadingDocument}
-          class="flex items-center gap-3 p-3 bg-slate-700/50 rounded-lg hover:bg-slate-600/50 transition-colors cursor-pointer border border-slate-600 min-w-[200px]"
+          class="flex items-center gap-3 p-3 bg-slate-700/50 rounded-lg hover:bg-slate-600/50 transition-colors cursor-pointer border border-theme-base-600 min-w-[200px]"
         >
           <span class="text-2xl">{getDocumentIcon(msg.text || "document")}</span
           >
@@ -257,7 +259,7 @@
             <span class="text-sm font-medium text-white truncate max-w-[180px]"
               >{msg.text || "Document"}</span
             >
-            <span class="text-xs text-slate-400">
+            <span class="text-xs text-theme-base-400">
               {#if downloadingDocument}
                 Downloading...
               {:else}
@@ -271,7 +273,7 @@
             ></div>
           {:else}
             <svg
-              class="w-5 h-5 text-slate-400"
+              class="w-5 h-5 text-theme-base-400"
               fill="none"
               viewBox="0 0 24 24"
               stroke="currentColor"
@@ -289,7 +291,7 @@
         <!-- Video content -->
         <button
           on:click={() => (showVideoViewer = true)}
-          class="relative w-48 h-32 bg-slate-800 rounded-lg overflow-hidden cursor-pointer hover:opacity-90 transition-opacity border border-slate-600"
+          class="relative w-48 h-32 bg-theme-base-800 rounded-lg overflow-hidden cursor-pointer hover:opacity-90 transition-opacity border border-theme-base-600"
         >
           <!-- Video icon/thumbnail -->
           <div
@@ -319,7 +321,7 @@
         <span>{msg.text}</span>
       {/if}
       <span
-        class={`text-[10px] ${isMe ? "text-teal-200" : "text-slate-400"} self-end flex items-center gap-1`}
+        class={`text-[10px] ${isMe ? "text-theme-primary-200" : "text-theme-base-400"} self-end flex items-center gap-1`}
       >
         {formatTime(msg.timestamp)}
         {#if isMe}

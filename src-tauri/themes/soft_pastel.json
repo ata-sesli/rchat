@@ -1,0 +1,10 @@
+{
+  "name": "Soft Pastel",
+  "description": "Light and airy with gentle pastel tones. Easy on the eyes.",
+  "background": "#F5F7FB",
+  "chatPanel": "#FBFCFF",
+  "primaryAccent": "#B8C1FF",
+  "secondaryAccent": "#F6D6E8",
+  "textPrimary": "#2A3342",
+  "textMuted": "#7A8296"
+}

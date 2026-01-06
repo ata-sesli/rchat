@@ -249,14 +249,14 @@
     on:click|self={handleClose}
   >
     <div
-      class="bg-slate-900 border border-slate-700 p-6 rounded-2xl w-full max-w-md shadow-2xl space-y-4"
+      class="bg-theme-base-900 border border-theme-base-700 p-6 rounded-2xl w-full max-w-md shadow-2xl space-y-4"
     >
       <!-- Header with Back Button -->
       <div class="flex items-center gap-3">
         {#if step !== "select-network"}
           <button
             on:click={() => setStep(getParentStep(step))}
-            class="p-1 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-colors"
+            class="p-1 rounded-lg hover:bg-theme-base-800 text-theme-base-400 hover:text-white transition-colors"
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -272,7 +272,7 @@
             </svg>
           </button>
         {/if}
-        <h3 class="text-xl font-bold text-white">
+        <h3 class="text-xl font-bold text-theme-base-100">
           {#if step === "select-network"}
             Add New Person
           {:else if step === "local-scan"}
@@ -289,16 +289,16 @@
 
       <!-- Step 1: Network Selection -->
       {#if step === "select-network"}
-        <p class="text-sm text-slate-400">
+        <p class="text-sm text-theme-base-400">
           Choose how to find people to connect with.
         </p>
         <div class="space-y-3">
           <button
             on:click={() => setStep("local-scan")}
-            class="w-full flex items-center gap-4 p-4 bg-slate-800/50 hover:bg-slate-800 border border-slate-700 rounded-xl transition-colors text-left group"
+            class="w-full flex items-center gap-4 p-4 bg-slate-800/50 hover:bg-theme-base-800 border border-theme-base-700 rounded-xl transition-colors text-left group"
           >
             <div
-              class="w-12 h-12 rounded-xl bg-teal-500/10 text-teal-400 flex items-center justify-center group-hover:bg-teal-500/20 transition-colors"
+              class="w-12 h-12 rounded-xl bg-teal-500/10 text-theme-primary-400 flex items-center justify-center group-hover:bg-teal-500/20 transition-colors"
             >
               <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -315,13 +315,13 @@
             </div>
             <div class="flex-1">
               <div class="font-semibold text-white">Local Network (Wi-Fi)</div>
-              <div class="text-sm text-slate-400">
+              <div class="text-sm text-theme-base-400">
                 Find RChat users on the same network
               </div>
             </div>
             <svg
               xmlns="http://www.w3.org/2000/svg"
-              class="h-5 w-5 text-slate-500"
+              class="h-5 w-5 text-theme-base-500"
               viewBox="0 0 20 20"
               fill="currentColor"
             >
@@ -335,10 +335,10 @@
 
           <button
             on:click={() => setStep("online")}
-            class="w-full flex items-center gap-4 p-4 bg-slate-800/50 hover:bg-slate-800 border border-slate-700 rounded-xl transition-colors text-left group"
+            class="w-full flex items-center gap-4 p-4 bg-slate-800/50 hover:bg-theme-base-800 border border-theme-base-700 rounded-xl transition-colors text-left group"
           >
             <div
-              class="w-12 h-12 rounded-xl bg-purple-500/10 text-purple-400 flex items-center justify-center group-hover:bg-purple-500/20 transition-colors"
+              class="w-12 h-12 rounded-xl bg-purple-500/10 text-theme-secondary-400 flex items-center justify-center group-hover:bg-purple-500/20 transition-colors"
             >
               <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -355,13 +355,13 @@
             </div>
             <div class="flex-1">
               <div class="font-semibold text-white">Online (GitHub)</div>
-              <div class="text-sm text-slate-400">
+              <div class="text-sm text-theme-base-400">
                 Connect with anyone globally
               </div>
             </div>
             <svg
               xmlns="http://www.w3.org/2000/svg"
-              class="h-5 w-5 text-slate-500"
+              class="h-5 w-5 text-theme-base-500"
               viewBox="0 0 20 20"
               fill="currentColor"
             >
@@ -380,13 +380,13 @@
         <div class="space-y-4">
           <!-- Scanning Indicator -->
           <div
-            class="flex items-center gap-3 p-3 bg-teal-500/10 border border-teal-500/20 rounded-lg text-teal-400"
+            class="flex items-center gap-3 p-3 bg-teal-500/10 border border-teal-500/20 rounded-lg text-theme-primary-400"
           >
             <div class="relative">
               <div
-                class="w-3 h-3 bg-teal-400 rounded-full animate-ping absolute"
+                class="w-3 h-3 bg-theme-primary-400 rounded-full animate-ping absolute"
               ></div>
-              <div class="w-3 h-3 bg-teal-400 rounded-full"></div>
+              <div class="w-3 h-3 bg-theme-primary-400 rounded-full"></div>
             </div>
             <span class="text-sm">Scanning local network...</span>
           </div>
@@ -394,7 +394,7 @@
           <!-- Peers List -->
           <div class="space-y-2 max-h-64 overflow-y-auto">
             {#if localPeers.length === 0}
-              <div class="text-center py-8 text-slate-500">
+              <div class="text-center py-8 text-theme-base-500">
                 <svg
                   xmlns="http://www.w3.org/2000/svg"
                   class="h-12 w-12 mx-auto mb-3 opacity-50"
@@ -410,14 +410,14 @@
                   />
                 </svg>
                 <p class="text-sm">No peers found yet</p>
-                <p class="text-xs text-slate-600 mt-1">
+                <p class="text-xs text-theme-base-600 mt-1">
                   Make sure RChat is running on other devices
                 </p>
               </div>
             {:else}
               {#each localPeers as peer}
                 <div
-                  class="flex items-center gap-3 p-3 bg-slate-800/50 rounded-lg border border-slate-700"
+                  class="flex items-center gap-3 p-3 bg-slate-800/50 rounded-lg border border-theme-base-700"
                 >
                   <div
                     class="w-10 h-10 rounded-full bg-gradient-to-br from-teal-400 to-cyan-500 flex items-center justify-center text-white font-bold text-sm"
@@ -428,13 +428,13 @@
                     <div class="text-sm font-medium text-white truncate">
                       Peer {peer.peer_id.slice(-8)}
                     </div>
-                    <div class="text-xs text-slate-500 truncate">
+                    <div class="text-xs text-theme-base-500 truncate">
                       {peer.addresses[0] || "No address"}
                     </div>
                   </div>
                   {#if waitingForPeer === peer.peer_id}
                     <div
-                      class="px-3 py-1.5 bg-amber-600 text-white text-sm rounded-lg font-medium flex items-center gap-2"
+                      class="px-3 py-1.5 bg-theme-warning-600 text-white text-sm rounded-lg font-medium flex items-center gap-2"
                     >
                       <svg class="animate-spin h-4 w-4" viewBox="0 0 24 24">
                         <circle
@@ -457,7 +457,7 @@
                   {:else}
                     <button
                       on:click={() => handleConnect(peer.peer_id)}
-                      class="px-3 py-1.5 bg-teal-600 hover:bg-teal-500 text-white text-sm rounded-lg font-medium transition-colors"
+                      class="px-3 py-1.5 bg-theme-primary-600 hover:bg-theme-primary-500 text-white text-sm rounded-lg font-medium transition-colors"
                     >
                       Connect
                     </button>
@@ -471,16 +471,16 @@
 
       <!-- Step 2b: Online - Choice Menu -->
       {#if step === "online"}
-        <p class="text-sm text-slate-400">
+        <p class="text-sm text-theme-base-400">
           Connect with anyone globally via encrypted invitations.
         </p>
         <div class="space-y-3">
           <button
             on:click={() => setStep("create-invite-user")}
-            class="w-full flex items-center gap-4 p-4 bg-slate-800/50 hover:bg-slate-800 border border-slate-700 rounded-xl transition-colors text-left group"
+            class="w-full flex items-center gap-4 p-4 bg-slate-800/50 hover:bg-theme-base-800 border border-theme-base-700 rounded-xl transition-colors text-left group"
           >
             <div
-              class="w-12 h-12 rounded-xl bg-teal-500/10 text-teal-400 flex items-center justify-center group-hover:bg-teal-500/20 transition-colors"
+              class="w-12 h-12 rounded-xl bg-teal-500/10 text-theme-primary-400 flex items-center justify-center group-hover:bg-teal-500/20 transition-colors"
             >
               <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -495,13 +495,13 @@
             </div>
             <div class="flex-1">
               <div class="font-semibold text-white">Create Invitation</div>
-              <div class="text-sm text-slate-400">
+              <div class="text-sm text-theme-base-400">
                 Send encrypted invite to a friend
               </div>
             </div>
             <svg
               xmlns="http://www.w3.org/2000/svg"
-              class="h-5 w-5 text-slate-500"
+              class="h-5 w-5 text-theme-base-500"
               viewBox="0 0 20 20"
               fill="currentColor"
             >
@@ -515,10 +515,10 @@
 
           <button
             on:click={() => setStep("accept-invite-user")}
-            class="w-full flex items-center gap-4 p-4 bg-slate-800/50 hover:bg-slate-800 border border-slate-700 rounded-xl transition-colors text-left group"
+            class="w-full flex items-center gap-4 p-4 bg-slate-800/50 hover:bg-theme-base-800 border border-theme-base-700 rounded-xl transition-colors text-left group"
           >
             <div
-              class="w-12 h-12 rounded-xl bg-purple-500/10 text-purple-400 flex items-center justify-center group-hover:bg-purple-500/20 transition-colors"
+              class="w-12 h-12 rounded-xl bg-purple-500/10 text-theme-secondary-400 flex items-center justify-center group-hover:bg-purple-500/20 transition-colors"
             >
               <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -536,13 +536,13 @@
             </div>
             <div class="flex-1">
               <div class="font-semibold text-white">Accept Invitation</div>
-              <div class="text-sm text-slate-400">
+              <div class="text-sm text-theme-base-400">
                 Redeem invite from a friend
               </div>
             </div>
             <svg
               xmlns="http://www.w3.org/2000/svg"
-              class="h-5 w-5 text-slate-500"
+              class="h-5 w-5 text-theme-base-500"
               viewBox="0 0 20 20"
               fill="currentColor"
             >
@@ -559,7 +559,7 @@
       <!-- Create Invitation - Username -->
       {#if step === "create-invite-user"}
         <div class="space-y-4">
-          <p class="text-sm text-slate-400">
+          <p class="text-sm text-theme-base-400">
             Enter the GitHub username of the person you want to invite.
           </p>
           <div class="flex flex-col sm:flex-row gap-3">
@@ -567,26 +567,26 @@
               <div
                 class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none"
               >
-                <span class="text-slate-500">@</span>
+                <span class="text-theme-base-500">@</span>
               </div>
               <input
                 type="text"
                 bind:value={createInvitee}
                 placeholder="github_username"
-                class="w-full pl-8 pr-4 py-2.5 bg-slate-900 border border-slate-700 rounded-lg text-slate-200 focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500 transition-all placeholder:text-slate-600"
+                class="w-full pl-8 pr-4 py-2.5 bg-theme-base-900 border border-theme-base-700 rounded-lg text-theme-base-200 focus:outline-none focus:border-theme-primary-500 focus:ring-1 focus:ring-teal-500 transition-all placeholder:text-theme-base-600"
                 on:keydown={(e) => e.key === "Enter" && startCreateInvite()}
               />
             </div>
             <button
               on:click={startCreateInvite}
               disabled={createLoading || !createInvitee.trim()}
-              class="px-6 py-2.5 bg-teal-600 hover:bg-teal-500 text-slate-950 font-semibold rounded-lg shadow-lg shadow-teal-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              class="px-6 py-2.5 bg-theme-primary-600 hover:bg-theme-primary-500 text-theme-base-950 font-semibold rounded-lg shadow-lg shadow-teal-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {createLoading ? "Generating..." : "Next"}
             </button>
           </div>
           {#if createError}
-            <p class="text-sm text-red-400">{createError}</p>
+            <p class="text-sm text-theme-error-400">{createError}</p>
           {/if}
         </div>
       {/if}
@@ -594,8 +594,9 @@
       <!-- Create Invitation - Password & QR -->
       {#if step === "create-invite-code"}
         <div class="space-y-4">
-          <p class="text-sm text-slate-400">
-            Share this code with <span class="text-teal-400 font-semibold"
+          <p class="text-sm text-theme-base-400">
+            Share this code with <span
+              class="text-theme-primary-400 font-semibold"
               >@{createInvitee}</span
             >:
           </p>
@@ -607,15 +608,15 @@
           {/if}
 
           <div
-            class="flex items-center gap-2 p-3 bg-slate-950 border border-slate-700 rounded-lg"
+            class="flex items-center gap-2 p-3 bg-theme-base-950 border border-theme-base-700 rounded-lg"
           >
             <code
-              class="flex-1 text-xl font-mono text-teal-400 tracking-wider text-center"
+              class="flex-1 text-xl font-mono text-theme-primary-400 tracking-wider text-center"
               >{createPassword}</code
             >
             <button
               on:click={copyPassword}
-              class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm rounded-lg transition-colors flex items-center gap-1"
+              class="px-3 py-1.5 bg-theme-base-800 hover:bg-theme-base-700 text-theme-base-300 text-sm rounded-lg transition-colors flex items-center gap-1"
             >
               <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -636,28 +637,28 @@
             <input
               type="checkbox"
               bind:checked={showQrCode}
-              class="rounded border-slate-600 bg-slate-800 text-teal-500 focus:ring-teal-500"
+              class="rounded border-theme-base-600 bg-theme-base-800 text-theme-primary-500 focus:ring-teal-500"
             />
-            <span class="text-sm text-slate-400">Show QR Code</span>
+            <span class="text-sm text-theme-base-400">Show QR Code</span>
           </label>
 
           <div class="flex gap-2 pt-2">
             <button
               on:click={() => setStep("create-invite-user")}
-              class="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors"
+              class="px-4 py-2 text-sm text-theme-base-400 hover:text-white transition-colors"
             >
               ← Back
             </button>
             <button
               on:click={confirmCreateInvite}
               disabled={createLoading}
-              class="flex-1 px-6 py-2.5 bg-teal-600 hover:bg-teal-500 text-slate-950 font-semibold rounded-lg transition-all disabled:opacity-50"
+              class="flex-1 px-6 py-2.5 bg-theme-primary-600 hover:bg-theme-primary-500 text-theme-base-950 font-semibold rounded-lg transition-all disabled:opacity-50"
             >
               {createLoading ? "Creating..." : "Confirm"}
             </button>
           </div>
           {#if createError}
-            <p class="text-sm text-red-400">{createError}</p>
+            <p class="text-sm text-theme-error-400">{createError}</p>
           {/if}
         </div>
       {/if}
@@ -665,7 +666,7 @@
       <!-- Accept Invitation - Username -->
       {#if step === "accept-invite-user"}
         <div class="space-y-4">
-          <p class="text-sm text-slate-400">
+          <p class="text-sm text-theme-base-400">
             Enter the GitHub username of the person who invited you.
           </p>
           <div class="flex flex-col sm:flex-row gap-3">
@@ -673,26 +674,26 @@
               <div
                 class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none"
               >
-                <span class="text-slate-500">@</span>
+                <span class="text-theme-base-500">@</span>
               </div>
               <input
                 type="text"
                 bind:value={acceptInviter}
                 placeholder="github_username"
-                class="w-full pl-8 pr-4 py-2.5 bg-slate-900 border border-slate-700 rounded-lg text-slate-200 focus:outline-none focus:border-purple-500 focus:ring-1 focus:ring-purple-500 transition-all placeholder:text-slate-600"
+                class="w-full pl-8 pr-4 py-2.5 bg-theme-base-900 border border-theme-base-700 rounded-lg text-theme-base-200 focus:outline-none focus:border-theme-secondary-500 focus:ring-1 focus:ring-purple-500 transition-all placeholder:text-theme-base-600"
                 on:keydown={(e) => e.key === "Enter" && startAcceptInvite()}
               />
             </div>
             <button
               on:click={startAcceptInvite}
               disabled={!acceptInviter.trim()}
-              class="px-6 py-2.5 bg-purple-600 hover:bg-purple-500 text-white font-semibold rounded-lg shadow-lg shadow-purple-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              class="px-6 py-2.5 bg-theme-secondary-600 hover:bg-theme-secondary-500 text-white font-semibold rounded-lg shadow-lg shadow-purple-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Next
             </button>
           </div>
           {#if acceptError}
-            <p class="text-sm text-red-400">{acceptError}</p>
+            <p class="text-sm text-theme-error-400">{acceptError}</p>
           {/if}
         </div>
       {/if}
@@ -700,8 +701,9 @@
       <!-- Accept Invitation - Code Input -->
       {#if step === "accept-invite-code"}
         <div class="space-y-4">
-          <p class="text-sm text-slate-400">
-            Enter the code from <span class="text-purple-400 font-semibold"
+          <p class="text-sm text-theme-base-400">
+            Enter the code from <span
+              class="text-theme-secondary-400 font-semibold"
               >@{acceptInviter}</span
             >:
           </p>
@@ -714,8 +716,8 @@
               class={`flex-1 px-4 py-2 text-sm rounded-lg transition-all flex items-center justify-center gap-2
                 ${
                   showQrScanner
-                    ? "bg-purple-600 text-white"
-                    : "bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white"
+                    ? "bg-theme-secondary-600 text-white"
+                    : "bg-theme-base-800 text-theme-base-400 hover:bg-theme-base-700 hover:text-white"
                 }`}
             >
               <svg
@@ -740,14 +742,14 @@
           <!-- QR Scanner Viewport -->
           {#if showQrScanner}
             <div
-              class="relative rounded-lg overflow-hidden bg-slate-950 border border-slate-700"
+              class="relative rounded-lg overflow-hidden bg-theme-base-950 border border-theme-base-700"
             >
               <div
                 id="qr-reader"
                 class="w-full"
                 style="min-height: 250px;"
               ></div>
-              <p class="text-xs text-slate-500 text-center py-2">
+              <p class="text-xs text-theme-base-500 text-center py-2">
                 Point camera at QR code
               </p>
             </div>
@@ -758,11 +760,11 @@
               bind:value={acceptPassword}
               placeholder="14-character code"
               maxlength="14"
-              class="w-full px-4 py-3 bg-slate-950 border border-slate-700 rounded-lg text-xl font-mono text-center text-purple-400 tracking-wider focus:outline-none focus:border-purple-500 focus:ring-1 focus:ring-purple-500 transition-all placeholder:text-slate-600 placeholder:text-base placeholder:font-sans"
+              class="w-full px-4 py-3 bg-theme-base-950 border border-theme-base-700 rounded-lg text-xl font-mono text-center text-theme-secondary-400 tracking-wider focus:outline-none focus:border-theme-secondary-500 focus:ring-1 focus:ring-purple-500 transition-all placeholder:text-theme-base-600 placeholder:text-base placeholder:font-sans"
               on:keydown={(e) => e.key === "Enter" && confirmRedeemInvite()}
             />
 
-            <p class="text-xs text-slate-500 text-center">
+            <p class="text-xs text-theme-base-500 text-center">
               {acceptPassword.length}/14 characters
             </p>
           {/if}
@@ -773,29 +775,29 @@
                 stopQrScanner();
                 setStep("accept-invite-user");
               }}
-              class="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors"
+              class="px-4 py-2 text-sm text-theme-base-400 hover:text-white transition-colors"
             >
               ← Back
             </button>
             <button
               on:click={confirmRedeemInvite}
               disabled={acceptLoading || acceptPassword.length !== 14}
-              class="flex-1 px-6 py-2.5 bg-purple-600 hover:bg-purple-500 text-white font-semibold rounded-lg transition-all disabled:opacity-50"
+              class="flex-1 px-6 py-2.5 bg-theme-secondary-600 hover:bg-theme-secondary-500 text-white font-semibold rounded-lg transition-all disabled:opacity-50"
             >
               {acceptLoading ? "Redeeming..." : "Redeem Invite"}
             </button>
           </div>
           {#if acceptError}
-            <p class="text-sm text-red-400">{acceptError}</p>
+            <p class="text-sm text-theme-error-400">{acceptError}</p>
           {/if}
         </div>
       {/if}
 
       <!-- Footer -->
-      <div class="flex justify-end gap-2 pt-2 border-t border-slate-800">
+      <div class="flex justify-end gap-2 pt-2 border-t border-theme-base-800">
         <button
           on:click={handleClose}
-          class="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors"
+          class="px-4 py-2 text-sm text-theme-base-400 hover:text-white transition-colors"
         >
           Close
         </button>

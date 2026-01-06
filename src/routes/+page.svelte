@@ -8,7 +8,7 @@
   <div class="p-6 rounded-full bg-slate-900/50 mb-6">
     <svg
       xmlns="http://www.w3.org/2000/svg"
-      class="h-16 w-16 text-slate-700"
+      class="h-16 w-16 text-theme-base-700"
       fill="none"
       viewBox="0 0 24 24"
       stroke="currentColor"
@@ -21,8 +21,8 @@
       />
     </svg>
   </div>
-  <h2 class="text-2xl font-bold text-slate-300 mb-2">Select a Conversation</h2>
-  <p class="text-slate-500 max-w-sm">
+  <h2 class="text-2xl font-bold text-theme-base-300 mb-2">Select a Conversation</h2>
+  <p class="text-theme-base-500 max-w-sm">
     Choose a person or group from the sidebar to start chatting, or explore new
     connections.
   </p>

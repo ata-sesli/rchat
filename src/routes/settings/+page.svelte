@@ -19,14 +19,16 @@
 </script>
 
 <div
-  class="h-full flex flex-col bg-slate-950 text-slate-200 p-8 overflow-y-auto"
+  class="h-full flex flex-col bg-theme-base-950 text-theme-base-200 p-8 overflow-y-auto"
 >
   <!-- VIEW: MENU -->
   {#if currentView === "menu"}
     <!-- Header -->
     <div class="mb-8 border-b border-slate-800/50 pb-4">
-      <h2 class="text-3xl font-bold text-white tracking-tight">Settings</h2>
-      <p class="text-slate-400 mt-1">Manage application preferences.</p>
+      <h2 class="text-3xl font-bold text-theme-base-100 tracking-tight">
+        Settings
+      </h2>
+      <p class="text-theme-base-400 mt-1">Manage application preferences.</p>
     </div>
 
     <SettingsMenu onnavigate={handleNavigate} />

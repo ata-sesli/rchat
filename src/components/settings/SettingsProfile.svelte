@@ -53,7 +53,7 @@
 <div class="mb-6 flex items-center gap-4 border-b border-slate-800/50 pb-4">
   <button
     on:click={goBack}
-    class="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition-colors"
+    class="p-2 hover:bg-theme-base-800 rounded-lg text-theme-base-400 hover:text-white transition-colors"
     aria-label="Go Back"
   >
     <svg
@@ -69,47 +69,49 @@
       />
     </svg>
   </button>
-  <h2 class="text-xl font-bold text-white">Profile</h2>
+  <h2 class="text-xl font-bold text-theme-base-100">Profile</h2>
 </div>
 
 <div class="space-y-6 animate-fade-in-up">
   <div class="space-y-2">
     <label class="block">
-      <span class="text-sm font-medium text-slate-400"
+      <span class="text-sm font-medium text-theme-base-400"
         >Alias (Display Name)</span
       >
       <input
         type="text"
         bind:value={alias}
         placeholder="Your visual name"
-        class="mt-1 w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 text-slate-200 focus:outline-none focus:border-blue-500 transition-colors"
+        class="mt-1 w-full bg-theme-base-900 border border-theme-base-700 rounded-lg px-4 py-3 text-theme-base-200 focus:outline-none focus:border-blue-500 transition-colors"
       />
     </label>
   </div>
 
   <div class="space-y-2">
     <label class="block">
-      <span class="text-sm font-medium text-slate-400"
+      <span class="text-sm font-medium text-theme-base-400"
         >Avatar URL (Optional)</span
       >
       <input
         type="text"
         bind:value={avatarPath}
         placeholder="https://..."
-        class="mt-1 w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 text-slate-200 focus:outline-none focus:border-blue-500 transition-colors"
+        class="mt-1 w-full bg-theme-base-900 border border-theme-base-700 rounded-lg px-4 py-3 text-theme-base-200 focus:outline-none focus:border-blue-500 transition-colors"
       />
     </label>
-    <p class="text-xs text-slate-500">Enter a URL for your profile picture.</p>
+    <p class="text-xs text-theme-base-500">
+      Enter a URL for your profile picture.
+    </p>
   </div>
 
   {#if error}
-    <p class="text-sm text-red-400">{error}</p>
+    <p class="text-sm text-theme-error-400">{error}</p>
   {/if}
 
   <button
     on:click={saveProfile}
     disabled={isSavingProfile}
-    class="w-full py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl shadow-lg shadow-blue-500/20 transition-all disabled:opacity-50"
+    class="w-full py-3 bg-blue-600 hover:bg-theme-info-500 text-white font-semibold rounded-xl shadow-lg shadow-blue-500/20 transition-all disabled:opacity-50"
   >
     {isSavingProfile ? "Saving..." : "Save Profile"}
   </button>

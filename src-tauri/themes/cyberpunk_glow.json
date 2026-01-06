@@ -1,0 +1,10 @@
+{
+  "name": "Cyberpunk Glow",
+  "description": "Neon pinks and cyans on deep purple. Futuristic vibes.",
+  "background": "#070014",
+  "chatPanel": "#12002B",
+  "primaryAccent": "#E879F9",
+  "secondaryAccent": "#22D3EE",
+  "textPrimary": "#FDF4FF",
+  "textMuted": "#C084FC"
+}

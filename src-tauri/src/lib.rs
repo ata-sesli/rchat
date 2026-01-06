@@ -18,6 +18,7 @@ pub struct NetworkState {
 pub struct AppState {
     pub config_manager: tokio::sync::Mutex<ConfigManager>,
     pub db_conn: std::sync::Mutex<rusqlite::Connection>,
+    pub app_dir: std::path::PathBuf,
 }
 
 #[tauri::command]
@@ -252,6 +253,80 @@ async fn get_user_profile(state: State<'_, AppState>) -> Result<UserProfile, Str
             // Return default profile to prevent frontend crash
             Ok(UserProfile::default())
         }
+    }
+}
+
+#[tauri::command]
+async fn get_theme(state: State<'_, AppState>) -> Result<storage::config::ThemeConfig, String> {
+    println!("[Backend] get_theme called");
+    let mgr = state.config_manager.lock().await;
+    match mgr.load().await {
+        Ok(config) => Ok(config.user.theme.clone()),
+        Err(e) => {
+            eprintln!("[Backend] Error loading theme: {}", e);
+            Ok(storage::config::ThemeConfig::default())
+        }
+    }
+}
+
+#[tauri::command]
+async fn update_theme(
+    theme: storage::config::ThemeConfig,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    println!("[Backend] update_theme called");
+    let mgr = state.config_manager.lock().await;
+    let mut config = mgr.load().await.map_err(|e| e.to_string())?;
+    config.user.theme = theme;
+    mgr.save(&config).await.map_err(|e| e.to_string())?;
+    println!("[Backend] Theme updated successfully");
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct PresetInfo {
+    key: String,
+    name: String,
+    description: String,
+}
+
+#[tauri::command]
+async fn list_theme_presets(state: State<'_, AppState>) -> Result<Vec<PresetInfo>, String> {
+    println!("[Backend] list_theme_presets called");
+    let theme_manager = storage::theme::ThemeManager::new(&state.app_dir);
+    Ok(theme_manager
+        .list_presets_info()
+        .into_iter()
+        .map(|(key, name, description)| PresetInfo { key, name, description })
+        .collect())
+}
+
+#[tauri::command]
+async fn apply_preset(
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<storage::theme::ThemeConfig, String> {
+    println!("[Backend] apply_preset called with: {}", name);
+    let theme_manager = storage::theme::ThemeManager::new(&state.app_dir);
+    let theme = theme_manager.load_preset(&name).map_err(|e| e.to_string())?;
+    
+    // Save to user config with selected preset key
+    let mgr = state.config_manager.lock().await;
+    let mut config = mgr.load().await.map_err(|e| e.to_string())?;
+    config.user.theme = theme.clone();
+    config.user.selected_preset = Some(name.clone());
+    mgr.save(&config).await.map_err(|e| e.to_string())?;
+    
+    println!("[Backend] Preset {} applied successfully", name);
+    Ok(theme)
+}
+
+#[tauri::command]
+async fn get_selected_preset(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let mgr = state.config_manager.lock().await;
+    match mgr.load().await {
+        Ok(config) => Ok(config.user.selected_preset),
+        Err(_) => Ok(None),
     }
 }
 
@@ -1242,7 +1317,7 @@ pub fn run() {
                 .app_data_dir()
                 .expect("failed to get app data dir");
             std::fs::create_dir_all(&app_dir).expect("failed to create app data dir");
-            let mut config_manager = ConfigManager::new(app_dir);
+            let mut config_manager = ConfigManager::new(app_dir.clone());
 
             // Initialize Database (Schema in connect)
             // storage::db::connect_to_db ensures schema exists
@@ -1263,6 +1338,7 @@ pub fn run() {
             app.manage(AppState {
                 config_manager: tokio::sync::Mutex::new(config_manager),
                 db_conn: std::sync::Mutex::new(db_connection),
+                app_dir: app_dir.clone(),
             });
 
             // --- 2. Network is now initialized after vault unlock ---
@@ -1291,6 +1367,11 @@ pub fn run() {
             delete_peer,
             remove_friend,
             get_user_profile,
+            get_theme,
+            update_theme,
+            list_theme_presets,
+            apply_preset,
+            get_selected_preset,
             update_user_profile,
             get_pinned_peers,
             toggle_pin_peer,

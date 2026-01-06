@@ -1,0 +1,10 @@
+{
+  "name": "Midnight Neon",
+  "description": "Dark mode with vibrant cyan and purple accents. Perfect for night owls.",
+  "background": "#0B0F1A",
+  "chatPanel": "#131A2A",
+  "primaryAccent": "#3DF2C2",
+  "secondaryAccent": "#6C7CFF",
+  "textPrimary": "#E8EBF0",
+  "textMuted": "#9AA4BF"
+}

@@ -200,7 +200,7 @@
 </script>
 
 <div
-  class="flex items-center justify-center h-screen bg-slate-950 text-slate-200"
+  class="flex items-center justify-center h-screen bg-theme-base-950 text-theme-base-200"
 >
   <div
     class="w-full max-w-md p-8 space-y-8 bg-slate-900/90 backdrop-blur-md rounded-2xl shadow-2xl border border-slate-700/50"
@@ -216,7 +216,7 @@
         {#if view === "setup"}Setup Vault{:else if view === "unlock"}Unlock
           Vault{:else}Welcome Back{/if}
       </h2>
-      <p class="mt-2 text-slate-400">
+      <p class="mt-2 text-theme-base-400">
         {#if view === "setup"}Create a master password to secure your tokens{:else if view === "unlock"}Enter
           your master password to continue{:else}Sign in to sync your peers{/if}
       </p>
@@ -226,7 +226,7 @@
     {#if view === "loading"}
       <div class="flex justify-center p-8">
         <div
-          class="animate-spin rounded-full h-8 w-8 border-b-2 border-teal-500"
+          class="animate-spin rounded-full h-8 w-8 border-b-2 border-theme-primary-500"
         ></div>
       </div>
 
@@ -237,18 +237,18 @@
           type="password"
           bind:value={password}
           placeholder="Create Master Password"
-          class="w-full px-4 py-3 bg-slate-950/50 border border-slate-700 rounded-xl focus:border-teal-500 focus:ring-1 focus:ring-teal-500 outline-none transition-all placeholder:text-slate-600 text-white"
+          class="w-full px-4 py-3 bg-slate-950/50 border border-theme-base-700 rounded-xl focus:border-theme-primary-500 focus:ring-1 focus:ring-teal-500 outline-none transition-all placeholder:text-theme-base-600 text-white"
         />
         <input
           type="password"
           bind:value={confirmPassword}
           placeholder="Confirm Password"
-          class="w-full px-4 py-3 bg-slate-950/50 border border-slate-700 rounded-xl focus:border-teal-500 focus:ring-1 focus:ring-teal-500 outline-none transition-all placeholder:text-slate-600 text-white"
+          class="w-full px-4 py-3 bg-slate-950/50 border border-theme-base-700 rounded-xl focus:border-theme-primary-500 focus:ring-1 focus:ring-teal-500 outline-none transition-all placeholder:text-theme-base-600 text-white"
         />
         <button
           on:click={handleSetup}
           disabled={isLoading}
-          class="w-full py-3 bg-teal-600 hover:bg-teal-500 text-white rounded-xl font-semibold shadow-lg shadow-teal-500/20 transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
+          class="w-full py-3 bg-theme-primary-600 hover:bg-theme-primary-500 text-white rounded-xl font-semibold shadow-lg shadow-teal-500/20 transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {isLoading ? "Creating..." : "Create Vault"}
         </button>
@@ -261,20 +261,20 @@
           type="password"
           bind:value={password}
           placeholder="Master Password"
-          class="w-full px-4 py-3 bg-slate-950/50 border border-slate-700 rounded-xl focus:border-teal-500 focus:ring-1 focus:ring-teal-500 outline-none transition-all placeholder:text-slate-600 text-white"
+          class="w-full px-4 py-3 bg-slate-950/50 border border-theme-base-700 rounded-xl focus:border-theme-primary-500 focus:ring-1 focus:ring-teal-500 outline-none transition-all placeholder:text-theme-base-600 text-white"
           on:keydown={(e) => e.key === "Enter" && handleUnlock()}
         />
         <button
           on:click={handleUnlock}
           disabled={isLoading}
-          class="w-full py-3 bg-teal-600 hover:bg-teal-500 text-white rounded-xl font-semibold shadow-lg shadow-teal-500/20 transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
+          class="w-full py-3 bg-theme-primary-600 hover:bg-theme-primary-500 text-white rounded-xl font-semibold shadow-lg shadow-teal-500/20 transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {isLoading ? "Unlocking..." : "Unlock"}
         </button>
         <div class="text-center pt-2">
           <button
             on:click={handleReset}
-            class="text-xs text-red-500 hover:text-red-400 hover:underline transition-colors block mx-auto py-2"
+            class="text-xs text-red-500 hover:text-theme-error-400 hover:underline transition-colors block mx-auto py-2"
           >
             Reset Vault (Delete All Data)
           </button>
@@ -291,25 +291,25 @@
           <div
             class="bg-slate-950/50 p-6 rounded-xl text-center space-y-4 border border-teal-500/30 shadow-inner"
           >
-            <p class="text-sm text-slate-300">Copy this code:</p>
+            <p class="text-sm text-theme-base-300">Copy this code:</p>
             <div
-              class="text-3xl font-mono font-bold text-teal-400 tracking-widest select-all bg-slate-900/50 p-2 rounded-lg border border-slate-800"
+              class="text-3xl font-mono font-bold text-theme-primary-400 tracking-widest select-all bg-slate-900/50 p-2 rounded-lg border border-theme-base-800"
             >
               {userCode}
             </div>
-            <p class="text-xs text-slate-400">Then authorize at:</p>
+            <p class="text-xs text-theme-base-400">Then authorize at:</p>
             <a
               href={verificationUri}
               target="_blank"
-              class="block text-teal-400 hover:text-teal-300 hover:underline font-medium transition-colors"
+              class="block text-theme-primary-400 hover:text-theme-primary-300 hover:underline font-medium transition-colors"
             >
               {verificationUri}
             </a>
             <div class="pt-4 flex justify-center items-center gap-2">
               <div
-                class="animate-spin rounded-full h-4 w-4 border-b-2 border-teal-500"
+                class="animate-spin rounded-full h-4 w-4 border-b-2 border-theme-primary-500"
               ></div>
-              <p class="text-xs text-slate-500 animate-pulse">
+              <p class="text-xs text-theme-base-500 animate-pulse">
                 Waiting for authorization...
               </p>
             </div>
@@ -318,10 +318,10 @@
 
         <div class="relative py-4">
           <div class="absolute inset-0 flex items-center">
-            <div class="w-full border-t border-slate-700"></div>
+            <div class="w-full border-t border-theme-base-700"></div>
           </div>
           <div class="relative flex justify-center text-sm">
-            <span class="px-2 bg-slate-900 text-slate-500"
+            <span class="px-2 bg-theme-base-900 text-theme-base-500"
               >Or use a Personal Access Token</span
             >
           </div>
@@ -332,11 +332,11 @@
             type="password"
             bind:value={token}
             placeholder="ghp_..."
-            class="w-full px-4 py-3 bg-slate-950/50 border border-slate-700 rounded-xl focus:border-teal-500 focus:ring-1 focus:ring-teal-500 outline-none transition-all placeholder:text-slate-600 text-white"
+            class="w-full px-4 py-3 bg-slate-950/50 border border-theme-base-700 rounded-xl focus:border-theme-primary-500 focus:ring-1 focus:ring-teal-500 outline-none transition-all placeholder:text-theme-base-600 text-white"
           />
           <button
             on:click={handleSaveToken}
-            class="w-full py-3 px-4 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl font-medium transition-all border border-slate-700"
+            class="w-full py-3 px-4 bg-theme-base-800 hover:bg-theme-base-700 text-theme-base-200 rounded-xl font-medium transition-all border border-theme-base-700"
           >
             Save Token
           </button>
@@ -347,7 +347,7 @@
     {#if error}
       <div class="animate-fade-in-up">
         <p
-          class="text-red-400 text-sm text-center bg-red-950/30 border border-red-900/50 p-3 rounded-lg"
+          class="text-theme-error-400 text-sm text-center bg-red-950/30 border border-red-900/50 p-3 rounded-lg"
         >
           {error}
         </p>

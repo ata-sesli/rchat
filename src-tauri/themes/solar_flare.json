@@ -1,0 +1,10 @@
+{
+  "name": "Solar Flare",
+  "description": "Warm oranges and yellows. Energetic like a sunrise.",
+  "background": "#1A0F0A",
+  "chatPanel": "#2A160E",
+  "primaryAccent": "#F97316",
+  "secondaryAccent": "#FACC15",
+  "textPrimary": "#FFF7ED",
+  "textMuted": "#FDBA74"
+}

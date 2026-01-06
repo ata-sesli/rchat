@@ -195,7 +195,7 @@
   }
 </script>
 
-<div class="h-full flex flex-col bg-slate-950">
+<div class="h-full flex flex-col bg-theme-base-950">
   <ChatArea
     {activePeer}
     {peerAlias}

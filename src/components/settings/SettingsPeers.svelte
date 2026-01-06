@@ -56,7 +56,7 @@
 <div class="mb-6 flex items-center gap-4 border-b border-slate-800/50 pb-4">
   <button
     on:click={goBack}
-    class="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition-colors"
+    class="p-2 hover:bg-theme-base-800 rounded-lg text-theme-base-400 hover:text-white transition-colors"
   >
     <svg
       xmlns="http://www.w3.org/2000/svg"
@@ -71,7 +71,7 @@
       />
     </svg>
   </button>
-  <h2 class="text-xl font-bold text-white">Add Peers</h2>
+  <h2 class="text-xl font-bold text-theme-base-100">Add Peers</h2>
 </div>
 
 <!-- Peer Management Section -->
@@ -86,7 +86,7 @@
     >
       <div class="flex items-center gap-3">
         <div
-          class="p-2 rounded-lg bg-teal-500/10 text-teal-400 group-hover:bg-teal-500/20 group-hover:text-teal-300 transition-colors"
+          class="p-2 rounded-lg bg-teal-500/10 text-theme-primary-400 group-hover:bg-teal-500/20 group-hover:text-theme-primary-300 transition-colors"
         >
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -102,14 +102,17 @@
           </svg>
         </div>
         <div>
-          <span class="block font-medium text-slate-200">Add New Peer</span>
-          <span class="text-xs text-slate-500">Connect with a GitHub user</span>
+          <span class="block font-medium text-theme-base-200">Add New Peer</span
+          >
+          <span class="text-xs text-theme-base-500"
+            >Connect with a GitHub user</span
+          >
         </div>
       </div>
 
       <svg
         xmlns="http://www.w3.org/2000/svg"
-        class={`h-5 w-5 text-slate-500 transition-transform duration-300 ${isAddPeerOpen ? "rotate-180" : ""}`}
+        class={`h-5 w-5 text-theme-base-500 transition-transform duration-300 ${isAddPeerOpen ? "rotate-180" : ""}`}
         viewBox="0 0 20 20"
         fill="currentColor"
       >
@@ -131,26 +134,26 @@
             <div
               class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none"
             >
-              <span class="text-slate-500">@</span>
+              <span class="text-theme-base-500">@</span>
             </div>
             <input
               type="text"
               bind:value={newPeer}
               placeholder="github_username"
-              class="w-full pl-8 pr-4 py-2.5 bg-slate-900 border border-slate-700 rounded-lg text-slate-200 focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500 transition-all placeholder:text-slate-600"
+              class="w-full pl-8 pr-4 py-2.5 bg-theme-base-900 border border-theme-base-700 rounded-lg text-theme-base-200 focus:outline-none focus:border-theme-primary-500 focus:ring-1 focus:ring-teal-500 transition-all placeholder:text-theme-base-600"
               on:keydown={(e) => e.key === "Enter" && addPeer()}
             />
           </div>
           <button
             on:click={addPeer}
             disabled={isLoading || !newPeer}
-            class="px-6 py-2.5 bg-teal-600 hover:bg-teal-500 text-slate-950 font-semibold rounded-lg shadow-lg shadow-teal-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
+            class="px-6 py-2.5 bg-theme-primary-600 hover:bg-theme-primary-500 text-theme-base-950 font-semibold rounded-lg shadow-lg shadow-teal-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
           >
             {isLoading ? "Adding..." : "Add Peer"}
           </button>
         </div>
         {#if error}
-          <p class="mt-2 text-sm text-red-400">{error}</p>
+          <p class="mt-2 text-sm text-theme-error-400">{error}</p>
         {/if}
       </div>
     {/if}
@@ -161,7 +164,7 @@
     class="bg-slate-900/50 rounded-xl border border-slate-700/50 shadow-sm mt-4 p-4"
   >
     <h4
-      class="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3 px-1"
+      class="text-sm font-semibold text-theme-base-400 uppercase tracking-wider mb-3 px-1"
     >
       Trusted Users ({peers.length})
     </h4>
@@ -169,10 +172,10 @@
     <div class="space-y-2">
       {#if peers.length === 0}
         <div
-          class="p-8 text-center border-2 border-dashed border-slate-800 rounded-lg"
+          class="p-8 text-center border-2 border-dashed border-theme-base-800 rounded-lg"
         >
-          <p class="text-slate-500">No trusted peers yet.</p>
-          <p class="text-xs text-slate-600 mt-1">
+          <p class="text-theme-base-500">No trusted peers yet.</p>
+          <p class="text-xs text-theme-base-600 mt-1">
             Add a GitHub username above to start chatting securely.
           </p>
         </div>
@@ -186,16 +189,16 @@
             <img
               src={`https://github.com/${peer}.png?size=40`}
               alt={peer}
-              class="w-8 h-8 rounded-full bg-slate-800 ring-2 ring-slate-800"
+              class="w-8 h-8 rounded-full bg-theme-base-800 ring-2 ring-slate-800"
               on:error={(e) =>
                 ((e.currentTarget as HTMLImageElement).src =
                   "https://github.com/github.png?size=40")}
             />
-            <span class="text-slate-200 font-medium">{peer}</span>
+            <span class="text-theme-base-200 font-medium">{peer}</span>
           </div>
           <button
             on:click={() => removePeer(peer)}
-            class="p-2 text-slate-500 hover:text-red-400 hover:bg-red-950/30 rounded-lg transition-all opacity-0 group-hover:opacity-100"
+            class="p-2 text-theme-base-500 hover:text-theme-error-400 hover:bg-red-950/30 rounded-lg transition-all opacity-0 group-hover:opacity-100"
             title="Remove"
           >
             <svg

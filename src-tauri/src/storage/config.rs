@@ -10,6 +10,9 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use x25519_dalek::StaticSecret;
 
+// Re-export theme types from theme module
+pub use super::theme::{AccentColors, BaseColors, ThemeConfig};
+
 // System Configuration, can be modified only internally.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SystemConfig {
@@ -17,7 +20,7 @@ pub struct SystemConfig {
     pub github_token: Option<String>,
     pub public_key: Option<String>,
     pub private_key: Option<String>,
-    pub master_hash: Option<String>, // New: For password verification
+    pub master_hash: Option<String>,
 }
 
 // User Configuration, can be modified via UI.
@@ -59,6 +62,10 @@ pub struct UserConfig {
     pub libp2p_keypair: Option<String>, // Base64-encoded protobuf keypair for persistent peer ID
     #[serde(default)]
     pub pending_invitations: Option<Vec<String>>, // JSON-encoded TrackedInvite objects
+    #[serde(default)]
+    pub theme: ThemeConfig, // Customizable color theme
+    #[serde(default)]
+    pub selected_preset: Option<String>, // Currently selected theme preset key
 }
 
 impl Default for UserConfig {
@@ -76,6 +83,8 @@ impl Default for UserConfig {
             is_online: false,
             libp2p_keypair: None,
             pending_invitations: None,
+            theme: ThemeConfig::default(),
+            selected_preset: None,
         }
     }
 }

@@ -5,7 +5,7 @@
 <button
   on:click
   disabled={loading}
-  class="w-full flex items-center justify-center gap-3 px-4 py-3 bg-[#24292F] hover:bg-[#2b3137] text-white rounded-xl font-bold transition-all transform hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed border border-slate-700 shadow-lg"
+  class="w-full flex items-center justify-center gap-3 px-4 py-3 bg-[#24292F] hover:bg-[#2b3137] text-white rounded-xl font-bold transition-all transform hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed border border-theme-base-700 shadow-lg"
 >
   {#if loading}
     <svg class="animate-spin h-5 w-5 text-white" viewBox="0 0 24 24">

@@ -1,0 +1,10 @@
+{
+  "name": "Rose Noir",
+  "description": "Deep reds and pinks on dark burgundy. Romantic and bold.",
+  "background": "#140A0E",
+  "chatPanel": "#1F0F15",
+  "primaryAccent": "#FB7185",
+  "secondaryAccent": "#BE123C",
+  "textPrimary": "#FFF1F2",
+  "textMuted": "#FCA5A5"
+}

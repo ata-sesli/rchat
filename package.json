@@ -21,6 +21,7 @@
     "@tauri-apps/plugin-opener": "^2",
     "html5-qrcode": "^2.3.8",
     "qrcode": "^1.5.4",
+    "svelte-awesome-color-picker": "^4.1.0",
     "tailwindcss": "^4.1.17"
   },
   "devDependencies": {

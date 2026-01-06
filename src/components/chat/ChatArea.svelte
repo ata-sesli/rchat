@@ -307,7 +307,7 @@
   class="h-16 flex items-center px-6 border-b border-slate-800/50 bg-slate-900/10 backdrop-blur-sm"
 >
   <div class="flex items-center gap-3">
-    <span class="text-xl font-bold text-white">
+    <span class="text-xl font-bold text-theme-base-100">
       {#if activePeer === "Me"}
         Me (You)
       {:else if activePeer === "General"}
@@ -317,12 +317,13 @@
       {/if}
     </span>
     {#if activePeer !== "Me" && activePeer !== "General"}
-      <span class="text-xs text-slate-500 ml-2">@ {truncateId(activePeer)}</span
+      <span class="text-xs text-theme-base-500 ml-2"
+        >@ {truncateId(activePeer)}</span
       >
     {/if}
     {#if activePeer !== "Me" && activePeer !== "General"}
       <div
-        class="w-2 h-2 rounded-full bg-green-500 shadow-lg shadow-green-500/50"
+        class="w-2 h-2 rounded-full bg-theme-success-500 shadow-lg shadow-green-500/50"
       ></div>
     {/if}
   </div>
@@ -335,11 +336,11 @@
 >
   {#if messages.length === 0}
     <div
-      class="flex flex-col items-center justify-center h-full text-slate-500 space-y-4 opacity-0 animate-fade-in-up"
+      class="flex flex-col items-center justify-center h-full text-theme-base-500 space-y-4 opacity-0 animate-fade-in-up"
       style="animation-fill-mode: forwards;"
     >
       <div
-        class="w-16 h-16 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center"
+        class="w-16 h-16 rounded-2xl bg-theme-base-900 border border-theme-base-800 flex items-center justify-center"
       >
         <span class="text-3xl">👋</span>
       </div>
@@ -368,7 +369,7 @@
       {#each pendingImages as img, index}
         <div class="relative group">
           <div
-            class="w-16 h-16 bg-slate-800 rounded-lg flex items-center justify-center overflow-hidden border border-slate-600 relative"
+            class="w-16 h-16 bg-theme-base-800 rounded-lg flex items-center justify-center overflow-hidden border border-theme-base-600 relative"
           >
             {#if img.dataUrl}
               <!-- Actual image preview -->
@@ -380,7 +381,7 @@
             {:else}
               <!-- Fallback icon when loading or no dataUrl -->
               <svg
-                class="w-8 h-8 text-purple-400"
+                class="w-8 h-8 text-theme-secondary-400"
                 fill="none"
                 viewBox="0 0 24 24"
                 stroke="currentColor"
@@ -396,11 +397,11 @@
           </div>
           <button
             on:click={() => removeImage(index)}
-            class="absolute -top-2 -right-2 w-5 h-5 bg-red-500 hover:bg-red-400 text-white rounded-full flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+            class="absolute -top-2 -right-2 w-5 h-5 bg-theme-error-500 hover:bg-theme-error-400 text-white rounded-full flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
           >
             ×
           </button>
-          <p class="text-xs text-slate-400 mt-1 truncate w-16 text-center">
+          <p class="text-xs text-theme-base-400 mt-1 truncate w-16 text-center">
             {img.name}
           </p>
         </div>
@@ -415,7 +416,7 @@
     >
       {#each pendingDocuments as doc, index}
         <div
-          class="relative group flex items-center gap-2 bg-slate-800 rounded-lg p-2 pr-8 border border-slate-600"
+          class="relative group flex items-center gap-2 bg-theme-base-800 rounded-lg p-2 pr-8 border border-theme-base-600"
         >
           <span class="text-xl">
             {#if doc.name.endsWith(".pdf")}📕
@@ -425,12 +426,12 @@
             {:else}📄
             {/if}
           </span>
-          <span class="text-xs text-slate-300 truncate max-w-[120px]"
+          <span class="text-xs text-theme-base-300 truncate max-w-[120px]"
             >{doc.name}</span
           >
           <button
             on:click={() => removeDocument(index)}
-            class="absolute top-1 right-1 w-5 h-5 bg-red-500 hover:bg-red-400 text-white rounded-full flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+            class="absolute top-1 right-1 w-5 h-5 bg-theme-error-500 hover:bg-theme-error-400 text-white rounded-full flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
           >
             ×
           </button>
@@ -447,7 +448,7 @@
       {#each pendingVideos as vid, index}
         <div class="relative group">
           <div
-            class="w-20 h-14 bg-slate-800 rounded-lg flex items-center justify-center overflow-hidden border border-slate-600 relative"
+            class="w-20 h-14 bg-theme-base-800 rounded-lg flex items-center justify-center overflow-hidden border border-theme-base-600 relative"
           >
             {#if vid.dataUrl}
               <!-- svelte-ignore a11y_media_has_caption -->
@@ -468,7 +469,7 @@
             {:else}
               <!-- Fallback icon -->
               <svg
-                class="w-8 h-8 text-purple-400"
+                class="w-8 h-8 text-theme-secondary-400"
                 fill="none"
                 viewBox="0 0 24 24"
                 stroke="currentColor"
@@ -490,12 +491,12 @@
           </div>
           <button
             on:click={() => removeVideo(index)}
-            class="absolute -top-2 -right-2 w-5 h-5 bg-red-500 hover:bg-red-400 text-white rounded-full flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+            class="absolute -top-2 -right-2 w-5 h-5 bg-theme-error-500 hover:bg-theme-error-400 text-white rounded-full flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
             title="Remove video"
           >
             ×
           </button>
-          <p class="text-xs text-slate-400 mt-1 truncate w-20 text-center">
+          <p class="text-xs text-theme-base-400 mt-1 truncate w-20 text-center">
             {vid.name}
           </p>
         </div>
@@ -504,13 +505,13 @@
   {/if}
 
   <div
-    class="bg-slate-900/90 backdrop-blur-md border border-slate-700 rounded-2xl p-1.5 shadow-2xl flex items-center gap-2 relative"
+    class="bg-theme-base-900/90 backdrop-blur-md border border-theme-base-700 rounded-2xl p-1.5 shadow-2xl flex items-center gap-2 relative"
   >
     <!-- Attachments Button -->
     <div class="relative">
       <button
         on:click={toggleAttachments}
-        class={`p-2 rounded-xl transition-all ${showAttachments ? "bg-slate-700 text-teal-400" : "text-slate-400 hover:text-white hover:bg-slate-800"}`}
+        class={`p-2 rounded-xl transition-all ${showAttachments ? "bg-theme-base-700 text-theme-primary-400" : "text-theme-base-400 hover:text-white hover:bg-theme-base-800"}`}
         title="Add Attachment"
       >
         <svg
@@ -531,16 +532,16 @@
 
       {#if showAttachments}
         <div
-          class="absolute bottom-full left-0 mb-2 w-48 bg-slate-800 border border-slate-700 rounded-xl shadow-xl overflow-hidden z-50 animate-fade-in-up"
+          class="absolute bottom-full left-0 mb-2 w-48 bg-theme-base-800 border border-theme-base-700 rounded-xl shadow-xl overflow-hidden z-50 animate-fade-in-up"
         >
           <button
             on:click={pickImage}
-            class="w-full text-left px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 hover:text-white flex items-center gap-3 transition-colors"
+            class="w-full text-left px-4 py-3 text-sm text-theme-base-200 hover:bg-theme-base-700 hover:text-white flex items-center gap-3 transition-colors"
             disabled={isSendingImage}
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
-              class="h-5 w-5 text-purple-400"
+              class="h-5 w-5 text-theme-secondary-400"
               fill="none"
               viewBox="0 0 24 24"
               stroke="currentColor"
@@ -561,7 +562,7 @@
           <div class="h-px bg-slate-700/50"></div>
           <button
             on:click={pickVideo}
-            class="w-full text-left px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 hover:text-white flex items-center gap-3 transition-colors"
+            class="w-full text-left px-4 py-3 text-sm text-theme-base-200 hover:bg-theme-base-700 hover:text-white flex items-center gap-3 transition-colors"
             disabled={isSendingVideo}
           >
             <svg
@@ -593,12 +594,12 @@
           <div class="h-px bg-slate-700/50"></div>
           <button
             on:click={pickDocument}
-            class="w-full text-left px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 hover:text-white flex items-center gap-3 transition-colors"
+            class="w-full text-left px-4 py-3 text-sm text-theme-base-200 hover:bg-theme-base-700 hover:text-white flex items-center gap-3 transition-colors"
             disabled={isSendingDocument}
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
-              class="h-5 w-5 text-blue-400"
+              class="h-5 w-5 text-theme-info-400"
               fill="none"
               viewBox="0 0 24 24"
               stroke="currentColor"
@@ -618,7 +619,7 @@
           </button>
           <div class="h-px bg-slate-700/50"></div>
           <button
-            class="w-full text-left px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 hover:text-white flex items-center gap-3 transition-colors"
+            class="w-full text-left px-4 py-3 text-sm text-theme-base-200 hover:bg-theme-base-700 hover:text-white flex items-center gap-3 transition-colors"
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -647,12 +648,12 @@
       on:input={handleInput}
       placeholder={`Message ${activePeer}...`}
       rows="1"
-      class="flex-1 bg-transparent text-slate-100 placeholder:text-slate-600 px-4 py-2.5 focus:outline-none min-w-0 resize-none overflow-hidden max-h-32 self-end mb-1"
+      class="flex-1 bg-transparent text-theme-base-100 placeholder:text-theme-base-600 px-4 py-2.5 focus:outline-none min-w-0 resize-none overflow-hidden max-h-32 self-end mb-1"
     ></textarea>
 
     <button
       on:click={sendMessage}
-      class="bg-teal-500 hover:bg-teal-400 text-slate-950 p-2.5 rounded-xl font-semibold transition-all hover:scale-105 active:scale-95 shadow-lg shadow-teal-500/20 disabled:opacity-50 disabled:cursor-not-allowed"
+      class="bg-theme-primary-500 hover:bg-theme-primary-400 text-theme-base-950 p-2.5 rounded-xl font-semibold transition-all hover:scale-105 active:scale-95 shadow-lg shadow-teal-500/20 disabled:opacity-50 disabled:cursor-not-allowed"
       disabled={!message.trim() && pendingImages.length === 0}
     >
       <svg

@@ -1,0 +1,10 @@
+{
+  "name": "Ocean Breeze",
+  "description": "Aqua and teal on soft cyan. Like a day at the beach.",
+  "background": "#ECFEFF",
+  "chatPanel": "#CFFAFE",
+  "primaryAccent": "#06B6D4",
+  "secondaryAccent": "#0EA5E9",
+  "textPrimary": "#083344",
+  "textMuted": "#475569"
+}

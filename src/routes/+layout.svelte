@@ -12,6 +12,7 @@
   import NewPersonModal from "../components/sidebar/NewPersonModal.svelte";
   import GroupChatModal from "../components/chat/GroupChatModal.svelte";
   import Sidebar from "../components/sidebar/Sidebar.svelte";
+  import ThemeProvider from "../components/ThemeProvider.svelte";
 
   // Types
   type Message = { sender: string; text: string; timestamp: Date };
@@ -434,128 +435,134 @@
 
 <svelte:window on:click={handleGlobalClick} />
 
-<main
-  class="flex h-screen bg-slate-950 text-slate-200 font-sans overflow-hidden selection:bg-teal-500/30"
->
-  <Sidebar
-    {isSidebarOpen}
-    {currentEnvelope}
-    bind:searchQuery
-    {showCreateMenu}
-    {envelopes}
-    {sortedPeers}
-    {peerAliases}
-    {pinnedPeers}
-    {activePeer}
-    {userProfile}
-    {dragOverEnvelopeId}
-    {isDragging}
-    {draggingPeer}
-    {isOnline}
-    {localPeers}
-    {unreadCounts}
-    ontoggleOnline={handleToggleOnline}
-    ontoggleSidebar={() => (isSidebarOpen = !isSidebarOpen)}
-    onopenSettings={() => goto("/settings")}
-    onselectPeer={handleSelectPeer}
-    onopenNewPerson={() => (showNewPersonModal = true)}
-    onopenNewGroup={() => (showNewGroupModal = true)}
-    onopenEnvelopeModal={openEnvelopeModal}
-    ontoggleCreateMenu={() => (showCreateMenu = !showCreateMenu)}
-    onenterEnvelope={(id: string) => (currentEnvelope = id)}
-    onexitEnvelope={() => (currentEnvelope = null)}
-    onsearchChange={(query: string) => (searchQuery = query)}
-    oncontextMenu={(data: {
-      event: MouseEvent;
-      type: "peer" | "envelope";
-      id: string;
-    }) => {
-      contextMenuTarget = { type: data.type, id: data.id };
-      contextMenuPos = { x: data.event.clientX, y: data.event.clientY };
-      showContextMenu = true;
-    }}
-    ondragStart={(data: { event: PointerEvent; peer: string }) =>
-      handleDragStart(data.event, data.peer)}
-    ondragMove={handleDragMove}
-    ondragEnd={handleDragEnd}
-  />
-
-  <section class="flex-1 flex flex-col relative h-full overflow-hidden">
-    <section class="flex-1 flex flex-col relative h-full overflow-hidden">
-      {#if showEnvelopeSettings}
-        <div class="flex-1 flex flex-col bg-slate-950">
-          <div
-            class="h-16 flex items-center px-6 border-b border-slate-800/50 bg-slate-900/10 backdrop-blur-sm gap-4"
-          >
-            <button
-              on:click={() => (showEnvelopeSettings = false)}
-              class="p-2 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-colors"
-            >
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                class="h-5 w-5"
-                viewBox="0 0 20 20"
-                fill="currentColor"
-              >
-                <path
-                  fill-rule="evenodd"
-                  d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z"
-                  clip-rule="evenodd"
-                />
-              </svg>
-            </button>
-            <h2 class="text-xl font-bold text-white">Envelope Settings</h2>
-          </div>
-          <div class="flex-1 flex items-center justify-center text-slate-500">
-            <p>Settings for Envelope ID: {envelopeSettingsTargetId}</p>
-          </div>
-        </div>
-      {:else}
-        <slot />
-      {/if}
-    </section>
-
-    <!-- Modals -->
-    <EnvelopeModal
-      show={showEnvelopeModal}
-      bind:name={newEnvelopeName}
-      bind:selectedIcon={newEnvelopeIcon}
-      editingId={editingEnvelopeId}
-      icons={AVAILABLE_ICONS}
-      onclose={() => (showEnvelopeModal = false)}
-      onsubmit={submitEnvelopeCreation}
-    />
-
-    <NewPersonModal
-      show={showNewPersonModal}
-      bind:step={newPersonStep}
-      {localPeers}
-      onclose={() => {
-        showNewPersonModal = false;
-        newPersonStep = "select-network";
-      }}
-      onconnect={async (peerId: string) => {
-        console.log("Peer connected:", peerId);
-        // Refresh data to show the new peer (already in known_devices from backend)
-        await refreshData();
-      }}
-    />
-
-    <GroupChatModal
-      show={showNewGroupModal}
-      onclose={() => (showNewGroupModal = false)}
-    />
-
-    <ContextMenu
-      show={showContextMenu}
-      position={contextMenuPos}
-      target={contextMenuTarget}
-      {pinnedPeers}
+<ThemeProvider>
+  <main
+    class="flex h-screen bg-theme-base-950 text-theme-base-200 font-sans overflow-hidden selection:bg-teal-500/30"
+  >
+    <Sidebar
+      {isSidebarOpen}
       {currentEnvelope}
-      onaction={handleContextAction}
+      bind:searchQuery
+      {showCreateMenu}
+      {envelopes}
+      {sortedPeers}
+      {peerAliases}
+      {pinnedPeers}
+      {activePeer}
+      {userProfile}
+      {dragOverEnvelopeId}
+      {isDragging}
+      {draggingPeer}
+      {isOnline}
+      {localPeers}
+      {unreadCounts}
+      ontoggleOnline={handleToggleOnline}
+      ontoggleSidebar={() => (isSidebarOpen = !isSidebarOpen)}
+      onopenSettings={() => goto("/settings")}
+      onselectPeer={handleSelectPeer}
+      onopenNewPerson={() => (showNewPersonModal = true)}
+      onopenNewGroup={() => (showNewGroupModal = true)}
+      onopenEnvelopeModal={openEnvelopeModal}
+      ontoggleCreateMenu={() => (showCreateMenu = !showCreateMenu)}
+      onenterEnvelope={(id: string) => (currentEnvelope = id)}
+      onexitEnvelope={() => (currentEnvelope = null)}
+      onsearchChange={(query: string) => (searchQuery = query)}
+      oncontextMenu={(data: {
+        event: MouseEvent;
+        type: "peer" | "envelope";
+        id: string;
+      }) => {
+        contextMenuTarget = { type: data.type, id: data.id };
+        contextMenuPos = { x: data.event.clientX, y: data.event.clientY };
+        showContextMenu = true;
+      }}
+      ondragStart={(data: { event: PointerEvent; peer: string }) =>
+        handleDragStart(data.event, data.peer)}
+      ondragMove={handleDragMove}
+      ondragEnd={handleDragEnd}
     />
-  </section>
-</main>
+
+    <section class="flex-1 flex flex-col relative h-full overflow-hidden">
+      <section class="flex-1 flex flex-col relative h-full overflow-hidden">
+        {#if showEnvelopeSettings}
+          <div class="flex-1 flex flex-col bg-theme-base-950">
+            <div
+              class="h-16 flex items-center px-6 border-b border-slate-800/50 bg-slate-900/10 backdrop-blur-sm gap-4"
+            >
+              <button
+                on:click={() => (showEnvelopeSettings = false)}
+                class="p-2 rounded-lg hover:bg-theme-base-800 text-theme-base-400 hover:text-white transition-colors"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  class="h-5 w-5"
+                  viewBox="0 0 20 20"
+                  fill="currentColor"
+                >
+                  <path
+                    fill-rule="evenodd"
+                    d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z"
+                    clip-rule="evenodd"
+                  />
+                </svg>
+              </button>
+              <h2 class="text-xl font-bold text-theme-base-100">
+                Envelope Settings
+              </h2>
+            </div>
+            <div
+              class="flex-1 flex items-center justify-center text-theme-base-500"
+            >
+              <p>Settings for Envelope ID: {envelopeSettingsTargetId}</p>
+            </div>
+          </div>
+        {:else}
+          <slot />
+        {/if}
+      </section>
+
+      <!-- Modals -->
+      <EnvelopeModal
+        show={showEnvelopeModal}
+        bind:name={newEnvelopeName}
+        bind:selectedIcon={newEnvelopeIcon}
+        editingId={editingEnvelopeId}
+        icons={AVAILABLE_ICONS}
+        onclose={() => (showEnvelopeModal = false)}
+        onsubmit={submitEnvelopeCreation}
+      />
+
+      <NewPersonModal
+        show={showNewPersonModal}
+        bind:step={newPersonStep}
+        {localPeers}
+        onclose={() => {
+          showNewPersonModal = false;
+          newPersonStep = "select-network";
+        }}
+        onconnect={async (peerId: string) => {
+          console.log("Peer connected:", peerId);
+          // Refresh data to show the new peer (already in known_devices from backend)
+          await refreshData();
+        }}
+      />
+
+      <GroupChatModal
+        show={showNewGroupModal}
+        onclose={() => (showNewGroupModal = false)}
+      />
+
+      <ContextMenu
+        show={showContextMenu}
+        position={contextMenuPos}
+        target={contextMenuTarget}
+        {pinnedPeers}
+        {currentEnvelope}
+        onaction={handleContextAction}
+      />
+    </section>
+  </main>
+</ThemeProvider>
 
 <svelte:body class:is-dragging={isDragging} />
 

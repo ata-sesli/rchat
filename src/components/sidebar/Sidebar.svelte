@@ -118,7 +118,7 @@
 </script>
 
 <aside
-  class={`flex flex-col bg-slate-900 border-r border-slate-800/50 transition-all duration-300 ease-in-out overflow-hidden h-full select-none
+  class={`flex flex-col bg-theme-base-900 border-r border-slate-800/50 transition-all duration-300 ease-in-out overflow-hidden h-full select-none
   ${isSidebarOpen ? "w-80 opacity-100" : "w-16 opacity-100"}`}
 >
   <!-- Sidebar Header / Search -->
@@ -140,7 +140,7 @@
               class="w-8 h-8 rounded-lg shadow-lg"
             />
           {/if}
-          <span class="font-bold text-slate-200 truncate"
+          <span class="font-bold text-theme-base-200 truncate"
             >{userProfile.alias || "RChat"}</span
           >
         </div>
@@ -148,7 +148,7 @@
 
       <button
         onclick={toggleSidebar}
-        class={`p-2 text-slate-500 hover:text-white hover:bg-slate-800 rounded-lg transition-colors ${!isSidebarOpen ? "mx-auto" : ""}`}
+        class={`p-2 text-theme-base-500 hover:text-white hover:bg-theme-base-800 rounded-lg transition-colors ${!isSidebarOpen ? "mx-auto" : ""}`}
         title={isSidebarOpen ? "Close Sidebar" : "Open Sidebar"}
       >
         <svg
@@ -179,7 +179,7 @@
         <!-- Offline/Online Switch -->
         <div class="flex items-center justify-between px-1 mb-2">
           <span
-            class="text-xs font-semibold uppercase tracking-wider text-slate-500"
+            class="text-xs font-semibold uppercase tracking-wider text-theme-base-500"
           >
             {isOnline ? "Online" : "Offline"}
           </span>
@@ -188,7 +188,7 @@
               console.log("Sidebar: Toggle clicked");
               ontoggleOnline();
             }}
-            class={`w-10 h-5 rounded-full relative transition-colors duration-300 z-50 cursor-pointer ${isOnline ? "bg-teal-500" : "bg-slate-700"}`}
+            class={`w-10 h-5 rounded-full relative transition-colors duration-300 z-50 cursor-pointer ${isOnline ? "bg-theme-primary-500" : "bg-theme-base-700"}`}
             title={isOnline ? "Go Offline" : "Go Online"}
           >
             <div
@@ -203,7 +203,7 @@
             placeholder="Search..."
             bind:value={searchQuery}
             oninput={() => onsearchChange(searchQuery)}
-            class="flex-1 bg-slate-800 text-sm text-slate-300 rounded-lg pl-4 pr-4 py-2.5 border border-slate-700 focus:outline-none focus:border-slate-600 transition-colors placeholder:text-slate-600"
+            class="flex-1 bg-theme-base-800 text-sm text-theme-base-300 rounded-lg pl-4 pr-4 py-2.5 border border-theme-base-700 focus:outline-none focus:border-theme-base-600 transition-colors placeholder:text-theme-base-600"
           />
           <div class="relative">
             <button
@@ -211,7 +211,7 @@
                 e.stopPropagation();
                 toggleCreateMenu();
               }}
-              class="p-2 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white rounded-lg border border-slate-700 transition-colors relative"
+              class="p-2 bg-theme-base-800 hover:bg-theme-base-700 text-theme-base-400 hover:text-white rounded-lg border border-theme-base-700 transition-colors relative"
               title="Create New"
             >
               <svg
@@ -230,12 +230,12 @@
 
             {#if showCreateMenu}
               <div
-                class="absolute top-full right-0 mt-2 w-48 bg-slate-900 border border-slate-700 rounded-lg shadow-xl z-50 py-1"
+                class="absolute top-full right-0 mt-2 w-48 bg-theme-base-900 border border-theme-base-700 rounded-lg shadow-xl z-50 py-1"
                 transition:fade={{ duration: 100 }}
               >
                 <button
                   onclick={openNewPerson}
-                  class="w-full text-left px-4 py-2 text-sm text-slate-300 hover:bg-slate-700 hover:text-white transition-colors flex items-center gap-3"
+                  class="w-full text-left px-4 py-2 text-sm text-theme-base-300 hover:bg-theme-base-700 hover:text-white transition-colors flex items-center gap-3"
                 >
                   <svg
                     xmlns="http://www.w3.org/2000/svg"
@@ -253,7 +253,7 @@
                 </button>
                 <button
                   onclick={openNewGroup}
-                  class="w-full text-left px-4 py-2 text-sm text-slate-300 hover:bg-slate-700 hover:text-white transition-colors flex items-center gap-3"
+                  class="w-full text-left px-4 py-2 text-sm text-theme-base-300 hover:bg-theme-base-700 hover:text-white transition-colors flex items-center gap-3"
                 >
                   <svg
                     xmlns="http://www.w3.org/2000/svg"
@@ -267,10 +267,10 @@
                   </svg>
                   New Group Chat
                 </button>
-                <div class="h-px bg-slate-700 my-1"></div>
+                <div class="h-px bg-theme-base-700 my-1"></div>
                 <button
                   onclick={openEnvelopeModal}
-                  class="w-full text-left px-4 py-2 text-sm text-slate-300 hover:bg-slate-700 hover:text-white transition-colors flex items-center gap-3"
+                  class="w-full text-left px-4 py-2 text-sm text-theme-base-300 hover:bg-theme-base-700 hover:text-white transition-colors flex items-center gap-3"
                 >
                   <svg
                     xmlns="http://www.w3.org/2000/svg"
@@ -292,7 +292,7 @@
         {#if currentEnvelope}
           <button
             onclick={exitEnvelope}
-            class="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-400 hover:text-white bg-slate-800/50 hover:bg-slate-800 rounded-lg transition-colors border border-dashed border-slate-700"
+            class="w-full flex items-center gap-2 px-3 py-2 text-sm text-theme-base-400 hover:text-white bg-slate-800/50 hover:bg-theme-base-800 rounded-lg transition-colors border border-dashed border-theme-base-700"
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -362,22 +362,22 @@
                 {#if userProfile.avatar_path}
                   <img
                     src={userProfile.avatar_path}
-                    class="w-10 h-10 rounded-full bg-slate-800 object-cover shadow-lg shadow-teal-500/10"
+                    class="w-10 h-10 rounded-full bg-theme-base-800 object-cover shadow-lg shadow-teal-500/10"
                     alt="Me"
                   />
                 {:else}
                   <div
-                    class="w-10 h-10 rounded-full bg-teal-600 flex items-center justify-center text-white font-medium shadow-lg shadow-teal-500/20"
+                    class="w-10 h-10 rounded-full bg-theme-primary-600 flex items-center justify-center text-white font-medium shadow-lg shadow-teal-500/20"
                   >
                     ME
                   </div>
                 {/if}
                 <div
-                  class="absolute bottom-0 right-0 w-3 h-3 bg-green-500 border-2 border-slate-800 rounded-full"
+                  class="absolute bottom-0 right-0 w-3 h-3 bg-theme-success-500 border-2 border-theme-base-800 rounded-full"
                 ></div>
               {:else if peer === "General"}
                 <div
-                  class="w-10 h-10 rounded-full bg-slate-700 flex items-center justify-center text-slate-300 font-medium group-hover:bg-slate-600 shadow-md"
+                  class="w-10 h-10 rounded-full bg-theme-base-700 flex items-center justify-center text-theme-base-300 font-medium group-hover:bg-theme-base-600 shadow-md"
                 >
                   #
                 </div>
@@ -390,15 +390,17 @@
                 </div>
                 <!-- Status indicator dot -->
                 <div
-                  class={`absolute bottom-0 right-0 w-3 h-3 border-2 border-slate-800 rounded-full ${
-                    isPeerOnline(peer) ? "bg-green-500" : "bg-slate-500"
+                  class={`absolute bottom-0 right-0 w-3 h-3 border-2 border-theme-base-800 rounded-full ${
+                    isPeerOnline(peer)
+                      ? "bg-theme-success-500"
+                      : "bg-theme-base-500"
                   }`}
                 ></div>
               {/if}
 
               {#if isPinned}
                 <div
-                  class="absolute -top-1 -right-1 bg-yellow-500/90 text-slate-950 p-0.5 rounded-full shadow-sm pointer-events-none z-30"
+                  class="absolute -top-1 -right-1 bg-amber-500/90 text-theme-base-950 p-0.5 rounded-full shadow-sm pointer-events-none z-30"
                 >
                   <svg
                     xmlns="http://www.w3.org/2000/svg"
@@ -416,27 +418,29 @@
             <div class="flex-1 min-w-0 text-left pointer-events-none">
               <div class="flex justify-between items-baseline mb-0.5">
                 <span
-                  class="font-medium text-slate-200 truncate group-hover:text-white transition-colors"
+                  class="font-medium text-theme-base-200 truncate group-hover:text-white transition-colors"
                   >{peer === "Me"
                     ? "Me (You)"
                     : peerAliases[peer] || peer}</span
                 >
               </div>
               {#if peer === "Me"}
-                <p class="text-xs text-slate-500 truncate">Note to self</p>
+                <p class="text-xs text-theme-base-500 truncate">Note to self</p>
               {:else if peer === "General"}
-                <p class="text-xs text-slate-500 truncate">Public Broadcast</p>
+                <p class="text-xs text-theme-base-500 truncate">
+                  Public Broadcast
+                </p>
               {:else}
                 <div class="flex items-center gap-2">
                   <p
-                    class={`text-xs truncate ${isPeerOnline(peer) ? "text-green-400" : "text-slate-500"}`}
+                    class={`text-xs truncate ${isPeerOnline(peer) ? "text-theme-success-400" : "text-theme-base-500"}`}
                   >
                     {isPeerOnline(peer) ? "Online" : "Offline"}
                   </p>
                   <!-- Unread Badge (inline with status) -->
                   {#if unreadCounts[peer] && unreadCounts[peer] > 0}
                     <div
-                      class="min-w-5 h-5 px-1.5 bg-red-500 text-white text-xs font-bold rounded-full flex items-center justify-center"
+                      class="min-w-5 h-5 px-1.5 bg-theme-error-500 text-white text-xs font-bold rounded-full flex items-center justify-center"
                     >
                       {unreadCounts[peer] > 99 ? "99+" : unreadCounts[peer]}
                     </div>
@@ -450,7 +454,7 @@
                 e.stopPropagation();
                 openContextMenu(e, "peer", peer);
               }}
-              class="absolute right-0 top-0 bottom-0 w-8 flex items-center justify-center text-slate-500 hover:text-white hover:bg-slate-700/50 transition-all opacity-0 group-hover/item:opacity-100 z-20 pointer-events-auto rounded-r-xl"
+              class="absolute right-0 top-0 bottom-0 w-8 flex items-center justify-center text-theme-base-500 hover:text-white hover:bg-slate-700/50 transition-all opacity-0 group-hover/item:opacity-100 z-20 pointer-events-auto rounded-r-xl"
               title="Options"
             >
               <svg
@@ -472,7 +476,7 @@
         {#each sortedPeers as peer}
           <button
             onclick={() => selectPeer(peer)}
-            class={`w-10 h-10 rounded-full bg-slate-800 overflow-hidden border-2 transition-transform hover:scale-105 ${activePeer === peer ? "border-teal-500" : "border-transparent"}`}
+            class={`w-10 h-10 rounded-full bg-theme-base-800 overflow-hidden border-2 transition-transform hover:scale-105 ${activePeer === peer ? "border-theme-primary-500" : "border-transparent"}`}
             title={peer}
           >
             <img
@@ -494,7 +498,7 @@
   <div class="p-4 border-t border-slate-800/50 shrink-0">
     <button
       onclick={openSettings}
-      class="flex items-center justify-center gap-3 text-sm text-slate-400 hover:text-white transition-colors w-full p-2 rounded-lg hover:bg-slate-800"
+      class="flex items-center justify-center gap-3 text-sm text-theme-base-400 hover:text-white transition-colors w-full p-2 rounded-lg hover:bg-theme-base-800"
       title="Settings"
     >
       <svg

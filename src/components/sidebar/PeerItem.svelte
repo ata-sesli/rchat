@@ -67,23 +67,23 @@
         {#if userProfile.avatar_path}
           <img
             src={userProfile.avatar_path}
-            class="w-10 h-10 rounded-full bg-slate-800 object-cover shadow-lg shadow-teal-500/10"
+            class="w-10 h-10 rounded-full bg-theme-base-800 object-cover shadow-lg shadow-teal-500/10"
             alt="Me"
           />
         {:else}
           <div
-            class="w-10 h-10 rounded-full bg-teal-600 flex items-center justify-center text-white font-medium shadow-lg shadow-teal-500/20"
+            class="w-10 h-10 rounded-full bg-theme-primary-600 flex items-center justify-center text-white font-medium shadow-lg shadow-teal-500/20"
           >
             ME
           </div>
         {/if}
         <div
-          class="absolute bottom-0 right-0 w-3 h-3 bg-green-500 border-2 border-slate-800 rounded-full"
+          class="absolute bottom-0 right-0 w-3 h-3 bg-theme-success-500 border-2 border-theme-base-800 rounded-full"
         ></div>
       {:else if peer === "General"}
         <!-- GENERAL Icon -->
         <div
-          class="w-10 h-10 rounded-full bg-slate-700 flex items-center justify-center text-slate-300 font-medium group-hover:bg-slate-600 shadow-md"
+          class="w-10 h-10 rounded-full bg-theme-base-700 flex items-center justify-center text-theme-base-300 font-medium group-hover:bg-theme-base-600 shadow-md"
         >
           #
         </div>
@@ -92,7 +92,7 @@
         <img
           src={`https://github.com/${peer}.png?size=40`}
           alt={peer}
-          class="w-10 h-10 rounded-full bg-slate-800 shadow-md ring-2 ring-transparent group-hover:ring-slate-700 transition-all"
+          class="w-10 h-10 rounded-full bg-theme-base-800 shadow-md ring-2 ring-transparent group-hover:ring-slate-700 transition-all"
           on:error={(e) =>
             ((e.currentTarget as HTMLImageElement).src =
               "https://github.com/github.png?size=40")}
@@ -102,7 +102,7 @@
       <!-- Pin Indicator -->
       {#if isPinned}
         <div
-          class="absolute -top-1 -right-1 bg-yellow-500/90 text-slate-950 p-0.5 rounded-full shadow-sm pointer-events-none z-30"
+          class="absolute -top-1 -right-1 bg-amber-500/90 text-theme-base-950 p-0.5 rounded-full shadow-sm pointer-events-none z-30"
         >
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -118,24 +118,24 @@
     <div class="flex-1 min-w-0 text-left pointer-events-none">
       <div class="flex justify-between items-baseline mb-0.5">
         <span
-          class="font-medium text-slate-200 truncate group-hover:text-white transition-colors"
+          class="font-medium text-theme-base-200 truncate group-hover:text-white transition-colors"
           >{peer === "Me" ? "Me (You)" : peer}</span
         >
       </div>
       <!-- Status/Subtitle -->
       {#if peer === "Me"}
-        <p class="text-xs text-slate-500 truncate">Note to self</p>
+        <p class="text-xs text-theme-base-500 truncate">Note to self</p>
       {:else if peer === "General"}
-        <p class="text-xs text-slate-500 truncate">Public Broadcast</p>
+        <p class="text-xs text-theme-base-500 truncate">Public Broadcast</p>
       {:else}
-        <p class="text-xs text-slate-400 truncate">Connected</p>
+        <p class="text-xs text-theme-base-400 truncate">Connected</p>
       {/if}
     </div>
 
     <!-- Context Menu Button -->
     <button
       on:click|stopPropagation={handleContextMenu}
-      class="absolute right-0 top-0 bottom-0 w-8 flex items-center justify-center text-slate-500 hover:text-white hover:bg-slate-700/50 transition-all opacity-0 group-hover/item:opacity-100 z-20 pointer-events-auto rounded-r-xl"
+      class="absolute right-0 top-0 bottom-0 w-8 flex items-center justify-center text-theme-base-500 hover:text-white hover:bg-slate-700/50 transition-all opacity-0 group-hover/item:opacity-100 z-20 pointer-events-auto rounded-r-xl"
       title="Options"
     >
       <svg

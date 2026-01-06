@@ -1,0 +1,10 @@
+{
+  "name": "Arctic Ice",
+  "description": "Cool blues on a crisp white canvas. Clean and refreshing.",
+  "background": "#F0F9FF",
+  "chatPanel": "#E0F2FE",
+  "primaryAccent": "#0284C7",
+  "secondaryAccent": "#38BDF8",
+  "textPrimary": "#0F172A",
+  "textMuted": "#475569"
+}

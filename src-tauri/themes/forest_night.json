@@ -1,0 +1,10 @@
+{
+  "name": "Forest Night",
+  "description": "Deep greens inspired by moonlit forests. Natural and calming.",
+  "background": "#0F1F17",
+  "chatPanel": "#162B22",
+  "primaryAccent": "#4ADE80",
+  "secondaryAccent": "#22C55E",
+  "textPrimary": "#ECFDF5",
+  "textMuted": "#9CA3AF"
+}

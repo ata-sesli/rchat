@@ -71,7 +71,7 @@
   <div class="relative max-w-[90vw] max-h-[90vh] animate-scale-in">
     {#if loading}
       <div
-        class="w-64 h-48 bg-slate-800 rounded-lg flex items-center justify-center"
+        class="w-64 h-48 bg-theme-base-800 rounded-lg flex items-center justify-center"
       >
         <div
           class="animate-spin w-8 h-8 border-2 border-white border-t-transparent rounded-full"
@@ -79,7 +79,7 @@
       </div>
     {:else if error}
       <div
-        class="w-64 h-48 bg-slate-800 rounded-lg flex items-center justify-center text-slate-400"
+        class="w-64 h-48 bg-theme-base-800 rounded-lg flex items-center justify-center text-theme-base-400"
       >
         Failed to load video
       </div>
