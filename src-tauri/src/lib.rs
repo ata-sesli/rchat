@@ -23,9 +23,25 @@ pub struct AppState {
 
 #[tauri::command]
 async fn save_api_token(token: String, state: State<'_, AppState>) -> Result<(), String> {
+    // Fetch username from GitHub API using octocrab
+    let octocrab = octocrab::Octocrab::builder()
+        .personal_token(token.clone())
+        .build()
+        .map_err(|e| format!("Failed to build octocrab client: {}", e))?;
+    
+    let user: octocrab::models::Author = octocrab
+        .get("/user", None::<&()>)
+        .await
+        .map_err(|e| format!("Failed to fetch GitHub user: {}", e))?;
+    
+    let username = user.login;
+    println!("[Backend] GitHub username fetched: {}", username);
+    
+    // Save both token and username
     let mgr = state.config_manager.lock().await;
     let mut config = mgr.load().await.map_err(|e| e.to_string())?;
     config.system.github_token = Some(token);
+    config.system.github_username = Some(username);
     mgr.save(&config).await.map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -45,6 +61,28 @@ async fn check_auth_status(state: State<'_, AppState>) -> Result<AuthStatus, Str
     } else {
         false
     };
+
+    // Migration: if token exists but username is missing, fetch and save it
+    if mgr.is_unlocked() {
+        if let Ok(config) = mgr.load().await {
+            if config.system.github_token.is_some() && config.system.github_username.is_none() {
+                if let Some(ref token) = config.system.github_token {
+                    // Fetch username from GitHub
+                    if let Ok(octocrab) = octocrab::Octocrab::builder()
+                        .personal_token(token.clone())
+                        .build()
+                    {
+                        if let Ok(user) = octocrab.get::<octocrab::models::Author, _, _>("/user", None::<&()>).await {
+                            println!("[Backend] Migrating: fetched GitHub username {}", user.login);
+                            let mut updated_config = config.clone();
+                            updated_config.system.github_username = Some(user.login);
+                            let _ = mgr.save(&updated_config).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     Ok(AuthStatus {
         is_setup: mgr.exists(),
