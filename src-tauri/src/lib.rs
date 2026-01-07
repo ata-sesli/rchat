@@ -952,15 +952,19 @@ async fn create_invite(
     invitee: String,
     password: String,
     app_state: State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
     use crate::network::invite;
     use crate::network::gist;
+    use crate::network::discovery;
     
-    // 1. Get my username from config
-    let my_username = {
+    // 1. Get my username and token from config
+    let (my_username, token) = {
         let mgr = app_state.config_manager.lock().await;
         let config = mgr.load().await.map_err(|e| e.to_string())?;
-        config.system.github_username.clone().ok_or("GitHub username not set")?
+        let username = config.system.github_username.clone().ok_or("GitHub username not set")?;
+        let tok = config.system.github_token.clone().ok_or("GitHub token not set")?;
+        (username, tok)
     };
     
     // 2. Get my multiaddress or IP (placeholder - use display name for now)
@@ -996,6 +1000,12 @@ async fn create_invite(
         
         mgr.save(&config).await.map_err(|e| e.to_string())?;
     }
+    
+    // 6. IMMEDIATELY publish to Gist so invitee can find it
+    println!("[Backend] Publishing invite to Gist immediately...");
+    discovery::publish_peer_info(&token, vec![], app)
+        .await
+        .map_err(|e| format!("Failed to publish invite: {}", e))?;
     
     println!("[Backend] Created invite for {} with password len {}", invitee, password.len());
     Ok(())

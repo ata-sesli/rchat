@@ -1,6 +1,6 @@
 mod behaviour;
 pub mod direct_message;
-mod discovery;
+pub mod discovery;
 pub mod gist;
 pub mod hks;
 pub mod invite;
