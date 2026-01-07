@@ -178,6 +178,13 @@
         refreshData();
       });
 
+      // Force repaint on resize to fix WebKit rendering bug
+      window.addEventListener("resize", () => {
+        document.body.style.display = "none";
+        void document.body.offsetHeight; // Force reflow
+        document.body.style.display = "";
+      });
+
       await refreshData();
     } catch (e) {
       console.error("Setup failed:", e);

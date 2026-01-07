@@ -4,7 +4,7 @@ use libp2p::Multiaddr;
 use tokio::sync::mpsc::Sender;
 // use serde::{Deserialize, Serialize}; // Unused
 use crate::network::gist; // Import new module
-use crate::network::hks::HksTree;
+use crate::network::hks::{HksTree, TrackedInvite};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -104,8 +104,8 @@ pub async fn publish_peer_info(
     addrs: Vec<String>,
     app: tauri::AppHandle,
 ) -> anyhow::Result<()> {
-    // 1. Prepare Content (HKS Blob)
-    let blob_content = {
+    // 1. Prepare Content (HKS Blob) and extract pending invitations
+    let (blob_content, pending_invites) = {
         let state = app.state::<AppState>();
         let mgr = state.config_manager.lock().await;
         // Load config to access keys and friends
@@ -118,10 +118,12 @@ pub async fn publish_peer_info(
         let identity_priv_b64 = config
             .user
             .identity_private_key
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("Missing Identity Private Key"))?;
         let encryption_priv_b64 = config
             .user
             .encryption_private_key
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("Missing Encryption Private Key"))?;
 
         // Decode Keys
@@ -153,18 +155,44 @@ pub async fn publish_peer_info(
 
         // Export
         let payload = addrs.join("\n");
-        tree.export(&payload, &signing_key, &encryption_pubkey)?
+        let blob = tree.export(&payload, &signing_key, &encryption_pubkey)?;
+        
+        // Parse pending invitations from config
+        let invites: Vec<TrackedInvite> = if let Some(ref inv_list) = config.user.pending_invitations {
+            inv_list.iter()
+                .filter_map(|s| serde_json::from_str(s).ok())
+                .collect()
+        } else {
+            vec![]
+        };
+        
+        (blob, invites)
     };
 
-    // Check for existing Gist
+    // 2. Inject pending invitations into blob
+    let final_blob_content = if !pending_invites.is_empty() {
+        match gist::parse_blob(&blob_content) {
+            Ok(mut blob) => {
+                blob.invitations = pending_invites;
+                gist::clean_expired_invitations(&mut blob);
+                println!("[Discovery] Publishing {} invitations", blob.invitations.len());
+                gist::serialize_blob(&blob).unwrap_or_else(|_| blob_content.clone())
+            }
+            Err(_) => blob_content.clone()
+        }
+    } else {
+        blob_content
+    };
+
+    // 3. Check for existing Gist
     let existing_gist = gist::find_rchat_gist(token).await?;
 
     if let Some(existing) = existing_gist {
         // Update
-        let _ = gist::update_peer_info(token, &existing.id, blob_content).await?;
+        let _ = gist::update_peer_info(token, &existing.id, final_blob_content).await?;
     } else {
         // Create
-        let _ = gist::create_peer_info(token, blob_content).await?;
+        let _ = gist::create_peer_info(token, final_blob_content).await?;
     }
 
     Ok(())
