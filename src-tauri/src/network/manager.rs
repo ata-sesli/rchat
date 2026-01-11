@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use tauri::async_runtime::Receiver;
 use tauri::AppHandle;
 use tauri::Emitter;
+use tauri::Manager;
 
 #[derive(Clone, Serialize)]
 pub struct LocalPeer {
@@ -39,6 +40,8 @@ pub struct NetworkManager {
     pending_requests: HashSet<PeerId>,
     // Track incoming connection requests from others
     incoming_requests: HashSet<PeerId>,
+    // Pending GitHub mappings: multiaddr → github_username (for connection events)
+    pending_github_mappings: HashMap<String, String>,
 }
 
 impl NetworkManager {
@@ -61,6 +64,7 @@ impl NetworkManager {
             local_peers: HashMap::new(),
             pending_requests: HashSet::new(),
             incoming_requests: HashSet::new(),
+            pending_github_mappings: HashMap::new(),
         }
     }
     pub async fn run(mut self: Self) {
@@ -146,6 +150,32 @@ impl NetworkManager {
     pub fn handle_ui_command(&mut self, msg_content: String) {
         println!("UI Command Received: {}", msg_content);
 
+        // Handle dial command (DIAL:multiaddr:github_username)
+        if msg_content.starts_with("DIAL:") {
+            let parts: Vec<&str> = msg_content.splitn(3, ':').collect();
+            if parts.len() >= 2 {
+                let multiaddr_str = parts[1];
+                let github_username = if parts.len() >= 3 { Some(parts[2].to_string()) } else { None };
+                
+                println!("[DIAL] 📞 Dialing {} (github: {:?})", multiaddr_str, github_username);
+                
+                if let Ok(addr) = multiaddr_str.parse::<Multiaddr>() {
+                    if let Err(e) = self.swarm.dial(addr.clone()) {
+                        eprintln!("[DIAL] ❌ Failed to dial {}: {}", multiaddr_str, e);
+                    } else {
+                        println!("[DIAL] ✅ Dial initiated to {}", multiaddr_str);
+                        // Store pending mapping for when connection succeeds
+                        if let Some(gh_user) = github_username {
+                            self.pending_github_mappings.insert(multiaddr_str.to_string(), gh_user);
+                        }
+                    }
+                } else {
+                    eprintln!("[DIAL] ❌ Invalid multiaddr: {}", multiaddr_str);
+                }
+                return;
+            }
+        }
+
         // Handle connection request command
         if msg_content.starts_with("REQUEST_CONNECTION:") {
             if let Some(peer_id_str) = msg_content.strip_prefix("REQUEST_CONNECTION:") {
@@ -169,8 +199,35 @@ impl NetworkManager {
                     target_peer_id, sender_alias, content
                 );
 
+                // Handle GitHub chat prefix (gh:username)
+                let actual_peer_id_str = if target_peer_id.starts_with("gh:") {
+                    let github_username = &target_peer_id[3..]; // Remove "gh:" prefix
+                    
+                    // Look up the actual PeerId from config's github_peer_mapping
+                    let state = self.app_handle.state::<crate::AppState>();
+                    let mapping = tauri::async_runtime::block_on(async {
+                        let mgr = state.config_manager.lock().await;
+                        if let Ok(config) = mgr.load().await {
+                            config.user.github_peer_mapping.get(github_username).cloned()
+                        } else {
+                            None
+                        }
+                    });
+                    
+                    if let Some(peer_id_string) = mapping {
+                        println!("[DM] 🔄 Resolved GitHub user {} to PeerId {}", github_username, peer_id_string);
+                        peer_id_string
+                    } else {
+                        eprintln!("[DM] ❌ No PeerId mapping found for GitHub user {}. Message queued.", github_username);
+                        // TODO: Queue message for later delivery when PeerId is discovered
+                        return;
+                    }
+                } else {
+                    target_peer_id.to_string()
+                };
+
                 // Find the peer in connected peers
-                if let Ok(peer_id) = target_peer_id.parse::<PeerId>() {
+                if let Ok(peer_id) = actual_peer_id_str.parse::<PeerId>() {
                     use crate::network::direct_message::DirectMessageRequest;
                     let request = DirectMessageRequest {
                         id: msg_id.to_string(),
@@ -191,7 +248,7 @@ impl NetworkManager {
                         .send_request(&peer_id, request);
                     println!("[DM] ✅ Request sent to {}", peer_id);
                 } else {
-                    eprintln!("[DM] ❌ Invalid peer_id: {}", target_peer_id);
+                    eprintln!("[DM] ❌ Invalid peer_id: {}", actual_peer_id_str);
                 }
                 return;
             }
@@ -905,6 +962,85 @@ impl NetworkManager {
                                                     .direct_message
                                                     .send_response(channel, response);
                                             }
+                                            "invite_handshake" => {
+                                                // Invitee connected and sent their GitHub username
+                                                // Create gh: chat and PeerId mapping for this inviter
+                                                if let Some(invitee_github) = request.text_content.clone() {
+                                                    let invitee_peer_id = request.sender_id.clone();
+                                                    println!(
+                                                        "[HANDSHAKE] 🤝 Received handshake from GitHub user: {} (PeerId: {})",
+                                                        invitee_github, invitee_peer_id
+                                                    );
+                                                    
+                                                    let chat_id = format!("gh:{}", invitee_github);
+                                                    
+                                                    // Store mapping and create chat
+                                                    use tauri::Manager;
+                                                    let state = self.app_handle.state::<crate::AppState>();
+                                                    
+                                                    // 1. Store PeerId mapping in config
+                                                    {
+                                                        let app_handle = self.app_handle.clone();
+                                                        let gh_user = invitee_github.clone();
+                                                        let peer_id_str = invitee_peer_id.clone();
+                                                        tauri::async_runtime::spawn(async move {
+                                                            let state = app_handle.state::<crate::AppState>();
+                                                            let mgr = state.config_manager.lock().await;
+                                                            if let Ok(mut config) = mgr.load().await {
+                                                                config.user.github_peer_mapping.insert(gh_user.clone(), peer_id_str.clone());
+                                                                if let Err(e) = mgr.save(&config).await {
+                                                                    eprintln!("[HANDSHAKE] Failed to save mapping: {}", e);
+                                                                } else {
+                                                                    println!("[HANDSHAKE] ✅ Saved mapping: {} → {}", gh_user, peer_id_str);
+                                                                }
+                                                            }
+                                                        });
+                                                    }
+                                                    
+                                                    // 2. Create peer and chat in SQLite
+                                                    if let Ok(conn) = state.db_conn.lock() {
+                                                        // Add peer
+                                                        if !crate::storage::db::is_peer(&conn, &chat_id) {
+                                                            let _ = crate::storage::db::add_peer(
+                                                                &conn,
+                                                                &chat_id,
+                                                                Some(&invitee_github),
+                                                                None,
+                                                                "github",
+                                                            );
+                                                        }
+                                                        // Create chat
+                                                        if !crate::storage::db::chat_exists(&conn, &chat_id) {
+                                                            let _ = crate::storage::db::create_chat(
+                                                                &conn,
+                                                                &chat_id,
+                                                                &invitee_github,
+                                                                false,
+                                                            );
+                                                        }
+                                                        println!("[HANDSHAKE] ✅ Created chat: {}", chat_id);
+                                                    }
+                                                    
+                                                    // 3. Notify frontend about new chat
+                                                    let _ = self.app_handle.emit("new-github-chat", serde_json::json!({
+                                                        "chat_id": chat_id,
+                                                        "github_username": invitee_github,
+                                                        "peer_id": invitee_peer_id,
+                                                    }));
+                                                }
+                                                
+                                                // Send response
+                                                let response = DirectMessageResponse {
+                                                    msg_id: request.id.clone(),
+                                                    status: "delivered".to_string(),
+                                                    error: None,
+                                                };
+                                                let _ = self
+                                                    .swarm
+                                                    .behaviour_mut()
+                                                    .direct_message
+                                                    .send_response(channel, response);
+                                            }
                                             "read_receipt" => {
                                                 // text_content contains comma-separated message IDs
                                                 if let Some(ref msg_ids_str) = request.text_content
@@ -1325,8 +1461,95 @@ impl NetworkManager {
                 }
             }
             // CASE B: Connection Status Changes
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                 println!("[Swarm] Connected to {}", peer_id);
+                
+                // Check if this connection is from a GitHub invite dial
+                // The endpoint contains the dialed address
+                let remote_addr = endpoint.get_remote_address().to_string();
+                
+                // Check all pending mappings for partial match (IP portion)
+                let mut matched_github_user = None;
+                for (pending_addr, github_user) in self.pending_github_mappings.iter() {
+                    // Match if the pending address contains same IP
+                    if remote_addr.starts_with("/ip4/") && pending_addr.starts_with("/ip4/") {
+                        // Extract IP from both
+                        let pending_ip = pending_addr.split('/').nth(2);
+                        let remote_ip = remote_addr.split('/').nth(2);
+                        if pending_ip == remote_ip && pending_ip.is_some() {
+                            matched_github_user = Some((pending_addr.clone(), github_user.clone()));
+                            break;
+                        }
+                    }
+                }
+                
+                if let Some((addr_key, inviter_github_user)) = matched_github_user {
+                    self.pending_github_mappings.remove(&addr_key);
+                    let peer_id_str = peer_id.to_string();
+                    println!("[DIAL] ✅ GitHub user {} connected with PeerId {}", inviter_github_user, peer_id_str);
+                    
+                    // Store in config (inviter's PeerId)
+                    let app_handle = self.app_handle.clone();
+                    let gh_user = inviter_github_user.clone();
+                    let peer_id_for_mapping = peer_id_str.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state = app_handle.state::<crate::AppState>();
+                        let mgr = state.config_manager.lock().await;
+                        if let Ok(mut config) = mgr.load().await {
+                            config.user.github_peer_mapping.insert(gh_user.clone(), peer_id_for_mapping.clone());
+                            if let Err(e) = mgr.save(&config).await {
+                                eprintln!("[DIAL] Failed to save GitHub peer mapping: {}", e);
+                            } else {
+                                println!("[DIAL] ✅ Saved mapping: {} → {}", gh_user, peer_id_for_mapping);
+                            }
+                        }
+                    });
+                    
+                    // Send handshake to inviter so they can create reverse mapping
+                    // Get MY GitHub username and send it
+                    let app_handle2 = self.app_handle.clone();
+                    let my_github_username = {
+                        let state = app_handle2.state::<crate::AppState>();
+                        tauri::async_runtime::block_on(async {
+                            let mgr = state.config_manager.lock().await;
+                            if let Ok(config) = mgr.load().await {
+                                config.system.github_username.clone()
+                            } else {
+                                None
+                            }
+                        })
+                    };
+                    
+                    if let Some(my_username) = my_github_username {
+                        println!("[HANDSHAKE] 🤝 Sending invite_handshake to {} with my username: {}", peer_id, my_username);
+                        
+                        use crate::network::direct_message::DirectMessageRequest;
+                        let handshake = DirectMessageRequest {
+                            id: format!("handshake-{}", std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs()),
+                            sender_id: self.swarm.local_peer_id().to_string(),
+                            msg_type: "invite_handshake".to_string(),
+                            text_content: Some(my_username),
+                            file_hash: None,
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs() as i64,
+                            chunk_hash: None,
+                            chunk_data: None,
+                            chunk_list: None,
+                            sender_alias: None,
+                        };
+                        
+                        self.swarm
+                            .behaviour_mut()
+                            .direct_message
+                            .send_request(&peer_id, handshake);
+                        println!("[HANDSHAKE] ✅ Handshake sent to {}", peer_id);
+                    }
+                }
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
@@ -1350,6 +1573,20 @@ impl NetworkManager {
             // CASE C: New Listener Address (expected at startup)
             SwarmEvent::NewListenAddr { address, .. } => {
                 println!("[Swarm] Listening on: {}", address);
+
+                // Store in NetworkState for invite creation (filter out localhost)
+                let addr_str = address.to_string();
+                if !addr_str.contains("127.0.0.1") && !addr_str.contains("::1") {
+                    let app_handle = self.app_handle.clone();
+                    let addr_clone = addr_str.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state = app_handle.state::<crate::NetworkState>();
+                        let mut addrs = state.listening_addresses.lock().await;
+                        if !addrs.contains(&addr_clone) {
+                            addrs.push(addr_clone);
+                        }
+                    });
+                }
 
                 // If we haven't started mDNS yet, and this is a TCP address, start it!
                 // If we haven't started mDNS yet, and this is a TCP address, start it!

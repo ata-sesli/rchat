@@ -13,6 +13,7 @@ use crate::storage::config::ConfigManager;
 // We wrap it in Mutex so multiple UI threads can use it safely.
 pub struct NetworkState {
     pub sender: Mutex<mpsc::Sender<String>>,
+    pub listening_addresses: Mutex<Vec<String>>, // Current libp2p listening addresses
 }
 // Add State Management
 pub struct AppState {
@@ -967,8 +968,17 @@ async fn create_invite(
         (username, tok)
     };
     
-    // 2. Get my multiaddress or IP (placeholder - use display name for now)
-    let my_address = my_username.clone();
+    // 2. Get my multiaddress from NetworkState
+    let net_state = app.state::<NetworkState>();
+    let my_address = {
+        let addrs = net_state.listening_addresses.lock().await;
+        // Prefer TCP address (not QUIC) for reliability
+        addrs.iter()
+            .find(|a| a.contains("/tcp/") && !a.contains("/quic"))
+            .or_else(|| addrs.first())
+            .cloned()
+            .ok_or("No listening address available. Is the network started?")?
+    };
     
     // 3. Generate the encrypted invite
     let encrypted_invite = invite::generate_invite(
@@ -1093,16 +1103,18 @@ async fn redeem_and_connect(
     
     match result {
         Some((payload, _index)) => {
-            let peer_id = inviter.clone();
+            // Use gh: prefix to distinguish GitHub chats from mDNS/libp2p chats
+            let github_username = inviter.clone();
+            let chat_id = format!("gh:{}", github_username);
             
             // 3. Add as friend to config.json
             {
                 let mgr = app_state.config_manager.lock().await;
                 let mut config = mgr.load().await.map_err(|e| e.to_string())?;
                 
-                if !config.user.friends.iter().any(|f| f.username == peer_id) {
+                if !config.user.friends.iter().any(|f| f.username == github_username) {
                     config.user.friends.push(FriendConfig {
-                        username: peer_id.clone(),
+                        username: github_username.clone(),
                         alias: None,
                         x25519_pubkey: None,
                         ed25519_pubkey: None,
@@ -1114,38 +1126,37 @@ async fn redeem_and_connect(
                 }
             }
             
-            // 4. Add to SQLite database
+            // 4. Add to SQLite database with gh: prefix
             {
                 let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
                 
-                // Add peer if not exists
-                if !storage::db::is_peer(&conn, &peer_id) {
-                    storage::db::add_peer(&conn, &peer_id, None, None, "gist")
+                // Add peer if not exists (store with gh: prefix)
+                if !storage::db::is_peer(&conn, &chat_id) {
+                    storage::db::add_peer(&conn, &chat_id, Some(&github_username), None, "github")
                         .map_err(|e| e.to_string())?;
                 }
                 
                 // Create chat if not exists
-                if !storage::db::chat_exists(&conn, &peer_id) {
-                    storage::db::create_chat(&conn, &peer_id, &peer_id, false)
+                if !storage::db::chat_exists(&conn, &chat_id) {
+                    storage::db::create_chat(&conn, &chat_id, &github_username, false)
                         .map_err(|e| e.to_string())?;
                 }
             }
             
-            // 5. Send automatic "Hi!" message
+            // 5. Save welcome message to database (don't send via network yet - needs PeerId resolution)
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as i64;
             
-            // Save message to database first
-            let msg_id = {
+            {
                 let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
                 let id_suffix: u32 = rand::random();
                 let msg_id = format!("{}-{}", timestamp, id_suffix);
                 
                 let msg = storage::db::Message {
                     id: msg_id.clone(),
-                    chat_id: peer_id.clone(),
+                    chat_id: chat_id.clone(),
                     peer_id: "Me".to_string(),
                     timestamp,
                     content_type: "text".to_string(),
@@ -1153,20 +1164,24 @@ async fn redeem_and_connect(
                     file_hash: None,
                     status: "pending".to_string(),
                     content_metadata: None,
-                    sender_alias: None, // Will send alias in DM
+                    sender_alias: None,
                 };
                 
                 storage::db::insert_message(&conn, &msg).map_err(|e| e.to_string())?;
-                msg_id
-            };
+            }
             
-            // Send via network
+            // 6. Dial the inviter's address to establish libp2p connection
+            // The DIAL command will trigger connection and store PeerId mapping
+            let dial_command = format!("DIAL:{}:{}", payload.ip_address, github_username);
+            println!("[Backend] Sending dial command: {}", dial_command);
+            
             let tx = net_state.sender.lock().await;
-            let dm_command = format!("DM:{}:{}:{}:Hi!", peer_id, msg_id, timestamp);
-            tx.send(dm_command).await.map_err(|e| e.to_string())?;
+            tx.send(dial_command).await.map_err(|e| format!("Failed to dial: {}", e))?;
             
-            println!("[Backend] Successfully connected with {} and sent Hi! (ip: {})", inviter, payload.ip_address.clone());
-            Ok(peer_id) // Return peer_id for frontend navigation
+            println!("[Backend] GitHub invite accepted from {}. Chat created: {}", 
+                     github_username, chat_id);
+            
+            Ok(chat_id) // Return gh:username for frontend navigation
         }
         None => {
             Err("No valid invitation found for you. Check password and usernames.".to_string())

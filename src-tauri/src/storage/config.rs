@@ -66,6 +66,8 @@ pub struct UserConfig {
     pub theme: ThemeConfig, // Customizable color theme
     #[serde(default)]
     pub selected_preset: Option<String>, // Currently selected theme preset key
+    #[serde(default)]
+    pub github_peer_mapping: std::collections::HashMap<String, String>, // GitHub username → libp2p PeerId
 }
 
 impl Default for UserConfig {
@@ -85,6 +87,7 @@ impl Default for UserConfig {
             pending_invitations: None,
             theme: ThemeConfig::default(),
             selected_preset: None,
+            github_peer_mapping: std::collections::HashMap::new(),
         }
     }
 }

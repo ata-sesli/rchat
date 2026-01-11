@@ -92,6 +92,7 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
     // Store the sender in app state
     let network_state = crate::NetworkState {
         sender: tokio::sync::Mutex::new(ctx),
+        listening_addresses: tokio::sync::Mutex::new(vec![]),
     };
     app_handle.manage(network_state);
 
