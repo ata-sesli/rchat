@@ -40,8 +40,8 @@ pub struct NetworkManager {
     pending_requests: HashSet<PeerId>,
     // Track incoming connection requests from others
     incoming_requests: HashSet<PeerId>,
-    // Pending GitHub mappings: multiaddr → github_username (for connection events)
-    pending_github_mappings: HashMap<String, String>,
+    // Pending GitHub mappings: multiaddr → (inviter_username, my_username) for connection events
+    pending_github_mappings: HashMap<String, (String, String)>,
 }
 
 impl NetworkManager {
@@ -150,14 +150,15 @@ impl NetworkManager {
     pub fn handle_ui_command(&mut self, msg_content: String) {
         println!("UI Command Received: {}", msg_content);
 
-        // Handle dial command (DIAL:multiaddr:github_username)
+        // Handle dial command (DIAL:multiaddr:inviter_username:my_username)
         if msg_content.starts_with("DIAL:") {
-            let parts: Vec<&str> = msg_content.splitn(3, ':').collect();
-            if parts.len() >= 2 {
+            let parts: Vec<&str> = msg_content.splitn(4, ':').collect();
+            if parts.len() >= 3 {
                 let multiaddr_str = parts[1];
-                let github_username = if parts.len() >= 3 { Some(parts[2].to_string()) } else { None };
+                let inviter_username = parts[2].to_string();
+                let my_username = if parts.len() >= 4 { Some(parts[3].to_string()) } else { None };
                 
-                println!("[DIAL] 📞 Dialing {} (github: {:?})", multiaddr_str, github_username);
+                println!("[DIAL] 📞 Dialing {} (inviter: {}, me: {:?})", multiaddr_str, inviter_username, my_username);
                 
                 if let Ok(addr) = multiaddr_str.parse::<Multiaddr>() {
                     if let Err(e) = self.swarm.dial(addr.clone()) {
@@ -165,8 +166,11 @@ impl NetworkManager {
                     } else {
                         println!("[DIAL] ✅ Dial initiated to {}", multiaddr_str);
                         // Store pending mapping for when connection succeeds
-                        if let Some(gh_user) = github_username {
-                            self.pending_github_mappings.insert(multiaddr_str.to_string(), gh_user);
+                        if let Some(my_user) = my_username {
+                            self.pending_github_mappings.insert(
+                                multiaddr_str.to_string(), 
+                                (inviter_username, my_user)
+                            );
                         }
                     }
                 } else {
@@ -1469,21 +1473,21 @@ impl NetworkManager {
                 let remote_addr = endpoint.get_remote_address().to_string();
                 
                 // Check all pending mappings for partial match (IP portion)
-                let mut matched_github_user = None;
-                for (pending_addr, github_user) in self.pending_github_mappings.iter() {
+                let mut matched_data = None;
+                for (pending_addr, (inviter_user, my_user)) in self.pending_github_mappings.iter() {
                     // Match if the pending address contains same IP
                     if remote_addr.starts_with("/ip4/") && pending_addr.starts_with("/ip4/") {
                         // Extract IP from both
                         let pending_ip = pending_addr.split('/').nth(2);
                         let remote_ip = remote_addr.split('/').nth(2);
                         if pending_ip == remote_ip && pending_ip.is_some() {
-                            matched_github_user = Some((pending_addr.clone(), github_user.clone()));
+                            matched_data = Some((pending_addr.clone(), inviter_user.clone(), my_user.clone()));
                             break;
                         }
                     }
                 }
                 
-                if let Some((addr_key, inviter_github_user)) = matched_github_user {
+                if let Some((addr_key, inviter_github_user, my_username)) = matched_data {
                     self.pending_github_mappings.remove(&addr_key);
                     let peer_id_str = peer_id.to_string();
                     println!("[DIAL] ✅ GitHub user {} connected with PeerId {}", inviter_github_user, peer_id_str);
@@ -1506,49 +1510,34 @@ impl NetworkManager {
                     });
                     
                     // Send handshake to inviter so they can create reverse mapping
-                    // Get MY GitHub username and send it
-                    let app_handle2 = self.app_handle.clone();
-                    let my_github_username = {
-                        let state = app_handle2.state::<crate::AppState>();
-                        tauri::async_runtime::block_on(async {
-                            let mgr = state.config_manager.lock().await;
-                            if let Ok(config) = mgr.load().await {
-                                config.system.github_username.clone()
-                            } else {
-                                None
-                            }
-                        })
+                    // Use my_username from the stored tuple (no block_on needed)
+                    println!("[HANDSHAKE] 🤝 Sending invite_handshake to {} with my username: {}", peer_id, my_username);
+                    
+                    use crate::network::direct_message::DirectMessageRequest;
+                    let handshake = DirectMessageRequest {
+                        id: format!("handshake-{}", std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs()),
+                        sender_id: self.swarm.local_peer_id().to_string(),
+                        msg_type: "invite_handshake".to_string(),
+                        text_content: Some(my_username),
+                        file_hash: None,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() as i64,
+                        chunk_hash: None,
+                        chunk_data: None,
+                        chunk_list: None,
+                        sender_alias: None,
                     };
                     
-                    if let Some(my_username) = my_github_username {
-                        println!("[HANDSHAKE] 🤝 Sending invite_handshake to {} with my username: {}", peer_id, my_username);
-                        
-                        use crate::network::direct_message::DirectMessageRequest;
-                        let handshake = DirectMessageRequest {
-                            id: format!("handshake-{}", std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs()),
-                            sender_id: self.swarm.local_peer_id().to_string(),
-                            msg_type: "invite_handshake".to_string(),
-                            text_content: Some(my_username),
-                            file_hash: None,
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs() as i64,
-                            chunk_hash: None,
-                            chunk_data: None,
-                            chunk_list: None,
-                            sender_alias: None,
-                        };
-                        
-                        self.swarm
-                            .behaviour_mut()
-                            .direct_message
-                            .send_request(&peer_id, handshake);
-                        println!("[HANDSHAKE] ✅ Handshake sent to {}", peer_id);
-                    }
+                    self.swarm
+                        .behaviour_mut()
+                        .direct_message
+                        .send_request(&peer_id, handshake);
+                    println!("[HANDSHAKE] ✅ Handshake sent to {}", peer_id);
                 }
             }
             SwarmEvent::ConnectionClosed {

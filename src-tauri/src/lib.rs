@@ -1171,8 +1171,8 @@ async fn redeem_and_connect(
             }
             
             // 6. Dial the inviter's address to establish libp2p connection
-            // The DIAL command will trigger connection and store PeerId mapping
-            let dial_command = format!("DIAL:{}:{}", payload.ip_address, github_username);
+            // DIAL format: DIAL:multiaddr:inviter_username:my_username
+            let dial_command = format!("DIAL:{}:{}:{}", payload.ip_address, github_username, my_username);
             println!("[Backend] Sending dial command: {}", dial_command);
             
             let tx = net_state.sender.lock().await;
