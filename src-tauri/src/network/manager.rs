@@ -1673,6 +1673,18 @@ impl NetworkManager {
                     println!("[Swarm] Dialing peer: {}", peer);
                 }
             }
+            // CASE F: Outgoing connection error (important for relay debugging)
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                eprintln!("[Swarm] ❌ Outgoing connection error to {:?}: {:?}", peer_id, error);
+            }
+            // CASE G: Listener error (relay listen failures)
+            SwarmEvent::ListenerError { listener_id, error } => {
+                eprintln!("[Swarm] ❌ Listener {:?} error: {:?}", listener_id, error);
+            }
+            // CASE H: Listener closed
+            SwarmEvent::ListenerClosed { listener_id, reason, .. } => {
+                eprintln!("[Swarm] Listener {:?} closed: {:?}", listener_id, reason);
+            }
             // Catch-all for anything else
             other => {
                 eprintln!(
