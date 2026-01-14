@@ -969,12 +969,16 @@ async fn create_invite(
     };
     
     // 2. Get my multiaddress from NetworkState
+    // Prefer relay address (p2p-circuit) for cross-network connectivity
     let net_state = app.state::<NetworkState>();
     let my_address = {
         let addrs = net_state.listening_addresses.lock().await;
-        // Prefer TCP address (not QUIC) for reliability
+        // Priority: 1. Relay address (p2p-circuit) for NAT traversal
+        //          2. TCP address for local network
+        //          3. Any available address
         addrs.iter()
-            .find(|a| a.contains("/tcp/") && !a.contains("/quic"))
+            .find(|a| a.contains("p2p-circuit"))
+            .or_else(|| addrs.iter().find(|a| a.contains("/tcp/") && !a.contains("/quic")))
             .or_else(|| addrs.first())
             .cloned()
             .ok_or("No listening address available. Is the network started?")?

@@ -78,6 +78,36 @@ impl NetworkManager {
             println!("[Gossipsub] ✅ Subscribed to global-chat topic");
         }
 
+        // Connect to public bootstrap relays for NAT traversal
+        // We dial first, then listen via the relay to get a p2p-circuit address
+        let bootstrap_relays = vec![
+            "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTzyxMNLWwcJvif47q25rL2k58yRZ44n",
+            "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+            "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+        ];
+        
+        for relay_addr in bootstrap_relays {
+            if let Ok(addr) = relay_addr.parse::<Multiaddr>() {
+                // First dial the relay
+                match self.swarm.dial(addr.clone()) {
+                    Ok(_) => {
+                        println!("[Relay] 🌐 Dialing bootstrap relay: {}", relay_addr);
+                        
+                        // Request a reservation (listen via relay) to get p2p-circuit address
+                        // Format: /relay_multiaddr/p2p-circuit
+                        let circuit_addr: Multiaddr = format!("{}/p2p-circuit", relay_addr)
+                            .parse()
+                            .expect("valid circuit multiaddr");
+                        match self.swarm.listen_on(circuit_addr.clone()) {
+                            Ok(_) => println!("[Relay] 📡 Requesting reservation at: {}", relay_addr),
+                            Err(e) => eprintln!("[Relay] ❌ Failed to listen via relay: {:?}", e),
+                        }
+                    }
+                    Err(e) => eprintln!("[Relay] ❌ Failed to dial relay {}: {:?}", relay_addr, e),
+                }
+            }
+        }
+
         // Publish every 5 minutes
         let mut publish_interval = tokio::time::interval(std::time::Duration::from_secs(300));
         // Heartbeat every 60 seconds
@@ -1454,6 +1484,16 @@ impl NetworkManager {
                     }
                     RChatBehaviourEvent::Kademlia(_) => {
                         // Kademlia events are expected, no logging needed
+                    }
+                    
+                    // Relay client events - for NAT traversal
+                    RChatBehaviourEvent::RelayClient(event) => {
+                        println!("[Relay] 📡 Event: {:?}", event);
+                    }
+                    
+                    // DCUtR events - for hole punching
+                    RChatBehaviourEvent::Dcutr(event) => {
+                        println!("[DCUtR] 🔄 Event: {:?}", event);
                     }
 
                     other => {
