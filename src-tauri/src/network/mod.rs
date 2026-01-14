@@ -77,6 +77,7 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
             libp2p::yamux::Config::default()
         })?
         .with_quic()
+        .with_dns()?
         .with_relay_client(configure_noise, || libp2p::yamux::Config::default())?
         .with_behaviour(|key, relay_client| RChatBehaviour::new(key.clone(), relay_client))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
