@@ -5,7 +5,8 @@ pub mod gist;
 pub mod hks;
 pub mod invite;
 mod manager;
-pub mod mdns; // New module
+pub mod mdns;
+pub mod stun;
 use anyhow::Result;
 use libp2p::{identity, PeerId, SwarmBuilder};
 use tauri::{AppHandle, Manager};
@@ -84,10 +85,12 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
         .build();
 
     println!("[Backend] Swarm built. Listening...");
-    // Listen on all interfaces (Random Port)
+    // Listen on all interfaces (IPv6 first, then IPv4 fallback)
+    swarm.listen_on("/ip6/::/udp/0/quic-v1".parse()?)?;
+    swarm.listen_on("/ip6/::/tcp/0".parse()?)?;
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-    println!("[Backend] Swarm listeners started.");
+    println!("[Backend] Swarm listeners started (IPv6 + IPv4).");
 
     let (ctx, crx) = mpsc::channel(32);
 
@@ -95,6 +98,8 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
     let network_state = crate::NetworkState {
         sender: tokio::sync::Mutex::new(ctx),
         listening_addresses: tokio::sync::Mutex::new(vec![]),
+        public_address_v6: tokio::sync::Mutex::new(None),
+        public_address_v4: tokio::sync::Mutex::new(None),
     };
     app_handle.manage(network_state);
 

@@ -78,35 +78,24 @@ impl NetworkManager {
             println!("[Gossipsub] ✅ Subscribed to global-chat topic");
         }
 
-        // Connect to public bootstrap relays for NAT traversal
-        // We dial first, then listen via the relay to get a p2p-circuit address
-        let bootstrap_relays = vec![
-            "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTzyxMNLWwcJvif47q25rL2k58yRZ44n",
-            "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-            "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
-        ];
-        
-        for relay_addr in bootstrap_relays {
-            if let Ok(addr) = relay_addr.parse::<Multiaddr>() {
-                // First dial the relay
-                match self.swarm.dial(addr.clone()) {
-                    Ok(_) => {
-                        println!("[Relay] 🌐 Dialing bootstrap relay: {}", relay_addr);
-                        
-                        // Request a reservation (listen via relay) to get p2p-circuit address
-                        // Format: /relay_multiaddr/p2p-circuit
-                        let circuit_addr: Multiaddr = format!("{}/p2p-circuit", relay_addr)
-                            .parse()
-                            .expect("valid circuit multiaddr");
-                        match self.swarm.listen_on(circuit_addr.clone()) {
-                            Ok(_) => println!("[Relay] 📡 Requesting reservation at: {}", relay_addr),
-                            Err(e) => eprintln!("[Relay] ❌ Failed to listen via relay: {:?}", e),
-                        }
-                    }
-                    Err(e) => eprintln!("[Relay] ❌ Failed to dial relay {}: {:?}", relay_addr, e),
-                }
+        // Discover public IPs using STUN servers (IPv6-first)
+        let app_handle = self.app_handle.clone();
+        tokio::spawn(async move {
+            println!("[STUN] 🔍 Discovering public addresses (IPv6-first)...");
+            let result = crate::network::stun::discover_public_addresses().await;
+            let state = app_handle.state::<crate::NetworkState>();
+            
+            if let Some(v6) = result.ipv6 {
+                let v6_str = v6.to_string();
+                *state.public_address_v6.lock().await = Some(v6_str.clone());
+                println!("[STUN] ✅ IPv6: {}", v6_str);
             }
-        }
+            if let Some(v4) = result.ipv4 {
+                let v4_str = v4.to_string();
+                *state.public_address_v4.lock().await = Some(v4_str.clone());
+                println!("[STUN] ✅ IPv4: {}", v4_str);
+            }
+        });
 
         // Publish every 5 minutes
         let mut publish_interval = tokio::time::interval(std::time::Duration::from_secs(300));

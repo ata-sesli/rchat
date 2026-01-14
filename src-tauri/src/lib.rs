@@ -14,6 +14,8 @@ use crate::storage::config::ConfigManager;
 pub struct NetworkState {
     pub sender: Mutex<mpsc::Sender<String>>,
     pub listening_addresses: Mutex<Vec<String>>, // Current libp2p listening addresses
+    pub public_address_v6: Mutex<Option<String>>, // STUN-discovered IPv6
+    pub public_address_v4: Mutex<Option<String>>, // STUN-discovered IPv4
 }
 // Add State Management
 pub struct AppState {
@@ -968,20 +970,57 @@ async fn create_invite(
         (username, tok)
     };
     
-    // 2. Get my multiaddress from NetworkState
-    // Prefer relay address (p2p-circuit) for cross-network connectivity
+    // 2. Get my address for invite (IPv6 first)
+    // Priority: IPv6 STUN > IPv4 STUN > Local IPv6 > Local IPv4
     let net_state = app.state::<NetworkState>();
     let my_address = {
         let addrs = net_state.listening_addresses.lock().await;
-        // Priority: 1. Relay address (p2p-circuit) for NAT traversal
-        //          2. TCP address for local network
-        //          3. Any available address
-        addrs.iter()
-            .find(|a| a.contains("p2p-circuit"))
-            .or_else(|| addrs.iter().find(|a| a.contains("/tcp/") && !a.contains("/quic")))
-            .or_else(|| addrs.first())
-            .cloned()
-            .ok_or("No listening address available. Is the network started?")?
+        let v6_stun = net_state.public_address_v6.lock().await.clone();
+        let v4_stun = net_state.public_address_v4.lock().await.clone();
+        
+        // Helper to extract port from listening addresses
+        let get_port = |addrs: &[String], ip_ver: &str| -> Option<String> {
+            addrs.iter()
+                .find(|a| a.contains(ip_ver) && a.contains("/tcp/") && !a.contains("127.0.0.1") && !a.contains("::1"))
+                .and_then(|a| a.split("/tcp/").nth(1))
+                .and_then(|s| s.split('/').next())
+                .map(|s| s.to_string())
+        };
+        
+        // 1. Try IPv6 STUN address
+        if let Some(ref v6) = v6_stun {
+            if let Some(port) = get_port(&addrs, "/ip6/") {
+                let addr = format!("/ip6/{}/tcp/{}", v6.split(':').next().unwrap_or(v6), port);
+                println!("[Invite] Using IPv6 STUN: {}", addr);
+                addr
+            } else if let Some(port) = get_port(&addrs, "/ip4/") {
+                // Fallback: use v6 IP with v4 port (might work for dual-stack)
+                let addr = format!("/ip6/{}/tcp/{}", v6.split(':').next().unwrap_or(v6), port);
+                println!("[Invite] Using IPv6 STUN (v4 port): {}", addr);
+                addr
+            } else {
+                format!("/ip6/{}", v6)
+            }
+        }
+        // 2. Try IPv4 STUN address
+        else if let Some(ref v4) = v4_stun {
+            if let Some(port) = get_port(&addrs, "/ip4/") {
+                let addr = format!("/ip4/{}/tcp/{}", v4.split(':').next().unwrap_or(v4), port);
+                println!("[Invite] Using IPv4 STUN: {}", addr);
+                addr
+            } else {
+                format!("/ip4/{}", v4)
+            }
+        }
+        // 3. Fallback to local addresses (IPv6 first)
+        else {
+            addrs.iter()
+                .find(|a| a.contains("/ip6/") && a.contains("/tcp/") && !a.contains("::1"))
+                .or_else(|| addrs.iter().find(|a| a.contains("/ip4/") && a.contains("/tcp/") && !a.contains("127.0.0.1")))
+                .or_else(|| addrs.first())
+                .cloned()
+                .ok_or("No listening address available. Is the network started?")?
+        }
     };
     
     // 3. Generate the encrypted invite
