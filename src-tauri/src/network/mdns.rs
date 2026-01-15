@@ -239,21 +239,21 @@ fn handle_browser_event(
                 }
             }
 
-            println!("[mDNS] 🔍 Discovered: {} at {}:{}", device_name, addr, port);
-
-            // Extract peer_id and alias from TXT record
+            // Extract peer_id from TXT record first for self-check
             let txt = discovery.txt();
             let discovered_peer_id = txt
                 .as_ref()
                 .and_then(|t| t.get("peer_id"))
                 .unwrap_or_else(|| device_name.clone());
 
-            let discovered_alias = txt.as_ref().and_then(|t| t.get("alias"));
-
-            // Skip self
+            // Skip self - don't even log it
             if discovered_peer_id == **my_peer_id {
                 return;
             }
+
+            println!("[mDNS] 🔍 Discovered: {} at {}:{}", device_name, addr, port);
+
+            let discovered_alias = txt.as_ref().and_then(|t| t.get("alias"));
 
             let multiaddr = format!("/ip4/{}/tcp/{}", addr, port);
 

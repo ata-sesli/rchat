@@ -85,12 +85,27 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
         .build();
 
     println!("[Backend] Swarm built. Listening...");
-    // Listen on all interfaces (IPv6 first, then IPv4 fallback)
-    swarm.listen_on("/ip6/::/udp/0/quic-v1".parse()?)?;
-    swarm.listen_on("/ip6/::/tcp/0".parse()?)?;
-    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-    println!("[Backend] Swarm listeners started (IPv6 + IPv4).");
+    
+    // Get a random available port first, then use it for both IPv4 and IPv6
+    // This ensures mDNS advertises a port that works for both protocols
+    let tcp_port = {
+        let socket = std::net::TcpListener::bind("0.0.0.0:0")?;
+        socket.local_addr()?.port()
+    };
+    let udp_port = {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        socket.local_addr()?.port()
+    };
+    
+    println!("[Backend] Using TCP port {} and UDP port {} for both IPv4 and IPv6", tcp_port, udp_port);
+    
+    // Listen on both protocols with the SAME ports
+    swarm.listen_on(format!("/ip6/::/udp/{}/quic-v1", udp_port).parse()?)?;
+    swarm.listen_on(format!("/ip6/::/tcp/{}", tcp_port).parse()?)?;
+    swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", udp_port).parse()?)?;
+    swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", tcp_port).parse()?)?;
+    
+    println!("[Backend] Swarm listeners started (IPv6 + IPv4 on same ports).");
 
     let (ctx, crx) = mpsc::channel(32);
 
