@@ -1691,6 +1691,11 @@ impl NetworkManager {
         let peer_id_res = peer.peer_id.parse::<PeerId>();
         match peer_id_res {
             Ok(peer_id) => {
+                // Skip if already connected to this peer
+                if self.swarm.is_connected(&peer_id) {
+                    return; // Already connected, no need to dial
+                }
+                
                 // 1. Add to known peers
                 for addr_str in peer.addresses {
                     // Filter out invalid 0.0.0.0 addresses
