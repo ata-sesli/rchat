@@ -199,3 +199,86 @@ pub async fn get_friend_invitations(username: &str) -> Result<Vec<EncryptedInvit
     Ok(vec![])
 }
 
+/// Publish a shadow invite to the user's own Gist
+/// This is called by the invitee after accepting an invite
+pub async fn publish_shadow_invite(token: &str, shadow: super::hks::ShadowInvite) -> Result<()> {
+    // 1. Find or create existing Gist
+    let mut blob = if let Some(gist) = find_rchat_gist(token).await? {
+        // Get existing content
+        if let Some(file) = gist.files.get(RCHAT_FILE_NAME) {
+            let resp = reqwest::get(file.raw_url.clone()).await?;
+            if resp.status().is_success() {
+                let content = resp.text().await?;
+                parse_blob(&content).unwrap_or_else(|_| default_blob())
+            } else {
+                default_blob()
+            }
+        } else {
+            default_blob()
+        }
+    } else {
+        default_blob()
+    };
+    
+    // 2. Add shadow invite to blob
+    // Remove expired shadows first (2 minute TTL)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    blob.shadow_invites.retain(|s| now.saturating_sub(s.created_at) < INVITE_TTL_SECS);
+    
+    // Remove any existing shadow for this target
+    blob.shadow_invites.retain(|s| s.target_username != shadow.target_username);
+    
+    // Add new shadow
+    blob.shadow_invites.push(shadow);
+    
+    // 3. Serialize and update Gist
+    let blob_b64 = serialize_blob(&blob)?;
+    
+    if let Some(gist) = find_rchat_gist(token).await? {
+        update_peer_info(token, &gist.id, blob_b64).await?;
+    } else {
+        create_peer_info(token, blob_b64).await?;
+    }
+    
+    Ok(())
+}
+
+/// Create a default empty blob
+fn default_blob() -> PublishedBlob {
+    PublishedBlob {
+        payload: String::new(),
+        payload_nonce: String::new(),
+        tree_links: std::collections::HashMap::new(),
+        roster: std::collections::HashMap::new(),
+        signature: String::new(),
+        sender_x25519_pubkey: String::new(),
+        invitations: vec![],
+        shadow_invites: vec![],
+    }
+}
+
+/// Fetch shadow invites from a user's Gist
+pub async fn get_friend_shadows(username: &str) -> Result<Vec<super::hks::ShadowInvite>> {
+    if let Some(blob_b64) = get_friend_content(username).await? {
+        if let Ok(blob) = parse_blob(&blob_b64) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            
+            // Filter expired shadows
+            let valid_shadows: Vec<_> = blob
+                .shadow_invites
+                .into_iter()
+                .filter(|s| now.saturating_sub(s.created_at) < INVITE_TTL_SECS)
+                .collect();
+            
+            return Ok(valid_shadows);
+        }
+    }
+    
+    Ok(vec![])
+}

@@ -42,6 +42,9 @@ pub struct NetworkManager {
     incoming_requests: HashSet<PeerId>,
     // Pending GitHub mappings: multiaddr → (inviter_username, my_username) for connection events
     pending_github_mappings: HashMap<String, (String, String)>,
+    // Pending shadow polls: invitee_username → (password, my_username, created_at)
+    // Used to poll invitee's Gist for shadow invite (bidirectional hole punch)
+    pending_shadow_polls: HashMap<String, (String, String, u64)>,
 }
 
 impl NetworkManager {
@@ -65,6 +68,7 @@ impl NetworkManager {
             pending_requests: HashSet::new(),
             incoming_requests: HashSet::new(),
             pending_github_mappings: HashMap::new(),
+            pending_shadow_polls: HashMap::new(),
         }
     }
     pub async fn run(mut self: Self) {
@@ -89,6 +93,8 @@ impl NetworkManager {
         let mut nat_keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         // Dummy address for NAT keepalive (will fail, but outbound packet keeps NAT alive)
         let nat_keepalive_addr: Multiaddr = "/ip4/1.1.1.1/udp/9/quic-v1".parse().unwrap();
+        // Shadow invite polling every 10 seconds - check invitees for their shadow invites
+        let mut shadow_poll_interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
         loop {
             tokio::select! {
@@ -104,6 +110,10 @@ impl NetworkManager {
                     // The dial will fail, but the outbound packet is enough for NAT
                     let _ = self.swarm.dial(nat_keepalive_addr.clone());
                     // Don't log every time to avoid spam, but occasionally log
+                }
+                _ = shadow_poll_interval.tick() => {
+                    // Poll for shadow invites from invitees
+                    self.poll_shadow_invites().await;
                 }
                 Some(cmd) = self.crx.recv() => {
                     self.handle_ui_command(cmd);
@@ -209,6 +219,18 @@ impl NetworkManager {
         if msg_content.starts_with("REQUEST_CONNECTION:") {
             if let Some(peer_id_str) = msg_content.strip_prefix("REQUEST_CONNECTION:") {
                 self.handle_connection_request(peer_id_str);
+                return;
+            }
+        }
+
+        // Handle shadow poll registration (REGISTER_SHADOW:invitee:password:my_username)
+        if msg_content.starts_with("REGISTER_SHADOW:") {
+            let parts: Vec<&str> = msg_content.splitn(4, ':').collect();
+            if parts.len() == 4 {
+                let invitee = parts[1];
+                let password = parts[2];
+                let my_username = parts[3];
+                self.register_shadow_poll(invitee, password, my_username);
                 return;
             }
         }
@@ -1745,6 +1767,94 @@ impl NetworkManager {
             }
             Err(e) => {
                 eprintln!("[NetworkManager] Invalid Peer ID from mDNS: {}", e);
+            }
+        }
+    }
+    
+    /// Register a pending shadow poll (called when creating an invite)
+    /// REGISTER_SHADOW:invitee_username:password:my_username
+    fn register_shadow_poll(&mut self, invitee: &str, password: &str, my_username: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        self.pending_shadow_polls.insert(
+            invitee.to_lowercase(),
+            (password.to_string(), my_username.to_lowercase(), now)
+        );
+        println!("[Shadow] 📋 Registered poll for {}", invitee);
+    }
+    
+    /// Poll for shadow invites from all pending invitees
+    async fn poll_shadow_invites(&mut self) {
+        use crate::network::gist;
+        use crate::network::invite;
+        
+        // Skip if no pending polls
+        if self.pending_shadow_polls.is_empty() {
+            return;
+        }
+        
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // Remove expired polls (2 minute TTL)
+        self.pending_shadow_polls.retain(|_, (_, _, created)| now - *created < 120);
+        
+        // Clone keys to avoid borrow issues
+        let invitees: Vec<String> = self.pending_shadow_polls.keys().cloned().collect();
+        
+        for invitee in invitees {
+            let (password, my_username, _) = match self.pending_shadow_polls.get(&invitee) {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            
+            // Fetch shadow invites from invitee's Gist
+            match gist::get_friend_shadows(&invitee).await {
+                Ok(shadows) => {
+                    for shadow in shadows {
+                        // Try to decrypt with our key
+                        match invite::decrypt_shadow_invite(&shadow, &password, &my_username, &invitee) {
+                            Ok(Some(payload)) => {
+                                println!("[Shadow] 🎯 Found shadow from {}: {}", invitee, payload.invitee_address);
+                                
+                                // Dial the invitee's address for bidirectional hole punch
+                                if let Ok(addr) = payload.invitee_address.parse::<Multiaddr>() {
+                                    println!("[Shadow] 📞 Punching to {}", payload.invitee_address);
+                                    for attempt in 1..=5 {
+                                        match self.swarm.dial(addr.clone()) {
+                                            Ok(_) => {
+                                                println!("[Shadow] ✅ Punch {}/5 sent to {}", attempt, invitee);
+                                                break;
+                                            }
+                                            Err(e) => {
+                                                if attempt < 5 {
+                                                    println!("[Shadow] ⚠️ Punch {}/5 failed: {}", attempt, e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                // Remove from pending after successful discovery
+                                self.pending_shadow_polls.remove(&invitee);
+                            }
+                            Ok(None) => {
+                                // Wrong key or not for us, continue
+                            }
+                            Err(e) => {
+                                eprintln!("[Shadow] Decrypt error: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[Shadow] Failed to fetch shadows from {}: {}", invitee, e);
+                }
             }
         }
     }

@@ -39,6 +39,34 @@ pub struct TrackedInvite {
     pub created_at: u64,
 }
 
+/// Shadow invite for bidirectional hole punching
+/// Created by invitee and posted to their own Gist
+/// Encrypted with the same 18-digit key as the original invite
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowInvite {
+    /// Target username (the original inviter) - for routing
+    pub target_username: String,
+    /// Salt for Argon2 key derivation (Base64)
+    pub salt: String,
+    /// XChaCha20 nonce (Base64)
+    pub nonce: String,
+    /// Encrypted ShadowPayload (Base64)
+    pub ciphertext: String,
+    /// Unix timestamp when shadow was created
+    pub created_at: u64,
+}
+
+/// Payload inside the encrypted shadow invite
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowPayload {
+    /// Invitee's QUIC address (STUN-discovered)
+    pub invitee_address: String,
+    /// Invitee's libp2p peer ID
+    pub invitee_peer_id: String,
+    /// Unix timestamp
+    pub timestamp: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HksTree {
     // We persist the raw keys for all nodes.
@@ -62,6 +90,9 @@ pub struct PublishedBlob {
     /// Encrypted invitations with 2-minute TTL
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invitations: Vec<TrackedInvite>,
+    /// Shadow invites for bidirectional hole punching (created by invitees)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shadow_invites: Vec<ShadowInvite>,
 }
 
 impl HksTree {
@@ -209,6 +240,7 @@ impl HksTree {
             signature: String::new(),
             sender_x25519_pubkey: BASE64.encode(encryption_pubkey.as_bytes()),
             invitations: vec![],
+            shadow_invites: vec![],
         };
 
         // 4. Serialize & Sign

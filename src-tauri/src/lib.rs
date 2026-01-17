@@ -1025,13 +1025,26 @@ async fn create_invite(
         mgr.save(&config).await.map_err(|e| e.to_string())?;
     }
     
-    // 6. IMMEDIATELY publish to Gist so invitee can find it
     println!("[Backend] Publishing invite to Gist immediately...");
-    discovery::publish_peer_info(&token, vec![], app)
+    discovery::publish_peer_info(&token, vec![], app.clone())
         .await
         .map_err(|e| format!("Failed to publish invite: {}", e))?;
     
-    println!("[Backend] Created invite for {} with password len {}", invitee, password.len());
+    println!("[Backend] Published invite to Gist");
+    
+    // 7. Register shadow polling for this invitee
+    {
+        let net_state = app.state::<NetworkState>();
+        let tx = net_state.sender.lock().await;
+        // REGISTER_SHADOW:invitee:password:my_username
+        let cmd = format!("REGISTER_SHADOW:{}:{}:{}", invitee, password, my_username);
+        if let Err(e) = tx.send(cmd).await {
+            println!("[Backend] Failed to register shadow poll: {}", e);
+        } else {
+            println!("[Backend] Registered shadow poll for {}", invitee);
+        }
+    }
+
     Ok(())
 }
 
@@ -1191,6 +1204,57 @@ async fn redeem_and_connect(
             
             let tx = net_state.sender.lock().await;
             tx.send(dial_command).await.map_err(|e| format!("Failed to dial: {}", e))?;
+            
+            // 7. Create and publish shadow invite for bidirectional hole punching
+            // This allows the inviter to discover our address and punch back
+            {
+                // Get my QUIC address
+                let my_address = {
+                    let v4_stun = net_state.public_address_v4.lock().await.clone();
+                    let stun_port = net_state.stun_external_port.lock().await.clone();
+                    
+                    if let (Some(ip), Some(port)) = (v4_stun, stun_port) {
+                        format!("/ip4/{}/udp/{}/quic-v1", ip, port)
+                    } else {
+                        // Fallback to local address
+                        let addrs = net_state.listening_addresses.lock().await;
+                        addrs.iter()
+                            .find(|a| a.contains("/udp/") && a.contains("/quic-v1") && !a.contains("127.0.0.1"))
+                            .cloned()
+                            .unwrap_or_else(|| "unknown".to_string())
+                    }
+                };
+                
+                // Get GitHub token for publishing
+                let github_token = {
+                    let mgr = app_state.config_manager.lock().await;
+                    let config = mgr.load().await.map_err(|e| e.to_string())?;
+                    config.system.github_token.clone()
+                };
+                
+                if let Some(token) = github_token {
+                    // Generate shadow invite
+                    match invite::generate_shadow_invite(
+                        &password,
+                        &inviter,
+                        &my_username,
+                        &my_address,
+                        "pending", // PeerId will be discovered later
+                    ) {
+                        Ok(shadow) => {
+                            // Publish shadow to my own Gist
+                            if let Err(e) = gist::publish_shadow_invite(&token, shadow).await {
+                                eprintln!("[Shadow] Failed to publish: {}", e);
+                            } else {
+                                println!("[Shadow] ✅ Published to Gist for {}", inviter);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[Shadow] Failed to create: {}", e);
+                        }
+                    }
+                }
+            }
             
             println!("[Backend] GitHub invite accepted from {}. Chat created: {}", 
                      github_username, chat_id);

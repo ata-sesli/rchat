@@ -297,6 +297,113 @@ pub fn process_invites(
 }
 
 // ============================================================================
+// Shadow Invite Protocol (Bidirectional Hole Punching)
+// ============================================================================
+
+use super::hks::{ShadowInvite, ShadowPayload};
+
+/// Creates a shadow invite for bidirectional hole punching.
+/// Called by the invitee after accepting an invite.
+/// Encrypted with the same 18-digit key as the original invite.
+///
+/// # Arguments
+/// * `password` - 14-char passphrase (same as original invite)
+/// * `inviter` - Original inviter's username (becomes shadow target)
+/// * `invitee` - This user's username (the one creating the shadow)
+/// * `invitee_address` - Invitee's QUIC address (STUN-discovered)
+/// * `invitee_peer_id` - Invitee's libp2p peer ID
+pub fn generate_shadow_invite(
+    password: &str,
+    inviter: &str,
+    invitee: &str,
+    invitee_address: &str,
+    invitee_peer_id: &str,
+) -> Result<ShadowInvite> {
+    use rand::RngCore;
+    
+    // 1. Generate Harvester Key (same key derivation as original invite)
+    let harvested_key = harvest_key(password, inviter, invitee)?;
+    
+    // 2. Create Shadow Payload
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    
+    let payload = ShadowPayload {
+        invitee_address: invitee_address.to_string(),
+        invitee_peer_id: invitee_peer_id.to_string(),
+        timestamp: now,
+    };
+    
+    // 3. Generate random salt for Argon2
+    let mut salt = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    
+    // 4. Derive key and encrypt
+    let key = crypto::derive_key(harvested_key.as_bytes(), &salt)
+        .map_err(|e| anyhow!("Key derivation failed: {}", e))?;
+    
+    let payload_json = serde_json::to_string(&payload)?;
+    let (ciphertext_b64, nonce_b64) = crypto::encrypt_with_key(&key, payload_json.as_bytes())
+        .map_err(|e| anyhow!("Encryption failed: {}", e))?;
+    
+    println!("[Shadow] ✅ Created shadow invite for {}", inviter);
+    
+    Ok(ShadowInvite {
+        target_username: inviter.trim().to_lowercase(),
+        salt: BASE64.encode(salt),
+        nonce: nonce_b64,
+        ciphertext: ciphertext_b64,
+        created_at: now,
+    })
+}
+
+/// Decrypts a shadow invite using the same 18-digit key.
+/// Called by the inviter to get invitee's address for hole punching.
+///
+/// # Returns
+/// - `Ok(Some(payload))` if decryption succeeds and target matches
+/// - `Ok(None)` if decryption fails (wrong key)
+pub fn decrypt_shadow_invite(
+    shadow: &ShadowInvite,
+    password: &str,
+    inviter: &str,  // Original inviter (this user)
+    invitee: &str,  // Original invitee (shadow creator)
+) -> Result<Option<ShadowPayload>> {
+    // 1. Verify target matches
+    let inviter_normalized = inviter.trim().to_lowercase();
+    if shadow.target_username != inviter_normalized {
+        return Ok(None); // Not for us
+    }
+    
+    // 2. Generate Harvester Key (same as original invite)
+    let harvested_key = harvest_key(password, inviter, invitee)?;
+    
+    // 3. Decode salt
+    let salt_bytes = BASE64
+        .decode(&shadow.salt)
+        .map_err(|e| anyhow!("Invalid salt: {}", e))?;
+    let salt: [u8; 16] = salt_bytes
+        .try_into()
+        .map_err(|_| anyhow!("Salt must be 16 bytes"))?;
+    
+    // 4. Derive key
+    let key = crypto::derive_key(harvested_key.as_bytes(), &salt)
+        .map_err(|e| anyhow!("Key derivation failed: {}", e))?;
+    
+    // 5. Attempt decryption
+    match crypto::decrypt_with_key(&key, &shadow.ciphertext, &shadow.nonce) {
+        Ok(plaintext_json) => {
+            let payload: ShadowPayload = serde_json::from_str(&plaintext_json)?;
+            println!("[Shadow] ✅ Decrypted shadow from {}: {}", invitee, payload.invitee_address);
+            Ok(Some(payload))
+        }
+        Err(_) => Ok(None), // Wrong key
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
