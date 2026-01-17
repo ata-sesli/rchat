@@ -83,9 +83,12 @@ impl NetworkManager {
 
         // Publish every 5 minutes
         let mut publish_interval = tokio::time::interval(std::time::Duration::from_secs(300));
-        // Heartbeat every 60 seconds
         // Heartbeat every 10 seconds (Checking connectivity)
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        // NAT keepalive every 15 seconds - dial dummy address to keep port mapping alive
+        let mut nat_keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        // Dummy address for NAT keepalive (will fail, but outbound packet keeps NAT alive)
+        let nat_keepalive_addr: Multiaddr = "/ip4/1.1.1.1/udp/9/quic-v1".parse().unwrap();
 
         loop {
             tokio::select! {
@@ -95,6 +98,12 @@ impl NetworkManager {
                 _ = heartbeat_interval.tick() => {
                     let peer_count = self.local_peers.len();
                     println!("[Network Debug] Heartbeat: Swarm active. Peer count: {}. Listening...", peer_count);
+                }
+                _ = nat_keepalive_interval.tick() => {
+                    // Dial a dummy address to send outbound UDP and keep NAT mapping alive
+                    // The dial will fail, but the outbound packet is enough for NAT
+                    let _ = self.swarm.dial(nat_keepalive_addr.clone());
+                    // Don't log every time to avoid spam, but occasionally log
                 }
                 Some(cmd) = self.crx.recv() => {
                     self.handle_ui_command(cmd);

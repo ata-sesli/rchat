@@ -42,6 +42,178 @@ impl StunResult {
     }
 }
 
+/// Handle for STUN keepalive background task
+pub struct StunKeepalive {
+    cancel_tx: tokio::sync::oneshot::Sender<()>,
+    pub external_addr: SocketAddr,
+}
+
+impl StunKeepalive {
+    /// Stop the keepalive background task
+    pub fn stop(self) {
+        let _ = self.cancel_tx.send(());
+    }
+}
+
+/// Discover external address and start keepalive background task
+/// Returns the keepalive handle and result
+pub async fn discover_and_keepalive(local_port: u16) -> (Option<StunKeepalive>, StunResult) {
+    use std::sync::Arc;
+    use tokio::net::UdpSocket as TokioUdpSocket;
+    
+    let mut result = StunResult { 
+        ipv6: None, 
+        ipv4: None,
+        local_port,
+        external_port: None,
+    };
+    
+    println!("[STUN] 🔍 Discovering on local port {} (with keepalive)...", local_port);
+    
+    // Bind tokio UDP socket (async, can be kept alive)
+    let socket = match TokioUdpSocket::bind(format!("0.0.0.0:{}", local_port)).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("[STUN] ❌ Failed to bind to port {}: {}", local_port, e);
+            return (None, result);
+        }
+    };
+    
+    // Find a working STUN server
+    let mut stun_server: Option<SocketAddr> = None;
+    
+    for server in STUN_SERVERS {
+        let addrs: Vec<SocketAddr> = match tokio::net::lookup_host(server).await {
+            Ok(iter) => iter.collect(),
+            Err(_) => continue,
+        };
+        
+        if let Some(v4_server) = addrs.iter().find(|a| a.is_ipv4()) {
+            // Try STUN query
+            if let Ok(external_addr) = query_stun_async(&socket, *v4_server).await {
+                println!("[STUN] ✅ External address: {} (from {})", external_addr, server);
+                result.ipv4 = Some(external_addr);
+                result.external_port = Some(external_addr.port());
+                stun_server = Some(*v4_server);
+                break;
+            }
+        }
+    }
+    
+    if result.ipv4.is_none() {
+        eprintln!("[STUN] ❌ No external address discovered on port {}", local_port);
+        return (None, result);
+    }
+    
+    let external_addr = result.ipv4.unwrap();
+    let stun_server = stun_server.unwrap();
+    
+    // Start keepalive background task
+    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+    let socket_clone = socket.clone();
+    
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Send STUN binding to keep NAT port open
+                    if let Err(e) = send_stun_keepalive(&socket_clone, stun_server).await {
+                        eprintln!("[STUN] ⚠️ Keepalive failed: {}", e);
+                    } else {
+                        println!("[STUN] 💓 Keepalive sent (port {})", local_port);
+                    }
+                }
+                _ = &mut cancel_rx => {
+                    println!("[STUN] 🛑 Keepalive stopped");
+                    break;
+                }
+            }
+        }
+    });
+    
+    let keepalive = StunKeepalive {
+        cancel_tx,
+        external_addr,
+    };
+    
+    (Some(keepalive), result)
+}
+
+/// Send a STUN binding request (async version for keepalive)
+async fn send_stun_keepalive(socket: &tokio::net::UdpSocket, server: SocketAddr) -> Result<(), String> {
+    let mut request = [0u8; 20];
+    request[0] = 0x00; request[1] = 0x01; // Binding Request
+    request[2] = 0x00; request[3] = 0x00; // Length: 0
+    request[4] = 0x21; request[5] = 0x12; request[6] = 0xA4; request[7] = 0x42; // Magic cookie
+    for i in 8..20 { request[i] = rand::random(); }
+    
+    socket.send_to(&request, server).await
+        .map_err(|e| format!("Send failed: {}", e))?;
+    
+    // We don't need to wait for response - just sending keeps NAT alive
+    Ok(())
+}
+
+/// Async STUN query (returns external address)
+async fn query_stun_async(socket: &tokio::net::UdpSocket, server: SocketAddr) -> Result<SocketAddr, String> {
+    let mut request = [0u8; 20];
+    request[0] = 0x00; request[1] = 0x01;
+    request[2] = 0x00; request[3] = 0x00;
+    request[4] = 0x21; request[5] = 0x12; request[6] = 0xA4; request[7] = 0x42;
+    for i in 8..20 { request[i] = rand::random(); }
+    
+    socket.send_to(&request, server).await
+        .map_err(|e| format!("Send failed: {}", e))?;
+    
+    let mut buf = [0u8; 1024];
+    let timeout = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await;
+    
+    match timeout {
+        Ok(Ok((len, _))) => parse_stun_response(&buf[..len]),
+        Ok(Err(e)) => Err(format!("Recv failed: {}", e)),
+        Err(_) => Err("Timeout".to_string()),
+    }
+}
+
+/// Parse STUN response to extract mapped address
+fn parse_stun_response(buf: &[u8]) -> Result<SocketAddr, String> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    
+    if buf.len() < 20 {
+        return Err("Response too short".to_string());
+    }
+    
+    let msg_type = u16::from_be_bytes([buf[0], buf[1]]);
+    if msg_type != STUN_BINDING_RESPONSE {
+        return Err(format!("Bad message type: 0x{:04x}", msg_type));
+    }
+    
+    let msg_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let mut offset = 20;
+    
+    while offset + 4 <= 20 + msg_len && offset + 4 <= buf.len() {
+        let attr_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+        let attr_len = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
+        
+        if offset + 4 + attr_len > buf.len() { break; }
+        let data = &buf[offset + 4..offset + 4 + attr_len];
+        
+        if attr_type == ATTR_XOR_MAPPED_ADDRESS && data.len() >= 8 {
+            let family = data[1];
+            if family == 0x01 { // IPv4
+                let port = u16::from_be_bytes([data[2], data[3]]) ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+                let ip = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) ^ STUN_MAGIC_COOKIE;
+                return Ok(SocketAddr::new(Ipv4Addr::from(ip).into(), port));
+            }
+        }
+        
+        offset += 4 + ((attr_len + 3) & !3);
+    }
+    
+    Err("No mapped address found".to_string())
+}
+
 /// Discover public address using a SPECIFIC local UDP port
 /// This is critical for hole punching - must match QUIC listener port
 pub async fn discover_on_port(local_port: u16) -> StunResult {
