@@ -99,6 +99,16 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
     
     println!("[Backend] Using TCP port {} and UDP port {} for both IPv4 and IPv6", tcp_port, udp_port);
     
+    // Do STUN discovery on the UDP port BEFORE binding QUIC
+    // This is critical: STUN must use same socket as QUIC for hole punching
+    let stun_result = stun::discover_on_port(udp_port).await;
+    let stun_external_port = stun_result.external_port;
+    let stun_public_ip = stun_result.ipv4.map(|a| a.ip().to_string());
+    
+    if let Some(ext_port) = stun_external_port {
+        println!("[Backend] STUN external port: {} (local: {})", ext_port, udp_port);
+    }
+    
     // Listen on both protocols with the SAME ports
     swarm.listen_on(format!("/ip6/::/udp/{}/quic-v1", udp_port).parse()?)?;
     swarm.listen_on(format!("/ip6/::/tcp/{}", tcp_port).parse()?)?;
@@ -109,12 +119,13 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
 
     let (ctx, crx) = mpsc::channel(32);
 
-    // Store the sender in app state
+    // Store the sender in app state (with STUN results)
     let network_state = crate::NetworkState {
         sender: tokio::sync::Mutex::new(ctx),
         listening_addresses: tokio::sync::Mutex::new(vec![]),
         public_address_v6: tokio::sync::Mutex::new(None),
-        public_address_v4: tokio::sync::Mutex::new(None),
+        public_address_v4: tokio::sync::Mutex::new(stun_public_ip),
+        stun_external_port: tokio::sync::Mutex::new(stun_external_port),
     };
     app_handle.manage(network_state);
 

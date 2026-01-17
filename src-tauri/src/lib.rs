@@ -16,6 +16,7 @@ pub struct NetworkState {
     pub listening_addresses: Mutex<Vec<String>>, // Current libp2p listening addresses
     pub public_address_v6: Mutex<Option<String>>, // STUN-discovered IPv6
     pub public_address_v4: Mutex<Option<String>>, // STUN-discovered IPv4
+    pub stun_external_port: Mutex<Option<u16>>,   // NAT-mapped UDP port for QUIC invites
 }
 // Add State Management
 pub struct AppState {
@@ -970,53 +971,23 @@ async fn create_invite(
         (username, tok)
     };
     
-    // 2. Get my address for invite (IPv6 first)
-    // Priority: IPv6 STUN > IPv4 STUN > Local IPv6 > Local IPv4
+    // 2. Get my address for invite - MUST use QUIC with STUN external port for hole punching
     let net_state = app.state::<NetworkState>();
     let my_address = {
-        let addrs = net_state.listening_addresses.lock().await;
-        let v6_stun = net_state.public_address_v6.lock().await.clone();
         let v4_stun = net_state.public_address_v4.lock().await.clone();
+        let stun_port = net_state.stun_external_port.lock().await.clone();
         
-        // Helper to extract port from listening addresses
-        let get_port = |addrs: &[String], ip_ver: &str| -> Option<String> {
+        // For cross-network: use QUIC with STUN-mapped port
+        if let (Some(ref ip), Some(port)) = (&v4_stun, stun_port) {
+            let addr = format!("/ip4/{}/udp/{}/quic-v1", ip, port);
+            println!("[Invite] Using QUIC STUN: {}", addr);
+            addr
+        } else {
+            // Fallback to local addresses for same-network
+            let addrs = net_state.listening_addresses.lock().await;
             addrs.iter()
-                .find(|a| a.contains(ip_ver) && a.contains("/tcp/") && !a.contains("127.0.0.1") && !a.contains("::1"))
-                .and_then(|a| a.split("/tcp/").nth(1))
-                .and_then(|s| s.split('/').next())
-                .map(|s| s.to_string())
-        };
-        
-        // 1. Try IPv6 STUN address
-        if let Some(ref v6) = v6_stun {
-            if let Some(port) = get_port(&addrs, "/ip6/") {
-                let addr = format!("/ip6/{}/tcp/{}", v6.split(':').next().unwrap_or(v6), port);
-                println!("[Invite] Using IPv6 STUN: {}", addr);
-                addr
-            } else if let Some(port) = get_port(&addrs, "/ip4/") {
-                // Fallback: use v6 IP with v4 port (might work for dual-stack)
-                let addr = format!("/ip6/{}/tcp/{}", v6.split(':').next().unwrap_or(v6), port);
-                println!("[Invite] Using IPv6 STUN (v4 port): {}", addr);
-                addr
-            } else {
-                format!("/ip6/{}", v6)
-            }
-        }
-        // 2. Try IPv4 STUN address
-        else if let Some(ref v4) = v4_stun {
-            if let Some(port) = get_port(&addrs, "/ip4/") {
-                let addr = format!("/ip4/{}/tcp/{}", v4.split(':').next().unwrap_or(v4), port);
-                println!("[Invite] Using IPv4 STUN: {}", addr);
-                addr
-            } else {
-                format!("/ip4/{}", v4)
-            }
-        }
-        // 3. Fallback to local addresses (IPv6 first)
-        else {
-            addrs.iter()
-                .find(|a| a.contains("/ip6/") && a.contains("/tcp/") && !a.contains("::1"))
-                .or_else(|| addrs.iter().find(|a| a.contains("/ip4/") && a.contains("/tcp/") && !a.contains("127.0.0.1")))
+                .find(|a| a.contains("/udp/") && a.contains("/quic-v1") && !a.contains("127.0.0.1") && !a.contains("::1"))
+                .or_else(|| addrs.iter().find(|a| a.contains("/tcp/") && !a.contains("127.0.0.1") && !a.contains("::1")))
                 .or_else(|| addrs.first())
                 .cloned()
                 .ok_or("No listening address available. Is the network started?")?

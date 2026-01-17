@@ -26,6 +26,8 @@ const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 pub struct StunResult {
     pub ipv6: Option<SocketAddr>,
     pub ipv4: Option<SocketAddr>,
+    pub local_port: u16,         // The local port we used
+    pub external_port: Option<u16>, // The NAT-mapped external port (from IPv4 STUN)
 }
 
 impl StunResult {
@@ -33,11 +35,63 @@ impl StunResult {
     pub fn best(&self) -> Option<SocketAddr> {
         self.ipv6.or(self.ipv4)
     }
+    
+    /// Get external port (from STUN mapping)
+    pub fn get_external_port(&self) -> Option<u16> {
+        self.external_port.or_else(|| self.ipv4.map(|a| a.port()))
+    }
+}
+
+/// Discover public address using a SPECIFIC local UDP port
+/// This is critical for hole punching - must match QUIC listener port
+pub async fn discover_on_port(local_port: u16) -> StunResult {
+    let mut result = StunResult { 
+        ipv6: None, 
+        ipv4: None,
+        local_port,
+        external_port: None,
+    };
+    
+    println!("[STUN] 🔍 Discovering on local port {}...", local_port);
+    
+    // Bind to the specific port
+    let socket = match std::net::UdpSocket::bind(format!("0.0.0.0:{}", local_port)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[STUN] ❌ Failed to bind to port {}: {}", local_port, e);
+            return result;
+        }
+    };
+    socket.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    
+    // Try STUN servers
+    for server in STUN_SERVERS {
+        let addrs: Vec<SocketAddr> = match tokio::net::lookup_host(server).await {
+            Ok(iter) => iter.collect(),
+            Err(_) => continue,
+        };
+        
+        // Try IPv4 server
+        if let Some(v4_server) = addrs.iter().find(|a| a.is_ipv4()) {
+            if let Ok(addr) = query_stun_raw(&socket, *v4_server) {
+                println!("[STUN] ✅ External address: {} (from {})", addr, server);
+                result.ipv4 = Some(addr);
+                result.external_port = Some(addr.port());
+                break;
+            }
+        }
+    }
+    
+    if result.ipv4.is_none() {
+        eprintln!("[STUN] ❌ No external address discovered on port {}", local_port);
+    }
+    
+    result
 }
 
 /// Discover public addresses using STUN (IPv6 first)
 pub async fn discover_public_addresses() -> StunResult {
-    let mut result = StunResult { ipv6: None, ipv4: None };
+    let mut result = StunResult { ipv6: None, ipv4: None, local_port: 0, external_port: None };
     
     // Try to get both IPv6 and IPv4 addresses
     for server in STUN_SERVERS {

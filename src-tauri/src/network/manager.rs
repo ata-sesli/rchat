@@ -78,24 +78,8 @@ impl NetworkManager {
             println!("[Gossipsub] ✅ Subscribed to global-chat topic");
         }
 
-        // Discover public IPs using STUN servers (IPv6-first)
-        let app_handle = self.app_handle.clone();
-        tokio::spawn(async move {
-            println!("[STUN] 🔍 Discovering public addresses (IPv6-first)...");
-            let result = crate::network::stun::discover_public_addresses().await;
-            let state = app_handle.state::<crate::NetworkState>();
-            
-            if let Some(v6) = result.ipv6 {
-                let v6_str = v6.to_string();
-                *state.public_address_v6.lock().await = Some(v6_str.clone());
-                println!("[STUN] ✅ IPv6: {}", v6_str);
-            }
-            if let Some(v4) = result.ipv4 {
-                let v4_str = v4.to_string();
-                *state.public_address_v4.lock().await = Some(v4_str.clone());
-                println!("[STUN] ✅ IPv4: {}", v4_str);
-            }
-        });
+        // NOTE: STUN discovery is now done in mod.rs during init with the correct UDP port
+        // This ensures the STUN external port matches the QUIC listener port
 
         // Publish every 5 minutes
         let mut publish_interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -180,16 +164,29 @@ impl NetworkManager {
                 println!("[DIAL] 📞 Dialing {} (inviter: {}, me: {:?})", multiaddr_str, inviter_username, my_username);
                 
                 if let Ok(addr) = multiaddr_str.parse::<Multiaddr>() {
-                    if let Err(e) = self.swarm.dial(addr.clone()) {
-                        eprintln!("[DIAL] ❌ Failed to dial {}: {}", multiaddr_str, e);
-                    } else {
-                        println!("[DIAL] ✅ Dial initiated to {}", multiaddr_str);
-                        // Store pending mapping for when connection succeeds
-                        if let Some(my_user) = my_username {
-                            self.pending_github_mappings.insert(
-                                multiaddr_str.to_string(), 
-                                (inviter_username, my_user)
-                            );
+                    // Store pending mapping for when connection succeeds
+                    if let Some(my_user) = my_username {
+                        self.pending_github_mappings.insert(
+                            multiaddr_str.to_string(), 
+                            (inviter_username.clone(), my_user)
+                        );
+                    }
+                    
+                    // Aggressive dial: try multiple times immediately
+                    // libp2p will handle the actual connection attempts
+                    for attempt in 1..=3 {
+                        match self.swarm.dial(addr.clone()) {
+                            Ok(_) => {
+                                println!("[DIAL] ✅ Attempt {}/3 initiated to {}", attempt, multiaddr_str);
+                                break;
+                            }
+                            Err(e) => {
+                                if attempt < 3 {
+                                    println!("[DIAL] ⚠️ Attempt {}/3 failed, retrying: {}", attempt, e);
+                                } else {
+                                    eprintln!("[DIAL] ❌ All 3 attempts failed to {}: {}", multiaddr_str, e);
+                                }
+                            }
                         }
                     }
                 } else {
