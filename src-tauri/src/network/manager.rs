@@ -1894,7 +1894,7 @@ impl NetworkManager {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[Shadow] Failed to fetch shadows from {}: {}", invitee, e);
+                    eprintln!("[Shadow] Failed to fetch shadows from {}: {:?}", invitee, e);
                 }
             }
         }
