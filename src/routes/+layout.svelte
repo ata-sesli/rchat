@@ -86,7 +86,7 @@
     latestMessageTimes,
     searchQuery,
     currentEnvelope,
-    chatAssignments
+    chatAssignments,
   );
 
   function computeSortedPeers(
@@ -95,7 +95,7 @@
     latestMessageTimes: Record<string, number>,
     searchQuery: string,
     currentEnvelope: string | null,
-    chatAssignments: Record<string, string>
+    chatAssignments: Record<string, string>,
   ): string[] {
     let allPeers = [...peers];
 
@@ -172,6 +172,16 @@
         }
       });
 
+      // Listen for new GitHub chats (handshake received)
+      await listen("new-github-chat", (event: any) => {
+        const chatId = event.payload?.chat_id;
+        console.log("[Layout] Received new-github-chat event:", event.payload);
+        if (chatId && !peers.includes(chatId)) {
+          peers = [...peers, chatId];
+          console.log("[Layout] Added new peer to list:", chatId);
+        }
+      });
+
       // Listen for profile updates from settings
       window.addEventListener("profile-updated", () => {
         console.log("[Layout] Profile updated, refreshing...");
@@ -216,11 +226,11 @@
       userProfile = await invoke("get_user_profile");
       envelopes = await invoke<Envelope[]>("get_envelopes");
       chatAssignments = await invoke<Record<string, string>>(
-        "get_chat_assignments"
+        "get_chat_assignments",
       );
       // Load latest message times for sorting
       latestMessageTimes = await invoke<Record<string, number>>(
-        "get_chat_latest_times"
+        "get_chat_latest_times",
       );
       // Load unread message counts for badges
       unreadCounts = await invoke<Record<string, number>>("get_unread_counts");
@@ -245,7 +255,7 @@
   function openContextMenu(
     e: MouseEvent,
     type: "peer" | "envelope",
-    id: string
+    id: string,
   ) {
     e.preventDefault();
     contextMenuPos = { x: e.clientX, y: e.clientY };
@@ -338,7 +348,7 @@
           icon: icon,
         });
         envelopes = envelopes.map((e) =>
-          e.id === editingEnvelopeId ? { ...e, name: name, icon: icon } : e
+          e.id === editingEnvelopeId ? { ...e, name: name, icon: icon } : e,
         );
       } else {
         const id = `env_${Date.now()}`;
