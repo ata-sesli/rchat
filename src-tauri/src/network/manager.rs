@@ -281,22 +281,29 @@ impl NetworkManager {
                 let github_username = &target_peer_id[3..]; // Remove "gh:" prefix
                 
                 // Look up the actual PeerId from config's github_peer_mapping
-                let state = self.app_handle.state::<crate::AppState>();
-                let mapping = tauri::async_runtime::block_on(async {
-                    let mgr = state.config_manager.lock().await;
-                    if let Ok(config) = mgr.load().await {
-                        config.user.github_peer_mapping.get(github_username).cloned()
-                    } else {
-                        None
-                    }
-                });
+                // Use a spawned thread to avoid "block_on inside runtime" panic
+                let app_handle = self.app_handle.clone();
+                let gh_user = github_username.to_string();
+                
+                let mapping = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        use tauri::Manager;
+                        let state = app_handle.state::<crate::AppState>();
+                        let mgr = state.config_manager.lock().await;
+                        if let Ok(config) = mgr.load().await {
+                            config.user.github_peer_mapping.get(&gh_user).cloned()
+                        } else {
+                            None
+                        }
+                    })
+                }).join().unwrap_or(None);
                 
                 if let Some(peer_id_string) = mapping {
                     println!("[DM] 🔄 Resolved GitHub user {} to PeerId {}", github_username, peer_id_string);
                     peer_id_string
                 } else {
                     eprintln!("[DM] ❌ No PeerId mapping found for GitHub user {}. Message queued.", github_username);
-                    // TODO: Queue message for later delivery when PeerId is discovered
                     return;
                 }
             } else {
