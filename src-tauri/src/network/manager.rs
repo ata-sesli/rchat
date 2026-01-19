@@ -45,6 +45,9 @@ pub struct NetworkManager {
     // Pending shadow polls: invitee_username → (password, my_username, created_at)
     // Used to poll invitee's Gist for shadow invite (bidirectional hole punch)
     pending_shadow_polls: HashMap<String, (String, String, u64)>,
+    // Active punch targets: target_name → (Multiaddr, start_time)
+    // Continuous 500ms punching for 30 seconds
+    active_punch_targets: HashMap<String, (Multiaddr, std::time::Instant)>,
 }
 
 impl NetworkManager {
@@ -69,6 +72,7 @@ impl NetworkManager {
             incoming_requests: HashSet::new(),
             pending_github_mappings: HashMap::new(),
             pending_shadow_polls: HashMap::new(),
+            active_punch_targets: HashMap::new(),
         }
     }
     pub async fn run(mut self: Self) {
@@ -93,8 +97,10 @@ impl NetworkManager {
         let mut nat_keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         // Dummy address for NAT keepalive (will fail, but outbound packet keeps NAT alive)
         let nat_keepalive_addr: Multiaddr = "/ip4/1.1.1.1/udp/9/quic-v1".parse().unwrap();
-        // Shadow invite polling every 10 seconds - check invitees for their shadow invites
-        let mut shadow_poll_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        // Shadow invite polling every 5 seconds - check invitees for their shadow invites
+        let mut shadow_poll_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        // Aggressive punch interval - 500ms for continuous hole punching
+        let mut punch_interval = tokio::time::interval(std::time::Duration::from_millis(500));
 
         loop {
             tokio::select! {
@@ -114,6 +120,10 @@ impl NetworkManager {
                 _ = shadow_poll_interval.tick() => {
                     // Poll for shadow invites from invitees
                     self.poll_shadow_invites().await;
+                }
+                _ = punch_interval.tick() => {
+                    // Continuously punch all active targets
+                    self.punch_active_targets();
                 }
                 Some(cmd) = self.crx.recv() => {
                     self.handle_ui_command(cmd);
@@ -191,25 +201,27 @@ impl NetworkManager {
                         );
                     }
                     
-                    // Aggressive dial: try multiple times immediately
-                    // libp2p will handle the actual connection attempts
-                    for attempt in 1..=3 {
-                        match self.swarm.dial(addr.clone()) {
-                            Ok(_) => {
-                                println!("[DIAL] ✅ Attempt {}/3 initiated to {}", attempt, multiaddr_str);
-                                break;
-                            }
-                            Err(e) => {
-                                if attempt < 3 {
-                                    println!("[DIAL] ⚠️ Attempt {}/3 failed, retrying: {}", attempt, e);
-                                } else {
-                                    eprintln!("[DIAL] ❌ All 3 attempts failed to {}: {}", multiaddr_str, e);
-                                }
-                            }
-                        }
-                    }
+                    // Add to active punch targets for continuous punching
+                    self.add_punch_target(&inviter_username, addr);
                 } else {
                     eprintln!("[DIAL] ❌ Invalid multiaddr: {}", multiaddr_str);
+                }
+                return;
+            }
+        }
+        
+        // Handle START_PUNCH command (START_PUNCH:multiaddr:target_username)
+        // Used by invitee to start punching after publishing shadow invite
+        if msg_content.starts_with("START_PUNCH:") {
+            let parts: Vec<&str> = msg_content.splitn(3, ':').collect();
+            if parts.len() == 3 {
+                let multiaddr_str = parts[1];
+                let target_username = parts[2];
+                
+                println!("[PUNCH] 🥊 Starting punch to {} at {}", target_username, multiaddr_str);
+                
+                if let Ok(addr) = multiaddr_str.parse::<Multiaddr>() {
+                    self.add_punch_target(target_username, addr);
                 }
                 return;
             }
@@ -1525,9 +1537,27 @@ impl NetworkManager {
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                 println!("[Swarm] Connected to {}", peer_id);
                 
+                // Cleanup active punch targets
+                let remote_addr = endpoint.get_remote_address();
+                let mut to_remove = Vec::new();
+                for (name, (addr, _)) in self.active_punch_targets.iter() {
+                    // Check if the connected address matches the punch target address
+                    // Since QUIC/UDP addresses might slightly vary (port mapping), check IP
+                    let target_ip = addr.to_string().split('/').nth(2).unwrap_or("").to_string();
+                    let connected_ip = remote_addr.to_string().split('/').nth(2).unwrap_or("").to_string();
+                    
+                    if !target_ip.is_empty() && target_ip == connected_ip {
+                        to_remove.push(name.clone());
+                    }
+                }
+                
+                for name in to_remove {
+                    self.remove_punch_target(&name);
+                }
+                
                 // Check if this connection is from a GitHub invite dial
                 // The endpoint contains the dialed address
-                let remote_addr = endpoint.get_remote_address().to_string();
+                let remote_addr = remote_addr.to_string();
                 
                 // Check all pending mappings for partial match (IP portion)
                 let mut matched_data = None;
@@ -1822,25 +1852,12 @@ impl NetworkManager {
                             Ok(Some(payload)) => {
                                 println!("[Shadow] 🎯 Found shadow from {}: {}", invitee, payload.invitee_address);
                                 
-                                // Dial the invitee's address for bidirectional hole punch
+                                // Add to active punch targets for continuous punching
                                 if let Ok(addr) = payload.invitee_address.parse::<Multiaddr>() {
-                                    println!("[Shadow] 📞 Punching to {}", payload.invitee_address);
-                                    for attempt in 1..=5 {
-                                        match self.swarm.dial(addr.clone()) {
-                                            Ok(_) => {
-                                                println!("[Shadow] ✅ Punch {}/5 sent to {}", attempt, invitee);
-                                                break;
-                                            }
-                                            Err(e) => {
-                                                if attempt < 5 {
-                                                    println!("[Shadow] ⚠️ Punch {}/5 failed: {}", attempt, e);
-                                                }
-                                            }
-                                        }
-                                    }
+                                    self.add_punch_target(&invitee, addr);
                                 }
                                 
-                                // Remove from pending after successful discovery
+                                // Remove from pending shadow polls
                                 self.pending_shadow_polls.remove(&invitee);
                             }
                             Ok(None) => {
@@ -1856,6 +1873,57 @@ impl NetworkManager {
                     eprintln!("[Shadow] Failed to fetch shadows from {}: {}", invitee, e);
                 }
             }
+        }
+    }
+    
+    /// Continuously punch all active targets (called every 500ms)
+    fn punch_active_targets(&mut self) {
+        if self.active_punch_targets.is_empty() {
+            return;
+        }
+        
+        let now = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(30);
+        
+        // Remove expired targets (older than 30 seconds)
+        let expired: Vec<String> = self.active_punch_targets
+            .iter()
+            .filter(|(_, (_, start))| now.duration_since(*start) > timeout)
+            .map(|(name, _)| name.clone())
+            .collect();
+        
+        for name in expired {
+            println!("[Punch] ⏰ Timeout for {}", name);
+            self.active_punch_targets.remove(&name);
+        }
+        
+        // Punch all remaining active targets
+        for (name, (addr, start)) in &self.active_punch_targets {
+            let attempt = (now.duration_since(*start).as_millis() / 500) + 1;
+            let _ = self.swarm.dial(addr.clone());
+            // Only log every 10th attempt to reduce spam
+            if attempt % 10 == 1 || attempt <= 3 {
+                println!("[Punch] 📤 {}/60 to {}", attempt.min(60), name);
+            }
+        }
+    }
+    
+    /// Add a target to active punch list
+    fn add_punch_target(&mut self, name: &str, addr: Multiaddr) {
+        println!("[Punch] 🎯 Added target: {} -> {}", name, addr);
+        self.active_punch_targets.insert(
+            name.to_string(),
+            (addr, std::time::Instant::now())
+        );
+    }
+    
+    /// Remove a target from active punch list (e.g., on connection success)
+    fn remove_punch_target(&mut self, name: &str) -> bool {
+        if self.active_punch_targets.remove(name).is_some() {
+            println!("[Punch] 🎉 {} connected, removed from targets", name);
+            true
+        } else {
+            false
         }
     }
 }

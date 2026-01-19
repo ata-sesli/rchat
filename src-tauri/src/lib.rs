@@ -1197,16 +1197,8 @@ async fn redeem_and_connect(
                 storage::db::insert_message(&conn, &msg).map_err(|e| e.to_string())?;
             }
             
-            // 6. Dial the inviter's address to establish libp2p connection
-            // DIAL format: DIAL:multiaddr:inviter_username:my_username
-            let dial_command = format!("DIAL:{}:{}:{}", payload.ip_address, github_username, my_username);
-            println!("[Backend] Sending dial command: {}", dial_command);
-            
-            let tx = net_state.sender.lock().await;
-            tx.send(dial_command).await.map_err(|e| format!("Failed to dial: {}", e))?;
-            
-            // 7. Create and publish shadow invite for bidirectional hole punching
-            // This allows the inviter to discover our address and punch back
+            // 6. Create and publish shadow invite FIRST for bidirectional hole punching
+            // This ensures the inviter can discover us
             {
                 // Get my QUIC address
                 let my_address = {
@@ -1247,6 +1239,16 @@ async fn redeem_and_connect(
                                 eprintln!("[Shadow] Failed to publish: {}", e);
                             } else {
                                 println!("[Shadow] ✅ Published to Gist for {}", inviter);
+                                
+                                // 7. NOW start punching to inviter
+                                // START_PUNCH:multiaddr:target_username
+                                let punch_cmd = format!("START_PUNCH:{}:{}", payload.ip_address, github_username);
+                                println!("[Backend] Sending punch command: {}", punch_cmd);
+                                
+                                let tx = net_state.sender.lock().await;
+                                if let Err(e) = tx.send(punch_cmd).await {
+                                    eprintln!("[Backend] Failed to send punch command: {}", e);
+                                }
                             }
                         }
                         Err(e) => {
