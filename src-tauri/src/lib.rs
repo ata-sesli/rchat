@@ -1245,8 +1245,8 @@ async fn redeem_and_connect(
                                 println!("[Shadow] ⏳ Waiting 2.5s for shadow invite propagation...");
                                 tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
-                                // START_PUNCH:multiaddr:target_username
-                                let punch_cmd = format!("START_PUNCH:{}:{}", payload.ip_address, github_username);
+                                // START_PUNCH:multiaddr:target_username:my_username
+                                let punch_cmd = format!("START_PUNCH:{}:{}:{}", payload.ip_address, github_username, my_username);
                                 println!("[Backend] Sending punch command: {}", punch_cmd);
                                 
                                 let tx = net_state.sender.lock().await;

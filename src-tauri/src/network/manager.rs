@@ -210,17 +210,24 @@ impl NetworkManager {
             }
         }
         
-        // Handle START_PUNCH command (START_PUNCH:multiaddr:target_username)
+        // Handle START_PUNCH command (START_PUNCH:multiaddr:target_username:my_username)
         // Used by invitee to start punching after publishing shadow invite
         if msg_content.starts_with("START_PUNCH:") {
-            let parts: Vec<&str> = msg_content.splitn(3, ':').collect();
-            if parts.len() == 3 {
+            let parts: Vec<&str> = msg_content.splitn(4, ':').collect();
+            if parts.len() == 4 {
                 let multiaddr_str = parts[1];
                 let target_username = parts[2];
+                let my_username = parts[3];
                 
-                println!("[PUNCH] 🥊 Starting punch to {} at {}", target_username, multiaddr_str);
+                println!("[PUNCH] 🥊 Starting punch to {} at {} (me: {})", target_username, multiaddr_str, my_username);
                 
                 if let Ok(addr) = multiaddr_str.parse::<Multiaddr>() {
+                    // Store pending mapping so handshake is sent on connection
+                    self.pending_github_mappings.insert(
+                        multiaddr_str.to_string(),
+                        (target_username.to_string(), my_username.to_string())
+                    );
+                    
                     self.add_punch_target(target_username, addr);
                 }
                 return;
