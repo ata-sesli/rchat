@@ -1830,8 +1830,8 @@ impl NetworkManager {
             .as_secs();
         
         self.pending_shadow_polls.insert(
-            invitee.to_lowercase(),
-            (password.to_string(), my_username.to_lowercase(), now)
+            invitee.to_string(),
+            (password.to_string(), my_username.to_string(), now)
         );
         println!("[Shadow] 📋 Registered poll for {}", invitee);
     }
