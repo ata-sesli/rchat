@@ -1241,6 +1241,10 @@ async fn redeem_and_connect(
                                 println!("[Shadow] ✅ Published to Gist for {}", inviter);
                                 
                                 // 7. NOW start punching to inviter
+                                // Wait 2.5s for shadow invite to propagate
+                                println!("[Shadow] ⏳ Waiting 2.5s for shadow invite propagation...");
+                                tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
                                 // START_PUNCH:multiaddr:target_username
                                 let punch_cmd = format!("START_PUNCH:{}:{}", payload.ip_address, github_username);
                                 println!("[Backend] Sending punch command: {}", punch_cmd);
