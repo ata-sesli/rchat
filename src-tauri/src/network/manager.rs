@@ -903,9 +903,36 @@ impl NetworkManager {
                                                 let state =
                                                     self.app_handle.state::<crate::AppState>();
 
+                                                // Reverse lookup: PeerId → GitHub username
+                                                // Use gh:username as chat_id if found, otherwise fallback to PeerId
+                                                let chat_id = {
+                                                    let app_handle = self.app_handle.clone();
+                                                    let sender_peer_id = request.sender_id.clone();
+                                                    
+                                                    std::thread::spawn(move || {
+                                                        let rt = tokio::runtime::Runtime::new().unwrap();
+                                                        rt.block_on(async {
+                                                            use tauri::Manager;
+                                                            let state = app_handle.state::<crate::AppState>();
+                                                            let mgr = state.config_manager.lock().await;
+                                                            if let Ok(config) = mgr.load().await {
+                                                                // Find GitHub username that maps to this PeerId
+                                                                for (gh_user, peer_id) in &config.user.github_peer_mapping {
+                                                                    if peer_id == &sender_peer_id {
+                                                                        return Some(format!("gh:{}", gh_user));
+                                                                    }
+                                                                }
+                                                            }
+                                                            None
+                                                        })
+                                                    }).join().unwrap_or(None).unwrap_or_else(|| request.sender_id.clone())
+                                                };
+                                                
+                                                println!("[DM] Using chat_id: {} for sender {}", chat_id, request.sender_id);
+
                                                 let db_msg = crate::storage::db::Message {
                                                     id: request.id.clone(),
-                                                    chat_id: request.sender_id.clone(),
+                                                    chat_id: chat_id.clone(),
                                                     peer_id: request.sender_id.clone(),
                                                     timestamp: request.timestamp,
                                                     content_type: request.msg_type.clone(),
@@ -937,13 +964,13 @@ impl NetworkManager {
                                                     
                                                     let chat_exists = crate::storage::db::chat_exists(
                                                         &conn,
-                                                        &request.sender_id,
+                                                        &chat_id,
                                                     );
                                                     if !chat_exists {
-                                                        println!("[DM] Creating chat for {}", request.sender_id);
+                                                        println!("[DM] Creating chat for {}", chat_id);
                                                         if let Err(e) = crate::storage::db::create_chat(
                                                             &conn,
-                                                            &request.sender_id,
+                                                            &chat_id,
                                                             &request.sender_id,
                                                             false,
                                                         ) {
@@ -1024,7 +1051,7 @@ impl NetworkManager {
                                                 let _ = self.app_handle.emit(
                                                     "message-received",
                                                     serde_json::json!({
-                                                        "chat_id": request.sender_id,
+                                                        "chat_id": chat_id,
                                                         "peer_id": request.sender_id,
                                                         "msg_id": request.id,
                                                         "text_content": request.text_content,

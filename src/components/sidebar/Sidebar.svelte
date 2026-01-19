@@ -64,7 +64,7 @@
   function openContextMenu(
     e: MouseEvent,
     type: "peer" | "envelope",
-    id: string
+    id: string,
   ) {
     oncontextMenu({ event: e, type, id });
   }
@@ -386,7 +386,9 @@
                 <div
                   class="w-10 h-10 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white font-bold shadow-md ring-2 ring-transparent group-hover:ring-slate-700 transition-all"
                 >
-                  {peer.slice(0, 2).toUpperCase()}
+                  {(peer.startsWith("gh:") ? peer.slice(3) : peer)
+                    .slice(0, 2)
+                    .toUpperCase()}
                 </div>
                 <!-- Status indicator dot -->
                 <div
@@ -421,7 +423,8 @@
                   class="font-medium text-theme-base-200 truncate group-hover:text-white transition-colors"
                   >{peer === "Me"
                     ? "Me (You)"
-                    : peerAliases[peer] || peer}</span
+                    : peerAliases[peer] ||
+                      (peer.startsWith("gh:") ? peer.slice(3) : peer)}</span
                 >
               </div>
               {#if peer === "Me"}
