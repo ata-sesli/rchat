@@ -1557,8 +1557,12 @@ impl NetworkManager {
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                 println!("[Swarm] Connected to {}", peer_id);
                 
-                // Cleanup active punch targets
-                let remote_addr = endpoint.get_remote_address();
+                // Track connection in local_peers for online status
+                let remote_addr = endpoint.get_remote_address().clone();
+                self.local_peers
+                    .entry(peer_id)
+                    .or_insert_with(Vec::new)
+                    .push(remote_addr.clone());
                 let mut to_remove = Vec::new();
                 for (name, (addr, _)) in self.active_punch_targets.iter() {
                     // Check if the connected address matches the punch target address
