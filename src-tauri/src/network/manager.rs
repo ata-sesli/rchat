@@ -255,19 +255,26 @@ impl NetworkManager {
         }
 
         // Handle direct messages (DM:peer_id:msg_id:timestamp:alias:content)
+        // Note: For gh:username chats, peer_id contains a colon, so we use splitn(7)
         if msg_content.starts_with("DM:") {
-            let parts: Vec<&str> = msg_content.splitn(6, ':').collect();
-            if parts.len() >= 6 {
-                let target_peer_id = parts[1];
-                let msg_id = parts[2];
-                let timestamp: i64 = parts[3].parse().unwrap_or(0);
-                let sender_alias = parts[4];
-                let content = parts[5];
+            let parts: Vec<&str> = msg_content.splitn(7, ':').collect();
+            
+            // Determine if this is a gh: chat (has extra colon)
+            let (target_peer_id, msg_id, timestamp, sender_alias, content) = if parts.len() >= 7 && parts[1] == "gh" {
+                // Reconstruct gh:username from parts[1] and parts[2]
+                let gh_chat_id = format!("gh:{}", parts[2]);
+                (gh_chat_id, parts[3].to_string(), parts[4].parse::<i64>().unwrap_or(0), parts[5].to_string(), parts[6].to_string())
+            } else if parts.len() >= 6 {
+                (parts[1].to_string(), parts[2].to_string(), parts[3].parse::<i64>().unwrap_or(0), parts[4].to_string(), parts[5].to_string())
+            } else {
+                eprintln!("[DM] ❌ Invalid DM format: {}", msg_content);
+                return;
+            };
 
-                println!(
-                    "[DM] 📤 Sending direct message to {} (alias: {}): {}",
-                    target_peer_id, sender_alias, content
-                );
+            println!(
+                "[DM] 📤 Sending direct message to {} (alias: {}): {}",
+                target_peer_id, sender_alias, content
+            );
 
                 // Handle GitHub chat prefix (gh:username)
                 let actual_peer_id_str = if target_peer_id.starts_with("gh:") {
