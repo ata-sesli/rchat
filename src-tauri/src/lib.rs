@@ -3,7 +3,7 @@ mod network;
 mod oauth;
 mod storage; // New module
 
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 // use tauri::Runtime; // Unused
@@ -1096,6 +1096,7 @@ async fn redeem_invite(
 /// Complete invitation redemption with friend persistence and auto-message
 #[tauri::command]
 async fn redeem_and_connect(
+    handle: tauri::AppHandle,
     inviter: String,
     password: String,
     app_state: State<'_, AppState>,
