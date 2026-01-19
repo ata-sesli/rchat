@@ -97,8 +97,8 @@ impl NetworkManager {
         let mut nat_keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         // Dummy address for NAT keepalive (will fail, but outbound packet keeps NAT alive)
         let nat_keepalive_addr: Multiaddr = "/ip4/1.1.1.1/udp/9/quic-v1".parse().unwrap();
-        // Shadow invite polling every 5 seconds - check invitees for their shadow invites
-        let mut shadow_poll_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        // Shadow invite polling every 2 seconds - check invitees for their shadow invites
+        let mut shadow_poll_interval = tokio::time::interval(std::time::Duration::from_secs(2));
         // Aggressive punch interval - 500ms for continuous hole punching
         let mut punch_interval = tokio::time::interval(std::time::Duration::from_millis(500));
 
