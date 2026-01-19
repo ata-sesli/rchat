@@ -1265,6 +1265,12 @@ async fn redeem_and_connect(
             println!("[Backend] GitHub invite accepted from {}. Chat created: {}", 
                      github_username, chat_id);
             
+            // Emit event to frontend so sidebar updates
+            handle.emit("new-github-chat", serde_json::json!({
+                "chat_id": chat_id,
+                "github_username": github_username,
+            })).ok();
+            
             Ok(chat_id) // Return gh:username for frontend navigation
         }
         None => {
