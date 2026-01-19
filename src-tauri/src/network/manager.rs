@@ -276,59 +276,58 @@ impl NetworkManager {
                 target_peer_id, sender_alias, content
             );
 
-                // Handle GitHub chat prefix (gh:username)
-                let actual_peer_id_str = if target_peer_id.starts_with("gh:") {
-                    let github_username = &target_peer_id[3..]; // Remove "gh:" prefix
-                    
-                    // Look up the actual PeerId from config's github_peer_mapping
-                    let state = self.app_handle.state::<crate::AppState>();
-                    let mapping = tauri::async_runtime::block_on(async {
-                        let mgr = state.config_manager.lock().await;
-                        if let Ok(config) = mgr.load().await {
-                            config.user.github_peer_mapping.get(github_username).cloned()
-                        } else {
-                            None
-                        }
-                    });
-                    
-                    if let Some(peer_id_string) = mapping {
-                        println!("[DM] 🔄 Resolved GitHub user {} to PeerId {}", github_username, peer_id_string);
-                        peer_id_string
+            // Handle GitHub chat prefix (gh:username)
+            let actual_peer_id_str = if target_peer_id.starts_with("gh:") {
+                let github_username = &target_peer_id[3..]; // Remove "gh:" prefix
+                
+                // Look up the actual PeerId from config's github_peer_mapping
+                let state = self.app_handle.state::<crate::AppState>();
+                let mapping = tauri::async_runtime::block_on(async {
+                    let mgr = state.config_manager.lock().await;
+                    if let Ok(config) = mgr.load().await {
+                        config.user.github_peer_mapping.get(github_username).cloned()
                     } else {
-                        eprintln!("[DM] ❌ No PeerId mapping found for GitHub user {}. Message queued.", github_username);
-                        // TODO: Queue message for later delivery when PeerId is discovered
-                        return;
+                        None
                     }
+                });
+                
+                if let Some(peer_id_string) = mapping {
+                    println!("[DM] 🔄 Resolved GitHub user {} to PeerId {}", github_username, peer_id_string);
+                    peer_id_string
                 } else {
-                    target_peer_id.to_string()
+                    eprintln!("[DM] ❌ No PeerId mapping found for GitHub user {}. Message queued.", github_username);
+                    // TODO: Queue message for later delivery when PeerId is discovered
+                    return;
+                }
+            } else {
+                target_peer_id.to_string()
+            };
+
+            // Find the peer in connected peers
+            if let Ok(peer_id) = actual_peer_id_str.parse::<PeerId>() {
+                use crate::network::direct_message::DirectMessageRequest;
+                let request = DirectMessageRequest {
+                    id: msg_id.to_string(),
+                    sender_id: self.swarm.local_peer_id().to_string(),
+                    msg_type: "text".to_string(),
+                    text_content: Some(content.to_string()),
+                    file_hash: None,
+                    timestamp,
+                    chunk_hash: None,
+                    chunk_data: None,
+                    chunk_list: None,
+                    sender_alias: if sender_alias.is_empty() { None } else { Some(sender_alias.to_string()) },
                 };
 
-                // Find the peer in connected peers
-                if let Ok(peer_id) = actual_peer_id_str.parse::<PeerId>() {
-                    use crate::network::direct_message::DirectMessageRequest;
-                    let request = DirectMessageRequest {
-                        id: msg_id.to_string(),
-                        sender_id: self.swarm.local_peer_id().to_string(),
-                        msg_type: "text".to_string(),
-                        text_content: Some(content.to_string()),
-                        file_hash: None,
-                        timestamp,
-                        chunk_hash: None,
-                        chunk_data: None,
-                        chunk_list: None,
-                        sender_alias: if sender_alias.is_empty() { None } else { Some(sender_alias.to_string()) },
-                    };
-
-                    self.swarm
-                        .behaviour_mut()
-                        .direct_message
-                        .send_request(&peer_id, request);
-                    println!("[DM] ✅ Request sent to {}", peer_id);
-                } else {
-                    eprintln!("[DM] ❌ Invalid peer_id: {}", actual_peer_id_str);
-                }
-                return;
+                self.swarm
+                    .behaviour_mut()
+                    .direct_message
+                    .send_request(&peer_id, request);
+                println!("[DM] ✅ Request sent to {}", peer_id);
+            } else {
+                eprintln!("[DM] ❌ Invalid peer_id: {}", actual_peer_id_str);
             }
+            return;
         }
 
         // Handle read receipts (READ_RECEIPT:peer_id:msg_id1,msg_id2,...)
