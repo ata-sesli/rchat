@@ -113,7 +113,7 @@ fn run_service_registration(
     port: u16,
     user_alias: Option<String>,
 ) -> Result<()> {
-    let service_type = ServiceType::new("rchat", "tcp")
+    let service_type = ServiceType::new("rchat", "udp")
         .map_err(|e| anyhow::anyhow!("Invalid service type: {:?}", e))?;
 
     let mut service = MdnsService::new(service_type, port);
@@ -169,13 +169,13 @@ fn on_service_registered(
 }
 
 fn run_service_browser(sender: mpsc::Sender<MdnsPeer>, my_peer_id: String) -> Result<()> {
-    let service_type = ServiceType::new("rchat", "tcp")
+    let service_type = ServiceType::new("rchat", "udp")
         .map_err(|e| anyhow::anyhow!("Invalid service type: {:?}", e))?;
 
     let sender = Arc::new(std::sync::Mutex::new(sender));
     let my_peer_id = Arc::new(my_peer_id);
 
-    println!("[mDNS] Started browsing for _rchat._tcp...");
+    println!("[mDNS] Started browsing for _rchat._udp...");
 
     // Periodic re-browse loop
     loop {
@@ -255,7 +255,7 @@ fn handle_browser_event(
 
             let discovered_alias = txt.as_ref().and_then(|t| t.get("alias"));
 
-            let multiaddr = format!("/ip4/{}/tcp/{}", addr, port);
+            let multiaddr = format!("/ip4/{}/udp/{}/quic-v1", addr, port);
 
             let peer = MdnsPeer {
                 peer_id: discovered_peer_id,

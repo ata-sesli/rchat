@@ -1664,13 +1664,13 @@ impl NetworkManager {
                     });
                 }
 
-                // If we haven't started mDNS yet, and this is a TCP address, start it!
-                // IPv4 and IPv6 now share the same port, so any TCP address works
-                if !self.mdns_started && address.to_string().contains("/tcp/") {
+                // If we haven't started mDNS yet, and this is a QUIC address (UDP), start it!
+                // IPv4 and IPv6 share the same port.
+                if !self.mdns_started && address.to_string().contains("/udp/") && address.to_string().contains("quic") {
                     if let Some(port) = crate::network::get_port_from_multiaddr(&address) {
                         if port != 0 {
                             println!(
-                                "[NetworkManager] Found TCP listen port: {}, starting mDNS...",
+                                "[NetworkManager] Found QUIC listen port: {}, starting mDNS...",
                                 port
                             );
                             let peer_id = *self.swarm.local_peer_id();
