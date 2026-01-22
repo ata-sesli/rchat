@@ -1190,7 +1190,7 @@ async fn redeem_and_connect(
                     content_type: "text".to_string(),
                     text_content: Some("Hi!".to_string()),
                     file_hash: None,
-                    status: "pending".to_string(),
+                    status: "delivered".to_string(), // Signaling message - show as delivered (one tick)
                     content_metadata: None,
                     sender_alias: None,
                 };

@@ -349,7 +349,40 @@ impl NetworkManager {
                     target_peer_id
                 );
 
-                if let Ok(peer_id) = target_peer_id.parse::<PeerId>() {
+                // Handle GitHub chat prefix (gh:username)
+                let actual_peer_id_str = if target_peer_id.starts_with("gh:") {
+                    let github_username = &target_peer_id[3..]; // Remove "gh:" prefix
+                    
+                    // Look up the actual PeerId from config's github_peer_mapping
+                    let app_handle = self.app_handle.clone();
+                    let gh_user = github_username.to_string();
+                    
+                    let mapping = std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        rt.block_on(async {
+                            use tauri::Manager;
+                            let state = app_handle.state::<crate::AppState>();
+                            let mgr = state.config_manager.lock().await;
+                            if let Ok(config) = mgr.load().await {
+                                config.user.github_peer_mapping.get(&gh_user).cloned()
+                            } else {
+                                None
+                            }
+                        })
+                    }).join().unwrap_or(None);
+                    
+                    if let Some(peer_id_string) = mapping {
+                        println!("[READ_RECEIPT] 🔄 Resolved GitHub user {} to PeerId {}", github_username, peer_id_string);
+                        peer_id_string
+                    } else {
+                        eprintln!("[READ_RECEIPT] ❌ No PeerId mapping found for GitHub user {}", github_username);
+                        return;
+                    }
+                } else {
+                    target_peer_id.to_string()
+                };
+
+                if let Ok(peer_id) = actual_peer_id_str.parse::<PeerId>() {
                     use crate::network::direct_message::DirectMessageRequest;
                     let request = DirectMessageRequest {
                         id: format!(
@@ -379,7 +412,7 @@ impl NetworkManager {
                         .send_request(&peer_id, request);
                     println!("[READ_RECEIPT] ✅ Sent to {}", peer_id);
                 } else {
-                    eprintln!("[READ_RECEIPT] ❌ Invalid peer_id: {}", target_peer_id);
+                    eprintln!("[READ_RECEIPT] ❌ Invalid peer_id: {}", actual_peer_id_str);
                 }
                 return;
             }
@@ -1137,6 +1170,14 @@ impl NetworkManager {
                                                         "github_username": invitee_github,
                                                         "peer_id": invitee_peer_id,
                                                     }));
+                                                    
+                                                    // 4. Emit local-peer-discovered with gh:username so sidebar shows online status
+                                                    let peer_info = LocalPeer {
+                                                        peer_id: chat_id.clone(),
+                                                        addresses: vec![],
+                                                    };
+                                                    let _ = self.app_handle.emit("local-peer-discovered", peer_info);
+                                                    println!("[HANDSHAKE] ✅ Emitted local-peer-discovered for {}", chat_id);
                                                 }
                                                 
                                                 // Send response
@@ -1676,6 +1717,15 @@ impl NetworkManager {
                         .direct_message
                         .send_request(&peer_id, handshake);
                     println!("[HANDSHAKE] ✅ Handshake sent to {}", peer_id);
+                    
+                    // Emit local-peer-discovered with gh:username so sidebar shows online status
+                    let chat_id = format!("gh:{}", inviter_github_user);
+                    let peer_info = LocalPeer {
+                        peer_id: chat_id.clone(),
+                        addresses: vec![],
+                    };
+                    let _ = self.app_handle.emit("local-peer-discovered", peer_info);
+                    println!("[HANDSHAKE] ✅ Emitted local-peer-discovered for {}", chat_id);
                 }
             }
             SwarmEvent::ConnectionClosed {
@@ -1690,10 +1740,30 @@ impl NetworkManager {
                     // Remove from local_peers
                     if self.local_peers.remove(&peer_id).is_some() {
                         println!("[Swarm] Peer {} fully disconnected, notifying UI", peer_id);
-                        // Emit event to frontend
-                        let _ = self
-                            .app_handle
-                            .emit("local-peer-expired", peer_id.to_string());
+                        
+                        // Check if this is a GitHub peer and emit gh:username if so
+                        let peer_id_str = peer_id.to_string();
+                        let app_handle = self.app_handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let state = app_handle.state::<crate::AppState>();
+                            let mgr = state.config_manager.lock().await;
+                            if let Ok(config) = mgr.load().await {
+                                // Reverse lookup: find GitHub username for this PeerId
+                                let gh_username = config.user.github_peer_mapping.iter()
+                                    .find(|(_, v)| *v == &peer_id_str)
+                                    .map(|(k, _)| k.clone());
+                                
+                                if let Some(username) = gh_username {
+                                    let chat_id = format!("gh:{}", username);
+                                    let _ = app_handle.emit("local-peer-expired", chat_id);
+                                } else {
+                                    // Not a GitHub peer, emit raw PeerId
+                                    let _ = app_handle.emit("local-peer-expired", peer_id_str);
+                                }
+                            } else {
+                                let _ = app_handle.emit("local-peer-expired", peer_id_str);
+                            }
+                        });
                     }
                 }
             }
