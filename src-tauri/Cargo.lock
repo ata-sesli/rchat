@@ -5930,6 +5930,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 [[package]]
 name = "rvault-core"
 version = "0.0.5"
+source = "git+https://github.com/ata-sesli/rvault?branch=main#7dda2de45ac31eccb17dad7d1a4f1ebdd893e99c"
 dependencies = [
  "arboard",
  "argon2",
