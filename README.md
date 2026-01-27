@@ -1,9 +1,8 @@
 # <img src="rchat-logo.svg" height="30" alt="RChat Logo" /> RChat
 
 > **Decentralized, Peer-to-Peer Local Messaging.**
-
 <p align="center">
-  <video src="assets/rchat-demo.webm" width="100%" autoplay loop muted playsinline></video>
+  <video src="https://github.com/user-attachments/assets/773ef4b0-6813-45da-a266-b6b56b7e4140" width="100%" autoplay loop muted playsinline></video>
 </p>
 
 RChat is a local-first, serverless communication tool built for secure and private messaging. It automatically discovers peers using **Hybrid Discovery** (mDNS + GitHub Gists) and enables direct sharing of text, images, documents, and videos. All group communications are secured using **Hierarchical Key Sharing (HKS)**, ensuring efficient and encrypted payload distribution.
@@ -18,3 +17,4 @@ RChat is a local-first, serverless communication tool built for secure and priva
 - **Storage**: SQLite
 
 For a visual showcase, visit: [ata-sesli.github.io/rchat](https://ata-sesli.github.io/rchat/)
+
