@@ -2,6 +2,10 @@
 
 > **Decentralized, Peer-to-Peer Local Messaging.**
 
+<p align="center">
+  <video src="assets/rchat-demo.webm" width="100%" autoplay loop muted playsinline></video>
+</p>
+
 RChat is a local-first, serverless communication tool built for secure and private messaging. It automatically discovers peers using **Hybrid Discovery** (mDNS + GitHub Gists) and enables direct sharing of text, images, documents, and videos. All group communications are secured using **Hierarchical Key Sharing (HKS)**, ensuring efficient and encrypted payload distribution.
 
 ### Tech Stack
