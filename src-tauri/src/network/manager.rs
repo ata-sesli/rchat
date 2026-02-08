@@ -179,6 +179,50 @@ impl NetworkManager {
         }
     }
 
+    /// Helper to resolve a peer ID string (which might be "gh:username") to a valid PeerId
+    fn resolve_peer_id(&self, target_peer_id: &str, context: &str) -> Option<PeerId> {
+        let actual_peer_id_str = if target_peer_id.starts_with("gh:") {
+            let github_username = &target_peer_id[3..]; // Remove "gh:" prefix
+            
+            // Look up the actual PeerId from config's github_peer_mapping
+            // Use a spawned thread to avoid "block_on inside runtime" panic
+            let app_handle = self.app_handle.clone();
+            let gh_user = github_username.to_string();
+            
+            let mapping = std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    use tauri::Manager;
+                    let state = app_handle.state::<crate::AppState>();
+                    let mgr = state.config_manager.lock().await;
+                    if let Ok(config) = mgr.load().await {
+                        config.user.github_peer_mapping.get(&gh_user).cloned()
+                    } else {
+                        None
+                    }
+                })
+            }).join().unwrap_or(None);
+            
+            if let Some(peer_id_string) = mapping {
+                println!("[{}] 🔄 Resolved GitHub user {} to PeerId {}", context, github_username, peer_id_string);
+                peer_id_string
+            } else {
+                eprintln!("[{}] ❌ No PeerId mapping found for GitHub user {}. Message queued.", context, github_username);
+                return None;
+            }
+        } else {
+            target_peer_id.to_string()
+        };
+
+        match actual_peer_id_str.parse::<PeerId>() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("[{}] ❌ Invalid peer_id: {} ({})", context, actual_peer_id_str, e);
+                None
+            }
+        }
+    }
+
     pub fn handle_ui_command(&mut self, msg_content: String) {
         println!("UI Command Received: {}", msg_content);
 
@@ -276,42 +320,8 @@ impl NetworkManager {
                 target_peer_id, sender_alias, content
             );
 
-            // Handle GitHub chat prefix (gh:username)
-            let actual_peer_id_str = if target_peer_id.starts_with("gh:") {
-                let github_username = &target_peer_id[3..]; // Remove "gh:" prefix
-                
-                // Look up the actual PeerId from config's github_peer_mapping
-                // Use a spawned thread to avoid "block_on inside runtime" panic
-                let app_handle = self.app_handle.clone();
-                let gh_user = github_username.to_string();
-                
-                let mapping = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        use tauri::Manager;
-                        let state = app_handle.state::<crate::AppState>();
-                        let mgr = state.config_manager.lock().await;
-                        if let Ok(config) = mgr.load().await {
-                            config.user.github_peer_mapping.get(&gh_user).cloned()
-                        } else {
-                            None
-                        }
-                    })
-                }).join().unwrap_or(None);
-                
-                if let Some(peer_id_string) = mapping {
-                    println!("[DM] 🔄 Resolved GitHub user {} to PeerId {}", github_username, peer_id_string);
-                    peer_id_string
-                } else {
-                    eprintln!("[DM] ❌ No PeerId mapping found for GitHub user {}. Message queued.", github_username);
-                    return;
-                }
-            } else {
-                target_peer_id.to_string()
-            };
-
-            // Find the peer in connected peers
-            if let Ok(peer_id) = actual_peer_id_str.parse::<PeerId>() {
+            // Resolve peer identifier (handles gh:username)
+            if let Some(peer_id) = self.resolve_peer_id(&target_peer_id, "DM") {
                 use crate::network::direct_message::DirectMessageRequest;
                 let request = DirectMessageRequest {
                     id: msg_id.to_string(),
@@ -331,8 +341,6 @@ impl NetworkManager {
                     .direct_message
                     .send_request(&peer_id, request);
                 println!("[DM] ✅ Request sent to {}", peer_id);
-            } else {
-                eprintln!("[DM] ❌ Invalid peer_id: {}", actual_peer_id_str);
             }
             return;
         }
@@ -349,40 +357,8 @@ impl NetworkManager {
                     target_peer_id
                 );
 
-                // Handle GitHub chat prefix (gh:username)
-                let actual_peer_id_str = if target_peer_id.starts_with("gh:") {
-                    let github_username = &target_peer_id[3..]; // Remove "gh:" prefix
-                    
-                    // Look up the actual PeerId from config's github_peer_mapping
-                    let app_handle = self.app_handle.clone();
-                    let gh_user = github_username.to_string();
-                    
-                    let mapping = std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new().unwrap();
-                        rt.block_on(async {
-                            use tauri::Manager;
-                            let state = app_handle.state::<crate::AppState>();
-                            let mgr = state.config_manager.lock().await;
-                            if let Ok(config) = mgr.load().await {
-                                config.user.github_peer_mapping.get(&gh_user).cloned()
-                            } else {
-                                None
-                            }
-                        })
-                    }).join().unwrap_or(None);
-                    
-                    if let Some(peer_id_string) = mapping {
-                        println!("[READ_RECEIPT] 🔄 Resolved GitHub user {} to PeerId {}", github_username, peer_id_string);
-                        peer_id_string
-                    } else {
-                        eprintln!("[READ_RECEIPT] ❌ No PeerId mapping found for GitHub user {}", github_username);
-                        return;
-                    }
-                } else {
-                    target_peer_id.to_string()
-                };
-
-                if let Ok(peer_id) = actual_peer_id_str.parse::<PeerId>() {
+                // Resolve peer identifier (handles gh:username)
+                if let Some(peer_id) = self.resolve_peer_id(target_peer_id, "READ_RECEIPT") {
                     use crate::network::direct_message::DirectMessageRequest;
                     let request = DirectMessageRequest {
                         id: format!(
@@ -411,8 +387,6 @@ impl NetworkManager {
                         .direct_message
                         .send_request(&peer_id, request);
                     println!("[READ_RECEIPT] ✅ Sent to {}", peer_id);
-                } else {
-                    eprintln!("[READ_RECEIPT] ❌ Invalid peer_id: {}", actual_peer_id_str);
                 }
                 return;
             }
@@ -429,7 +403,8 @@ impl NetworkManager {
                     // 1v1 Chat: Use Request-Response (Direct Message)
                     println!("[Image] 📤 Sending image {} to {}", file_hash, target_peer_id);
                     
-                    if let Ok(peer_id) = target_peer_id.parse::<PeerId>() {
+                    // Resolve peer identifier (handles gh:username)
+                    if let Some(peer_id) = self.resolve_peer_id(target_peer_id, "Image") {
                         use crate::network::direct_message::DirectMessageRequest;
                         let request = DirectMessageRequest {
                             id: format!(
@@ -460,7 +435,6 @@ impl NetworkManager {
                         println!("[Image] ✅ Direct request sent to {}", peer_id);
                         return; // Done
                     } else {
-                        eprintln!("[Image] ❌ Invalid peer_id: {}", target_peer_id);
                         return;
                     }
                 }
@@ -486,7 +460,8 @@ impl NetworkManager {
                 if target_peer_id != "General" {
                     println!("[Document] 📤 Sending document {} ({}) to {}", file_hash, file_name, target_peer_id);
                     
-                    if let Ok(peer_id) = target_peer_id.parse::<PeerId>() {
+                    // Resolve peer identifier (handles gh:username)
+                    if let Some(peer_id) = self.resolve_peer_id(target_peer_id, "Document") {
                         use crate::network::direct_message::DirectMessageRequest;
                         let request = DirectMessageRequest {
                             id: format!(
@@ -517,7 +492,6 @@ impl NetworkManager {
                         println!("[Document] ✅ Direct request sent to {}", peer_id);
                         return;
                     } else {
-                        eprintln!("[Document] ❌ Invalid peer_id: {}", target_peer_id);
                         return;
                     }
                 }
@@ -542,7 +516,8 @@ impl NetworkManager {
                 if target_peer_id != "General" {
                     println!("[Video] 📤 Sending video {} ({}) to {}", file_hash, file_name, target_peer_id);
                     
-                    if let Ok(peer_id) = target_peer_id.parse::<PeerId>() {
+                    // Resolve peer identifier (handles gh:username)
+                    if let Some(peer_id) = self.resolve_peer_id(target_peer_id, "Video") {
                         use crate::network::direct_message::DirectMessageRequest;
                         let request = DirectMessageRequest {
                             id: format!(
@@ -573,7 +548,6 @@ impl NetworkManager {
                         println!("[Video] ✅ Direct request sent to {}", peer_id);
                         return;
                     } else {
-                        eprintln!("[Video] ❌ Invalid peer_id: {}", target_peer_id);
                         return;
                     }
                 }
@@ -625,13 +599,11 @@ impl NetworkManager {
     fn handle_connection_request(&mut self, peer_id_str: &str) {
         println!("[Handshake] User requested connection to: {}", peer_id_str);
 
-        // Parse peer_id
-        let peer_id = match peer_id_str.parse::<PeerId>() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[Handshake] Invalid peer_id: {}", e);
-                return;
-            }
+        // Parse peer_id (handling gh:username if needed)
+        let peer_id = if let Some(p) = self.resolve_peer_id(peer_id_str, "Handshake") {
+            p
+        } else {
+            return;
         };
 
         // Check if this peer already sent us a request (mutual handshake!)
