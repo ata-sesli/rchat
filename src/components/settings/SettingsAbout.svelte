@@ -9,7 +9,7 @@
 <!-- Sub-view Header -->
 <div class="mb-6 flex items-center gap-4 border-b border-slate-800/50 pb-4">
   <button
-    on:click={goBack}
+    onclick={goBack}
     class="p-2 hover:bg-theme-base-800 rounded-lg text-theme-base-400 hover:text-white transition-colors"
     aria-label="Go Back"
   >

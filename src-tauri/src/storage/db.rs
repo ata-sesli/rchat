@@ -3,6 +3,7 @@ use rusqlite::Connection;
 use anyhow::Context;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 // --- 1. Rust Structs (Data Models) ---
 
@@ -15,51 +16,18 @@ pub struct Peer {
     pub method: String, // "local", "gist", "manual", etc.
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Chat {
-    pub id: String,
-    pub name: String,
-    pub is_group: bool,
-    pub encryption_key: Vec<u8>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ChatPeer {
-    pub chat_id: String,
-    pub peer_id: String,
-    pub role: String, // 'admin', 'member'
-    pub joined_at: i64,
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Message {
     pub id: String,
     pub chat_id: String,
     pub peer_id: String,
     pub timestamp: i64,
-    pub content_type: String, // 'text', 'photo', 'video', 'document', 'voice'
+    pub content_type: String, // 'text', 'photo', 'video', 'document', 'audio'
     pub text_content: Option<String>,
     pub file_hash: Option<String>,
     pub status: String, // 'pending', 'delivered', 'read'
     pub content_metadata: Option<String>, // JSON: {"width": 1920, "height": 1080, ...}
     pub sender_alias: Option<String>, // Sender's display name
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FileMetadata {
-    pub file_hash: String,
-    pub file_name: String,
-    pub mime_type: String,
-    pub size_bytes: i64,
-    pub is_complete: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FileChunk {
-    pub file_hash: String,
-    pub chunk_order: i64,
-    pub chunk_hash: String,
-    pub chunk_size: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,6 +41,21 @@ pub struct Envelope {
 pub struct ChatAssignment {
     pub chat_id: String,
     pub envelope_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Sticker {
+    pub file_hash: String,
+    pub name: Option<String>,
+    pub created_at: i64,
+    pub size_bytes: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChatListItem {
+    pub id: String,
+    pub name: String,
+    pub is_group: bool,
 }
 
 // --- 2. Database Initialization ---
@@ -200,6 +183,18 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
         [],
     )?;
 
+    // 5b. Stickers (local sticker library registry)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS stickers (
+             file_hash TEXT NOT NULL PRIMARY KEY,
+             name TEXT,
+             created_at INTEGER NOT NULL,
+             source TEXT NOT NULL DEFAULT 'local',
+             FOREIGN KEY (file_hash) REFERENCES files(file_hash) ON DELETE CASCADE
+         )",
+        [],
+    )?;
+
     // 6. Messages
     conn.execute(
         "CREATE TABLE IF NOT EXISTS messages (
@@ -235,6 +230,15 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
         "ALTER TABLE messages ADD COLUMN sender_alias TEXT",
         [],
     );
+
+    // Migration: hard-cut legacy voice content type to canonical audio
+    let _ = conn.execute(
+        "UPDATE messages SET content_type = 'audio' WHERE content_type = 'voice'",
+        [],
+    );
+
+    // Migration: Add source column to stickers table if missing
+    let _ = conn.execute("ALTER TABLE stickers ADD COLUMN source TEXT NOT NULL DEFAULT 'local'", []);
 
     // 7. Envelopes
     // 7. Envelopes
@@ -282,7 +286,16 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
         [],
     )?;
 
+    // Speed up sticker list ordering
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_stickers_created_at ON stickers(created_at DESC)",
+        [],
+    )?;
+
     // known_devices index removed - table no longer exists
+
+    // Hard cutover: remove legacy accidental "General" chat data.
+    remove_legacy_general_data(conn)?;
 
     seed_defaults(conn)?;
 
@@ -321,6 +334,15 @@ fn seed_defaults(conn: &Connection) -> anyhow::Result<()> {
         ("self", "Me", "admin", 0),
     )?;
 
+    Ok(())
+}
+
+fn remove_legacy_general_data(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM messages WHERE chat_id = 'General' OR peer_id = 'General'", [])?;
+    conn.execute("DELETE FROM chat_peers WHERE chat_id = 'General' OR peer_id = 'General'", [])?;
+    conn.execute("DELETE FROM chat_envelopes WHERE chat_id = 'General'", [])?;
+    conn.execute("DELETE FROM chats WHERE id = 'General'", [])?;
+    conn.execute("DELETE FROM peers WHERE id = 'General'", [])?;
     Ok(())
 }
 
@@ -404,8 +426,129 @@ pub fn create_chat(
     Ok(())
 }
 
+pub fn upsert_chat(
+    conn: &Connection,
+    chat_id: &str,
+    name: &str,
+    is_group: bool,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO chats (id, name, is_group, encryption_key) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET
+             name = excluded.name,
+             is_group = excluded.is_group",
+        (chat_id, name, if is_group { 1 } else { 0 }, vec![0u8; 32]),
+    )?;
+    Ok(())
+}
+
+pub fn add_chat_member(
+    conn: &Connection,
+    chat_id: &str,
+    peer_id: &str,
+    role: &str,
+) -> anyhow::Result<()> {
+    let joined_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    conn.execute(
+        "INSERT OR IGNORE INTO chat_peers (chat_id, peer_id, role, joined_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        (chat_id, peer_id, role, joined_at),
+    )?;
+    Ok(())
+}
+
+pub fn remove_chat_member(conn: &Connection, chat_id: &str, peer_id: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM chat_peers WHERE chat_id = ?1 AND peer_id = ?2",
+        (chat_id, peer_id),
+    )?;
+    Ok(())
+}
+
+pub fn delete_group_chat(conn: &Connection, chat_id: &str) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM messages WHERE chat_id = ?1", [chat_id])?;
+    conn.execute("DELETE FROM chat_envelopes WHERE chat_id = ?1", [chat_id])?;
+    conn.execute("DELETE FROM chat_peers WHERE chat_id = ?1", [chat_id])?;
+    conn.execute("DELETE FROM chats WHERE id = ?1 AND is_group = 1", [chat_id])?;
+    Ok(())
+}
+
+pub fn get_joined_group_chat_ids(conn: &Connection, my_peer_id: &str) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.id
+         FROM chats c
+         INNER JOIN chat_peers cp ON cp.chat_id = c.id
+         WHERE c.is_group = 1 AND cp.peer_id = ?1",
+    )?;
+    let rows = stmt.query_map([my_peer_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn get_chat_list(conn: &Connection) -> anyhow::Result<Vec<ChatListItem>> {
+    let mut items = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    let mut stmt = conn.prepare(
+        "SELECT id, name, is_group
+         FROM chats",
+    )?;
+    let chat_rows = stmt.query_map([], |row| {
+        Ok(ChatListItem {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            is_group: row.get::<_, i64>(2)? != 0,
+        })
+    })?;
+
+    for row in chat_rows {
+        let item = row?;
+        seen_ids.insert(item.id.clone());
+        items.push(item);
+    }
+
+    // Include known peers without chat rows as direct chats.
+    let mut peer_stmt = conn.prepare(
+        "SELECT id, alias
+         FROM peers
+         WHERE id != 'Me'",
+    )?;
+    let peer_rows = peer_stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in peer_rows {
+        let (peer_id, alias) = row?;
+        if !seen_ids.contains(&peer_id) {
+            items.push(ChatListItem {
+                id: peer_id.clone(),
+                name: alias,
+                is_group: false,
+            });
+            seen_ids.insert(peer_id);
+        }
+    }
+
+    // Ensure self chat exists in list.
+    if !seen_ids.contains("self") {
+        items.push(ChatListItem {
+            id: "self".to_string(),
+            name: "Note to Self".to_string(),
+            is_group: false,
+        });
+    }
+
+    Ok(items)
+}
+
 /// Delete a peer and their related chat/messages
 pub fn delete_peer(conn: &Connection, peer_id: &str) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM chat_peers WHERE peer_id = ?1", [peer_id])?;
     // 1. Delete Messages
     conn.execute(
         "DELETE FROM messages WHERE peer_id = ?1 OR chat_id = ?1",
@@ -532,6 +675,23 @@ pub fn mark_messages_read(
         "UPDATE messages SET status = 'read' WHERE chat_id = ?1 AND peer_id = ?2 AND status != 'read'",
         [chat_id, sender_id],
     )?;
+    Ok(ids)
+}
+
+pub fn mark_group_messages_read(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM messages WHERE chat_id = ?1 AND peer_id != 'Me' AND status != 'read'",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map([chat_id], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    conn.execute(
+        "UPDATE messages SET status = 'read' WHERE chat_id = ?1 AND peer_id != 'Me' AND status != 'read'",
+        [chat_id],
+    )?;
+
     Ok(ids)
 }
 
@@ -671,4 +831,126 @@ pub fn get_chat_assignments(conn: &Connection) -> anyhow::Result<Vec<ChatAssignm
         result.push(row?);
     }
     Ok(result)
+}
+
+pub fn sticker_exists(conn: &Connection, file_hash: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM stickers WHERE file_hash = ?1",
+        [file_hash],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+pub fn upsert_sticker(
+    conn: &Connection,
+    file_hash: &str,
+    name: Option<&str>,
+    source: &str,
+) -> anyhow::Result<bool> {
+    let already_exists = sticker_exists(conn, file_hash);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    conn.execute(
+        "INSERT INTO stickers (file_hash, name, created_at, source)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(file_hash) DO UPDATE SET
+            name = COALESCE(excluded.name, stickers.name),
+            source = stickers.source",
+        (file_hash, name, now, source),
+    )?;
+
+    Ok(!already_exists)
+}
+
+pub fn list_stickers(conn: &Connection) -> anyhow::Result<Vec<Sticker>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.file_hash, s.name, s.created_at, COALESCE(f.size_bytes, 0) as size_bytes
+         FROM stickers s
+         LEFT JOIN files f ON f.file_hash = s.file_hash
+         ORDER BY s.created_at DESC",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok(Sticker {
+            file_hash: row.get(0)?,
+            name: row.get(1)?,
+            created_at: row.get(2)?,
+            size_bytes: row.get(3)?,
+        })
+    })?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+pub fn delete_sticker(conn: &Connection, file_hash: &str) -> anyhow::Result<()> {
+    let deleted = conn.execute("DELETE FROM stickers WHERE file_hash = ?1", [file_hash])?;
+    if deleted == 0 {
+        return Err(anyhow::anyhow!("Sticker not found: {}", file_hash));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_general_rows_are_removed() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        create_tables(&conn).expect("schema");
+
+        conn.execute(
+            "INSERT OR REPLACE INTO peers (id, alias, last_seen, public_key, method) VALUES ('General', 'General', 0, ?1, 'legacy')",
+            [vec![0u8; 32]],
+        )
+        .expect("insert peer");
+        conn.execute(
+            "INSERT OR REPLACE INTO chats (id, name, is_group, encryption_key) VALUES ('General', 'General', 0, ?1)",
+            [vec![0u8; 32]],
+        )
+        .expect("insert chat");
+        conn.execute(
+            "INSERT OR REPLACE INTO messages (id, chat_id, peer_id, timestamp, content_type, text_content, file_hash, status) VALUES ('m1', 'General', 'General', 1, 'text', 'hello', NULL, 'delivered')",
+            [],
+        )
+        .expect("insert message");
+
+        conn.execute(
+            "INSERT OR REPLACE INTO envelopes (id, name, icon) VALUES ('env1', 'Env', NULL)",
+            [],
+        )
+        .expect("insert envelope");
+        conn.execute(
+            "INSERT OR REPLACE INTO chat_envelopes (chat_id, envelope_id) VALUES ('General', 'env1')",
+            [],
+        )
+        .expect("insert chat envelope");
+
+        remove_legacy_general_data(&conn).expect("cleanup");
+
+        let chat_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM chats WHERE id='General')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check chat");
+        let msg_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE chat_id='General' OR peer_id='General')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check messages");
+        assert!(!chat_exists);
+        assert!(!msg_exists);
+    }
 }

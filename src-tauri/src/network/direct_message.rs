@@ -11,6 +11,52 @@ pub struct ChunkInfo {
     pub chunk_size: i64,
 }
 
+/// Wire-level message kind for request-response DMs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectMessageKind {
+    Text,
+    Image,
+    Sticker,
+    Document,
+    Video,
+    Audio,
+    ReadReceipt,
+    FileMetadataRequest,
+    FileMetadataResponse,
+    ChunkRequest,
+    ChunkResponse,
+    InviteHandshake,
+    TempHandshake,
+}
+
+impl DirectMessageKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+            Self::Sticker => "sticker",
+            Self::Document => "document",
+            Self::Video => "video",
+            Self::Audio => "audio",
+            Self::ReadReceipt => "read_receipt",
+            Self::FileMetadataRequest => "file_metadata_request",
+            Self::FileMetadataResponse => "file_metadata_response",
+            Self::ChunkRequest => "chunk_request",
+            Self::ChunkResponse => "chunk_response",
+            Self::InviteHandshake => "invite_handshake",
+            Self::TempHandshake => "temp_handshake",
+        }
+    }
+
+    pub fn needs_file_transfer(self) -> bool {
+        matches!(
+            self,
+            Self::Image | Self::Sticker | Self::Document | Self::Video | Self::Audio
+        )
+    }
+}
+
 /// Direct message request - sent from sender to recipient
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectMessageRequest {
@@ -18,10 +64,8 @@ pub struct DirectMessageRequest {
     pub id: String,
     /// Sender's peer ID
     pub sender_id: String,
-    /// Message type: "text", "image", "read_receipt", 
-    /// "file_metadata_request", "file_metadata_response",
-    /// "chunk_request", "chunk_response"
-    pub msg_type: String,
+    /// Message type.
+    pub msg_type: DirectMessageKind,
     /// Text content (for text messages)
     pub text_content: Option<String>,
     /// File hash (for image messages and file transfer)
@@ -50,4 +94,49 @@ pub struct DirectMessageResponse {
     pub status: String,
     /// Error message if status is "error"
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_message_kind_serialization_is_wire_compatible() {
+        let kinds = [
+            (DirectMessageKind::Text, "\"text\""),
+            (DirectMessageKind::Image, "\"image\""),
+            (DirectMessageKind::Sticker, "\"sticker\""),
+            (DirectMessageKind::Document, "\"document\""),
+            (DirectMessageKind::Video, "\"video\""),
+            (DirectMessageKind::Audio, "\"audio\""),
+            (DirectMessageKind::ReadReceipt, "\"read_receipt\""),
+            (
+                DirectMessageKind::FileMetadataRequest,
+                "\"file_metadata_request\"",
+            ),
+            (
+                DirectMessageKind::FileMetadataResponse,
+                "\"file_metadata_response\"",
+            ),
+            (DirectMessageKind::ChunkRequest, "\"chunk_request\""),
+            (DirectMessageKind::ChunkResponse, "\"chunk_response\""),
+            (DirectMessageKind::InviteHandshake, "\"invite_handshake\""),
+            (DirectMessageKind::TempHandshake, "\"temp_handshake\""),
+        ];
+
+        for (kind, expected_json) in kinds {
+            let encoded = serde_json::to_string(&kind).expect("serialize kind");
+            assert_eq!(encoded, expected_json);
+        }
+    }
+
+    #[test]
+    fn test_file_transfer_kinds_cover_document_and_video() {
+        assert!(DirectMessageKind::Image.needs_file_transfer());
+        assert!(DirectMessageKind::Sticker.needs_file_transfer());
+        assert!(DirectMessageKind::Document.needs_file_transfer());
+        assert!(DirectMessageKind::Video.needs_file_transfer());
+        assert!(DirectMessageKind::Audio.needs_file_transfer());
+        assert!(!DirectMessageKind::Text.needs_file_transfer());
+    }
 }

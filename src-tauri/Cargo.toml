@@ -1,31 +1,19 @@
 [package]
-
 name = "rchat"
-
 version = "0.1.0"
-
 description = "A Tauri App"
-
 authors = ["you"]
-
 edition = "2021"
-
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-
 [lib]
-
 # The `_lib` suffix may seem redundant but it is necessary
-
 # to make the lib name unique and wouldn't conflict with the bin name.
-
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 
 name = "rchat_lib"
-
 crate-type = ["staticlib", "cdylib", "rlib"]
-
 
 [build-dependencies]
 
@@ -37,14 +25,9 @@ opt-level = 3       # Maximize optimization for dependencies (makes app run fast
 
 [dependencies]
 
-rvault-core = { git = "https://github.com/ata-sesli/rvault", branch = "main" }
-
+rvault-core = { git = "https://github.com/ata-sesli/rvault", rev = "7dda2de45ac31eccb17dad7d1a4f1ebdd893e99c" }
 tauri = { version = "2", features = ["tray-icon"] }
-
-tauri-plugin-opener = "2"
-
 serde = { version = "1", features = ["derive"] }
-
 serde_json = "1"
 libp2p = { version = "0.56.0", features = [
     "tcp", "dns", "noise", "yamux", 
@@ -68,7 +51,6 @@ octocrab = "0.48.1"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 flate2 = { version = "1.1.5", features = ["zlib"] }
 rand = "0.8.5"
-tauri-plugin-fs = "2"
 sha2 = "0.10.9"
 hex = "0.4.3"
 tracing = "0.1.44"
@@ -77,6 +59,7 @@ hostname = "0.4.2"
 local-ip-address = "0.6.8"
 zeroconf = "0.17.0"
 tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 zeroize = { version = "1.8.2", features = ["derive"] }
 [dev-dependencies]

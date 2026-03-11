@@ -24,8 +24,25 @@
     }
   }
 
+  function handleKeydown(event: KeyboardEvent) {
+    if ((event.key === "Enter" || event.key === " ") && !isDragging) {
+      event.preventDefault();
+      handleClick();
+    }
+  }
+
   function handleContextMenu(e: MouseEvent) {
     oncontextmenu(e);
+  }
+
+  function isGroupChat(peerId: string) {
+    return peerId.startsWith("group:");
+  }
+
+  function displayName(peerId: string) {
+    if (peerId === "Me") return "Me (You)";
+    if (isGroupChat(peerId)) return `Group ${peerId.split(":")[1]?.split("-")[0] || ""}`;
+    return peerId;
   }
 
   function handlePointerDown(e: PointerEvent) {
@@ -46,17 +63,16 @@
 </script>
 
 <div transition:fade={{ duration: 150 }} class="relative group/item">
-  <!-- svelte-ignore a11y-interactive-supports-focus -->
-  <!-- svelte-ignore a11y-click-events-have-key-events -->
-  <!-- svelte-ignore a11y-no-static-element-interactions -->
   <div
-    on:pointerdown={handlePointerDown}
-    on:pointermove={handlePointerMove}
-    on:pointerup={handlePointerUp}
-    on:pointercancel={handlePointerCancel}
+    onpointerdown={handlePointerDown}
+    onpointermove={handlePointerMove}
+    onpointerup={handlePointerUp}
+    onpointercancel={handlePointerCancel}
     role="button"
+    tabindex="0"
     id={`peer-item-${peer}`}
-    on:click={handleClick}
+    onclick={handleClick}
+    onkeydown={handleKeydown}
     class={`w-full flex items-center gap-3 p-3 rounded-xl cursor-grab transition-all border border-transparent touch-none relative z-10
         ${isActive ? "bg-slate-800/80 border-slate-700/50" : "hover:bg-slate-800/30"}
         ${isDragging ? "opacity-50 cursor-grabbing" : ""}`}
@@ -80,7 +96,7 @@
         <div
           class="absolute bottom-0 right-0 w-3 h-3 bg-theme-success-500 border-2 border-theme-base-800 rounded-full"
         ></div>
-      {:else if peer === "General"}
+      {:else if isGroupChat(peer)}
         <!-- GENERAL Icon -->
         <div
           class="w-10 h-10 rounded-full bg-theme-base-700 flex items-center justify-center text-theme-base-300 font-medium group-hover:bg-theme-base-600 shadow-md"
@@ -93,7 +109,7 @@
           src={`https://github.com/${peer}.png?size=40`}
           alt={peer}
           class="w-10 h-10 rounded-full bg-theme-base-800 shadow-md ring-2 ring-transparent group-hover:ring-slate-700 transition-all"
-          on:error={(e) =>
+          onerror={(e) =>
             ((e.currentTarget as HTMLImageElement).src =
               "https://github.com/github.png?size=40")}
         />
@@ -119,14 +135,14 @@
       <div class="flex justify-between items-baseline mb-0.5">
         <span
           class="font-medium text-theme-base-200 truncate group-hover:text-white transition-colors"
-          >{peer === "Me" ? "Me (You)" : peer}</span
+          >{displayName(peer)}</span
         >
       </div>
       <!-- Status/Subtitle -->
       {#if peer === "Me"}
         <p class="text-xs text-theme-base-500 truncate">Note to self</p>
-      {:else if peer === "General"}
-        <p class="text-xs text-theme-base-500 truncate">Public Broadcast</p>
+      {:else if isGroupChat(peer)}
+        <p class="text-xs text-theme-base-500 truncate">Group chat</p>
       {:else}
         <p class="text-xs text-theme-base-400 truncate">Connected</p>
       {/if}
@@ -134,7 +150,10 @@
 
     <!-- Context Menu Button -->
     <button
-      on:click|stopPropagation={handleContextMenu}
+      onclick={(event) => {
+        event.stopPropagation();
+        handleContextMenu(event);
+      }}
       class="absolute right-0 top-0 bottom-0 w-8 flex items-center justify-center text-theme-base-500 hover:text-white hover:bg-slate-700/50 transition-all opacity-0 group-hover/item:opacity-100 z-20 pointer-events-auto rounded-r-xl"
       title="Options"
     >

@@ -2,10 +2,17 @@
   import SettingsMenu from "../../components/settings/SettingsMenu.svelte";
   import SettingsProfile from "../../components/settings/SettingsProfile.svelte";
   import SettingsPeers from "../../components/settings/SettingsPeers.svelte";
+  import SettingsStickers from "../../components/settings/SettingsStickers.svelte";
   import SettingsTheme from "../../components/settings/SettingsTheme.svelte";
   import SettingsAbout from "../../components/settings/SettingsAbout.svelte";
 
-  type View = "menu" | "profile" | "add-peers" | "set-theme" | "about";
+  type View =
+    | "menu"
+    | "profile"
+    | "add-peers"
+    | "stickers"
+    | "set-theme"
+    | "about";
 
   let currentView: View = "menu";
 
@@ -36,6 +43,8 @@
     <SettingsProfile onback={goBack} />
   {:else if currentView === "add-peers"}
     <SettingsPeers onback={goBack} />
+  {:else if currentView === "stickers"}
+    <SettingsStickers onback={goBack} />
   {:else if currentView === "set-theme"}
     <SettingsTheme onback={goBack} />
   {:else if currentView === "about"}

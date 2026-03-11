@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import GitHubButton from "../../components/GitHubButton.svelte";
+  import { api } from "$lib/tauri/api";
 
   // State
   type ViewState = "loading" | "setup" | "unlock" | "login";
@@ -29,11 +29,7 @@
   async function checkStatus() {
     console.log("[Login] checkStatus called");
     try {
-      const status = await invoke<{
-        is_setup: boolean;
-        is_unlocked: boolean;
-        is_github_connected: boolean;
-      }>("check_auth_status");
+      const status = await api.checkAuthStatus();
       console.log("[Login] Status received:", status);
 
       if (!status.is_setup) {
@@ -67,11 +63,11 @@
     isLoading = true;
     error = "";
     try {
-      await invoke("init_vault", { password });
+      await api.initVault(password);
 
       // Start P2P network AFTER vault is created (so we can save keypair)
       console.log("[Login] Starting network...");
-      await invoke("start_network");
+      await api.startNetwork();
       console.log("[Login] Network started");
 
       await checkStatus(); // Should move to 'login'
@@ -86,11 +82,11 @@
     isLoading = true;
     error = "";
     try {
-      await invoke("unlock_vault", { password });
+      await api.unlockVault(password);
 
       // Start P2P network AFTER vault is unlocked (so we can load persisted keypair)
       console.log("[Login] Starting network...");
-      await invoke("start_network");
+      await api.startNetwork();
       console.log("[Login] Network started");
 
       await checkStatus(); // Should move to 'login'
@@ -109,7 +105,7 @@
     isLoading = true;
     try {
       console.log("Calling reset_vault backend command...");
-      await invoke("reset_vault");
+      await api.resetVault();
       console.log("Reset successful. Updating UI...");
 
       password = "";
@@ -134,12 +130,7 @@
     isPolling = true;
     try {
       console.log("Initiating GitHub Auth...");
-      const res = await invoke<{
-        device_code: string;
-        user_code: string;
-        verification_uri: string;
-        interval: number;
-      }>("start_github_auth");
+      const res = await api.startGithubAuth();
 
       deviceCode = res.device_code;
       userCode = res.user_code;
@@ -159,9 +150,7 @@
       try {
         await new Promise((r) => setTimeout(r, (interval + 1) * 1000));
         console.log("Polling for token...");
-        const accessToken = await invoke<string>("poll_github_auth", {
-          deviceCode,
-        });
+        const accessToken = await api.pollGithubAuth(deviceCode);
 
         // Success!
         token = accessToken;
@@ -191,7 +180,7 @@
   async function handleSaveToken() {
     if (!token) return;
     try {
-      await invoke("save_api_token", { token });
+      await api.saveApiToken(token);
       goto("/"); // Redirect to home after successful token save
     } catch (e: any) {
       error = "Failed to save token: " + e.toString();
@@ -246,7 +235,7 @@
           class="w-full px-4 py-3 bg-slate-950/50 border border-theme-base-700 rounded-xl focus:border-theme-primary-500 focus:ring-1 focus:ring-teal-500 outline-none transition-all placeholder:text-theme-base-600 text-white"
         />
         <button
-          on:click={handleSetup}
+          onclick={handleSetup}
           disabled={isLoading}
           class="w-full py-3 bg-theme-primary-600 hover:bg-theme-primary-500 text-white rounded-xl font-semibold shadow-lg shadow-teal-500/20 transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
         >
@@ -262,10 +251,10 @@
           bind:value={password}
           placeholder="Master Password"
           class="w-full px-4 py-3 bg-slate-950/50 border border-theme-base-700 rounded-xl focus:border-theme-primary-500 focus:ring-1 focus:ring-teal-500 outline-none transition-all placeholder:text-theme-base-600 text-white"
-          on:keydown={(e) => e.key === "Enter" && handleUnlock()}
+          onkeydown={(e) => e.key === "Enter" && handleUnlock()}
         />
         <button
-          on:click={handleUnlock}
+          onclick={handleUnlock}
           disabled={isLoading}
           class="w-full py-3 bg-theme-primary-600 hover:bg-theme-primary-500 text-white rounded-xl font-semibold shadow-lg shadow-teal-500/20 transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
         >
@@ -273,7 +262,7 @@
         </button>
         <div class="text-center pt-2">
           <button
-            on:click={handleReset}
+            onclick={handleReset}
             class="text-xs text-red-500 hover:text-theme-error-400 hover:underline transition-colors block mx-auto py-2"
           >
             Reset Vault (Delete All Data)
@@ -285,7 +274,7 @@
     {:else if view === "login"}
       <div class="space-y-4">
         {#if !userCode}
-          <GitHubButton on:click={handleGitHubLogin} loading={isLoading} />
+          <GitHubButton onclick={handleGitHubLogin} loading={isLoading} />
         {:else}
           <!-- User Code Display -->
           <div
@@ -335,7 +324,7 @@
             class="w-full px-4 py-3 bg-slate-950/50 border border-theme-base-700 rounded-xl focus:border-theme-primary-500 focus:ring-1 focus:ring-teal-500 outline-none transition-all placeholder:text-theme-base-600 text-white"
           />
           <button
-            on:click={handleSaveToken}
+            onclick={handleSaveToken}
             class="w-full py-3 px-4 bg-theme-base-800 hover:bg-theme-base-700 text-theme-base-200 rounded-xl font-medium transition-all border border-theme-base-700"
           >
             Save Token

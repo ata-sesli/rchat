@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
   import { save } from "@tauri-apps/plugin-dialog";
   import { createEventDispatcher } from "svelte";
+  import { api } from "$lib/tauri/api";
 
   export let imageDataUrl: string;
   export let fileHash: string;
@@ -36,10 +36,7 @@
 
       if (filePath) {
         // Call backend to save the file
-        await invoke("save_image_to_file", {
-          fileHash,
-          targetPath: filePath,
-        });
+        await api.saveImageToFile(fileHash, filePath);
         console.log("Image saved to:", filePath);
       }
     } catch (e) {
@@ -48,18 +45,20 @@
   }
 </script>
 
-<svelte:window on:keydown={handleKeydown} />
+<svelte:window onkeydown={handleKeydown} />
 
 <!-- Fullscreen overlay -->
 <div
   class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md animate-fade-in"
-  on:click={handleBackdropClick}
+  onclick={handleBackdropClick}
+  onkeydown={handleKeydown}
   role="dialog"
   aria-modal="true"
+  tabindex="0"
 >
   <!-- Close button -->
   <button
-    on:click={close}
+    onclick={close}
     class="absolute top-4 right-4 w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center transition-colors"
     aria-label="Close"
   >
@@ -80,7 +79,7 @@
 
   <!-- Save button -->
   <button
-    on:click={saveImage}
+    onclick={saveImage}
     class="absolute top-4 right-16 w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center transition-colors"
     aria-label="Save image"
     title="Save image"
@@ -104,7 +103,7 @@
   <div class="relative max-w-[90vw] max-h-[90vh] animate-scale-in">
     <img
       src={imageDataUrl}
-      alt="Full size image"
+      alt="Expanded preview"
       class="max-w-full max-h-[90vh] object-contain rounded-lg shadow-2xl"
     />
   </div>

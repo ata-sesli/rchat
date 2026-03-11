@@ -1,5 +1,5 @@
 import { writable, derived, get } from "svelte/store";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from "$lib/tauri/api";
 
 // State
 export const peers = writable<string[]>([]);
@@ -14,10 +14,10 @@ export const dragOverEnvelopeId = writable<string | null>(null);
 // Actions
 export async function loadPeers() {
   try {
-    const trustedPeers = await invoke<string[]>("get_trusted_peers");
+    const trustedPeers = await api.getTrustedPeers();
     peers.set(trustedPeers);
     
-    const pinned = await invoke<string[]>("get_pinned_peers");
+    const pinned = await api.getPinnedPeers();
     pinnedPeers.set(pinned);
   } catch (e) {
     console.error("Failed to load peers:", e);
@@ -25,17 +25,13 @@ export async function loadPeers() {
 }
 
 export async function togglePin(peerId: string) {
-  const $pinnedPeers = get(pinnedPeers);
-  const isPinned = $pinnedPeers.includes(peerId);
-  
   try {
-    await invoke("set_peer_pinned", { peerId, pinned: !isPinned });
-    
+    const isPinned = await api.togglePinPeer(peerId);
     if (isPinned) {
-      pinnedPeers.update((p) => p.filter((id) => id !== peerId));
-    } else {
-      pinnedPeers.update((p) => [...p, peerId]);
+      pinnedPeers.update((p) => [...new Set([...p, peerId])]);
+      return;
     }
+    pinnedPeers.update((p) => p.filter((id) => id !== peerId));
   } catch (e) {
     console.error("Failed to toggle pin:", e);
   }
@@ -43,7 +39,7 @@ export async function togglePin(peerId: string) {
 
 export async function deletePeer(peerId: string) {
   try {
-    await invoke("remove_friend", { peerId });
+    await api.removeFriend(peerId);
     peers.update((p) => p.filter((id) => id !== peerId));
     pinnedPeers.update((p) => p.filter((id) => id !== peerId));
   } catch (e) {

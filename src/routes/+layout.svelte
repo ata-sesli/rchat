@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
+  import { api } from "$lib/tauri/api";
+  import { defaultGroupName, getChatKind } from "$lib/chatKind";
   import "../app.css"; // Ensure global styles are loaded
 
   // Components
@@ -15,13 +16,13 @@
   import ThemeProvider from "../components/ThemeProvider.svelte";
 
   // Types
-  type Message = { sender: string; text: string; timestamp: Date };
-  type Envelope = { id: string; name: string; icon?: string };
-  type FriendConfig = { username: string; alias: string | null };
+  type Envelope = { id: string; name: string; icon?: string | null };
 
   // State
   let peers: string[] = [];
-  let peerAliases: Record<string, string | null> = {}; // username -> alias
+  let peerAliases: Record<string, string | null> = {};
+  let chatNames: Record<string, string> = {};
+  let groupChats: Record<string, boolean> = {};
   let pinnedPeers: string[] = [];
   let userProfile = {
     alias: "Me" as string | null,
@@ -59,8 +60,15 @@
   let showCreateMenu = false;
   let showNewPersonModal = false;
   let showNewGroupModal = false;
-  let newPersonStep: "select-network" | "local-scan" | "online" =
-    "select-network";
+  let newPersonStep:
+    | "select-network"
+    | "local-scan"
+    | "online"
+    | "temporary-chat"
+    | "create-invite-user"
+    | "create-invite-code"
+    | "accept-invite-user"
+    | "accept-invite-code" = "select-network";
   let localPeers: { peer_id: string; addresses: string[] }[] = [];
 
   // Context Menu
@@ -146,6 +154,23 @@
   onMount(async () => {
     try {
       await listen("auth-status", () => refreshData());
+      window.addEventListener("open-chat", async (event: Event) => {
+        const peerId = (event as CustomEvent<{ peerId?: string }>).detail?.peerId;
+        if (!peerId) return;
+        await refreshData();
+        goto(`/chat/${peerId}`);
+      });
+      window.addEventListener("open-temp-invite", async (event: Event) => {
+        const link = (event as CustomEvent<{ link?: string }>).detail?.link;
+        if (!link) return;
+        try {
+          const result = await api.redeemTemporaryInvite(link);
+          await refreshData();
+          goto(`/chat/${result.chat_id}`);
+        } catch (e) {
+          console.error("Failed to redeem temporary invite from deep link:", e);
+        }
+      });
       await listen("local-peer-discovered", (event: any) => {
         const peer = event.payload;
         if (!localPeers.find((p) => p.peer_id === peer.peer_id)) {
@@ -157,8 +182,9 @@
       });
       // Update chat order and unread counts when new message arrives
       await listen("message-received", (event: any) => {
-        const chatId = event.payload?.chat_id;
-        if (chatId) {
+        const rawChatId = event.payload?.chat_id;
+        if (rawChatId) {
+          const chatId = rawChatId === "self" ? "Me" : rawChatId;
           const now = Math.floor(Date.now() / 1000);
           latestMessageTimes = { ...latestMessageTimes, [chatId]: now };
 
@@ -180,6 +206,16 @@
           peers = [...peers, chatId];
           console.log("[Layout] Added new peer to list:", chatId);
         }
+      });
+      await listen("temporary-chat-connected", async () => {
+        await refreshData();
+      });
+      await listen("temporary-chat-ended", async (event: any) => {
+        const chatId = event.payload?.chat_id;
+        if (chatId && activePeer === chatId) {
+          goto("/");
+        }
+        await refreshData();
       });
 
       // Listen for profile updates from settings
@@ -203,37 +239,50 @@
 
   async function refreshData() {
     try {
-      const auth = await invoke<{
-        is_setup: boolean;
-        is_unlocked: boolean;
-        is_online: boolean;
-      }>("check_auth_status");
+      const auth = await api.checkAuthStatus();
       if (!auth.is_setup || !auth.is_unlocked) return goto("/login");
 
       // Ensure network is started (handles session restore case)
       console.log("[Layout] Ensuring network is started...");
-      await invoke("start_network");
+      await api.startNetwork();
 
       isOnline = auth.is_online; // Sync state
 
-      peers = await invoke<string[]>("get_trusted_peers");
-      console.log("[Layout] Fetched peers:", peers);
+      const chatList = await api.getChatList();
+      const nextPeers: string[] = [];
+      const nextChatNames: Record<string, string> = {};
+      const nextGroupChats: Record<string, boolean> = {};
+      for (const chat of chatList) {
+        const uiId = chat.id === "self" ? "Me" : chat.id;
+        nextPeers.push(uiId);
+        nextChatNames[uiId] = chat.name;
+        nextGroupChats[uiId] = chat.is_group;
+      }
+      peers = nextPeers;
+      chatNames = nextChatNames;
+      groupChats = nextGroupChats;
 
-      // Fetch peer aliases from messages (last received alias per chat)
-      peerAliases = await invoke<Record<string, string>>("get_peer_aliases");
+      peerAliases = await api.getPeerAliases();
 
-      pinnedPeers = await invoke<string[]>("get_pinned_peers");
-      userProfile = await invoke("get_user_profile");
-      envelopes = await invoke<Envelope[]>("get_envelopes");
-      chatAssignments = await invoke<Record<string, string>>(
-        "get_chat_assignments",
+      pinnedPeers = await api.getPinnedPeers();
+      userProfile = await api.getUserProfile();
+      envelopes = await api.getEnvelopes();
+      chatAssignments = Object.fromEntries(
+        (await api.getEnvelopeAssignments()).map((item) => [
+          item.chat_id === "self" ? "Me" : item.chat_id,
+          item.envelope_id,
+        ]),
       );
       // Load latest message times for sorting
-      latestMessageTimes = await invoke<Record<string, number>>(
-        "get_chat_latest_times",
+      const latestTimesRaw = await api.getChatLatestTimes();
+      latestMessageTimes = Object.fromEntries(
+        Object.entries(latestTimesRaw).map(([k, v]) => [k === "self" ? "Me" : k, v]),
       );
       // Load unread message counts for badges
-      unreadCounts = await invoke<Record<string, number>>("get_unread_counts");
+      const unreadRaw = await api.getUnreadCounts("Me");
+      unreadCounts = Object.fromEntries(
+        Object.entries(unreadRaw).map(([k, v]) => [k === "self" ? "Me" : k, v]),
+      );
     } catch (e) {
       console.error("Refresh failed:", e);
     }
@@ -243,7 +292,7 @@
     console.log("Layout: handleToggleOnline called. Current:", isOnline);
     try {
       const newState = !isOnline;
-      await invoke("toggle_online_status", { online: newState });
+      await api.toggleOnlineStatus(newState);
       isOnline = newState;
       console.log("Layout: Toggled to", newState);
     } catch (e) {
@@ -280,32 +329,39 @@
     try {
       if (type === "peer") {
         if (action === "pin") {
-          const isPinned = pinnedPeers.includes(id);
-          await invoke("set_peer_pinned", { peerId: id, pinned: !isPinned });
+          const isPinned = await api.togglePinPeer(id);
           pinnedPeers = isPinned
-            ? pinnedPeers.filter((p) => p !== id)
-            : [...pinnedPeers, id];
+            ? [...new Set([...pinnedPeers, id])]
+            : pinnedPeers.filter((p) => p !== id);
         }
         if (action === "delete-peer") {
-          await invoke("delete_peer", { peerId: id });
+          if (getChatKind(id) === "group") {
+            await api.leaveGroupChat(id);
+          } else if (getChatKind(id) === "tempgroup" || getChatKind(id) === "tempdm") {
+            await api.cancelTemporaryInvite().catch(() => {});
+          } else {
+            await api.deletePeer(id);
+          }
           peers = peers.filter((p) => p !== id);
           if (activePeer === id) {
             goto("/");
           }
         }
+        if (action === "save-archive") {
+          const result = await api.saveTemporaryChatToArchive(id);
+          await refreshData();
+          goto(`/chat/${result.chat_id}`);
+        }
         if (action === "remove") {
           // Remove from envelope = move to root
-          await invoke("move_chat_to_envelope", {
-            chatId: id,
-            envelopeId: null,
-          });
+          await api.moveChatToEnvelope(id === "Me" ? "self" : id, null);
           const updated = { ...chatAssignments };
           delete updated[id];
           chatAssignments = updated;
         }
       } else if (type === "envelope") {
         if (action === "delete") {
-          await invoke("delete_envelope", { id });
+          await api.deleteEnvelope(id);
           envelopes = envelopes.filter((e) => e.id !== id);
           if (currentEnvelope === id) currentEnvelope = null;
         }
@@ -342,18 +398,14 @@
 
     try {
       if (editingEnvelopeId) {
-        await invoke("update_envelope", {
-          id: editingEnvelopeId,
-          name: name,
-          icon: icon,
-        });
+        await api.updateEnvelope(editingEnvelopeId, name, icon);
         envelopes = envelopes.map((e) =>
           e.id === editingEnvelopeId ? { ...e, name: name, icon: icon } : e,
         );
       } else {
         const id = `env_${Date.now()}`;
         const newEnv = { id, name: name, icon: icon };
-        await invoke("create_envelope", { id, name, icon });
+        await api.createEnvelope(id, name, icon);
         envelopes = [...envelopes, newEnv];
       }
     } catch (e) {
@@ -395,10 +447,8 @@
   async function handleDragEnd(e: PointerEvent) {
     if (draggingPeer && dragOverEnvelopeId) {
       try {
-        await invoke("move_chat_to_envelope", {
-          chatId: draggingPeer,
-          envelopeId: dragOverEnvelopeId,
-        });
+        const chatId = draggingPeer === "Me" ? "self" : draggingPeer;
+        await api.moveChatToEnvelope(chatId, dragOverEnvelopeId);
         chatAssignments = {
           ...chatAssignments,
           [draggingPeer]: dragOverEnvelopeId,
@@ -427,6 +477,39 @@
     showCreateMenu = false;
   }
 
+  async function handleCreateGroup(name: string) {
+    try {
+      const result = await api.createGroupChat(name || null);
+      showNewGroupModal = false;
+      await refreshData();
+      goto(`/chat/${result.chat_id}`);
+    } catch (e) {
+      console.error("Create group failed:", e);
+    }
+  }
+
+  async function handleJoinGroup(chatId: string, name: string) {
+    try {
+      const fallback = name || defaultGroupName(chatId);
+      const result = await api.joinGroupChat(chatId, fallback);
+      showNewGroupModal = false;
+      await refreshData();
+      goto(`/chat/${result.chat_id}`);
+    } catch (e) {
+      console.error("Join group failed:", e);
+    }
+  }
+
+  async function handleTempGroupJoin(chatId: string, _name: string) {
+    try {
+      showNewGroupModal = false;
+      await refreshData();
+      goto(`/chat/${chatId}`);
+    } catch (e) {
+      console.error("Open temporary group failed:", e);
+    }
+  }
+
   function handleToggleCreateMenu() {
     showCreateMenu = !showCreateMenu;
   }
@@ -441,7 +524,8 @@
       unreadCounts = rest;
 
       // Mark messages as read in backend
-      invoke("mark_messages_read", { chatId: peer }).catch((e) => {
+      const chatId = peer === "Me" ? "self" : peer;
+      api.markMessagesRead(chatId).catch((e) => {
         console.error("Failed to mark messages as read:", e);
       });
     }
@@ -450,7 +534,7 @@
   }
 </script>
 
-<svelte:window on:click={handleGlobalClick} />
+<svelte:window onclick={handleGlobalClick} />
 
 <ThemeProvider>
   <main
@@ -464,6 +548,8 @@
       {envelopes}
       {sortedPeers}
       {peerAliases}
+      {chatNames}
+      {groupChats}
       {pinnedPeers}
       {activePeer}
       {userProfile}
@@ -507,8 +593,9 @@
               class="h-16 flex items-center px-6 border-b border-slate-800/50 bg-slate-900/10 backdrop-blur-sm gap-4"
             >
               <button
-                on:click={() => (showEnvelopeSettings = false)}
+                onclick={() => (showEnvelopeSettings = false)}
                 class="p-2 rounded-lg hover:bg-theme-base-800 text-theme-base-400 hover:text-white transition-colors"
+                aria-label="Back to chat"
               >
                 <svg
                   xmlns="http://www.w3.org/2000/svg"
@@ -567,6 +654,9 @@
       <GroupChatModal
         show={showNewGroupModal}
         onclose={() => (showNewGroupModal = false)}
+        oncreate={handleCreateGroup}
+        onjoin={handleJoinGroup}
+        ontempjoin={handleTempGroupJoin}
       />
 
       <ContextMenu

@@ -1,20 +1,20 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { api } from "$lib/tauri/api";
 
   let { onback = () => {} } = $props();
 
-  let peers: string[] = [];
-  let newPeer = "";
-  let isLoading = false;
-  let error = "";
-  let isAddPeerOpen = false;
+  let peers = $state<string[]>([]);
+  let newPeer = $state("");
+  let isLoading = $state(false);
+  let error = $state("");
+  let isAddPeerOpen = $state(false);
 
   onMount(loadPeers);
 
   async function loadPeers() {
     try {
-      peers = await invoke<string[]>("get_trusted_peers");
+      peers = await api.getTrustedPeers();
     } catch (e) {
       console.error(e);
       error = "Failed to load peers";
@@ -26,7 +26,7 @@
     isLoading = true;
     error = "";
     try {
-      await invoke("add_trusted_peer", { username: newPeer.trim() });
+      await api.addFriend(newPeer.trim());
       await loadPeers();
       newPeer = "";
       isAddPeerOpen = false;
@@ -40,7 +40,7 @@
   async function removePeer(username: string) {
     if (!confirm(`Remove ${username}?`)) return;
     try {
-      await invoke("remove_trusted_peer", { username });
+      await api.removeFriend(username);
       await loadPeers();
     } catch (e: any) {
       error = e.toString();
@@ -55,8 +55,9 @@
 <!-- Sub-view Header -->
 <div class="mb-6 flex items-center gap-4 border-b border-slate-800/50 pb-4">
   <button
-    on:click={goBack}
+    onclick={goBack}
     class="p-2 hover:bg-theme-base-800 rounded-lg text-theme-base-400 hover:text-white transition-colors"
+    aria-label="Go back"
   >
     <svg
       xmlns="http://www.w3.org/2000/svg"
@@ -81,7 +82,7 @@
   >
     <!-- Accordion Header: Add Peer -->
     <button
-      on:click={() => (isAddPeerOpen = !isAddPeerOpen)}
+      onclick={() => (isAddPeerOpen = !isAddPeerOpen)}
       class="w-full flex items-center justify-between p-4 bg-slate-800/20 hover:bg-slate-800/40 transition-colors text-left group"
     >
       <div class="flex items-center gap-3">
@@ -141,11 +142,11 @@
               bind:value={newPeer}
               placeholder="github_username"
               class="w-full pl-8 pr-4 py-2.5 bg-theme-base-900 border border-theme-base-700 rounded-lg text-theme-base-200 focus:outline-none focus:border-theme-primary-500 focus:ring-1 focus:ring-teal-500 transition-all placeholder:text-theme-base-600"
-              on:keydown={(e) => e.key === "Enter" && addPeer()}
+              onkeydown={(e) => e.key === "Enter" && addPeer()}
             />
           </div>
           <button
-            on:click={addPeer}
+            onclick={addPeer}
             disabled={isLoading || !newPeer}
             class="px-6 py-2.5 bg-theme-primary-600 hover:bg-theme-primary-500 text-theme-base-950 font-semibold rounded-lg shadow-lg shadow-teal-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
           >
@@ -190,14 +191,14 @@
               src={`https://github.com/${peer}.png?size=40`}
               alt={peer}
               class="w-8 h-8 rounded-full bg-theme-base-800 ring-2 ring-slate-800"
-              on:error={(e) =>
+              onerror={(e) =>
                 ((e.currentTarget as HTMLImageElement).src =
                   "https://github.com/github.png?size=40")}
             />
             <span class="text-theme-base-200 font-medium">{peer}</span>
           </div>
           <button
-            on:click={() => removePeer(peer)}
+            onclick={() => removePeer(peer)}
             class="p-2 text-theme-base-500 hover:text-theme-error-400 hover:bg-red-950/30 rounded-lg transition-all opacity-0 group-hover:opacity-100"
             title="Remove"
           >

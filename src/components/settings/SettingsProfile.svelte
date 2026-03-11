@@ -1,25 +1,22 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { api } from "$lib/tauri/api";
 
   let {
     onprofileUpdated = (data: { alias: string; avatarPath: string }) => {},
     onback = () => {},
   } = $props();
 
-  let alias = "";
-  let avatarPath = "";
-  let isSavingProfile = false;
-  let error = "";
+  let alias = $state("");
+  let avatarPath = $state("");
+  let isSavingProfile = $state(false);
+  let error = $state("");
 
   onMount(loadProfile);
 
   async function loadProfile() {
     try {
-      const profile = await invoke<{
-        alias: string | null;
-        avatar_path: string | null;
-      }>("get_user_profile");
+      const profile = await api.getUserProfile();
       alias = profile.alias || "";
       avatarPath = profile.avatar_path || "";
     } catch (e) {
@@ -30,10 +27,7 @@
   async function saveProfile() {
     isSavingProfile = true;
     try {
-      await invoke("update_user_profile", {
-        alias: alias || null,
-        avatarPath: avatarPath || null,
-      });
+      await api.updateUserProfile(alias || null, avatarPath || null);
       onprofileUpdated({ alias, avatarPath });
       // Dispatch a custom event so the layout can refresh data
       window.dispatchEvent(new CustomEvent("profile-updated"));
@@ -52,7 +46,7 @@
 <!-- Sub-view Header -->
 <div class="mb-6 flex items-center gap-4 border-b border-slate-800/50 pb-4">
   <button
-    on:click={goBack}
+    onclick={goBack}
     class="p-2 hover:bg-theme-base-800 rounded-lg text-theme-base-400 hover:text-white transition-colors"
     aria-label="Go Back"
   >
@@ -109,7 +103,7 @@
   {/if}
 
   <button
-    on:click={saveProfile}
+    onclick={saveProfile}
     disabled={isSavingProfile}
     class="w-full py-3 bg-blue-600 hover:bg-theme-info-500 text-white font-semibold rounded-xl shadow-lg shadow-blue-500/20 transition-all disabled:opacity-50"
   >

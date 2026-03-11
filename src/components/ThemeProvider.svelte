@@ -1,43 +1,12 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
-
-  // Theme type matching backend ThemeConfig
-  type AccentColors = {
-    "600": string;
-    "500": string;
-    "400": string;
-    "300": string;
-  };
-
-  type BaseColors = {
-    "950": string;
-    "900": string;
-    "800": string;
-    "700": string;
-    "600": string;
-    "500": string;
-    "400": string;
-    "300": string;
-    "200": string;
-    "100": string;
-  };
-
-  type ThemeConfig = {
-    base: BaseColors;
-    primary: AccentColors;
-    secondary: AccentColors;
-    error: AccentColors;
-    success: AccentColors;
-    info: AccentColors;
-    warning: AccentColors;
-  };
+  import { api, type ThemeConfig } from "$lib/tauri/api";
 
   let themeLoaded = false;
 
   onMount(async () => {
     try {
-      const theme = await invoke<ThemeConfig>("get_theme");
+      const theme = await api.getTheme();
       applyTheme(theme);
       themeLoaded = true;
     } catch (e) {
@@ -96,13 +65,27 @@
     root.style.setProperty("--color-warning-500", theme.warning["500"]);
     root.style.setProperty("--color-warning-400", theme.warning["400"]);
     root.style.setProperty("--color-warning-300", theme.warning["300"]);
+    root.style.setProperty(
+      "--color-on-primary",
+      getContrastYIQ(theme.primary["600"])
+    );
 
     console.log("[ThemeProvider] Theme applied successfully");
   }
 
+  function getContrastYIQ(hex: string): string {
+    const value = hex.replace("#", "");
+    const bigint = Number.parseInt(value, 16);
+    const r = (bigint >> 16) & 255;
+    const g = (bigint >> 8) & 255;
+    const b = bigint & 255;
+    const yiq = (r * 299 + g * 587 + b * 114) / 1000;
+    return yiq >= 128 ? "#020617" : "#ffffff";
+  }
+
   // Export function for external theme updates
   export function refreshTheme() {
-    invoke<ThemeConfig>("get_theme").then(applyTheme);
+    api.getTheme().then(applyTheme);
   }
 </script>
 

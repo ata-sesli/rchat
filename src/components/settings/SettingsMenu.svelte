@@ -5,7 +5,7 @@
 <div class="space-y-3">
   <!-- Profile Button -->
   <button
-    on:click={() => onnavigate("profile")}
+    onclick={() => onnavigate("profile")}
     class="w-full flex items-center justify-between p-4 bg-theme-base-900 border border-theme-base-800 rounded-xl hover:bg-theme-base-800 transition-all group shadow-sm hover:shadow-md"
   >
     <div class="flex items-center gap-4">
@@ -51,7 +51,7 @@
 
   <!-- Set Theme Button -->
   <button
-    on:click={() => onnavigate("set-theme")}
+    onclick={() => onnavigate("set-theme")}
     class="w-full flex items-center justify-between p-4 bg-theme-base-900 border border-theme-base-800 rounded-xl hover:bg-theme-base-800 transition-all group shadow-sm hover:shadow-md"
   >
     <div class="flex items-center gap-4">
@@ -97,7 +97,53 @@
 
   <!-- About Button -->
   <button
-    on:click={() => onnavigate("about")}
+    onclick={() => onnavigate("stickers")}
+    class="w-full flex items-center justify-between p-4 bg-theme-base-900 border border-theme-base-800 rounded-xl hover:bg-theme-base-800 transition-all group shadow-sm hover:shadow-md"
+  >
+    <div class="flex items-center gap-4">
+      <div
+        class="p-2.5 rounded-lg bg-pink-500/10 text-pink-400 group-hover:bg-pink-500/20 group-hover:text-pink-300 transition-colors"
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          class="h-6 w-6"
+          fill="none"
+          viewBox="0 0 24 24"
+          stroke="currentColor"
+        >
+          <path
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="2"
+            d="M14 10H3m3-6h11l4 4v11a2 2 0 01-2 2h-5M8 16l3 3 5-5"
+          />
+        </svg>
+      </div>
+      <div class="text-left">
+        <span
+          class="block text-lg font-medium text-theme-base-200 group-hover:text-white transition-colors"
+          >Stickers</span
+        >
+        <span class="text-sm text-theme-base-500">Manage your sticker library</span>
+      </div>
+    </div>
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      class="h-5 w-5 text-theme-base-500 group-hover:translate-x-1 transition-transform"
+      viewBox="0 0 20 20"
+      fill="currentColor"
+    >
+      <path
+        fill-rule="evenodd"
+        d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z"
+        clip-rule="evenodd"
+      />
+    </svg>
+  </button>
+
+  <!-- About Button -->
+  <button
+    onclick={() => onnavigate("about")}
     class="w-full flex items-center justify-between p-4 bg-theme-base-900 border border-theme-base-800 rounded-xl hover:bg-theme-base-800 transition-all group shadow-sm hover:shadow-md"
   >
     <div class="flex items-center gap-4">

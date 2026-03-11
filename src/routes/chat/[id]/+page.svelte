@@ -1,9 +1,10 @@
 <script lang="ts">
   import { page } from "$app/stores";
   import { onMount, onDestroy } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import ChatArea from "../../../components/chat/ChatArea.svelte";
+  import { api, type DbMessage } from "$lib/tauri/api";
+  import { getChatKind } from "$lib/chatKind";
 
   // Types
   type Message = {
@@ -13,12 +14,14 @@
     timestamp: Date;
     status?: string;
     content_type?: string;
-    file_hash?: string;
+    file_hash?: string | null;
   };
 
   // Props/State
   let activePeer: string = "";
   $: activePeer = $page.params.id || "";
+  $: activeChatKind = getChatKind(activePeer);
+  $: outgoingStatus = activeChatKind === "dm" || activeChatKind === "tempdm" ? "pending" : "delivered";
 
   let messages: Message[] = [];
   let peerAlias: string | null = null;
@@ -37,18 +40,16 @@
   // Reactive loading
   $: loadChatHistory(activePeer);
 
-  type FriendConfig = { username: string; alias: string | null };
-
   async function loadChatHistory(peerId: string) {
     if (!peerId) return;
     try {
       // Map "Me" in URL to "self" for DB
       const chatId = peerId === "Me" ? "self" : peerId;
-      const history = await invoke<any[]>("get_chat_history", { chatId });
+      const history = await api.getChatHistory(chatId);
 
       messages = history.map((m) => ({
         id: m.id,
-        sender: m.peer_id === "Me" ? "Me" : m.peer_id,
+        sender: m.peer_id === "Me" ? "Me" : m.sender_alias || m.peer_id,
         text: m.text_content || "",
         timestamp: new Date(m.timestamp * 1000),
         status: m.status || "delivered",
@@ -56,14 +57,19 @@
         file_hash: m.file_hash,
       }));
 
-      // Fetch alias for this peer from messages
-      if (peerId !== "Me" && peerId !== "General") {
-        const aliases =
-          await invoke<Record<string, string>>("get_peer_aliases");
-        peerAlias = aliases[peerId] || null;
+      if (peerId !== "Me") {
+        const chatList = await api.getChatList();
+        const chatRow = chatList.find((c) => (c.id === "self" ? "Me" : c.id) === peerId);
+        if (chatRow?.name) {
+          peerAlias = chatRow.name;
+        } else {
+          const aliases = await api.getPeerAliases();
+          peerAlias = aliases[peerId] || null;
+        }
       } else {
         peerAlias = null;
       }
+
     } catch (e) {
       console.error("Failed to load history for", peerId, e);
       messages = [];
@@ -73,13 +79,13 @@
   onMount(async () => {
     // Fetch user profile locally for this page
     try {
-      userProfile = await invoke("get_user_profile");
+      userProfile = await api.getUserProfile();
     } catch (e) {
       console.error("Failed to fetch profile", e);
     }
 
     // Listen for incoming messages
-    unlisten = await listen("message-received", (event: any) => {
+    unlisten = await listen<DbMessage>("message-received", (event) => {
       const msg = event.payload;
       // Check if this message belongs to the current chat
       // Incoming messages have chat_id = sender_id
@@ -91,19 +97,19 @@
 
       if (relatedPeer === activePeer) {
         const newMsg: Message = {
-          id: msg.msg_id,
-          sender: msg.peer_id === "Me" ? "Me" : msg.peer_id,
+          id: msg.id,
+          sender: msg.peer_id === "Me" ? "Me" : msg.sender_alias || msg.peer_id,
           text: msg.text_content || "",
           timestamp: new Date(msg.timestamp * 1000),
-          status: "read",
-          content_type: msg.file_hash ? "image" : "text",
+          status: msg.status || "delivered",
+          content_type: msg.content_type || "text",
           file_hash: msg.file_hash,
         };
         messages = [...messages, newMsg];
 
         // Send read receipt since we're actively viewing this chat
         if (msg.peer_id !== "Me") {
-          invoke("mark_messages_read", { chatId: msg.chat_id }).catch((e) => {
+          api.markMessagesRead(msg.chat_id).catch((e) => {
             console.error("Failed to send read receipt:", e);
           });
         }
@@ -138,6 +144,7 @@
 
   async function handleSendMessage(text: string) {
     if (!text.trim()) return;
+    if (activeChatKind === "archived") return;
 
     // Generate a temporary id for tracking
     const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -148,23 +155,20 @@
       sender: "Me",
       text,
       timestamp: new Date(),
-      status: "pending",
+      status: outgoingStatus,
     };
     messages = [...messages, tempMsg];
 
     try {
       if (activePeer === "Me") {
-        await invoke("send_message_to_self", { message: text });
+        await api.sendMessageToSelf(text);
         // Self messages are always "read"
         messages = messages.map((m) =>
           m.id === tempId ? { ...m, status: "read" } : m
         );
       } else {
         // Get the msg_id from backend
-        const msgId = await invoke<string>("send_message", {
-          peerId: activePeer,
-          message: text,
-        });
+        const msgId = await api.sendMessage(activePeer, text);
 
         // Check if we have a cached status update for this msg_id (race condition fix)
         const cachedStatus = pendingStatusCache[msgId];
@@ -181,7 +185,13 @@
         // Replace temp id with real id and apply cached status if any
         messages = messages.map((m) =>
           m.id === tempId
-            ? { ...m, id: msgId, status: cachedStatus || m.status }
+            ? {
+                ...m,
+                id: msgId,
+                status:
+                  cachedStatus ||
+                  (activeChatKind === "dm" || activeChatKind === "tempdm" ? m.status : "delivered"),
+              }
             : m
         );
       }
@@ -207,39 +217,63 @@
     onImageSent={(fileHash) => {
       // Add sent image to messages list
       const newMsg: Message = {
-        id: `img-${Date.now()}`,
+        id: fileHash.msg_id,
         sender: "Me",
         text: "",
         timestamp: new Date(),
-        status: "delivered",
+        status: outgoingStatus,
         content_type: "image",
-        file_hash: fileHash,
+        file_hash: fileHash.file_hash,
       };
       messages = [...messages, newMsg];
     }}
-    onDocumentSent={(fileHash, fileName) => {
+    onDocumentSent={(result, fileName) => {
       // Add sent document to messages list
       const newMsg: Message = {
-        id: `doc-${Date.now()}`,
+        id: result.msg_id,
         sender: "Me",
         text: fileName,
         timestamp: new Date(),
-        status: "delivered",
+        status: outgoingStatus,
         content_type: "document",
-        file_hash: fileHash,
+        file_hash: result.file_hash,
       };
       messages = [...messages, newMsg];
     }}
-    onVideoSent={(fileHash, fileName) => {
+    onVideoSent={(result, fileName) => {
       // Add sent video to messages list
       const newMsg: Message = {
-        id: `vid-${Date.now()}`,
+        id: result.msg_id,
         sender: "Me",
         text: fileName,
         timestamp: new Date(),
-        status: "delivered",
+        status: outgoingStatus,
         content_type: "video",
-        file_hash: fileHash,
+        file_hash: result.file_hash,
+      };
+      messages = [...messages, newMsg];
+    }}
+    onAudioSent={(result, fileName) => {
+      const newMsg: Message = {
+        id: result.msg_id,
+        sender: "Me",
+        text: fileName,
+        timestamp: new Date(),
+        status: outgoingStatus,
+        content_type: "audio",
+        file_hash: result.file_hash,
+      };
+      messages = [...messages, newMsg];
+    }}
+    onStickerSent={(result) => {
+      const newMsg: Message = {
+        id: result.msg_id,
+        sender: "Me",
+        text: "",
+        timestamp: new Date(),
+        status: outgoingStatus,
+        content_type: "sticker",
+        file_hash: result.file_hash,
       };
       messages = [...messages, newMsg];
     }}

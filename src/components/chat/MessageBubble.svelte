@@ -1,54 +1,79 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { save } from "@tauri-apps/plugin-dialog";
   import { onMount, onDestroy } from "svelte";
   import ImageViewer from "./ImageViewer.svelte";
   import VideoViewer from "./VideoViewer.svelte";
+  import { api } from "$lib/tauri/api";
+  import { getChatKind } from "$lib/chatKind";
 
   export let msg: {
     sender: string;
     text: string;
     timestamp: Date;
     content_type?: string;
-    file_hash?: string;
+    file_hash?: string | null;
     status?: string; // 'pending', 'delivered', 'read'
   };
   export let userProfile: { alias: string | null; avatar_path: string | null };
   export let activePeer: string;
 
   $: isMe = msg.sender === "Me";
+  $: isGroupChat = getChatKind(activePeer) === "group";
   $: isImage = msg.content_type === "image" && msg.file_hash;
+  $: isSticker = msg.content_type === "sticker" && msg.file_hash;
   $: isDocument = msg.content_type === "document" && msg.file_hash;
   $: isVideo = msg.content_type === "video" && msg.file_hash;
+  $: isAudio = msg.content_type === "audio" && msg.file_hash;
 
   let imageDataUrl: string | null = null;
   let loadingImage = false;
   let downloadingImage = false; // File transfer in progress
+  let audioDataUrl: string | null = null;
+  let loadingAudio = false;
+  let downloadingAudio = false;
   let loadError = false;
   let unlistenTransfer: (() => void) | null = null;
   let showViewer = false;
   let showVideoViewer = false;
+  let isStickerSaved = false;
+  let checkingStickerSaved = false;
+  let savingSticker = false;
+  let stickerSaveError: string | null = null;
 
-  // Load image when this is an image message
-  $: if (isImage && msg.file_hash && !imageDataUrl && !loadingImage) {
+  // Load media preview when this is an image/sticker message
+  $: if ((isImage || isSticker) && msg.file_hash && !imageDataUrl && !loadingImage) {
     loadImage(msg.file_hash);
+  }
+  $: if (isAudio && msg.file_hash && !audioDataUrl && !loadingAudio) {
+    loadAudio(msg.file_hash);
   }
 
   onMount(async () => {
     // Listen for file transfer completion to reload image
-    if (isImage && msg.file_hash) {
+    if ((isImage || isSticker || isAudio) && msg.file_hash) {
       unlistenTransfer = await listen<{ file_hash: string }>(
         "file-transfer-complete",
         (event) => {
           if (event.payload.file_hash === msg.file_hash) {
             console.log("[MessageBubble] Transfer complete for", msg.file_hash);
-            downloadingImage = false;
-            imageDataUrl = null; // Reset to trigger reload
-            loadImage(msg.file_hash!);
+            if (isImage || isSticker) {
+              downloadingImage = false;
+              imageDataUrl = null; // Reset to trigger reload
+              loadImage(msg.file_hash!);
+            }
+            if (isAudio) {
+              downloadingAudio = false;
+              audioDataUrl = null;
+              loadAudio(msg.file_hash!);
+            }
           }
         }
       );
+    }
+
+    if (isSticker && msg.file_hash) {
+      await refreshStickerSavedState(msg.file_hash);
     }
   });
 
@@ -61,7 +86,7 @@
     loadingImage = true;
     loadError = false;
     try {
-      const dataUrl = await invoke<string>("get_image_data", { fileHash });
+      const dataUrl = await api.getImageData(fileHash);
       // Check if we got valid data (not empty)
       if (dataUrl && dataUrl.startsWith("data:image")) {
         imageDataUrl = dataUrl;
@@ -78,6 +103,56 @@
       loadError = true;
     } finally {
       loadingImage = false;
+    }
+  }
+
+  async function loadAudio(fileHash: string) {
+    if (loadingAudio) return;
+    loadingAudio = true;
+    try {
+      const dataUrl = await api.getAudioData(fileHash);
+      if (dataUrl && dataUrl.startsWith("data:audio")) {
+        audioDataUrl = dataUrl;
+        downloadingAudio = false;
+      } else {
+        downloadingAudio = true;
+        audioDataUrl = null;
+      }
+    } catch (e) {
+      console.error("Failed to load audio:", e);
+      downloadingAudio = true;
+    } finally {
+      loadingAudio = false;
+    }
+  }
+
+  async function refreshStickerSavedState(fileHash: string) {
+    checkingStickerSaved = true;
+    try {
+      const stickers = await api.listStickers();
+      isStickerSaved = stickers.some((s) => s.file_hash === fileHash);
+    } catch (e) {
+      console.error("Failed to check sticker saved state:", e);
+    } finally {
+      checkingStickerSaved = false;
+    }
+  }
+
+  async function saveStickerToLibrary() {
+    if (!isSticker || !msg.file_hash || savingSticker) return;
+    savingSticker = true;
+    stickerSaveError = null;
+    try {
+      const res = await api.saveStickerFromMessage(msg.file_hash);
+      isStickerSaved = true;
+      if (res.already_exists) {
+        stickerSaveError = "Already in your sticker library";
+      }
+    } catch (e: any) {
+      console.error("Failed to save sticker:", e);
+      stickerSaveError = e?.toString?.() || "Failed to save sticker";
+    } finally {
+      savingSticker = false;
     }
   }
 
@@ -104,15 +179,37 @@
         downloadingDocument = false;
         return; // User cancelled
       }
-      await invoke("save_document_to_file", {
-        fileHash: msg.file_hash,
-        targetPath,
-      });
+      await api.saveDocumentToFile(msg.file_hash, targetPath);
       console.log("Document saved to:", targetPath);
     } catch (e) {
       console.error("Failed to download document:", e);
     } finally {
       downloadingDocument = false;
+    }
+  }
+
+  // Audio download
+  let downloadingAudioFile = false;
+
+  async function downloadAudio() {
+    if (!msg.file_hash) return;
+    downloadingAudioFile = true;
+    try {
+      const fileName = msg.text || "audio";
+      const targetPath = await save({
+        defaultPath: fileName,
+        filters: [{ name: "Audio", extensions: ["mp3", "m4a", "wav", "ogg", "webm", "opus"] }],
+      });
+      if (!targetPath) {
+        downloadingAudioFile = false;
+        return;
+      }
+      await api.saveAudioToFile(msg.file_hash, targetPath);
+      console.log("Audio saved to:", targetPath);
+    } catch (e) {
+      console.error("Failed to download audio:", e);
+    } finally {
+      downloadingAudioFile = false;
     }
   }
 
@@ -165,14 +262,22 @@
           ></div>
         {/if}
       {:else}
-        <img
-          src={`https://github.com/${activePeer}.png?size=32`}
-          class="w-8 h-8 rounded-full bg-theme-secondary-500 shadow-lg shadow-purple-500/20 border-2 border-theme-base-950"
-          on:error={(e) =>
-            ((e.currentTarget as HTMLImageElement).src =
-              "https://github.com/github.png?size=32")}
-          alt="Peer"
-        />
+        {#if isGroupChat}
+          <div
+            class="w-8 h-8 rounded-full bg-theme-base-700 shadow-lg border-2 border-theme-base-950 flex items-center justify-center text-theme-base-200 text-[11px] font-semibold"
+          >
+            {(msg.sender || "?").slice(0, 2).toUpperCase()}
+          </div>
+        {:else}
+          <img
+            src={`https://github.com/${activePeer.startsWith("gh:") ? activePeer.slice(3) : activePeer}.png?size=32`}
+            class="w-8 h-8 rounded-full bg-theme-secondary-500 shadow-lg shadow-purple-500/20 border-2 border-theme-base-950"
+            onerror={(e) =>
+              ((e.currentTarget as HTMLImageElement).src =
+                "https://github.com/github.png?size=32")}
+            alt="Peer"
+          />
+        {/if}
       {/if}
     </div>
 
@@ -181,7 +286,67 @@
       class={`px-4 py-2.5 shadow-md text-sm leading-relaxed break-words flex flex-col gap-1
         ${isMe ? "bg-theme-primary-600 text-[var(--color-on-primary)] rounded-2xl rounded-tr-sm" : "bg-theme-base-800 text-theme-base-200 rounded-2xl rounded-tl-sm border border-theme-base-700"}`}
     >
-      {#if isImage}
+      {#if isGroupChat && !isMe}
+        <span class="text-[11px] text-theme-base-400">{msg.sender}</span>
+      {/if}
+      {#if isSticker}
+        {#if loadingImage}
+          <div
+            class="w-32 h-32 bg-theme-base-700 rounded-lg flex items-center justify-center"
+          >
+            <div
+              class="animate-spin w-6 h-6 border-2 border-white border-t-transparent rounded-full"
+            ></div>
+          </div>
+        {:else if downloadingImage}
+          <div
+            class="w-32 h-32 bg-slate-700/50 rounded-lg flex flex-col items-center justify-center gap-2 border border-theme-base-600"
+          >
+            <span class="text-xs text-theme-base-400">Downloading...</span>
+            <div
+              class="w-20 h-1 bg-theme-base-600 rounded-full overflow-hidden"
+            >
+              <div
+                class="h-full bg-theme-secondary-500 animate-pulse"
+                style="width: 60%"
+              ></div>
+            </div>
+          </div>
+        {:else if imageDataUrl}
+          <img
+            src={imageDataUrl}
+            alt="Sticker"
+            class="max-w-[180px] max-h-[180px] object-contain"
+          />
+        {:else}
+          <div
+            class="w-32 h-32 bg-slate-700/50 rounded-lg flex items-center justify-center text-xs text-theme-base-400 border border-theme-base-600"
+          >
+            Sticker unavailable
+          </div>
+        {/if}
+
+        {#if !isMe && msg.file_hash}
+          <div class="mt-1">
+            <button
+              onclick={saveStickerToLibrary}
+              disabled={checkingStickerSaved || savingSticker || isStickerSaved}
+              class="text-[11px] px-2 py-1 rounded-md bg-theme-base-700 hover:bg-theme-base-600 text-theme-base-200 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+            >
+              {#if savingSticker}
+                Saving...
+              {:else if isStickerSaved}
+                Saved to stickers
+              {:else}
+                Save sticker
+              {/if}
+            </button>
+            {#if stickerSaveError}
+              <p class="text-[10px] text-theme-base-400 mt-1">{stickerSaveError}</p>
+            {/if}
+          </div>
+        {/if}
+      {:else if isImage}
         <!-- Image content -->
         {#if loadingImage}
           <div
@@ -220,12 +385,18 @@
             </div>
           </div>
         {:else if imageDataUrl}
-          <img
-            src={imageDataUrl}
-            alt="Sent image"
-            class="max-w-[300px] max-h-[300px] rounded-lg cursor-pointer hover:opacity-90 transition-opacity"
-            on:click={() => (showViewer = true)}
-          />
+          <button
+            type="button"
+            class="rounded-lg overflow-hidden cursor-pointer hover:opacity-90 transition-opacity"
+            onclick={() => (showViewer = true)}
+            aria-label="Open attachment preview"
+          >
+            <img
+              src={imageDataUrl}
+              alt="Attachment preview"
+              class="max-w-[300px] max-h-[300px] rounded-lg"
+            />
+          </button>
         {:else}
           <div
             class="w-48 h-32 bg-slate-700/50 rounded-lg flex flex-col items-center justify-center gap-1 border border-theme-base-600"
@@ -246,10 +417,56 @@
             <span class="text-xs text-theme-base-400">Image not available</span>
           </div>
         {/if}
+      {:else if isAudio}
+        {#if loadingAudio}
+          <div
+            class="w-56 h-20 bg-theme-base-700 rounded-lg flex items-center justify-center"
+          >
+            <div
+              class="animate-spin w-6 h-6 border-2 border-white border-t-transparent rounded-full"
+            ></div>
+          </div>
+        {:else if downloadingAudio}
+          <div
+            class="w-56 h-20 bg-slate-700/50 rounded-lg flex flex-col items-center justify-center gap-2 border border-theme-base-600"
+          >
+            <span class="text-xs text-theme-base-400">Downloading...</span>
+            <div
+              class="w-24 h-1 bg-theme-base-600 rounded-full overflow-hidden"
+            >
+              <div
+                class="h-full bg-theme-secondary-500 animate-pulse"
+                style="width: 60%"
+              ></div>
+            </div>
+          </div>
+        {:else if audioDataUrl}
+          <div class="flex flex-col gap-2 min-w-[220px]">
+            <!-- svelte-ignore a11y_media_has_caption -->
+            <audio controls src={audioDataUrl} class="w-full"></audio>
+            <button
+              onclick={downloadAudio}
+              disabled={downloadingAudioFile}
+              class="self-start text-[11px] px-2 py-1 rounded-md bg-theme-base-700 hover:bg-theme-base-600 text-theme-base-200 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+            >
+              {#if downloadingAudioFile}
+                Saving...
+              {:else}
+                Save audio
+              {/if}
+            </button>
+          </div>
+        {:else}
+          <div
+            class="w-56 h-20 bg-slate-700/50 rounded-lg flex items-center justify-center text-xs text-theme-base-400 border border-theme-base-600"
+          >
+            Audio unavailable
+          </div>
+        {/if}
       {:else if isDocument}
         <!-- Document content -->
         <button
-          on:click={downloadDocument}
+          onclick={downloadDocument}
           disabled={downloadingDocument}
           class="flex items-center gap-3 p-3 bg-slate-700/50 rounded-lg hover:bg-slate-600/50 transition-colors cursor-pointer border border-theme-base-600 min-w-[200px]"
         >
@@ -290,7 +507,7 @@
       {:else if isVideo}
         <!-- Video content -->
         <button
-          on:click={() => (showVideoViewer = true)}
+          onclick={() => (showVideoViewer = true)}
           class="relative w-48 h-32 bg-theme-base-800 rounded-lg overflow-hidden cursor-pointer hover:opacity-90 transition-opacity border border-theme-base-600"
         >
           <!-- Video icon/thumbnail -->

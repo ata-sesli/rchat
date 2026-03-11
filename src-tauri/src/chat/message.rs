@@ -77,7 +77,7 @@ pub enum MessageContent {
         #[serde(flatten)]
         metadata: ContentMetadata,
     },
-    Voice {
+    Audio {
         file_hash: String,
         #[serde(flatten)]
         metadata: ContentMetadata,
@@ -92,37 +92,7 @@ impl MessageContent {
             Self::Photo { file_hash, .. } => Some(file_hash),
             Self::Video { file_hash, .. } => Some(file_hash),
             Self::Document { file_hash, .. } => Some(file_hash),
-            Self::Voice { file_hash, .. } => Some(file_hash),
-        }
-    }
-
-    /// Get content type string for DB storage
-    pub fn content_type(&self) -> &'static str {
-        match self {
-            Self::Text { .. } => "text",
-            Self::Photo { .. } => "photo",
-            Self::Video { .. } => "video",
-            Self::Document { .. } => "document",
-            Self::Voice { .. } => "voice",
-        }
-    }
-
-    /// Get text content if this is a text message
-    pub fn text_content(&self) -> Option<&str> {
-        match self {
-            Self::Text { text } => Some(text),
-            _ => None,
-        }
-    }
-
-    /// Get mutable reference to metadata for hydration
-    pub fn metadata_mut(&mut self) -> Option<&mut ContentMetadata> {
-        match self {
-            Self::Text { .. } => None,
-            Self::Photo { metadata, .. } => Some(metadata),
-            Self::Video { metadata, .. } => Some(metadata),
-            Self::Document { metadata, .. } => Some(metadata),
-            Self::Voice { metadata, .. } => Some(metadata),
+            Self::Audio { file_hash, .. } => Some(file_hash),
         }
     }
 
@@ -133,7 +103,7 @@ impl MessageContent {
             Self::Photo { metadata, .. } => Some(metadata),
             Self::Video { metadata, .. } => Some(metadata),
             Self::Document { metadata, .. } => Some(metadata),
-            Self::Voice { metadata, .. } => Some(metadata),
+            Self::Audio { metadata, .. } => Some(metadata),
         }
     }
 }
@@ -150,41 +120,6 @@ pub struct Message {
 }
 
 impl Message {
-    /// Create a new text message
-    pub fn text(id: String, chat_id: String, peer_id: String, timestamp: i64, text: String) -> Self {
-        Self {
-            id,
-            chat_id,
-            peer_id,
-            timestamp,
-            status: MessageStatus::Pending,
-            content: MessageContent::Text { text },
-        }
-    }
-
-    /// Create a new photo message
-    pub fn photo(
-        id: String,
-        chat_id: String,
-        peer_id: String,
-        timestamp: i64,
-        file_hash: String,
-        caption: Option<String>,
-    ) -> Self {
-        Self {
-            id,
-            chat_id,
-            peer_id,
-            timestamp,
-            status: MessageStatus::Pending,
-            content: MessageContent::Photo {
-                file_hash,
-                caption,
-                metadata: ContentMetadata::default(),
-            },
-        }
-    }
-
     /// Convert from DB row (flat structure) to rich Message
     pub fn from_db_row(db_msg: &crate::storage::db::Message) -> Self {
         // Parse cached content_metadata from JSON if present
@@ -214,7 +149,7 @@ impl Message {
                 caption: None,
                 metadata: cached_metadata,
             },
-            "voice" => MessageContent::Voice {
+            "audio" => MessageContent::Audio {
                 file_hash: db_msg.file_hash.clone().unwrap_or_default(),
                 metadata: cached_metadata,
             },
@@ -246,8 +181,8 @@ impl Message {
             MessageContent::Document { file_hash, file_name, .. } => {
                 ("document".to_string(), Some(file_name.clone()), Some(file_hash.clone()))
             }
-            MessageContent::Voice { file_hash, .. } => {
-                ("voice".to_string(), None, Some(file_hash.clone()))
+            MessageContent::Audio { file_hash, .. } => {
+                ("audio".to_string(), None, Some(file_hash.clone()))
             }
         };
 
@@ -278,7 +213,7 @@ impl Message {
             MessageContent::Photo { metadata, .. } => metadata.width.is_none(),
             MessageContent::Video { metadata, .. } => metadata.width.is_none() && metadata.duration_secs.is_none(),
             MessageContent::Document { metadata, .. } => metadata.size_bytes.is_none(),
-            MessageContent::Voice { metadata, .. } => metadata.duration_secs.is_none(),
+            MessageContent::Audio { metadata, .. } => metadata.duration_secs.is_none(),
         }
     }
 
@@ -327,7 +262,7 @@ impl Message {
                 // Word count would need document parsing library
                 true
             }
-            MessageContent::Voice { metadata, .. } => {
+            MessageContent::Audio { metadata, .. } => {
                 metadata.size_bytes = Some(file_data.len() as i64);
                 // Duration would need audio parsing
                 true
@@ -350,7 +285,7 @@ impl Message {
 
 /// Compute image dimensions from raw bytes
 fn compute_image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
-    use image::io::Reader as ImageReader;
+    use image::ImageReader;
     use std::io::Cursor;
 
     match ImageReader::new(Cursor::new(data)).with_guessed_format() {

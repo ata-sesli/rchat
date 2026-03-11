@@ -1,0 +1,376 @@
+use futures::StreamExt;
+use crate::network::behaviour::{RChatBehaviour, RChatBehaviourEvent};
+use crate::network::command::NetworkCommand;
+use crate::network::gossip::GroupMessageEnvelope;
+use libp2p::{swarm::SwarmEvent, Multiaddr, PeerId, Swarm};
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+use tauri::async_runtime::Receiver;
+use tauri::{AppHandle, Emitter, Manager};
+
+mod persistence;
+mod punching;
+mod run_loop;
+mod swarm_events;
+mod transfer;
+mod ui_commands;
+
+#[cfg(test)]
+mod tests;
+
+#[derive(Clone, Serialize)]
+pub struct LocalPeer {
+    pub peer_id: String,
+    pub addresses: Vec<String>,
+}
+
+pub struct NetworkManager {
+    // The P2P Node itself
+    swarm: Swarm<RChatBehaviour>,
+    // The channel to receive commands FROM the UI
+    crx: Receiver<NetworkCommand>,
+    // The handle to send events TO the UI
+    app_handle: AppHandle,
+    disc_rx: Receiver<Multiaddr>,
+    // Channel for mDNS-SD discovery
+    mdns_rx: Receiver<crate::network::mdns::MdnsPeer>,
+    // Sender to pass to mDNS service when starting it
+    mdns_tx: tokio::sync::mpsc::Sender<crate::network::mdns::MdnsPeer>,
+    // Flag to ensure we only start mDNS once
+    mdns_started: bool,
+    // Lifecycle handle for mDNS service threads.
+    mdns_handle: Option<crate::network::mdns::MdnsServiceHandle>,
+    // Track local peers discovered via mDNS
+    local_peers: HashMap<PeerId, Vec<Multiaddr>>,
+    // Track our outgoing connection requests (peers we pressed Connect on)
+    pending_requests: HashSet<PeerId>,
+    // Track incoming connection requests from others
+    incoming_requests: HashSet<PeerId>,
+    // Pending GitHub mappings: multiaddr → (inviter_username, my_username) for connection events
+    pending_github_mappings: HashMap<String, (String, String)>,
+    // Pending shadow polls: invitee_username → (password, my_username, created_at)
+    // Used to poll invitee's Gist for shadow invite (bidirectional hole punch)
+    pending_shadow_polls: HashMap<String, (String, String, u64)>,
+    // Active punch targets: target_name → (Multiaddr, start_time)
+    // Continuous 500ms punching for 30 seconds
+    active_punch_targets: HashMap<String, (Multiaddr, std::time::Instant)>,
+    // Joined group IDs we are currently subscribed to
+    subscribed_group_ids: HashSet<String>,
+    // Fast lookup cache: GitHub username -> PeerId string
+    peer_id_by_github: HashMap<String, String>,
+    // Reverse lookup cache: PeerId string -> GitHub username
+    github_by_peer_id: HashMap<String, String>,
+    // Temporary chat routing cache: temp chat id -> peer id
+    temp_peer_by_chat_id: HashMap<String, String>,
+    // Reverse temporary routing cache: peer id -> temp chat id
+    temp_chat_by_peer_id: HashMap<String, String>,
+    // Transfer per-file ordering/emit state.
+    transfer_states: HashMap<String, transfer::TransferState>,
+    // Transfer worker queue sender.
+    transfer_task_tx: tokio::sync::mpsc::Sender<transfer::TransferTask>,
+    // Transfer worker queue result receiver.
+    transfer_result_rx: Receiver<transfer::TransferResult>,
+    // Graceful shutdown signal for transfer workers.
+    transfer_worker_shutdown: Arc<AtomicBool>,
+    // Whether transfer queue accepts new tasks.
+    transfer_accepting_tasks: Arc<AtomicBool>,
+    // Transfer queue counters.
+    transfer_pending_tasks: Arc<AtomicUsize>,
+    transfer_inflight_tasks: Arc<AtomicUsize>,
+    // Worker handles owned by manager for lifecycle control.
+    transfer_worker_handles: Vec<tauri::async_runtime::JoinHandle<()>>,
+    // Persistence worker queue sender.
+    persistence_task_tx: tokio::sync::mpsc::Sender<persistence::PersistenceTask>,
+    // Graceful shutdown signal for persistence workers.
+    persistence_worker_shutdown: Arc<AtomicBool>,
+    // Whether persistence queue accepts new tasks.
+    persistence_accepting_tasks: Arc<AtomicBool>,
+    // Persistence queue counters.
+    persistence_pending_tasks: Arc<AtomicUsize>,
+    persistence_inflight_tasks: Arc<AtomicUsize>,
+    // Worker handles owned by manager for lifecycle control.
+    persistence_worker_handles: Vec<tauri::async_runtime::JoinHandle<()>>,
+}
+
+fn build_incoming_dm_db_message(
+    request: &crate::network::direct_message::DirectMessageRequest,
+    chat_id: String,
+) -> crate::storage::db::Message {
+    use crate::network::direct_message::DirectMessageKind;
+
+    let text_content = match request.msg_type {
+        DirectMessageKind::Text => request.text_content.clone(),
+        DirectMessageKind::Image => None,
+        DirectMessageKind::Sticker => None,
+        DirectMessageKind::Document => Some(
+            request
+                .text_content
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "document".to_string()),
+        ),
+        DirectMessageKind::Video => Some(
+            request
+                .text_content
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "video".to_string()),
+        ),
+        DirectMessageKind::Audio => Some(
+            request
+                .text_content
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "audio".to_string()),
+        ),
+        _ => request.text_content.clone(),
+    };
+
+    let file_hash = match request.msg_type {
+        DirectMessageKind::Text => None,
+        _ => request.file_hash.clone(),
+    };
+
+    crate::storage::db::Message {
+        id: request.id.clone(),
+        chat_id,
+        peer_id: request.sender_id.clone(),
+        timestamp: request.timestamp,
+        content_type: request.msg_type.as_str().to_string(),
+        text_content,
+        file_hash,
+        status: "delivered".to_string(),
+        content_metadata: None,
+        sender_alias: request.sender_alias.clone(),
+    }
+}
+
+fn build_incoming_group_db_message(
+    envelope: &GroupMessageEnvelope,
+) -> crate::storage::db::Message {
+    let text_content = match envelope.content_type {
+        crate::network::gossip::GroupContentType::Text => envelope.text_content.clone(),
+        crate::network::gossip::GroupContentType::Image => None,
+        crate::network::gossip::GroupContentType::Sticker => None,
+        crate::network::gossip::GroupContentType::Document => Some(
+            envelope
+                .text_content
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "document".to_string()),
+        ),
+        crate::network::gossip::GroupContentType::Video => Some(
+            envelope
+                .text_content
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "video".to_string()),
+        ),
+        crate::network::gossip::GroupContentType::Audio => Some(
+            envelope
+                .text_content
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "audio".to_string()),
+        ),
+    };
+
+    let file_hash = match envelope.content_type {
+        crate::network::gossip::GroupContentType::Text => None,
+        _ => envelope.file_hash.clone(),
+    };
+
+    crate::storage::db::Message {
+        id: envelope.id.clone(),
+        chat_id: envelope.group_id.clone(),
+        peer_id: envelope.sender_id.clone(),
+        timestamp: envelope.timestamp,
+        content_type: envelope.content_type.as_str().to_string(),
+        text_content,
+        file_hash,
+        status: "delivered".to_string(),
+        content_metadata: None,
+        sender_alias: envelope.sender_alias.clone(),
+    }
+}
+
+impl NetworkManager {
+    pub fn new(
+        swarm: Swarm<RChatBehaviour>,
+        crx: Receiver<NetworkCommand>,
+        disc_rx: Receiver<Multiaddr>,
+        mdns_rx: Receiver<crate::network::mdns::MdnsPeer>,
+        mdns_tx: tokio::sync::mpsc::Sender<crate::network::mdns::MdnsPeer>,
+        app_handle: AppHandle,
+    ) -> Self {
+        let (
+            transfer_task_tx,
+            transfer_result_rx,
+            transfer_worker_shutdown,
+            transfer_accepting_tasks,
+            transfer_pending_tasks,
+            transfer_inflight_tasks,
+            transfer_worker_handles,
+        ) = transfer::start_transfer_workers(app_handle.clone());
+        let (
+            persistence_task_tx,
+            persistence_worker_shutdown,
+            persistence_accepting_tasks,
+            persistence_pending_tasks,
+            persistence_inflight_tasks,
+            persistence_worker_handles,
+        ) = persistence::start_persistence_workers(app_handle.clone());
+
+        Self {
+            swarm,
+            crx,
+            disc_rx,
+            mdns_rx,
+            mdns_tx,
+            mdns_started: false,
+            mdns_handle: None,
+            app_handle,
+            local_peers: HashMap::new(),
+            pending_requests: HashSet::new(),
+            incoming_requests: HashSet::new(),
+            pending_github_mappings: HashMap::new(),
+            pending_shadow_polls: HashMap::new(),
+            active_punch_targets: HashMap::new(),
+            subscribed_group_ids: HashSet::new(),
+            peer_id_by_github: HashMap::new(),
+            github_by_peer_id: HashMap::new(),
+            temp_peer_by_chat_id: HashMap::new(),
+            temp_chat_by_peer_id: HashMap::new(),
+            transfer_states: HashMap::new(),
+            transfer_task_tx,
+            transfer_result_rx,
+            transfer_worker_shutdown,
+            transfer_accepting_tasks,
+            transfer_pending_tasks,
+            transfer_inflight_tasks,
+            transfer_worker_handles,
+            persistence_task_tx,
+            persistence_worker_shutdown,
+            persistence_accepting_tasks,
+            persistence_pending_tasks,
+            persistence_inflight_tasks,
+            persistence_worker_handles,
+        }
+    }
+
+    pub(super) fn cache_peer_mapping(&mut self, github_username: &str, peer_id: &str) {
+        self.peer_id_by_github
+            .insert(github_username.to_string(), peer_id.to_string());
+        self.github_by_peer_id
+            .insert(peer_id.to_string(), github_username.to_string());
+    }
+
+    pub(super) async fn refresh_peer_mapping_cache(&mut self) {
+        let mut next_peer_id_by_github: HashMap<String, String> = HashMap::new();
+        let mut next_github_by_peer_id: HashMap<String, String> = HashMap::new();
+
+        let state = self.app_handle.state::<crate::AppState>();
+        let mgr = state.config_manager.lock().await;
+        if let Ok(config) = mgr.load().await {
+            for (gh_user, peer_id) in config.user.github_peer_mapping {
+                next_peer_id_by_github.insert(gh_user.clone(), peer_id.clone());
+                next_github_by_peer_id.insert(peer_id, gh_user);
+            }
+        }
+
+        self.peer_id_by_github = next_peer_id_by_github;
+        self.github_by_peer_id = next_github_by_peer_id;
+    }
+
+    pub(super) async fn resolve_peer_id(
+        &mut self,
+        target_peer_id: &str,
+        context: &str,
+    ) -> Option<PeerId> {
+        let actual_peer_id_str = if let Some(mapped_peer_id) = self.temp_peer_by_chat_id.get(target_peer_id)
+        {
+            mapped_peer_id.clone()
+        } else if let Some(github_username) = target_peer_id.strip_prefix("gh:") {
+            if !self.peer_id_by_github.contains_key(github_username) {
+                self.refresh_peer_mapping_cache().await;
+            }
+
+            if let Some(peer_id_string) = self.peer_id_by_github.get(github_username) {
+                println!(
+                    "[{}] 🔄 Resolved GitHub user {} to PeerId {}",
+                    context, github_username, peer_id_string
+                );
+                peer_id_string.clone()
+            } else {
+                eprintln!(
+                    "[{}] ❌ No PeerId mapping found for GitHub user {}. Message queued.",
+                    context, github_username
+                );
+                return None;
+            }
+        } else {
+            target_peer_id.to_string()
+        };
+
+        match actual_peer_id_str.parse::<PeerId>() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!(
+                    "[{}] ❌ Invalid peer_id: {} ({})",
+                    context, actual_peer_id_str, e
+                );
+                None
+            }
+        }
+    }
+
+    pub(super) async fn resolve_chat_id_for_sender(&mut self, sender_peer_id: &str) -> String {
+        if let Some(temp_chat_id) = self.temp_chat_by_peer_id.get(sender_peer_id) {
+            return temp_chat_id.clone();
+        }
+
+        if let Some(gh_user) = self.github_by_peer_id.get(sender_peer_id) {
+            return format!("gh:{}", gh_user);
+        }
+
+        self.refresh_peer_mapping_cache().await;
+        if let Some(gh_user) = self.github_by_peer_id.get(sender_peer_id) {
+            return format!("gh:{}", gh_user);
+        }
+
+        sender_peer_id.to_string()
+    }
+
+    pub(super) fn cache_temporary_mapping(&mut self, chat_id: &str, peer_id: &str) {
+        self.temp_peer_by_chat_id
+            .insert(chat_id.to_string(), peer_id.to_string());
+        self.temp_chat_by_peer_id
+            .insert(peer_id.to_string(), chat_id.to_string());
+    }
+
+    pub(super) fn remove_temporary_by_chat_id(&mut self, chat_id: &str) {
+        if let Some(peer_id) = self.temp_peer_by_chat_id.remove(chat_id) {
+            self.temp_chat_by_peer_id.remove(&peer_id);
+        }
+    }
+
+    pub(super) fn remove_temporary_by_peer_id(&mut self, peer_id: &str) -> Option<String> {
+        let chat_id = self.temp_chat_by_peer_id.remove(peer_id)?;
+        self.temp_peer_by_chat_id.remove(&chat_id);
+        Some(chat_id)
+    }
+}
+
+impl Drop for NetworkManager {
+    fn drop(&mut self) {
+        self.shutdown_transfer_workers_gracefully(std::time::Duration::from_secs(5));
+        self.shutdown_persistence_workers_gracefully(std::time::Duration::from_secs(5));
+
+        if let Some(mut mdns_handle) = self.mdns_handle.take() {
+            mdns_handle.stop();
+        }
+    }
+}

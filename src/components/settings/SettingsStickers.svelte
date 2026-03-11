@@ -1,19 +1,16 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
-  import { open } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
+  import { open } from "@tauri-apps/plugin-dialog";
+  import { api, type StickerBatchImportResult, type StickerItem } from "$lib/tauri/api";
 
-  interface Sticker {
-    file_hash: string;
-    name: string | null;
-    created_at: number;
-    size_bytes: number;
-  }
+  let { onback = () => {} }: { onback?: () => void } = $props();
 
-  let stickers = $state<Sticker[]>([]);
+  let stickers = $state<StickerItem[]>([]);
   let stickerImages = $state<Map<string, string>>(new Map());
   let loading = $state(false);
   let adding = $state(false);
+  let error = $state<string | null>(null);
+  let batchResult = $state<StickerBatchImportResult | null>(null);
 
   onMount(async () => {
     await loadStickers();
@@ -21,88 +18,145 @@
 
   async function loadStickers() {
     loading = true;
+    error = null;
     try {
-      stickers = await invoke<Sticker[]>("get_stickers");
-      // Load sticker images
-      for (const sticker of stickers) {
-        const data = await invoke<number[]>("get_sticker_data", {
-          fileHash: sticker.file_hash,
-        });
-        const blob = new Blob([new Uint8Array(data)], { type: "image/webp" });
-        const url = URL.createObjectURL(blob);
-        stickerImages.set(sticker.file_hash, url);
-      }
-      stickerImages = new Map(stickerImages);
+      stickers = await api.listStickers();
+      const entries = await Promise.all(
+        stickers.map(async (sticker) => {
+          try {
+            const dataUrl = await api.getImageData(sticker.file_hash);
+            return [sticker.file_hash, dataUrl] as const;
+          } catch {
+            return [sticker.file_hash, ""] as const;
+          }
+        })
+      );
+      stickerImages = new Map(entries.filter(([, value]) => Boolean(value)));
     } catch (e) {
       console.error("Failed to load stickers:", e);
+      error = "Failed to load sticker library";
+      stickers = [];
+      stickerImages = new Map();
+    } finally {
+      loading = false;
     }
-    loading = false;
   }
 
-  async function addSticker() {
+  async function addStickersBatch() {
+    adding = true;
+    error = null;
+    batchResult = null;
     try {
-      const filePath = await open({
-        filters: [{ name: "WebP Images", extensions: ["webp"] }],
-        multiple: false,
+      const selected = await open({
+        multiple: true,
+        directory: false,
+        filters: [
+          {
+            name: "Sticker Images",
+            extensions: ["webp", "png", "jpg", "jpeg"],
+          },
+        ],
       });
 
-      if (!filePath) return;
+      if (!selected) return;
 
-      adding = true;
-      // Read file and send to backend
-      const response = await fetch(`file://${filePath}`);
-      const arrayBuffer = await response.arrayBuffer();
-      const webpData = Array.from(new Uint8Array(arrayBuffer));
+      const filePaths = Array.isArray(selected) ? selected : [selected];
+      if (filePaths.length === 0) return;
 
-      const fileName = (filePath as string).split("/").pop() || "sticker";
-      await invoke("add_sticker", {
-        webpData,
-        name: fileName.replace(".webp", ""),
-      });
-
+      batchResult = await api.addStickersBatch(filePaths);
       await loadStickers();
     } catch (e) {
-      console.error("Failed to add sticker:", e);
-      alert("Failed to add sticker: " + e);
+      console.error("Batch sticker import failed:", e);
+      error = "Sticker import failed";
     } finally {
       adding = false;
     }
   }
 
   async function deleteSticker(fileHash: string) {
-    if (!confirm("Delete this sticker?")) return;
+    if (!confirm("Delete this sticker from your library?")) return;
     try {
-      await invoke("delete_sticker", { fileHash });
-      await loadStickers();
+      await api.deleteSticker(fileHash);
+      stickers = stickers.filter((s) => s.file_hash !== fileHash);
+      stickerImages.delete(fileHash);
+      stickerImages = new Map(stickerImages);
     } catch (e) {
       console.error("Failed to delete sticker:", e);
+      error = "Failed to delete sticker";
     }
+  }
+
+  function formatSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  }
+
+  function formatDate(ts: number): string {
+    return new Date(ts * 1000).toLocaleDateString();
   }
 </script>
 
 <div class="space-y-6">
-  <!-- Header -->
-  <div class="flex items-center justify-between">
-    <div>
+  <div class="mb-6 flex items-center gap-4 border-b border-slate-800/50 pb-4">
+    <button
+      onclick={onback}
+      class="p-2 hover:bg-theme-base-800 rounded-lg text-theme-base-400 hover:text-white transition-colors"
+      aria-label="Go back"
+    >
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        class="h-5 w-5"
+        viewBox="0 0 20 20"
+        fill="currentColor"
+      >
+        <path
+          fill-rule="evenodd"
+          d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z"
+          clip-rule="evenodd"
+        />
+      </svg>
+    </button>
+    <div class="flex-1">
       <h2 class="text-xl font-semibold text-white">Stickers</h2>
       <p class="text-sm text-theme-base-500 mt-1">
-        Manage your sticker collection
+        Import and manage your personal sticker library
       </p>
     </div>
     <button
-      onclick={addSticker}
+      onclick={addStickersBatch}
       disabled={adding}
       class="px-4 py-2 bg-theme-primary-500 hover:bg-theme-primary-400 text-theme-base-950 rounded-lg font-medium transition-colors disabled:opacity-50"
     >
       {#if adding}
-        Adding...
+        Importing...
       {:else}
-        + Add Sticker
+        + Import Stickers
       {/if}
     </button>
   </div>
 
-  <!-- Sticker Grid -->
+  {#if batchResult}
+    <div class="rounded-xl border border-theme-base-700 bg-theme-base-900 p-4 space-y-2">
+      <p class="text-sm text-theme-base-200">
+        Imported {batchResult.success_count} / {batchResult.results.length} files.
+      </p>
+      {#if batchResult.failure_count > 0}
+        <div class="space-y-1">
+          {#each batchResult.results.filter((r) => r.error) as failed}
+            <p class="text-xs text-theme-error-400 truncate" title={failed.error || ""}>
+              {failed.file_path.split("/").pop()}: {failed.error}
+            </p>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  {/if}
+
+  {#if error}
+    <p class="text-sm text-theme-error-400">{error}</p>
+  {/if}
+
   <div class="bg-theme-base-800/50 rounded-xl border border-theme-base-700 p-6">
     {#if loading}
       <div class="flex items-center justify-center py-12">
@@ -114,11 +168,11 @@
       <div class="text-center py-12 text-theme-base-500">
         <p class="text-lg">No stickers yet</p>
         <p class="text-sm mt-2">
-          Click "Add Sticker" to upload WebP stickers (max 1MB)
+          Import WebP directly or PNG/JPEG (auto-converted to WebP).
         </p>
       </div>
     {:else}
-      <div class="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 gap-4">
+      <div class="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-7 gap-4">
         {#each stickers as sticker}
           <div class="group relative">
             <div
@@ -136,29 +190,27 @@
                 ></div>
               {/if}
             </div>
-            <!-- Delete button -->
             <button
               onclick={() => deleteSticker(sticker.file_hash)}
               class="absolute -top-2 -right-2 w-6 h-6 bg-theme-error-500 hover:bg-theme-error-400 text-white rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-lg"
+              aria-label="Delete sticker"
               title="Delete sticker"
             >
               ×
             </button>
-            {#if sticker.name}
-              <p
-                class="text-xs text-theme-base-400 text-center mt-1 truncate px-1"
-              >
-                {sticker.name}
-              </p>
-            {/if}
+            <p class="text-[11px] text-theme-base-400 mt-1 truncate px-1" title={sticker.name || "Sticker"}>
+              {sticker.name || "Sticker"}
+            </p>
+            <p class="text-[10px] text-theme-base-600 px-1">
+              {formatSize(sticker.size_bytes)} • {formatDate(sticker.created_at)}
+            </p>
           </div>
         {/each}
       </div>
     {/if}
   </div>
 
-  <!-- Info -->
   <p class="text-xs text-theme-base-600">
-    Stickers must be WebP format (supports animation) and under 1MB.
+    No marketplace or default packs. Stickers are local to your library.
   </p>
 </div>

@@ -156,6 +156,7 @@ pub fn load(conn: &Connection, file_hash: &str, root_dir: Option<PathBuf>) -> Re
 ///
 /// Note: Chunks are NOT deleted from disk to avoid race conditions with deduplication.
 /// A separate garbage collection process can clean up orphaned chunks.
+#[cfg(test)]
 pub fn delete(conn: &Connection, file_hash: &str) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
 

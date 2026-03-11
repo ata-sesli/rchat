@@ -1,6 +1,5 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 // ============================================================================
 // Theme Color Structures
@@ -51,6 +50,17 @@ pub struct ThemeConfig {
     pub success: AccentColors,
     pub info: AccentColors,
     pub warning: AccentColors,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CustomThemeEntry {
+    pub key: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub theme: ThemeConfig,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 // ============================================================================
@@ -124,6 +134,183 @@ impl Default for ThemeConfig {
     }
 }
 
+fn semantic_error() -> AccentColors {
+    AccentColors {
+        c600: "#dc2626".to_string(),
+        c500: "#ef4444".to_string(),
+        c400: "#f87171".to_string(),
+        c300: "#fca5a5".to_string(),
+    }
+}
+
+fn semantic_success() -> AccentColors {
+    AccentColors {
+        c600: "#16a34a".to_string(),
+        c500: "#22c55e".to_string(),
+        c400: "#4ade80".to_string(),
+        c300: "#86efac".to_string(),
+    }
+}
+
+fn semantic_info() -> AccentColors {
+    AccentColors {
+        c600: "#2563eb".to_string(),
+        c500: "#3b82f6".to_string(),
+        c400: "#60a5fa".to_string(),
+        c300: "#93c5fd".to_string(),
+    }
+}
+
+fn semantic_warning() -> AccentColors {
+    AccentColors {
+        c600: "#d97706".to_string(),
+        c500: "#f59e0b".to_string(),
+        c400: "#fbbf24".to_string(),
+        c300: "#fcd34d".to_string(),
+    }
+}
+
+pub fn normalize_hex(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    let hex = trimmed.strip_prefix('#').unwrap_or(trimmed);
+
+    let expanded = match hex.len() {
+        3 => {
+            let mut out = String::with_capacity(6);
+            for ch in hex.chars() {
+                if !ch.is_ascii_hexdigit() {
+                    return Err(anyhow::anyhow!("Invalid hex color '{}'", input));
+                }
+                out.push(ch);
+                out.push(ch);
+            }
+            out
+        }
+        6 => {
+            if !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                return Err(anyhow::anyhow!("Invalid hex color '{}'", input));
+            }
+            hex.to_string()
+        }
+        _ => return Err(anyhow::anyhow!("Invalid hex color '{}'", input)),
+    };
+
+    Ok(format!("#{}", expanded.to_ascii_lowercase()))
+}
+
+fn hex_to_rgb(hex: &str) -> (u8, u8, u8) {
+    let hex = hex.trim_start_matches('#');
+    let val = u32::from_str_radix(hex, 16).unwrap_or(0);
+    (
+        ((val >> 16) & 0xFF) as u8,
+        ((val >> 8) & 0xFF) as u8,
+        (val & 0xFF) as u8,
+    )
+}
+
+fn relative_luminance(hex: &str) -> f64 {
+    let (r, g, b) = hex_to_rgb(hex);
+    let srgb = [r, g, b].map(|v| v as f64 / 255.0);
+    let linear = srgb.map(|c| {
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    });
+    0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+}
+
+fn infer_light_palette_from_text(text_hex: &str) -> bool {
+    relative_luminance(text_hex) < 0.45
+}
+
+pub fn generate_simple_theme(primary: &str, secondary: &str, text: &str) -> Result<ThemeConfig> {
+    let normalized_primary = normalize_hex(primary)?;
+    let normalized_secondary = normalize_hex(secondary)?;
+    let normalized_text = normalize_hex(text)?;
+
+    let manager = ThemeManager;
+    let is_light_palette = infer_light_palette_from_text(&normalized_text);
+
+    let (background, chat_panel, text_muted) = if is_light_palette {
+        let bg = manager.interpolate_color(&normalized_text, "#ffffff", 0.96);
+        let panel = manager.interpolate_color(&bg, &normalized_secondary, 0.08);
+        let muted = manager.interpolate_color(&normalized_text, "#94a3b8", 0.55);
+        (bg, panel, muted)
+    } else {
+        let bg = manager.interpolate_color(&normalized_text, "#020617", 0.92);
+        let panel = manager.interpolate_color(&bg, &normalized_secondary, 0.12);
+        let muted = manager.interpolate_color(&normalized_text, "#64748b", 0.35);
+        (bg, panel, muted)
+    };
+
+    let theme = ThemeConfig {
+        base: manager.generate_base_colors(&background, &chat_panel, &text_muted, &normalized_text),
+        primary: manager.generate_accent_shades(&normalized_primary),
+        secondary: manager.generate_accent_shades(&normalized_secondary),
+        error: semantic_error(),
+        success: semantic_success(),
+        info: semantic_info(),
+        warning: semantic_warning(),
+    };
+
+    validate_and_normalize_theme(&theme)
+}
+
+pub fn validate_and_normalize_theme(theme: &ThemeConfig) -> Result<ThemeConfig> {
+    Ok(ThemeConfig {
+        base: BaseColors {
+            c950: normalize_hex(&theme.base.c950)?,
+            c900: normalize_hex(&theme.base.c900)?,
+            c800: normalize_hex(&theme.base.c800)?,
+            c700: normalize_hex(&theme.base.c700)?,
+            c600: normalize_hex(&theme.base.c600)?,
+            c500: normalize_hex(&theme.base.c500)?,
+            c400: normalize_hex(&theme.base.c400)?,
+            c300: normalize_hex(&theme.base.c300)?,
+            c200: normalize_hex(&theme.base.c200)?,
+            c100: normalize_hex(&theme.base.c100)?,
+        },
+        primary: AccentColors {
+            c600: normalize_hex(&theme.primary.c600)?,
+            c500: normalize_hex(&theme.primary.c500)?,
+            c400: normalize_hex(&theme.primary.c400)?,
+            c300: normalize_hex(&theme.primary.c300)?,
+        },
+        secondary: AccentColors {
+            c600: normalize_hex(&theme.secondary.c600)?,
+            c500: normalize_hex(&theme.secondary.c500)?,
+            c400: normalize_hex(&theme.secondary.c400)?,
+            c300: normalize_hex(&theme.secondary.c300)?,
+        },
+        error: AccentColors {
+            c600: normalize_hex(&theme.error.c600)?,
+            c500: normalize_hex(&theme.error.c500)?,
+            c400: normalize_hex(&theme.error.c400)?,
+            c300: normalize_hex(&theme.error.c300)?,
+        },
+        success: AccentColors {
+            c600: normalize_hex(&theme.success.c600)?,
+            c500: normalize_hex(&theme.success.c500)?,
+            c400: normalize_hex(&theme.success.c400)?,
+            c300: normalize_hex(&theme.success.c300)?,
+        },
+        info: AccentColors {
+            c600: normalize_hex(&theme.info.c600)?,
+            c500: normalize_hex(&theme.info.c500)?,
+            c400: normalize_hex(&theme.info.c400)?,
+            c300: normalize_hex(&theme.info.c300)?,
+        },
+        warning: AccentColors {
+            c600: normalize_hex(&theme.warning.c600)?,
+            c500: normalize_hex(&theme.warning.c500)?,
+            c400: normalize_hex(&theme.warning.c400)?,
+            c300: normalize_hex(&theme.warning.c300)?,
+        },
+    })
+}
+
 // ============================================================================
 // Theme Preset (simplified JSON schema)
 // ============================================================================
@@ -173,11 +360,6 @@ impl ThemeManager {
         Self
     }
 
-    /// List available theme preset names
-    pub fn list_presets(&self) -> Vec<String> {
-        EMBEDDED_THEMES.iter().map(|(name, _)| name.to_string()).collect()
-    }
-
     /// List presets with name and description
     pub fn list_presets_info(&self) -> Vec<(String, String, String)> {
         EMBEDDED_THEMES
@@ -216,40 +398,14 @@ impl ThemeManager {
         let primary = self.generate_accent_shades(&preset.primary_accent);
         let secondary = self.generate_accent_shades(&preset.secondary_accent);
 
-        // Use standard semantic colors
-        let error = AccentColors {
-            c600: "#dc2626".to_string(),
-            c500: "#ef4444".to_string(),
-            c400: "#f87171".to_string(),
-            c300: "#fca5a5".to_string(),
-        };
-        let success = AccentColors {
-            c600: "#16a34a".to_string(),
-            c500: "#22c55e".to_string(),
-            c400: "#4ade80".to_string(),
-            c300: "#86efac".to_string(),
-        };
-        let info = AccentColors {
-            c600: "#2563eb".to_string(),
-            c500: "#3b82f6".to_string(),
-            c400: "#60a5fa".to_string(),
-            c300: "#93c5fd".to_string(),
-        };
-        let warning = AccentColors {
-            c600: "#d97706".to_string(),
-            c500: "#f59e0b".to_string(),
-            c400: "#fbbf24".to_string(),
-            c300: "#fcd34d".to_string(),
-        };
-
         ThemeConfig {
             base,
             primary,
             secondary,
-            error,
-            success,
-            info,
-            warning,
+            error: semantic_error(),
+            success: semantic_success(),
+            info: semantic_info(),
+            warning: semantic_warning(),
         }
     }
 
@@ -297,13 +453,7 @@ impl ThemeManager {
     }
 
     fn hex_to_rgb(&self, hex: &str) -> (u8, u8, u8) {
-        let hex = hex.trim_start_matches('#');
-        let val = u32::from_str_radix(hex, 16).unwrap_or(0);
-        (
-            ((val >> 16) & 0xFF) as u8,
-            ((val >> 8) & 0xFF) as u8,
-            (val & 0xFF) as u8,
-        )
+        hex_to_rgb(hex)
     }
 
     fn hex_to_hsl(&self, hex: &str) -> (f64, f64, f64) {
@@ -350,5 +500,36 @@ impl ThemeManager {
         };
 
         format!("#{:02x}{:02x}{:02x}", f(0.0), f(8.0), f(4.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simple_theme_infers_dark_palette_for_light_text() {
+        let theme = generate_simple_theme("#14b8a6", "#a855f7", "#f8fafc").expect("simple theme");
+        assert_eq!(theme.base.c100, "#f8fafc");
+        assert!(relative_luminance(&theme.base.c950) < 0.2);
+    }
+
+    #[test]
+    fn simple_theme_infers_light_palette_for_dark_text() {
+        let theme = generate_simple_theme("#14b8a6", "#a855f7", "#0f172a").expect("simple theme");
+        assert_eq!(theme.base.c100, "#0f172a");
+        assert!(relative_luminance(&theme.base.c950) > 0.8);
+    }
+
+    #[test]
+    fn normalize_hex_accepts_short_form() {
+        assert_eq!(normalize_hex("#abc").expect("hex"), "#aabbcc");
+    }
+
+    #[test]
+    fn validate_theme_rejects_bad_hex() {
+        let mut theme = ThemeConfig::default();
+        theme.primary.c500 = "not-a-color".to_string();
+        assert!(validate_and_normalize_theme(&theme).is_err());
     }
 }

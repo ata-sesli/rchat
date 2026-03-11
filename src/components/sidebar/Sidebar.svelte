@@ -2,6 +2,7 @@
   import { fade } from "svelte/transition";
   import { flip } from "svelte/animate";
   import EnvelopeItem from "./EnvelopeItem.svelte";
+  import { getChatKind } from "$lib/chatKind";
 
   // Props with callbacks
   let {
@@ -9,9 +10,11 @@
     currentEnvelope = null as string | null,
     searchQuery = $bindable(""),
     showCreateMenu = false,
-    envelopes = [] as { id: string; name: string; icon?: string }[],
+    envelopes = [] as { id: string; name: string; icon?: string | null }[],
     sortedPeers = [] as string[],
     peerAliases = {} as Record<string, string | null>,
+    chatNames = {} as Record<string, string>,
+    groupChats = {} as Record<string, boolean>,
     pinnedPeers = [] as string[],
     activePeer = "Me",
     userProfile = {
@@ -110,9 +113,29 @@
   }
 
   // Helper to check if a peer is online
+  function isGroupChat(chatId: string) {
+    const kind = getChatKind(chatId);
+    return kind === "group" || kind === "tempgroup";
+  }
+
+  function isTemporaryChat(chatId: string) {
+    const kind = getChatKind(chatId);
+    return kind === "tempdm" || kind === "tempgroup";
+  }
+
+  function isArchivedChat(chatId: string) {
+    return getChatKind(chatId) === "archived";
+  }
+
+  function displayName(chatId: string) {
+    if (chatId === "Me") return "Me (You)";
+    if (chatNames[chatId]?.trim()) return chatNames[chatId];
+    return peerAliases[chatId] || (chatId.startsWith("gh:") ? chatId.slice(3) : chatId);
+  }
+
   function isPeerOnline(peerId: string) {
     if (peerId === "Me") return true;
-    if (peerId === "General") return true; // General is always "available"
+    if (isGroupChat(peerId)) return true;
     return localPeers.some((p) => p.peer_id === peerId);
   }
 </script>
@@ -342,17 +365,21 @@
           transition:fade={{ duration: 150 }}
           class="relative group/item"
         >
-          <!-- svelte-ignore a11y-interactive-supports-focus -->
-          <!-- svelte-ignore a11y-click-events-have-key-events -->
-          <!-- svelte-ignore a11y-no-static-element-interactions -->
           <div
             onpointerdown={(e) => handleDragStart(e, peer)}
             onpointermove={handleDragMove}
             onpointerup={handleDragEnd}
             onpointercancel={handleDragEnd}
             role="button"
+            tabindex="0"
             id={`peer-item-${peer}`}
             onclick={() => selectPeer(peer)}
+            onkeydown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                selectPeer(peer);
+              }
+            }}
             class={`w-full flex items-center gap-3 p-3 rounded-xl cursor-grab transition-all border border-transparent touch-none relative z-10 select-none
                 ${activePeer === peer ? "bg-slate-800/80 border-slate-700/50" : "hover:bg-slate-800/30"}
                 ${draggingPeer === peer ? "opacity-50 cursor-grabbing" : ""}`}
@@ -375,7 +402,7 @@
                 <div
                   class="absolute bottom-0 right-0 w-3 h-3 bg-theme-success-500 border-2 border-theme-base-800 rounded-full"
                 ></div>
-              {:else if peer === "General"}
+              {:else if isGroupChat(peer)}
                 <div
                   class="w-10 h-10 rounded-full bg-theme-base-700 flex items-center justify-center text-theme-base-300 font-medium group-hover:bg-theme-base-600 shadow-md"
                 >
@@ -421,17 +448,29 @@
               <div class="flex justify-between items-baseline mb-0.5">
                 <span
                   class="font-medium text-theme-base-200 truncate group-hover:text-white transition-colors"
-                  >{peer === "Me"
-                    ? "Me (You)"
-                    : peerAliases[peer] ||
-                      (peer.startsWith("gh:") ? peer.slice(3) : peer)}</span
+                  >{displayName(peer)}</span
                 >
               </div>
               {#if peer === "Me"}
                 <p class="text-xs text-theme-base-500 truncate">Note to self</p>
-              {:else if peer === "General"}
+              {:else if isArchivedChat(peer)}
                 <p class="text-xs text-theme-base-500 truncate">
-                  Public Broadcast
+                  Archived transcript (read-only)
+                </p>
+              {:else if isTemporaryChat(peer)}
+                <div class="flex items-center gap-2">
+                  <p class="text-xs text-theme-warning-400 truncate">Temporary chat</p>
+                  {#if unreadCounts[peer] && unreadCounts[peer] > 0}
+                    <div
+                      class="min-w-5 h-5 px-1.5 bg-theme-error-500 text-white text-xs font-bold rounded-full flex items-center justify-center"
+                    >
+                      {unreadCounts[peer] > 99 ? "99+" : unreadCounts[peer]}
+                    </div>
+                  {/if}
+                </div>
+              {:else if isGroupChat(peer)}
+                <p class="text-xs text-theme-base-500 truncate">
+                  Group chat
                 </p>
               {:else}
                 <div class="flex items-center gap-2">
@@ -480,17 +519,31 @@
           <button
             onclick={() => selectPeer(peer)}
             class={`w-10 h-10 rounded-full bg-theme-base-800 overflow-hidden border-2 transition-transform hover:scale-105 ${activePeer === peer ? "border-theme-primary-500" : "border-transparent"}`}
-            title={peer}
+            title={displayName(peer)}
           >
-            <img
-              src={`https://github.com/${peer}.png?size=40`}
-              alt={peer}
-              class="w-full h-full object-cover"
-              draggable="false"
-              onerror={(e) =>
-                ((e.currentTarget as HTMLImageElement).src =
-                  "https://github.com/github.png?size=40")}
-            />
+            {#if peer === "Me"}
+              <div
+                class="w-full h-full bg-theme-primary-600 flex items-center justify-center text-white font-medium"
+              >
+                ME
+              </div>
+            {:else if isGroupChat(peer)}
+              <div
+                class="w-full h-full bg-theme-base-700 flex items-center justify-center text-theme-base-300 font-medium"
+              >
+                #
+              </div>
+            {:else}
+              <img
+                src={`https://github.com/${peer.startsWith("gh:") ? peer.slice(3) : peer}.png?size=40`}
+                alt={peer}
+                class="w-full h-full object-cover"
+                draggable="false"
+                onerror={(e) =>
+                  ((e.currentTarget as HTMLImageElement).src =
+                    "https://github.com/github.png?size=40")}
+              />
+            {/if}
           </button>
         {/each}
       </div>

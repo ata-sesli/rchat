@@ -1,14 +1,15 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onMount, onDestroy } from "svelte";
   import QRCode from "qrcode";
   import { Html5Qrcode } from "html5-qrcode";
+  import { api } from "$lib/tauri/api";
 
   type StepType =
     | "select-network"
     | "local-scan"
     | "online"
+    | "temporary-chat"
     | "create-invite-user"
     | "create-invite-code"
     | "accept-invite-user"
@@ -25,6 +26,7 @@
   // Track which peer we're waiting for
   let waitingForPeer = $state<string | null>(null);
   let unlistenConnected: (() => void) | null = null;
+  let tempTicker: ReturnType<typeof setInterval> | null = null;
 
   onMount(async () => {
     // Listen for successful connection event
@@ -34,15 +36,25 @@
       onconnect(event.payload);
       handleClose();
     });
+
+    tempTicker = setInterval(() => {
+      if (tempInviteRemaining > 0) {
+        tempInviteRemaining -= 1;
+      }
+    }, 1000);
   });
 
   onDestroy(() => {
     if (unlistenConnected) unlistenConnected();
+    if (tempTicker) {
+      clearInterval(tempTicker);
+      tempTicker = null;
+    }
   });
 
   function handleClose() {
     // Disable fast discovery when closing
-    invoke("set_fast_discovery", { enabled: false }).catch(console.error);
+    api.setFastDiscovery(false).catch(console.error);
     waitingForPeer = null;
     // Reset invitation state
     createInvitee = "";
@@ -53,15 +65,24 @@
     acceptInviter = "";
     acceptPassword = "";
     acceptError = "";
+    tempInviteLink = "";
+    tempInviteRemaining = 0;
+    tempRedeemLink = "";
+    tempError = "";
+    tempBusy = false;
     onclose();
   }
 
-  function setStep(newStep: StepType) {
+  async function setStep(newStep: StepType) {
     // Toggle fast discovery mode based on step
     if (newStep === "local-scan" && step !== "local-scan") {
-      invoke("set_fast_discovery", { enabled: true }).catch(console.error);
+      api.setFastDiscovery(true).catch(console.error);
     } else if (step === "local-scan" && newStep !== "local-scan") {
-      invoke("set_fast_discovery", { enabled: false }).catch(console.error);
+      api.setFastDiscovery(false).catch(console.error);
+    }
+
+    if (newStep === "temporary-chat") {
+      await refreshActiveTemporaryInvite();
     }
     step = newStep;
   }
@@ -71,6 +92,7 @@
     switch (currentStep) {
       case "create-invite-user":
       case "accept-invite-user":
+      case "temporary-chat":
         return "online";
       case "create-invite-code":
         return "create-invite-user";
@@ -86,7 +108,7 @@
     waitingForPeer = peerId;
 
     try {
-      await invoke("request_connection", { peerId });
+      await api.requestConnection(peerId);
     } catch (e) {
       console.error("Failed to request connection:", e);
       waitingForPeer = null;
@@ -110,6 +132,13 @@
   let acceptPassword = $state("");
   let acceptError = $state("");
   let acceptLoading = $state(false);
+
+  // Temporary chat state
+  let tempInviteLink = $state("");
+  let tempInviteRemaining = $state(0);
+  let tempRedeemLink = $state("");
+  let tempError = $state("");
+  let tempBusy = $state(false);
 
   // QR Scanner state
   let showQrScanner = $state(false);
@@ -163,7 +192,7 @@
 
     try {
       // Generate password
-      createPassword = await invoke<string>("generate_invite_password");
+      createPassword = await api.generateInvitePassword();
       // Generate QR code
       qrDataUrl = await QRCode.toDataURL(createPassword, {
         width: 200,
@@ -183,10 +212,7 @@
     createError = "";
 
     try {
-      await invoke("create_invite", {
-        invitee: createInvitee.trim(),
-        password: createPassword,
-      });
+      await api.createInvite(createInvitee.trim(), createPassword);
       console.log("Invite created successfully");
       handleClose();
     } catch (e: any) {
@@ -222,10 +248,10 @@
     acceptError = "";
 
     try {
-      const peer_id = await invoke<string>("redeem_and_connect", {
-        inviter: acceptInviter.trim(),
-        password: acceptPassword,
-      });
+      const peer_id = await api.redeemAndConnect(
+        acceptInviter.trim(),
+        acceptPassword,
+      );
       console.log("Invite redeemed, connected with:", peer_id);
 
       // Close modal and emit event for navigation
@@ -241,12 +267,97 @@
       acceptLoading = false;
     }
   }
+
+  async function refreshActiveTemporaryInvite() {
+    try {
+      const active = await api.getActiveTemporaryInvite();
+      if (active) {
+        tempInviteLink = active.deep_link;
+        tempInviteRemaining = active.remaining_seconds;
+      } else {
+        tempInviteLink = "";
+        tempInviteRemaining = 0;
+      }
+    } catch (e) {
+      console.error("Failed to load active temporary invite:", e);
+    }
+  }
+
+  async function createTemporaryChatInvite() {
+    tempBusy = true;
+    tempError = "";
+    try {
+      const created = await api.createTemporaryInvite("dm");
+      tempInviteLink = created.deep_link;
+      tempInviteRemaining = created.remaining_seconds;
+    } catch (e: any) {
+      tempError = e?.toString?.() || "Failed to create temporary invite";
+    } finally {
+      tempBusy = false;
+    }
+  }
+
+  async function cancelTemporaryChatInvite() {
+    tempBusy = true;
+    tempError = "";
+    try {
+      await api.cancelTemporaryInvite();
+      tempInviteLink = "";
+      tempInviteRemaining = 0;
+    } catch (e: any) {
+      tempError = e?.toString?.() || "Failed to cancel temporary invite";
+    } finally {
+      tempBusy = false;
+    }
+  }
+
+  async function copyTemporaryInviteLink() {
+    if (!tempInviteLink) return;
+    try {
+      await navigator.clipboard.writeText(tempInviteLink);
+    } catch (e) {
+      console.error("Failed to copy temporary invite link:", e);
+    }
+  }
+
+  async function redeemTemporaryChatInvite() {
+    const input = tempRedeemLink.trim();
+    if (!input) {
+      tempError = "Paste a temporary invite link first";
+      return;
+    }
+    tempBusy = true;
+    tempError = "";
+    try {
+      const result = await api.redeemTemporaryInvite(input);
+      await refreshActiveTemporaryInvite();
+      handleClose();
+      window.dispatchEvent(
+        new CustomEvent("open-chat", { detail: { peerId: result.chat_id } }),
+      );
+    } catch (e: any) {
+      tempError = e?.toString?.() || "Failed to redeem temporary invite";
+    } finally {
+      tempBusy = false;
+    }
+  }
 </script>
 
 {#if show}
   <div
     class="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4 animate-fade-in-up"
-    on:click|self={handleClose}
+    onclick={(event) => {
+      if (event.target === event.currentTarget) {
+        handleClose();
+      }
+    }}
+    onkeydown={(event) => {
+      if (event.key === "Escape") {
+        handleClose();
+      }
+    }}
+    role="button"
+    tabindex="0"
   >
     <div
       class="bg-theme-base-900 border border-theme-base-700 p-6 rounded-2xl w-full max-w-md shadow-2xl space-y-4"
@@ -255,8 +366,9 @@
       <div class="flex items-center gap-3">
         {#if step !== "select-network"}
           <button
-            on:click={() => setStep(getParentStep(step))}
+            onclick={() => setStep(getParentStep(step))}
             class="p-1 rounded-lg hover:bg-theme-base-800 text-theme-base-400 hover:text-white transition-colors"
+            aria-label="Go back"
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -279,6 +391,8 @@
             Local Network
           {:else if step === "online"}
             Online (GitHub)
+          {:else if step === "temporary-chat"}
+            Temporary Chat
           {:else if step === "create-invite-user" || step === "create-invite-code"}
             Create Invitation
           {:else if step === "accept-invite-user" || step === "accept-invite-code"}
@@ -294,7 +408,7 @@
         </p>
         <div class="space-y-3">
           <button
-            on:click={() => setStep("local-scan")}
+            onclick={() => setStep("local-scan")}
             class="w-full flex items-center gap-4 p-4 bg-slate-800/50 hover:bg-theme-base-800 border border-theme-base-700 rounded-xl transition-colors text-left group"
           >
             <div
@@ -334,7 +448,7 @@
           </button>
 
           <button
-            on:click={() => setStep("online")}
+            onclick={() => setStep("online")}
             class="w-full flex items-center gap-4 p-4 bg-slate-800/50 hover:bg-theme-base-800 border border-theme-base-700 rounded-xl transition-colors text-left group"
           >
             <div
@@ -456,7 +570,7 @@
                     </div>
                   {:else}
                     <button
-                      on:click={() => handleConnect(peer.peer_id)}
+                      onclick={() => handleConnect(peer.peer_id)}
                       class="px-3 py-1.5 bg-theme-primary-600 hover:bg-theme-primary-500 text-white text-sm rounded-lg font-medium transition-colors"
                     >
                       Connect
@@ -476,7 +590,7 @@
         </p>
         <div class="space-y-3">
           <button
-            on:click={() => setStep("create-invite-user")}
+            onclick={() => setStep("create-invite-user")}
             class="w-full flex items-center gap-4 p-4 bg-slate-800/50 hover:bg-theme-base-800 border border-theme-base-700 rounded-xl transition-colors text-left group"
           >
             <div
@@ -514,7 +628,7 @@
           </button>
 
           <button
-            on:click={() => setStep("accept-invite-user")}
+            onclick={() => setStep("accept-invite-user")}
             class="w-full flex items-center gap-4 p-4 bg-slate-800/50 hover:bg-theme-base-800 border border-theme-base-700 rounded-xl transition-colors text-left group"
           >
             <div
@@ -553,6 +667,121 @@
               />
             </svg>
           </button>
+
+          <button
+            onclick={() => setStep("temporary-chat")}
+            class="w-full flex items-center gap-4 p-4 bg-slate-800/50 hover:bg-theme-base-800 border border-theme-base-700 rounded-xl transition-colors text-left group"
+          >
+            <div
+              class="w-12 h-12 rounded-xl bg-amber-500/10 text-theme-warning-400 flex items-center justify-center group-hover:bg-amber-500/20 transition-colors"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                class="h-6 w-6"
+                viewBox="0 0 20 20"
+                fill="currentColor"
+              >
+                <path
+                  fill-rule="evenodd"
+                  d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-9V5a1 1 0 10-2 0v4a1 1 0 00.293.707l2 2a1 1 0 101.414-1.414L11 8.586z"
+                  clip-rule="evenodd"
+                />
+              </svg>
+            </div>
+            <div class="flex-1">
+              <div class="font-semibold text-white">Temporary Chat</div>
+              <div class="text-sm text-theme-base-400">
+                Ephemeral chat link (expires in 120s)
+              </div>
+            </div>
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              class="h-5 w-5 text-theme-base-500"
+              viewBox="0 0 20 20"
+              fill="currentColor"
+            >
+              <path
+                fill-rule="evenodd"
+                d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z"
+                clip-rule="evenodd"
+              />
+            </svg>
+          </button>
+        </div>
+      {/if}
+
+      {#if step === "temporary-chat"}
+        <div class="space-y-4">
+          <p class="text-sm text-theme-base-400">
+            Both users must have an active temporary invite. Links expire after
+            <span class="font-semibold text-theme-base-300">120 seconds</span>.
+          </p>
+
+          <div class="flex gap-2">
+            <button
+              onclick={createTemporaryChatInvite}
+              disabled={tempBusy}
+              class="flex-1 px-4 py-2.5 bg-theme-warning-500 hover:bg-theme-warning-400 text-theme-base-950 font-semibold rounded-lg transition-all disabled:opacity-50"
+            >
+              {tempBusy ? "Working..." : "Create Temporary Invite"}
+            </button>
+            <button
+              onclick={cancelTemporaryChatInvite}
+              disabled={tempBusy || !tempInviteLink}
+              class="px-4 py-2.5 bg-theme-base-800 hover:bg-theme-base-700 text-theme-base-300 font-semibold rounded-lg transition-all disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
+
+          {#if tempInviteLink}
+            <div class="space-y-2">
+              <p class="text-xs text-theme-base-500">
+                Active invite expires in
+                <span class="text-theme-warning-400 font-semibold">
+                  {tempInviteRemaining}s
+                </span>
+              </p>
+              <div
+                class="flex items-center gap-2 p-3 bg-theme-base-950 border border-theme-base-700 rounded-lg"
+              >
+                <code class="flex-1 text-xs text-theme-warning-300 break-all">
+                  {tempInviteLink}
+                </code>
+                <button
+                  onclick={copyTemporaryInviteLink}
+                  class="px-3 py-1.5 bg-theme-base-800 hover:bg-theme-base-700 text-theme-base-300 text-sm rounded-lg transition-colors"
+                >
+                  Copy
+                </button>
+              </div>
+            </div>
+          {/if}
+
+          <div class="space-y-2">
+            <label class="block text-xs text-theme-base-400 uppercase tracking-wide"
+              for="temp-invite-link">Redeem Temporary Link</label
+            >
+            <input
+              id="temp-invite-link"
+              type="text"
+              bind:value={tempRedeemLink}
+              placeholder="rchat://temp/..."
+              class="w-full px-3 py-2.5 bg-theme-base-900 border border-theme-base-700 rounded-lg text-theme-base-200 focus:outline-none focus:border-theme-warning-500 focus:ring-1 focus:ring-theme-warning-500 transition-all placeholder:text-theme-base-600"
+              onkeydown={(e) => e.key === "Enter" && redeemTemporaryChatInvite()}
+            />
+            <button
+              onclick={redeemTemporaryChatInvite}
+              disabled={tempBusy || !tempRedeemLink.trim()}
+              class="w-full px-4 py-2.5 bg-theme-secondary-600 hover:bg-theme-secondary-500 text-white font-semibold rounded-lg transition-all disabled:opacity-50"
+            >
+              {tempBusy ? "Redeeming..." : "Redeem Temporary Chat"}
+            </button>
+          </div>
+
+          {#if tempError}
+            <p class="text-sm text-theme-error-400">{tempError}</p>
+          {/if}
         </div>
       {/if}
 
@@ -574,11 +803,11 @@
                 bind:value={createInvitee}
                 placeholder="github_username"
                 class="w-full pl-8 pr-4 py-2.5 bg-theme-base-900 border border-theme-base-700 rounded-lg text-theme-base-200 focus:outline-none focus:border-theme-primary-500 focus:ring-1 focus:ring-teal-500 transition-all placeholder:text-theme-base-600"
-                on:keydown={(e) => e.key === "Enter" && startCreateInvite()}
+                onkeydown={(e) => e.key === "Enter" && startCreateInvite()}
               />
             </div>
             <button
-              on:click={startCreateInvite}
+              onclick={startCreateInvite}
               disabled={createLoading || !createInvitee.trim()}
               class="px-6 py-2.5 bg-theme-primary-600 hover:bg-theme-primary-500 text-theme-base-950 font-semibold rounded-lg shadow-lg shadow-teal-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             >
@@ -615,7 +844,7 @@
               >{createPassword}</code
             >
             <button
-              on:click={copyPassword}
+              onclick={copyPassword}
               class="px-3 py-1.5 bg-theme-base-800 hover:bg-theme-base-700 text-theme-base-300 text-sm rounded-lg transition-colors flex items-center gap-1"
             >
               <svg
@@ -644,13 +873,13 @@
 
           <div class="flex gap-2 pt-2">
             <button
-              on:click={() => setStep("create-invite-user")}
+              onclick={() => setStep("create-invite-user")}
               class="px-4 py-2 text-sm text-theme-base-400 hover:text-white transition-colors"
             >
               ← Back
             </button>
             <button
-              on:click={confirmCreateInvite}
+              onclick={confirmCreateInvite}
               disabled={createLoading}
               class="flex-1 px-6 py-2.5 bg-theme-primary-600 hover:bg-theme-primary-500 text-theme-base-950 font-semibold rounded-lg transition-all disabled:opacity-50"
             >
@@ -681,11 +910,11 @@
                 bind:value={acceptInviter}
                 placeholder="github_username"
                 class="w-full pl-8 pr-4 py-2.5 bg-theme-base-900 border border-theme-base-700 rounded-lg text-theme-base-200 focus:outline-none focus:border-theme-secondary-500 focus:ring-1 focus:ring-purple-500 transition-all placeholder:text-theme-base-600"
-                on:keydown={(e) => e.key === "Enter" && startAcceptInvite()}
+                onkeydown={(e) => e.key === "Enter" && startAcceptInvite()}
               />
             </div>
             <button
-              on:click={startAcceptInvite}
+              onclick={startAcceptInvite}
               disabled={!acceptInviter.trim()}
               class="px-6 py-2.5 bg-theme-secondary-600 hover:bg-theme-secondary-500 text-white font-semibold rounded-lg shadow-lg shadow-purple-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             >
@@ -711,7 +940,7 @@
           <!-- QR Scanner Toggle -->
           <div class="flex gap-2 mb-2">
             <button
-              on:click={() =>
+              onclick={() =>
                 showQrScanner ? stopQrScanner() : startQrScanner()}
               class={`flex-1 px-4 py-2 text-sm rounded-lg transition-all flex items-center justify-center gap-2
                 ${
@@ -761,7 +990,7 @@
               placeholder="14-character code"
               maxlength="14"
               class="w-full px-4 py-3 bg-theme-base-950 border border-theme-base-700 rounded-lg text-xl font-mono text-center text-theme-secondary-400 tracking-wider focus:outline-none focus:border-theme-secondary-500 focus:ring-1 focus:ring-purple-500 transition-all placeholder:text-theme-base-600 placeholder:text-base placeholder:font-sans"
-              on:keydown={(e) => e.key === "Enter" && confirmRedeemInvite()}
+              onkeydown={(e) => e.key === "Enter" && confirmRedeemInvite()}
             />
 
             <p class="text-xs text-theme-base-500 text-center">
@@ -771,7 +1000,7 @@
 
           <div class="flex gap-2 pt-2">
             <button
-              on:click={() => {
+              onclick={() => {
                 stopQrScanner();
                 setStep("accept-invite-user");
               }}
@@ -780,7 +1009,7 @@
               ← Back
             </button>
             <button
-              on:click={confirmRedeemInvite}
+              onclick={confirmRedeemInvite}
               disabled={acceptLoading || acceptPassword.length !== 14}
               class="flex-1 px-6 py-2.5 bg-theme-secondary-600 hover:bg-theme-secondary-500 text-white font-semibold rounded-lg transition-all disabled:opacity-50"
             >
@@ -796,7 +1025,7 @@
       <!-- Footer -->
       <div class="flex justify-end gap-2 pt-2 border-t border-theme-base-800">
         <button
-          on:click={handleClose}
+          onclick={handleClose}
           class="px-4 py-2 text-sm text-theme-base-400 hover:text-white transition-colors"
         >
           Close

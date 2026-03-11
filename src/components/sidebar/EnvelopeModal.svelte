@@ -41,7 +41,6 @@
         bind:value={name}
         placeholder="e.g. Work, Family, Projects"
         class="w-full bg-theme-base-800 text-white rounded-xl px-4 py-3 border border-theme-base-700 focus:outline-none focus:border-theme-primary-500 focus:ring-1 focus:ring-teal-500 transition-all"
-        autofocus
         onkeydown={(e) => e.key === "Enter" && handleSubmit()}
       />
 

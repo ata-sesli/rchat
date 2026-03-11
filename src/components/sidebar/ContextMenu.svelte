@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { getChatKind } from "$lib/chatKind";
+
   let {
     show = false,
     position = { x: 0, y: 0 },
@@ -11,6 +13,10 @@
   function handleAction(action: string) {
     onaction(action);
   }
+
+  const targetKind = $derived(
+    target?.type === "peer" ? getChatKind(target.id) : null,
+  );
 </script>
 
 {#if show}
@@ -39,6 +45,14 @@
       >
         Info
       </button>
+      {#if targetKind === "tempdm" || targetKind === "tempgroup"}
+        <button
+          onclick={() => handleAction("save-archive")}
+          class="w-full text-left px-4 py-2 text-sm text-theme-warning-300 hover:bg-theme-base-700 hover:text-white transition-colors"
+        >
+          Save and Archive
+        </button>
+      {/if}
       <div class="h-px bg-slate-700/50 my-1 mx-2"></div>
       <button
         onclick={() => handleAction("delete-peer")}

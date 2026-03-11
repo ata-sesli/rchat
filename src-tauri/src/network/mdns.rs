@@ -1,10 +1,11 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use libp2p::PeerId;
 use local_ip_address::local_ip;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use zeroconf::prelude::*;
@@ -43,16 +44,47 @@ pub struct MdnsPeer {
     pub alias: Option<String>, // User's display name from TXT record
 }
 
+pub struct MdnsServiceHandle {
+    shutdown: Arc<AtomicBool>,
+    registration_thread: Option<JoinHandle<()>>,
+    browser_thread: Option<JoinHandle<()>>,
+}
+
+impl MdnsServiceHandle {
+    pub fn stop(&mut self) {
+        if self.registration_thread.is_none() && self.browser_thread.is_none() {
+            return;
+        }
+
+        self.shutdown.store(true, Ordering::SeqCst);
+
+        if let Some(handle) = self.registration_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.browser_thread.take() {
+            let _ = handle.join();
+        }
+
+        MDNS_INITIALIZED.store(false, Ordering::SeqCst);
+        println!("[mDNS] 🧹 Service threads stopped");
+    }
+}
+
+impl Drop for MdnsServiceHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Start mDNS service - always advertises and browses at startup
 pub fn start_mdns_service(
     peer_id: PeerId,
     port: u16,
     sender: mpsc::Sender<MdnsPeer>,
     user_alias: Option<String>, // User's alias from settings
-) -> Result<()> {
+) -> Result<MdnsServiceHandle> {
     if MDNS_INITIALIZED.swap(true, Ordering::SeqCst) {
-        println!("[mDNS] Already initialized");
-        return Ok(());
+        return Err(anyhow!("mDNS already initialized"));
     }
 
     let instance_name = peer_id.to_string();
@@ -84,27 +116,39 @@ pub fn start_mdns_service(
         instance_name, valid_hostname, local_ip, port
     );
 
+    let shutdown = Arc::new(AtomicBool::new(false));
+
     // Spawn registration thread (advertising)
     let instance_name_reg = instance_name.clone();
     let valid_hostname_reg = valid_hostname.clone();
     let alias_reg = user_alias.clone();
-    std::thread::spawn(move || {
-        if let Err(e) =
-            run_service_registration(instance_name_reg, valid_hostname_reg, port, alias_reg)
-        {
+    let reg_shutdown = shutdown.clone();
+    let registration_thread = std::thread::spawn(move || {
+        if let Err(e) = run_service_registration(
+            instance_name_reg,
+            valid_hostname_reg,
+            port,
+            alias_reg,
+            reg_shutdown,
+        ) {
             eprintln!("[mDNS] Registration error: {}", e);
         }
     });
 
     // Spawn browser thread (discovery)
-    let my_peer_id = instance_name.clone();
-    std::thread::spawn(move || {
-        if let Err(e) = run_service_browser(sender, my_peer_id) {
+    let my_peer_id = instance_name;
+    let browser_shutdown = shutdown.clone();
+    let browser_thread = std::thread::spawn(move || {
+        if let Err(e) = run_service_browser(sender, my_peer_id, browser_shutdown) {
             eprintln!("[mDNS] Browser error: {}", e);
         }
     });
 
-    Ok(())
+    Ok(MdnsServiceHandle {
+        shutdown,
+        registration_thread: Some(registration_thread),
+        browser_thread: Some(browser_thread),
+    })
 }
 
 fn run_service_registration(
@@ -112,6 +156,7 @@ fn run_service_registration(
     hostname: String,
     port: u16,
     user_alias: Option<String>,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     let service_type = ServiceType::new("rchat", "udp")
         .map_err(|e| anyhow::anyhow!("Invalid service type: {:?}", e))?;
@@ -146,12 +191,14 @@ fn run_service_registration(
 
     println!("[mDNS] ✅ Service registered, polling...");
 
-    // Keep polling forever to maintain the service
-    loop {
+    while !shutdown.load(Ordering::SeqCst) {
         if let Err(e) = event_loop.poll(Duration::from_secs(1)) {
             eprintln!("[mDNS] Poll error: {:?}", e);
         }
     }
+
+    println!("[mDNS] Registration loop stopped");
+    Ok(())
 }
 
 fn on_service_registered(
@@ -168,7 +215,11 @@ fn on_service_registered(
     }
 }
 
-fn run_service_browser(sender: mpsc::Sender<MdnsPeer>, my_peer_id: String) -> Result<()> {
+fn run_service_browser(
+    sender: mpsc::Sender<MdnsPeer>,
+    my_peer_id: String,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
     let service_type = ServiceType::new("rchat", "udp")
         .map_err(|e| anyhow::anyhow!("Invalid service type: {:?}", e))?;
 
@@ -177,8 +228,7 @@ fn run_service_browser(sender: mpsc::Sender<MdnsPeer>, my_peer_id: String) -> Re
 
     println!("[mDNS] Started browsing for _rchat._udp...");
 
-    // Periodic re-browse loop
-    loop {
+    while !shutdown.load(Ordering::SeqCst) {
         let mut browser = MdnsBrowser::new(service_type.clone());
 
         let sender_clone = sender.clone();
@@ -193,20 +243,30 @@ fn run_service_browser(sender: mpsc::Sender<MdnsPeer>, my_peer_id: String) -> Re
                 let start = std::time::Instant::now();
                 let requery_interval = get_requery_interval();
 
-                while start.elapsed() < requery_interval {
+                while start.elapsed() < requery_interval && !shutdown.load(Ordering::SeqCst) {
                     if let Err(e) = event_loop.poll(Duration::from_secs(1)) {
                         eprintln!("[mDNS] Browse poll error: {:?}", e);
                     }
                 }
 
-                println!("[mDNS] 🔄 Re-querying mDNS services...");
+                if !shutdown.load(Ordering::SeqCst) {
+                    println!("[mDNS] 🔄 Re-querying mDNS services...");
+                }
             }
             Err(e) => {
                 eprintln!("[mDNS] Failed to start browsing: {:?}", e);
-                std::thread::sleep(Duration::from_secs(5));
+                for _ in 0..5 {
+                    if shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
             }
         }
     }
+
+    println!("[mDNS] Browser loop stopped");
+    Ok(())
 }
 
 fn handle_browser_event(

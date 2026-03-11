@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
   import { createEventDispatcher, onMount } from "svelte";
+  import { api } from "$lib/tauri/api";
 
   export let fileHash: string;
 
@@ -11,7 +11,7 @@
 
   onMount(async () => {
     try {
-      videoDataUrl = await invoke<string>("get_video_data", { fileHash });
+      videoDataUrl = await api.getVideoData(fileHash);
       loading = false;
     } catch (e) {
       console.error("Failed to load video:", e);
@@ -37,18 +37,20 @@
   }
 </script>
 
-<svelte:window on:keydown={handleKeydown} />
+<svelte:window onkeydown={handleKeydown} />
 
 <!-- Fullscreen overlay -->
 <div
   class="fixed inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-md animate-fade-in"
-  on:click={handleBackdropClick}
+  onclick={handleBackdropClick}
+  onkeydown={handleKeydown}
   role="dialog"
   aria-modal="true"
+  tabindex="0"
 >
   <!-- Close button -->
   <button
-    on:click={close}
+    onclick={close}
     class="absolute top-4 right-4 w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center transition-colors z-10"
     aria-label="Close"
   >

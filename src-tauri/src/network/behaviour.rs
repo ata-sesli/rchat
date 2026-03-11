@@ -1,5 +1,5 @@
 use libp2p::{
-    dcutr, gossipsub, identify, identity::Keypair, kad, ping, relay, request_response, swarm::NetworkBehaviour, PeerId,
+    dcutr, gossipsub, identify, identity::Keypair, kad, ping, relay, request_response, swarm::NetworkBehaviour,
 };
 
 use super::direct_message::{DirectMessageRequest, DirectMessageResponse};

@@ -1,8 +1,8 @@
 import { writable, get } from "svelte/store";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from "$lib/tauri/api";
 
 // Types
-export type Envelope = { id: string; name: string; icon?: string };
+export type Envelope = { id: string; name: string; icon?: string | null };
 
 // State
 export const envelopes = writable<Envelope[]>([]);
@@ -28,11 +28,13 @@ export const AVAILABLE_ICONS = [
 // Actions
 export async function loadEnvelopes() {
   try {
-    const data = await invoke<Envelope[]>("get_envelopes");
+    const data = await api.getEnvelopes();
     envelopes.set(data);
     
-    const assignments = await invoke<Record<string, string>>("get_chat_assignments");
-    chatAssignments.set(assignments);
+    const assignments = await api.getEnvelopeAssignments();
+    chatAssignments.set(
+      Object.fromEntries(assignments.map((a) => [a.chat_id, a.envelope_id]))
+    );
   } catch (e) {
     console.error("Failed to load envelopes:", e);
   }
@@ -51,7 +53,7 @@ export async function createEnvelope(name: string, icon: string) {
   const newEnv: Envelope = { id, name, icon };
   
   try {
-    await invoke("create_envelope", { envelope: newEnv });
+    await api.createEnvelope(id, name, icon);
     envelopes.update((e) => [...e, newEnv]);
     return id;
   } catch (e) {
@@ -62,7 +64,7 @@ export async function createEnvelope(name: string, icon: string) {
 
 export async function updateEnvelope(id: string, name: string, icon: string) {
   try {
-    await invoke("update_envelope", { envelopeId: id, name, icon });
+    await api.updateEnvelope(id, name, icon);
     envelopes.update((envs) =>
       envs.map((e) => (e.id === id ? { ...e, name, icon } : e))
     );
@@ -74,7 +76,7 @@ export async function updateEnvelope(id: string, name: string, icon: string) {
 
 export async function deleteEnvelope(envelopeId: string) {
   try {
-    await invoke("delete_envelope", { envelopeId });
+    await api.deleteEnvelope(envelopeId);
     envelopes.update((e) => e.filter((env) => env.id !== envelopeId));
     
     // Clear assignments for this envelope
@@ -98,7 +100,7 @@ export async function deleteEnvelope(envelopeId: string) {
 
 export async function moveChatToEnvelope(chatId: string, envelopeId: string | null) {
   try {
-    await invoke("move_chat_to_envelope", { chatId, envelopeId });
+    await api.moveChatToEnvelope(chatId, envelopeId);
     
     chatAssignments.update((a) => {
       const updated = { ...a };

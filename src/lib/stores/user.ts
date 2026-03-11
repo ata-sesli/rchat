@@ -1,6 +1,6 @@
 import { writable, get } from "svelte/store";
-import { invoke } from "@tauri-apps/api/core";
 import { goto } from "$app/navigation";
+import { api } from "$lib/tauri/api";
 
 // Types
 export type UserProfile = {
@@ -19,7 +19,7 @@ export const isAuthenticated = writable<boolean>(false);
 // Actions
 export async function loadUserProfile() {
   try {
-    const profile = await invoke<UserProfile>("get_user_profile");
+    const profile = await api.getUserProfile();
     userProfile.set(profile);
   } catch (e) {
     console.error("Failed to load user profile:", e);
@@ -28,7 +28,7 @@ export async function loadUserProfile() {
 
 export async function checkAuth(): Promise<boolean> {
   try {
-    const auth = await invoke<{ is_setup: boolean; is_unlocked: boolean }>("check_auth_status");
+    const auth = await api.checkAuthStatus();
     
     if (!auth.is_setup || !auth.is_unlocked) {
       goto("/login");

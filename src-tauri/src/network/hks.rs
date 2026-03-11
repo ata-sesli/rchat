@@ -5,7 +5,6 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use rand::rngs::OsRng;
 use rvault_core::crypto;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -110,28 +109,8 @@ impl HksTree {
         }
     }
 
-    pub fn restore(nodes: Vec<[u8; 32]>, roster: HashMap<String, FriendEntry>) -> Self {
-        let next_friend_idx = roster.len(); // Approximate, assumes no deletions/gaps for MVP
-        Self {
-            nodes,
-            roster,
-            next_friend_idx,
-        }
-    }
-
     pub fn root_key(&self) -> &[u8; 32] {
         &self.nodes[0]
-    }
-
-    /// Generate a fresh Identity (Ed25519) and Encryption Key (X25519)
-    pub fn generate_identity() -> (SigningKey, StaticSecret) {
-        let mut csprng = OsRng;
-        let mut bytes = [0u8; 32];
-        use rand::RngCore;
-        csprng.fill_bytes(&mut bytes);
-        let signing_key = SigningKey::from_bytes(&bytes);
-        let encryption_key = StaticSecret::random_from_rng(OsRng);
-        (signing_key, encryption_key)
     }
 
     /// Add a friend to the roster

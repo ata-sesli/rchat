@@ -5,16 +5,14 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "opener:default",
-    "fs:default",
     "dialog:default",
+    "fs:read-dirs",
+    "fs:write-all",
     {
-      "identifier": "fs:allow-read-file",
+      "identifier": "fs:scope",
       "allow": [
-        { "path": "$HOME/**" },
-        { "path": "$DOWNLOAD/**" },
-        { "path": "$PICTURE/**" },
-        { "path": "$APPDATA/**" }
+        "$APPCACHE/recordings",
+        "$APPCACHE/recordings/**"
       ]
     }
   ]

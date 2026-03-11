@@ -1,153 +1,374 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
   import ColorPicker from "svelte-awesome-color-picker";
+  import { api, type PresetInfo, type ThemeConfig } from "$lib/tauri/api";
 
   let { onback = () => {} } = $props();
 
-  // --- TYPES ---
-  type AccentColors = {
-    "600": string;
-    "500": string;
-    "400": string;
-    "300": string;
-  };
+  type CreationMode = "simple" | "advanced";
+  type EditorMode = "create" | "edit";
 
-  type BaseColors = {
-    "950": string;
-    "900": string;
-    "800": string;
-    "700": string;
-    "600": string;
-    "500": string;
-    "400": string;
-    "300": string;
-    "200": string;
-    "100": string;
-  };
+  const DEFAULT_PRIMARY = "#14b8a6";
+  const DEFAULT_SECONDARY = "#a855f7";
+  const DEFAULT_TEXT = "#f1f5f9";
 
-  type ThemeConfig = {
-    base: BaseColors;
-    primary: AccentColors;
-    secondary: AccentColors;
-    error: AccentColors;
-    success: AccentColors;
-    info: AccentColors;
-    warning: AccentColors;
-  };
-
-  type PresetInfo = {
-    key: string;
-    name: string;
-    description: string;
-  };
-
-  // --- STATE ---
-  let theme = $state<ThemeConfig | null>(null);
-  let presets = $state<PresetInfo[]>([]);
   let loading = $state(true);
   let saving = $state(false);
-  let showManual = $state(false);
-  let expandedSection = $state<string | null>(null);
+  let errorMessage = $state<string | null>(null);
 
-  // Manual mode state
+  let presets = $state<PresetInfo[]>([]);
+  let selectedPreset = $state<string | null>(null);
+  let appliedTheme = $state<ThemeConfig | null>(null);
+
+  let editorOpen = $state(false);
+  let editorMode = $state<EditorMode>("create");
+  let creationMode = $state<CreationMode>("simple");
+  let editingKey = $state<string | null>(null);
+
+  let draftTheme = $state<ThemeConfig | null>(null);
+  let draftName = $state("");
+  let draftDescription = $state("");
+  let initialSignature = $state("");
+
+  let simplePrimary = $state(DEFAULT_PRIMARY);
+  let simpleSecondary = $state(DEFAULT_SECONDARY);
+  let simpleText = $state(DEFAULT_TEXT);
+
   let baseColor = $state("#64748b");
-  let primaryColor = $state("#14b8a6");
-  let secondaryColor = $state("#a855f7");
+  let primaryColor = $state(DEFAULT_PRIMARY);
+  let secondaryColor = $state(DEFAULT_SECONDARY);
   let errorColor = $state("#ef4444");
   let successColor = $state("#22c55e");
   let infoColor = $state("#3b82f6");
   let warningColor = $state("#f59e0b");
-  let selectedPreset = $state<string | null>(null);
+
+  const customPresets = $derived(presets.filter((preset) => preset.source === "custom"));
+
+  const isDraftDirty = $derived(editorOpen && editorSignature() !== initialSignature);
+
+  let simpleGenerateVersion = 0;
 
   onMount(async () => {
+    await loadThemeState();
+  });
+
+  function sourceBadgeClass(source: PresetInfo["source"]): string {
+    return source === "custom"
+      ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+      : "bg-slate-700/40 text-slate-300 border-slate-600/50";
+  }
+
+  function formatTs(ts?: number | null): string {
+    if (!ts) return "";
     try {
-      // Load current theme, available presets, and selected preset
-      const [loadedTheme, loadedPresets, loadedSelected] = await Promise.all([
-        invoke<ThemeConfig>("get_theme"),
-        invoke<PresetInfo[]>("list_theme_presets"),
-        invoke<string | null>("get_selected_preset"),
+      return new Date(ts * 1000).toLocaleDateString();
+    } catch {
+      return "";
+    }
+  }
+
+  async function loadThemeState() {
+    loading = true;
+    errorMessage = null;
+    try {
+      const [theme, listedPresets, selected] = await Promise.all([
+        api.getTheme(),
+        api.listThemePresets(),
+        api.getSelectedPreset(),
       ]);
-      theme = loadedTheme;
-      presets = loadedPresets;
-      selectedPreset = loadedSelected;
-      if (theme) {
-        updateManualStateFromTheme(theme);
-      }
-    } catch (e) {
-      console.error("Failed to load theme:", e);
+      appliedTheme = theme;
+      presets = listedPresets;
+      selectedPreset = selected;
+      applyThemeToCSS(theme);
+    } catch (error) {
+      errorMessage = `Failed to load theme settings: ${String(error)}`;
     } finally {
       loading = false;
     }
-  });
-
-  function updateManualStateFromTheme(t: ThemeConfig) {
-    baseColor = t.base["500"];
-    primaryColor = t.primary["500"];
-    secondaryColor = t.secondary["500"];
-    errorColor = t.error["500"];
-    successColor = t.success["500"];
-    infoColor = t.info["500"];
-    warningColor = t.warning["500"];
   }
 
-  // Format preset name for display (snake_case to Title Case)
-  function formatPresetName(name: string): string {
-    return name
-      .split("_")
-      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-      .join(" ");
-  }
+  async function applyPreset(presetKey: string) {
+    if (!(await confirmDiscardIfDirty("Discard unsaved draft and apply this preset?"))) {
+      return;
+    }
 
-  // --- APPLY PRESET VIA BACKEND ---
-  async function applyPreset(presetName: string) {
-    if (saving) return;
     saving = true;
+    errorMessage = null;
     try {
-      const newTheme = await invoke<ThemeConfig>("apply_preset", {
-        name: presetName,
-      });
-      theme = newTheme;
-      selectedPreset = presetName;
-      updateManualStateFromTheme(newTheme);
-      applyThemeToCSS(newTheme);
-    } catch (e) {
-      console.error("Failed to apply preset:", e);
+      const theme = await api.applyPreset(presetKey);
+      appliedTheme = theme;
+      selectedPreset = presetKey;
+      applyThemeToCSS(theme);
+      closeEditor();
+    } catch (error) {
+      errorMessage = `Failed to apply preset: ${String(error)}`;
     } finally {
       saving = false;
     }
   }
 
-  // --- HELPERS FOR PRESETS ---
+  async function startCreate(mode: CreationMode) {
+    if (!(await confirmDiscardIfDirty("Discard current draft and start a new theme?"))) {
+      return;
+    }
+
+    editorOpen = true;
+    editorMode = "create";
+    creationMode = mode;
+    editingKey = null;
+    draftName = "";
+    draftDescription = "";
+
+    const baseTheme = appliedTheme ?? defaultTheme();
+    loadColorInputsFromTheme(baseTheme);
+
+    if (mode === "simple") {
+      simplePrimary = baseTheme.primary["500"];
+      simpleSecondary = baseTheme.secondary["500"];
+      simpleText = baseTheme.base["100"];
+      await regenerateSimpleTheme();
+    } else {
+      draftTheme = buildAdvancedTheme();
+      applyThemeToCSS(draftTheme);
+    }
+
+    initialSignature = editorSignature();
+  }
+
+  async function startEdit(preset: PresetInfo) {
+    if (preset.source !== "custom") return;
+    if (!(await confirmDiscardIfDirty("Discard current draft and edit this custom theme?"))) {
+      return;
+    }
+
+    const theme = preset.theme;
+    if (!theme) {
+      errorMessage = "Selected custom theme does not include editable theme data.";
+      return;
+    }
+
+    editorOpen = true;
+    editorMode = "edit";
+    creationMode = "advanced";
+    editingKey = preset.key;
+    draftName = preset.name;
+    draftDescription = preset.description || "";
+    draftTheme = structuredClone(theme);
+
+    loadColorInputsFromTheme(theme);
+    simplePrimary = theme.primary["500"];
+    simpleSecondary = theme.secondary["500"];
+    simpleText = theme.base["100"];
+
+    applyThemeToCSS(theme);
+    initialSignature = editorSignature();
+  }
+
+  function loadColorInputsFromTheme(theme: ThemeConfig) {
+    baseColor = theme.base["500"];
+    primaryColor = theme.primary["500"];
+    secondaryColor = theme.secondary["500"];
+    errorColor = theme.error["500"];
+    successColor = theme.success["500"];
+    infoColor = theme.info["500"];
+    warningColor = theme.warning["500"];
+  }
+
+  async function switchCreationMode(mode: CreationMode) {
+    if (mode === creationMode) return;
+
+    if (!(await confirmDiscardIfDirty("Switching modes will discard unsaved draft changes. Continue?"))) {
+      return;
+    }
+
+    creationMode = mode;
+    const baseTheme = appliedTheme ?? defaultTheme();
+    loadColorInputsFromTheme(baseTheme);
+    simplePrimary = baseTheme.primary["500"];
+    simpleSecondary = baseTheme.secondary["500"];
+    simpleText = baseTheme.base["100"];
+
+    if (mode === "simple") {
+      await regenerateSimpleTheme();
+    } else {
+      draftTheme = buildAdvancedTheme();
+      applyThemeToCSS(draftTheme);
+    }
+
+    initialSignature = editorSignature();
+  }
+
+  async function saveDraftTheme() {
+    if (!draftTheme) return;
+    const trimmedName = draftName.trim();
+    if (!trimmedName) {
+      errorMessage = "Theme title is required.";
+      return;
+    }
+
+    saving = true;
+    errorMessage = null;
+
+    try {
+      let saved: PresetInfo;
+      const description = draftDescription.trim() || null;
+
+      if (editorMode === "create") {
+        saved = await api.createCustomTheme(trimmedName, description, draftTheme);
+      } else {
+        if (!editingKey) {
+          throw new Error("Missing custom theme key for update");
+        }
+        saved = await api.updateCustomTheme(editingKey, trimmedName, description, draftTheme);
+      }
+
+      selectedPreset = saved.key;
+      appliedTheme = saved.theme ?? draftTheme;
+      applyThemeToCSS(appliedTheme);
+      closeEditor();
+      await loadThemeState();
+    } catch (error) {
+      errorMessage = `Failed to save custom theme: ${String(error)}`;
+    } finally {
+      saving = false;
+    }
+  }
+
+  async function deleteCustomTheme(preset: PresetInfo) {
+    if (preset.source !== "custom") return;
+    if (!window.confirm(`Delete custom theme \"${preset.name}\"?`)) return;
+
+    saving = true;
+    errorMessage = null;
+    try {
+      await api.deleteCustomTheme(preset.key);
+
+      if (editingKey === preset.key) {
+        closeEditor();
+      }
+
+      await loadThemeState();
+    } catch (error) {
+      errorMessage = `Failed to delete custom theme: ${String(error)}`;
+    } finally {
+      saving = false;
+    }
+  }
+
+  function closeEditor() {
+    editorOpen = false;
+    editorMode = "create";
+    editingKey = null;
+    draftTheme = null;
+
+    if (appliedTheme) {
+      applyThemeToCSS(appliedTheme);
+    }
+  }
+
+  async function discardDraft() {
+    if (!(await confirmDiscardIfDirty("Discard unsaved draft changes?"))) return;
+    closeEditor();
+  }
+
+  async function goBack() {
+    if (!(await confirmDiscardIfDirty("Discard unsaved draft changes and leave Theme Settings?"))) {
+      return;
+    }
+    if (appliedTheme) {
+      applyThemeToCSS(appliedTheme);
+    }
+    onback();
+  }
+
+  async function confirmDiscardIfDirty(message: string): Promise<boolean> {
+    if (!isDraftDirty) return true;
+    return window.confirm(message);
+  }
+
+  function editorSignature(): string {
+    if (!editorOpen) return "";
+
+    const base = [draftName.trim(), draftDescription.trim(), creationMode];
+    if (creationMode === "simple") {
+      return JSON.stringify([...base, simplePrimary, simpleSecondary, simpleText]);
+    }
+
+    return JSON.stringify([
+      ...base,
+      baseColor,
+      primaryColor,
+      secondaryColor,
+      errorColor,
+      successColor,
+      infoColor,
+      warningColor,
+    ]);
+  }
+
+  $effect(() => {
+    if (!editorOpen || creationMode !== "advanced") return;
+
+    draftTheme = buildAdvancedTheme();
+    applyThemeToCSS(draftTheme);
+  });
+
+  $effect(() => {
+    if (!editorOpen || creationMode !== "simple") return;
+
+    const p = simplePrimary;
+    const s = simpleSecondary;
+    const t = simpleText;
+
+    const timer = window.setTimeout(() => {
+      void regenerateSimpleTheme(p, s, t);
+    }, 140);
+
+    return () => window.clearTimeout(timer);
+  });
+
+  async function regenerateSimpleTheme(
+    primary: string = simplePrimary,
+    secondary: string = simpleSecondary,
+    text: string = simpleText
+  ) {
+    if (!editorOpen || creationMode !== "simple") return;
+
+    const version = ++simpleGenerateVersion;
+    try {
+      const generated = await api.generateSimpleTheme(primary, secondary, text);
+      if (version !== simpleGenerateVersion) return;
+      draftTheme = generated;
+      applyThemeToCSS(generated);
+      errorMessage = null;
+    } catch (error) {
+      if (version !== simpleGenerateVersion) return;
+      errorMessage = `Failed to generate simple theme: ${String(error)}`;
+    }
+  }
+
   function hexToRgb(hex: string): [number, number, number] {
-    const bigint = parseInt(hex.replace("#", ""), 16);
-    return [(bigint >> 16) & 255, (bigint >> 8) & 255, bigint & 255];
+    const value = Number.parseInt(hex.replace("#", ""), 16);
+    return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
   }
 
   function rgbToHex(r: number, g: number, b: number): string {
     return (
       "#" +
-      [r, g, b].map((x) => Math.round(x).toString(16).padStart(2, "0")).join("")
+      [r, g, b]
+        .map((value) => Math.round(value).toString(16).padStart(2, "0"))
+        .join("")
     );
   }
 
-  function interpolateColor(c1: string, c2: string, factor: number): string {
-    const [r1, g1, b1] = hexToRgb(c1);
-    const [r2, g2, b2] = hexToRgb(c2);
-    const r = r1 + (r2 - r1) * factor;
-    const g = g1 + (g2 - g1) * factor;
-    const b = b1 + (b2 - b1) * factor;
-    return rgbToHex(r, g, b);
-  }
-
-  // Standard HSL helpers for accents
   function hexToHsl(hex: string): [number, number, number] {
-    const [r, g, b] = hexToRgb(hex).map((v) => v / 255);
-    const max = Math.max(r, g, b),
-      min = Math.min(r, g, b);
-    let h = 0,
-      s = 0,
-      l = (max + min) / 2;
+    const [r, g, b] = hexToRgb(hex).map((value) => value / 255);
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    let h = 0;
+    let s = 0;
+    const l = (max + min) / 2;
+
     if (max !== min) {
       const d = max - min;
       s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
@@ -163,24 +384,26 @@
           break;
       }
     }
+
     return [h * 360, s * 100, l * 100];
   }
 
   function hslToHex(h: number, s: number, l: number): string {
-    s /= 100;
-    l /= 100;
-    const a = s * Math.min(l, 1 - l);
+    const sat = s / 100;
+    const light = l / 100;
+    const a = sat * Math.min(light, 1 - light);
     const f = (n: number) => {
       const k = (n + h / 30) % 12;
-      const color = l - a * Math.max(Math.min(k - 3, 9 - k, 1), -1);
+      const color = light - a * Math.max(Math.min(k - 3, 9 - k, 1), -1);
       return Math.round(255 * color)
         .toString(16)
         .padStart(2, "0");
     };
+
     return `#${f(0)}${f(8)}${f(4)}`;
   }
 
-  function generateAccentShades(baseHex: string): AccentColors {
+  function generateAccentShades(baseHex: string): ThemeConfig["primary"] {
     const [h, s] = hexToHsl(baseHex);
     return {
       "600": hslToHex(h, Math.min(s + 10, 100), 40),
@@ -190,9 +413,7 @@
     };
   }
 
-  // --- MANUAL MODE --
-  function generateBaseShadesManual(baseHex: string): BaseColors {
-    // Current simple logic for manual mode (mostly for dark themes)
+  function generateBaseShades(baseHex: string): ThemeConfig["base"] {
     const [h, s] = hexToHsl(baseHex);
     return {
       "950": hslToHex(h, s, 3),
@@ -208,120 +429,111 @@
     };
   }
 
-  // Reactive effects for MANUAL mode live preview
-  $effect(() => {
-    // Only auto-update if IN manual mode
-    if (showManual && theme) theme.base = generateBaseShadesManual(baseColor);
-  });
-  $effect(() => {
-    if (showManual && theme) theme.primary = generateAccentShades(primaryColor);
-  });
-  $effect(() => {
-    if (showManual && theme)
-      theme.secondary = generateAccentShades(secondaryColor);
-  });
-  $effect(() => {
-    if (showManual && theme) theme.error = generateAccentShades(errorColor);
-  });
-  $effect(() => {
-    if (showManual && theme) theme.success = generateAccentShades(successColor);
-  });
-  $effect(() => {
-    if (showManual && theme) theme.info = generateAccentShades(infoColor);
-  });
-  $effect(() => {
-    if (showManual && theme) theme.warning = generateAccentShades(warningColor);
-  });
-
-  async function saveThemeManual() {
-    if (theme) await saveThemeImpl(theme);
+  function buildAdvancedTheme(): ThemeConfig {
+    return {
+      base: generateBaseShades(baseColor),
+      primary: generateAccentShades(primaryColor),
+      secondary: generateAccentShades(secondaryColor),
+      error: generateAccentShades(errorColor),
+      success: generateAccentShades(successColor),
+      info: generateAccentShades(infoColor),
+      warning: generateAccentShades(warningColor),
+    };
   }
 
-  async function saveThemeImpl(t: ThemeConfig) {
-    saving = true;
-    try {
-      await invoke("update_theme", { theme: t });
-      applyThemeToCSS(t);
-    } catch (e) {
-      console.error("Failed to save theme:", e);
-    } finally {
-      saving = false;
-    }
-  }
-
-  async function resetTheme() {
-    // Just re-apply 'midnightNeon' as roughly default? or hardcoded default?
-    // Default in backend is hardcoded.
-    // Let's use Manual Reset logic but set state variables.
-    baseColor = "#64748b";
-    primaryColor = "#14b8a6";
-    secondaryColor = "#a855f7";
-    errorColor = "#ef4444";
-    successColor = "#22c55e";
-    infoColor = "#3b82f6";
-    warningColor = "#f59e0b";
-
-    // This triggers effects if in Manual mode.
-    // If in Preset mode, we should manually construct default theme.
-    if (!showManual) {
-      // Force manual mode for a sec to trigger effects? or just construct it.
-      const t: ThemeConfig = {
-        base: generateBaseShadesManual(baseColor),
-        primary: generateAccentShades(primaryColor),
-        secondary: generateAccentShades(secondaryColor),
-        error: generateAccentShades(errorColor),
-        success: generateAccentShades(successColor),
-        info: generateAccentShades(infoColor),
-        warning: generateAccentShades(warningColor),
-      };
-      theme = t;
-      await saveThemeImpl(t);
-    }
+  function defaultTheme(): ThemeConfig {
+    return {
+      base: {
+        "950": "#020617",
+        "900": "#0f172a",
+        "800": "#1e293b",
+        "700": "#334155",
+        "600": "#475569",
+        "500": "#64748b",
+        "400": "#94a3b8",
+        "300": "#cbd5e1",
+        "200": "#e2e8f0",
+        "100": "#f1f5f9",
+      },
+      primary: {
+        "600": "#0d9488",
+        "500": "#14b8a6",
+        "400": "#2dd4bf",
+        "300": "#5eead4",
+      },
+      secondary: {
+        "600": "#9333ea",
+        "500": "#a855f7",
+        "400": "#c084fc",
+        "300": "#d8b4fe",
+      },
+      error: {
+        "600": "#dc2626",
+        "500": "#ef4444",
+        "400": "#f87171",
+        "300": "#fca5a5",
+      },
+      success: {
+        "600": "#16a34a",
+        "500": "#22c55e",
+        "400": "#4ade80",
+        "300": "#86efac",
+      },
+      info: {
+        "600": "#2563eb",
+        "500": "#3b82f6",
+        "400": "#60a5fa",
+        "300": "#93c5fd",
+      },
+      warning: {
+        "600": "#d97706",
+        "500": "#f59e0b",
+        "400": "#fbbf24",
+        "300": "#fcd34d",
+      },
+    };
   }
 
   function getContrastYIQ(hex: string): string {
     const [r, g, b] = hexToRgb(hex);
     const yiq = (r * 299 + g * 587 + b * 114) / 1000;
-    return yiq >= 128 ? "#020617" : "#FFFFFF";
+    return yiq >= 128 ? "#020617" : "#ffffff";
   }
 
-  function applyThemeToCSS(t: ThemeConfig) {
+  function applyThemeToCSS(theme: ThemeConfig) {
     const root = document.documentElement;
-    Object.entries(t.base).forEach(([k, v]) =>
-      root.style.setProperty(`--color-base-${k}`, v)
-    );
-    Object.entries(t.primary).forEach(([k, v]) =>
-      root.style.setProperty(`--color-primary-${k}`, v)
-    );
-    Object.entries(t.secondary).forEach(([k, v]) =>
-      root.style.setProperty(`--color-secondary-${k}`, v)
-    );
-    Object.entries(t.error).forEach(([k, v]) =>
-      root.style.setProperty(`--color-error-${k}`, v)
-    );
-    Object.entries(t.success).forEach(([k, v]) =>
-      root.style.setProperty(`--color-success-${k}`, v)
-    );
-    Object.entries(t.info).forEach(([k, v]) =>
-      root.style.setProperty(`--color-info-${k}`, v)
-    );
-    Object.entries(t.warning).forEach(([k, v]) =>
-      root.style.setProperty(`--color-warning-${k}`, v)
-    );
 
-    // Set contrast text color for primary bubble
-    root.style.setProperty(
-      "--color-on-primary",
-      getContrastYIQ(t.primary["600"])
-    );
+    for (const [key, value] of Object.entries(theme.base)) {
+      root.style.setProperty(`--color-base-${key}`, value);
+    }
+    for (const [key, value] of Object.entries(theme.primary)) {
+      root.style.setProperty(`--color-primary-${key}`, value);
+    }
+    for (const [key, value] of Object.entries(theme.secondary)) {
+      root.style.setProperty(`--color-secondary-${key}`, value);
+    }
+    for (const [key, value] of Object.entries(theme.error)) {
+      root.style.setProperty(`--color-error-${key}`, value);
+    }
+    for (const [key, value] of Object.entries(theme.success)) {
+      root.style.setProperty(`--color-success-${key}`, value);
+    }
+    for (const [key, value] of Object.entries(theme.info)) {
+      root.style.setProperty(`--color-info-${key}`, value);
+    }
+    for (const [key, value] of Object.entries(theme.warning)) {
+      root.style.setProperty(`--color-warning-${key}`, value);
+    }
+
+    root.style.setProperty("--color-on-primary", getContrastYIQ(theme.primary["600"]));
   }
 </script>
 
-<!-- Header -->
 <div class="mb-6 flex items-center gap-4 border-b border-slate-800/50 pb-4">
   <button
-    onclick={() => onback()}
+    onclick={goBack}
     class="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition-colors"
+    aria-label="Go back"
   >
     <svg
       xmlns="http://www.w3.org/2000/svg"
@@ -339,437 +551,256 @@
   <h2 class="text-xl font-bold text-theme-base-100">Theme Settings</h2>
 </div>
 
+{#if errorMessage}
+  <div class="mb-4 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+    {errorMessage}
+  </div>
+{/if}
+
 {#if loading}
   <div class="flex items-center justify-center py-12">
-    <div
-      class="animate-spin rounded-full h-8 w-8 border-b-2 border-teal-500"
-    ></div>
+    <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-teal-500"></div>
   </div>
-{:else if !showManual}
-  <!-- PRESETS MODE -->
+{:else}
   <div class="space-y-6">
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-      {#each presets as preset}
+    <div class="flex flex-wrap items-center justify-between gap-3">
+      <div>
+        <h3 class="text-sm font-semibold uppercase tracking-wide text-theme-base-300">Preset Library</h3>
+        <p class="text-xs text-theme-base-400">Built-in presets and your custom saved themes.</p>
+      </div>
+      <div class="flex items-center gap-2">
         <button
-          onclick={() => applyPreset(preset.key)}
+          onclick={() => startCreate("simple")}
+          class="px-3 py-2 rounded-lg bg-teal-600 hover:bg-teal-500 text-white text-sm disabled:opacity-50"
           disabled={saving}
-          class={`rounded-xl p-4 transition-all text-left group disabled:opacity-50 relative ${
+        >
+          New Simple Theme
+        </button>
+        <button
+          onclick={() => startCreate("advanced")}
+          class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-theme-base-200 text-sm disabled:opacity-50"
+          disabled={saving}
+        >
+          New Advanced Theme
+        </button>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+      {#each presets as preset}
+        <div
+          class={`rounded-xl border p-4 transition-colors ${
             selectedPreset === preset.key
-              ? "bg-teal-500/10 border-2 border-teal-500 ring-2 ring-teal-500/20"
-              : "bg-slate-900/50 border border-slate-800 hover:border-teal-500/50 hover:bg-slate-800/50"
+              ? "border-teal-500 bg-teal-500/10"
+              : "border-slate-800 bg-slate-900/50"
           }`}
         >
-          {#if selectedPreset === preset.key}
-            <div
-              class="absolute top-2 right-2 w-5 h-5 bg-teal-500 rounded-full flex items-center justify-center"
-            >
-              <svg
-                class="w-3 h-3 text-white"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="3"
-                  d="M5 13l4 4L19 7"
-                />
-              </svg>
+          <div class="mb-2 flex items-start justify-between gap-2">
+            <div>
+              <div class="text-sm font-semibold text-theme-base-100">{preset.name}</div>
+              <div class="text-xs text-theme-base-400">{preset.description || "No description"}</div>
+            </div>
+            <span class={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-wide ${sourceBadgeClass(preset.source)}`}>
+              {preset.source}
+            </span>
+          </div>
+
+          {#if preset.source === "custom"}
+            <div class="mb-2 text-[11px] text-theme-base-400">
+              Updated {formatTs(preset.updated_at) || "-"}
             </div>
           {/if}
-          <div
-            class={`font-medium transition-colors mb-1 ${
-              selectedPreset === preset.key
-                ? "text-teal-400"
-                : "text-white group-hover:text-teal-400"
-            }`}
-          >
-            {preset.name}
+
+          <div class="flex flex-wrap gap-2">
+            <button
+              onclick={() => applyPreset(preset.key)}
+              class="rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-1.5 text-xs text-theme-base-100"
+              disabled={saving}
+            >
+              Apply
+            </button>
+            {#if preset.source === "custom"}
+              <button
+                onclick={() => startEdit(preset)}
+                class="rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/40 px-3 py-1.5 text-xs text-emerald-200"
+                disabled={saving}
+              >
+                Edit
+              </button>
+              <button
+                onclick={() => deleteCustomTheme(preset)}
+                class="rounded-lg bg-red-600/20 hover:bg-red-600/30 border border-red-500/40 px-3 py-1.5 text-xs text-red-200"
+                disabled={saving}
+              >
+                Delete
+              </button>
+            {/if}
           </div>
-          <div class="text-xs text-slate-500">{preset.description}</div>
-        </button>
+        </div>
       {/each}
-
-      <!-- Manual Entry Button -->
-      <button
-        onclick={() => (showManual = true)}
-        class="bg-slate-900/30 border border-dashed border-slate-700 rounded-xl p-4 hover:border-slate-500 hover:bg-slate-800/30 transition-all text-left flex flex-col justify-center min-h-[100px]"
-      >
-        <div class="font-medium text-slate-300 mb-1">Manual Theme Creation</div>
-        <div class="text-xs text-slate-500">
-          Build a custom palette from scratch
-        </div>
-      </button>
-    </div>
-  </div>
-{:else if theme}
-  <!-- MANUAL MODE -->
-  <div class="mb-4">
-    <button
-      onclick={() => (showManual = false)}
-      class="text-sm text-slate-400 hover:text-white flex items-center gap-1"
-    >
-      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"
-        ><path
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          stroke-width="2"
-          d="M15 19l-7-7 7-7"
-        /></svg
-      >
-      Back to Presets
-    </button>
-  </div>
-
-  <div class="space-y-4">
-    <!-- Base Colors -->
-    <div
-      class="bg-slate-900/50 rounded-xl border border-slate-800 overflow-hidden"
-    >
-      <button
-        onclick={() =>
-          (expandedSection = expandedSection === "base" ? null : "base")}
-        class="w-full p-4 flex items-center justify-between gap-4 hover:bg-slate-800/30 transition-colors"
-      >
-        <div class="text-left">
-          <div class="font-medium text-white">Base</div>
-          <div class="text-xs text-slate-500">Backgrounds & text</div>
-        </div>
-        <div class="flex gap-1">
-          {#each ["950", "800", "600", "400", "200"] as shade}
-            <div
-              class="w-5 h-5 rounded"
-              style="background-color: {theme.base[shade as keyof BaseColors]}"
-            ></div>
-          {/each}
-        </div>
-        <svg
-          class="w-5 h-5 text-slate-400 transition-transform {expandedSection ===
-          'base'
-            ? 'rotate-180'
-            : ''}"
-          fill="none"
-          stroke="currentColor"
-          viewBox="0 0 24 24"
-        >
-          <path
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            stroke-width="2"
-            d="M19 9l-7 7-7-7"
-          />
-        </svg>
-      </button>
-      {#if expandedSection === "base"}
-        <div class="p-4 border-t border-slate-800/50 min-h-[280px]">
-          <ColorPicker bind:hex={baseColor} />
-        </div>
-      {/if}
     </div>
 
-    <!-- Primary -->
-    <div
-      class="bg-slate-900/50 rounded-xl border border-slate-800 overflow-hidden"
-    >
-      <button
-        onclick={() =>
-          (expandedSection = expandedSection === "primary" ? null : "primary")}
-        class="w-full p-4 flex items-center justify-between gap-4 hover:bg-slate-800/30 transition-colors"
-      >
-        <div class="text-left">
-          <div class="font-medium text-white">Primary</div>
-          <div class="text-xs text-slate-500">Main accent</div>
+    {#if editorOpen && draftTheme}
+      <div class="rounded-2xl border border-slate-700/80 bg-slate-950/80 p-4 space-y-4">
+        <div class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 pb-3">
+          <div>
+            <h3 class="text-base font-semibold text-theme-base-100">
+              {editorMode === "create" ? "Create Custom Theme" : "Edit Custom Theme"}
+            </h3>
+            <p class="text-xs text-theme-base-400">Choose a mode, adjust colors, then save.</p>
+          </div>
+          <div class="inline-flex rounded-lg border border-slate-700 overflow-hidden">
+            <button
+              onclick={() => switchCreationMode("simple")}
+              class={`px-3 py-1.5 text-sm ${
+                creationMode === "simple"
+                  ? "bg-teal-600 text-white"
+                  : "bg-slate-900 text-theme-base-300"
+              }`}
+            >
+              Simple
+            </button>
+            <button
+              onclick={() => switchCreationMode("advanced")}
+              class={`px-3 py-1.5 text-sm ${
+                creationMode === "advanced"
+                  ? "bg-teal-600 text-white"
+                  : "bg-slate-900 text-theme-base-300"
+              }`}
+            >
+              Advanced
+            </button>
+          </div>
         </div>
-        <div class="flex gap-1">
-          {#each ["600", "500", "400", "300"] as shade}
-            <div
-              class="w-5 h-5 rounded"
-              style="background-color: {theme.primary[
-                shade as keyof AccentColors
-              ]}"
-            ></div>
-          {/each}
-        </div>
-        <svg
-          class="w-5 h-5 text-slate-400 transition-transform {expandedSection ===
-          'primary'
-            ? 'rotate-180'
-            : ''}"
-          fill="none"
-          stroke="currentColor"
-          viewBox="0 0 24 24"
-        >
-          <path
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            stroke-width="2"
-            d="M19 9l-7 7-7-7"
-          />
-        </svg>
-      </button>
-      {#if expandedSection === "primary"}
-        <div class="p-4 border-t border-slate-800/50 min-h-[280px]">
-          <ColorPicker bind:hex={primaryColor} />
-        </div>
-      {/if}
-    </div>
 
-    <!-- Secondary -->
-    <div
-      class="bg-slate-900/50 rounded-xl border border-slate-800 overflow-hidden"
-    >
-      <button
-        onclick={() =>
-          (expandedSection =
-            expandedSection === "secondary" ? null : "secondary")}
-        class="w-full p-4 flex items-center justify-between gap-4 hover:bg-slate-800/30 transition-colors"
-      >
-        <div class="text-left">
-          <div class="font-medium text-white">Secondary</div>
-          <div class="text-xs text-slate-500">Secondary accent</div>
-        </div>
-        <div class="flex gap-1">
-          {#each ["600", "500", "400", "300"] as shade}
-            <div
-              class="w-5 h-5 rounded"
-              style="background-color: {theme.secondary[
-                shade as keyof AccentColors
-              ]}"
-            ></div>
-          {/each}
-        </div>
-        <svg
-          class="w-5 h-5 text-slate-400 transition-transform {expandedSection ===
-          'secondary'
-            ? 'rotate-180'
-            : ''}"
-          fill="none"
-          stroke="currentColor"
-          viewBox="0 0 24 24"
-        >
-          <path
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            stroke-width="2"
-            d="M19 9l-7 7-7-7"
-          />
-        </svg>
-      </button>
-      {#if expandedSection === "secondary"}
-        <div class="p-4 border-t border-slate-800/50 min-h-[280px]">
-          <ColorPicker bind:hex={secondaryColor} />
-        </div>
-      {/if}
-    </div>
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div class="lg:col-span-2 space-y-4">
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <label class="flex flex-col gap-1">
+                <span class="text-xs text-theme-base-300">Theme title</span>
+                <input
+                  bind:value={draftName}
+                  type="text"
+                  maxlength="64"
+                  class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-theme-base-100"
+                  placeholder="My Custom Theme"
+                />
+              </label>
 
-    <!-- Error -->
-    <div
-      class="bg-slate-900/50 rounded-xl border border-slate-800 overflow-hidden"
-    >
-      <button
-        onclick={() =>
-          (expandedSection = expandedSection === "error" ? null : "error")}
-        class="w-full p-4 flex items-center justify-between gap-4 hover:bg-slate-800/30 transition-colors"
-      >
-        <div class="text-left">
-          <div class="font-medium text-white">Error</div>
-          <div class="text-xs text-slate-500">Errors & delete</div>
-        </div>
-        <div class="flex gap-1">
-          {#each ["600", "500", "400", "300"] as shade}
-            <div
-              class="w-5 h-5 rounded"
-              style="background-color: {theme.error[
-                shade as keyof AccentColors
-              ]}"
-            ></div>
-          {/each}
-        </div>
-        <svg
-          class="w-5 h-5 text-slate-400 transition-transform {expandedSection ===
-          'error'
-            ? 'rotate-180'
-            : ''}"
-          fill="none"
-          stroke="currentColor"
-          viewBox="0 0 24 24"
-        >
-          <path
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            stroke-width="2"
-            d="M19 9l-7 7-7-7"
-          />
-        </svg>
-      </button>
-      {#if expandedSection === "error"}
-        <div class="p-4 border-t border-slate-800/50 min-h-[280px]">
-          <ColorPicker bind:hex={errorColor} />
-        </div>
-      {/if}
-    </div>
+              <label class="flex flex-col gap-1">
+                <span class="text-xs text-theme-base-300">Description (optional)</span>
+                <input
+                  bind:value={draftDescription}
+                  type="text"
+                  maxlength="160"
+                  class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-theme-base-100"
+                  placeholder="Optional note"
+                />
+              </label>
+            </div>
 
-    <!-- Success -->
-    <div
-      class="bg-slate-900/50 rounded-xl border border-slate-800 overflow-hidden"
-    >
-      <button
-        onclick={() =>
-          (expandedSection = expandedSection === "success" ? null : "success")}
-        class="w-full p-4 flex items-center justify-between gap-4 hover:bg-slate-800/30 transition-colors"
-      >
-        <div class="text-left">
-          <div class="font-medium text-white">Success</div>
-          <div class="text-xs text-slate-500">Online & success</div>
-        </div>
-        <div class="flex gap-1">
-          {#each ["600", "500", "400", "300"] as shade}
-            <div
-              class="w-5 h-5 rounded"
-              style="background-color: {theme.success[
-                shade as keyof AccentColors
-              ]}"
-            ></div>
-          {/each}
-        </div>
-        <svg
-          class="w-5 h-5 text-slate-400 transition-transform {expandedSection ===
-          'success'
-            ? 'rotate-180'
-            : ''}"
-          fill="none"
-          stroke="currentColor"
-          viewBox="0 0 24 24"
-        >
-          <path
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            stroke-width="2"
-            d="M19 9l-7 7-7-7"
-          />
-        </svg>
-      </button>
-      {#if expandedSection === "success"}
-        <div class="p-4 border-t border-slate-800/50 min-h-[280px]">
-          <ColorPicker bind:hex={successColor} />
-        </div>
-      {/if}
-    </div>
+            {#if creationMode === "simple"}
+              <div class="grid grid-cols-1 xl:grid-cols-3 gap-3">
+                <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
+                  <div class="mb-2 text-xs text-theme-base-300">Primary</div>
+                  <ColorPicker bind:hex={simplePrimary} />
+                </div>
+                <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
+                  <div class="mb-2 text-xs text-theme-base-300">Secondary</div>
+                  <ColorPicker bind:hex={simpleSecondary} />
+                </div>
+                <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
+                  <div class="mb-2 text-xs text-theme-base-300">Text</div>
+                  <ColorPicker bind:hex={simpleText} />
+                </div>
+              </div>
+            {:else}
+              <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
+                  <div class="mb-2 text-xs text-theme-base-300">Base</div>
+                  <ColorPicker bind:hex={baseColor} />
+                </div>
+                <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
+                  <div class="mb-2 text-xs text-theme-base-300">Primary</div>
+                  <ColorPicker bind:hex={primaryColor} />
+                </div>
+                <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
+                  <div class="mb-2 text-xs text-theme-base-300">Secondary</div>
+                  <ColorPicker bind:hex={secondaryColor} />
+                </div>
+                <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
+                  <div class="mb-2 text-xs text-theme-base-300">Error</div>
+                  <ColorPicker bind:hex={errorColor} />
+                </div>
+                <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
+                  <div class="mb-2 text-xs text-theme-base-300">Success</div>
+                  <ColorPicker bind:hex={successColor} />
+                </div>
+                <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
+                  <div class="mb-2 text-xs text-theme-base-300">Info</div>
+                  <ColorPicker bind:hex={infoColor} />
+                </div>
+                <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3 md:col-span-2 xl:col-span-1">
+                  <div class="mb-2 text-xs text-theme-base-300">Warning</div>
+                  <ColorPicker bind:hex={warningColor} />
+                </div>
+              </div>
+            {/if}
+          </div>
 
-    <!-- Info -->
-    <div
-      class="bg-slate-900/50 rounded-xl border border-slate-800 overflow-hidden"
-    >
-      <button
-        onclick={() =>
-          (expandedSection = expandedSection === "info" ? null : "info")}
-        class="w-full p-4 flex items-center justify-between gap-4 hover:bg-slate-800/30 transition-colors"
-      >
-        <div class="text-left">
-          <div class="font-medium text-white">Info</div>
-          <div class="text-xs text-slate-500">Information</div>
+          <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3 space-y-3">
+            <div class="text-xs uppercase tracking-wide text-theme-base-400">Live Preview</div>
+            <div class="rounded-lg border p-3" style={`background: ${draftTheme.base["900"]}; border-color: ${draftTheme.base["700"]};`}>
+              <div class="mb-3 text-sm font-semibold" style={`color: ${draftTheme.base["100"]};`}>Sample Chat</div>
+              <div class="space-y-2 text-xs">
+                <div class="max-w-[85%] rounded-xl rounded-bl-sm border px-3 py-2" style={`background: ${draftTheme.base["800"]}; border-color: ${draftTheme.base["700"]}; color: ${draftTheme.base["100"]};`}>
+                  Incoming message
+                </div>
+                <div class="ml-auto max-w-[85%] rounded-xl rounded-br-sm px-3 py-2" style={`background: ${draftTheme.primary["600"]}; color: ${getContrastYIQ(draftTheme.primary["600"])};`}>
+                  Outgoing message
+                </div>
+              </div>
+              <div class="mt-3 flex gap-2 text-[11px]">
+                <span class="rounded px-2 py-1" style={`background: ${draftTheme.success["600"]}; color: ${getContrastYIQ(draftTheme.success["600"])};`}>Success</span>
+                <span class="rounded px-2 py-1" style={`background: ${draftTheme.error["600"]}; color: ${getContrastYIQ(draftTheme.error["600"])};`}>Error</span>
+                <span class="rounded px-2 py-1" style={`background: ${draftTheme.secondary["600"]}; color: ${getContrastYIQ(draftTheme.secondary["600"])};`}>Secondary</span>
+              </div>
+            </div>
+            <div class="text-xs text-theme-base-400">
+              {isDraftDirty ? "Unsaved changes" : "No unsaved changes"}
+            </div>
+          </div>
         </div>
-        <div class="flex gap-1">
-          {#each ["600", "500", "400", "300"] as shade}
-            <div
-              class="w-5 h-5 rounded"
-              style="background-color: {theme.info[
-                shade as keyof AccentColors
-              ]}"
-            ></div>
-          {/each}
-        </div>
-        <svg
-          class="w-5 h-5 text-slate-400 transition-transform {expandedSection ===
-          'info'
-            ? 'rotate-180'
-            : ''}"
-          fill="none"
-          stroke="currentColor"
-          viewBox="0 0 24 24"
-        >
-          <path
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            stroke-width="2"
-            d="M19 9l-7 7-7-7"
-          />
-        </svg>
-      </button>
-      {#if expandedSection === "info"}
-        <div class="p-4 border-t border-slate-800/50 min-h-[280px]">
-          <ColorPicker bind:hex={infoColor} />
-        </div>
-      {/if}
-    </div>
 
-    <!-- Warning -->
-    <div
-      class="bg-slate-900/50 rounded-xl border border-slate-800 overflow-hidden"
-    >
-      <button
-        onclick={() =>
-          (expandedSection = expandedSection === "warning" ? null : "warning")}
-        class="w-full p-4 flex items-center justify-between gap-4 hover:bg-slate-800/30 transition-colors"
-      >
-        <div class="text-left">
-          <div class="font-medium text-white">Warning</div>
-          <div class="text-xs text-slate-500">Warnings</div>
+        <div class="flex flex-wrap justify-end gap-2 border-t border-slate-800/80 pt-3">
+          <button
+            onclick={discardDraft}
+            class="px-4 py-2 rounded-lg border border-slate-700 bg-slate-900 text-theme-base-200 hover:bg-slate-800"
+            disabled={saving}
+          >
+            Discard
+          </button>
+          <button
+            onclick={saveDraftTheme}
+            class="px-4 py-2 rounded-lg bg-teal-600 text-white hover:bg-teal-500 disabled:opacity-50"
+            disabled={saving || !draftName.trim()}
+          >
+            {saving ? "Saving..." : editorMode === "create" ? "Create Theme" : "Save Changes"}
+          </button>
         </div>
-        <div class="flex gap-1">
-          {#each ["600", "500", "400", "300"] as shade}
-            <div
-              class="w-5 h-5 rounded"
-              style="background-color: {theme.warning[
-                shade as keyof AccentColors
-              ]}"
-            ></div>
-          {/each}
-        </div>
-        <svg
-          class="w-5 h-5 text-slate-400 transition-transform {expandedSection ===
-          'warning'
-            ? 'rotate-180'
-            : ''}"
-          fill="none"
-          stroke="currentColor"
-          viewBox="0 0 24 24"
-        >
-          <path
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            stroke-width="2"
-            d="M19 9l-7 7-7-7"
-          />
-        </svg>
-      </button>
-      {#if expandedSection === "warning"}
-        <div class="p-4 border-t border-slate-800/50 min-h-[280px]">
-          <ColorPicker bind:hex={warningColor} />
-        </div>
-      {/if}
-    </div>
-  </div>
+      </div>
+    {/if}
 
-  <!-- Actions -->
-  <div class="mt-6 flex gap-3 border-t border-slate-800/50 pt-4">
-    <button
-      onclick={resetTheme}
-      class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg transition-colors"
-    >
-      Reset to Default
-    </button>
-    <button
-      onclick={saveThemeManual}
-      disabled={saving}
-      class="px-4 py-2 bg-teal-600 hover:bg-teal-500 text-white rounded-lg transition-colors disabled:opacity-50"
-    >
-      {saving ? "Saving..." : "Save Theme"}
-    </button>
+    {#if customPresets.length === 0}
+      <div class="rounded-xl border border-dashed border-slate-700 bg-slate-900/30 px-4 py-3 text-sm text-theme-base-400">
+        No custom themes yet. Create one in Simple or Advanced mode.
+      </div>
+    {/if}
   </div>
 {/if}
 
 <style>
-  /* Color picker now displays inline within expanded sections */
+  :global(.sacp-root) {
+    width: 100%;
+  }
 </style>

@@ -9,11 +9,6 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
-// Gist structs removed as they are handled in gist.rs now (or internal there)
-// But wait, fetch_friend_peers returns Multiaddr, so we don't need Gist structs here.
-const RCHAT_GIST_DESC: &str = "rchat-peer-info"; // Can be removed if not used
-                                                 // const RCHAT_FILE_NAME: &str = "peers.txt"; // Can be removed
-
 use crate::AppState;
 use tauri::Manager;
 

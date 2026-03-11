@@ -7,7 +7,7 @@
     onclick = () => {},
     oncontextmenu = (e: MouseEvent) => {},
   }: {
-    envelope: { id: string; name: string; icon?: string };
+    envelope: { id: string; name: string; icon?: string | null };
     isDropTarget?: boolean;
     onclick?: () => void;
     oncontextmenu?: (e: MouseEvent) => void;
@@ -17,6 +17,13 @@
     onclick();
   }
 
+  function handleKeydown(event: KeyboardEvent) {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      handleClick();
+    }
+  }
+
   function handleContextMenu(e: MouseEvent) {
     e.stopPropagation();
     oncontextmenu(e);
@@ -24,13 +31,12 @@
 </script>
 
 <div transition:fade={{ duration: 150 }}>
-  <!-- svelte-ignore a11y-interactive-supports-focus -->
-  <!-- svelte-ignore a11y-click-events-have-key-events -->
-  <!-- svelte-ignore a11y-no-static-element-interactions -->
   <div
     id={`envelope-drop-zone-${envelope.id}`}
     role="button"
     onclick={handleClick}
+    onkeydown={handleKeydown}
+    tabindex="0"
     class={`w-full flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-all group border border-dashed text-left relative z-0 select-none
        ${isDropTarget ? "bg-teal-900/40 border-theme-primary-500 scale-[1.02] shadow-lg shadow-teal-500/10" : "border-slate-800/50 hover:bg-slate-800/50"}`}
   >
@@ -69,6 +75,7 @@
     <button
       onclick={handleContextMenu}
       class="p-1 rounded-lg text-theme-base-500 hover:text-white hover:bg-slate-900/50 transition-all opacity-0 group-hover:opacity-100"
+      aria-label={`Open menu for envelope ${envelope.name}`}
     >
       <svg
         xmlns="http://www.w3.org/2000/svg"

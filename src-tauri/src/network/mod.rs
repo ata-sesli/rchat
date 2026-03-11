@@ -1,6 +1,8 @@
 mod behaviour;
+pub mod command;
 pub mod direct_message;
 pub mod discovery;
+pub mod gossip;
 pub mod gist;
 pub mod hks;
 pub mod invite;
@@ -102,6 +104,7 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
     // Do STUN discovery (socket closes after discovery)
     let stun_result = stun::discover_on_port(udp_port).await;
     let stun_external_port = stun_result.external_port;
+    let stun_public_ip_v6 = stun_result.ipv6.map(|a| a.ip().to_string());
     let stun_public_ip = stun_result.ipv4.map(|a| a.ip().to_string());
     
     if let Some(ext_port) = stun_external_port {
@@ -127,10 +130,12 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
     // Store the sender in app state (with STUN results)
     let network_state = crate::NetworkState {
         sender: tokio::sync::Mutex::new(ctx),
+        local_peer_id: tokio::sync::Mutex::new(Some(local_peer_id.to_string())),
         listening_addresses: tokio::sync::Mutex::new(vec![]),
-        public_address_v6: tokio::sync::Mutex::new(None),
+        public_address_v6: tokio::sync::Mutex::new(stun_public_ip_v6),
         public_address_v4: tokio::sync::Mutex::new(stun_public_ip),
         stun_external_port: tokio::sync::Mutex::new(stun_external_port),
+        temporary_state: tokio::sync::Mutex::new(crate::app_state::TemporaryRuntimeState::default()),
     };
     app_handle.manage(network_state);
 

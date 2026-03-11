@@ -1,6 +1,6 @@
 import { writable, derived, get } from "svelte/store";
-import { invoke } from "@tauri-apps/api/core";
 import { tick } from "svelte";
+import { api } from "$lib/tauri/api";
 
 // Types
 export type Message = { sender: string; text: string; timestamp: Date };
@@ -46,9 +46,9 @@ export async function sendMessage(peer: string) {
   // Send to backend
   try {
     if (peer === "Me") {
-      await invoke("send_message_to_self", { message: text });
+      await api.sendMessageToSelf(text);
     } else {
-      await invoke("send_message", { peerId: peer, message: text });
+      await api.sendMessage(peer, text);
     }
   } catch (e) {
     console.error("Failed to send message:", e);
@@ -58,16 +58,13 @@ export async function sendMessage(peer: string) {
 
 export async function loadChatHistory(peer: string) {
   try {
-    const history = await invoke<{ sender: string; text: string; timestamp: number }[]>(
-      "get_chat_history",
-      { peerId: peer === "Me" ? "self" : peer }
-    );
+    const history = await api.getChatHistory(peer === "Me" ? "self" : peer);
     
     conversations.update((c) => ({
       ...c,
       [peer]: history.map((m) => ({
-        sender: m.sender,
-        text: m.text,
+        sender: m.peer_id === "Me" ? "Me" : m.peer_id,
+        text: m.text_content || "",
         timestamp: new Date(m.timestamp * 1000),
       })),
     }));

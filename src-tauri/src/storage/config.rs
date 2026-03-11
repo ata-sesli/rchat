@@ -11,7 +11,7 @@ use rand::rngs::OsRng;
 use x25519_dalek::StaticSecret;
 
 // Re-export theme types from theme module
-pub use super::theme::{AccentColors, BaseColors, ThemeConfig};
+pub use super::theme::{CustomThemeEntry, ThemeConfig};
 
 // System Configuration, can be modified only internally.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -67,6 +67,8 @@ pub struct UserConfig {
     #[serde(default)]
     pub selected_preset: Option<String>, // Currently selected theme preset key
     #[serde(default)]
+    pub custom_themes: Vec<CustomThemeEntry>,
+    #[serde(default)]
     pub github_peer_mapping: std::collections::HashMap<String, String>, // GitHub username → libp2p PeerId
 }
 
@@ -87,6 +89,7 @@ impl Default for UserConfig {
             pending_invitations: None,
             theme: ThemeConfig::default(),
             selected_preset: None,
+            custom_themes: vec![],
             github_peer_mapping: std::collections::HashMap::new(),
         }
     }
