@@ -137,7 +137,10 @@ pub(super) fn start_transfer_workers(
                         eprintln!("[ChunkTransfer] worker-{} task failed: {}", worker_id, err);
                     }
                     Err(join_err) => {
-                        eprintln!("[ChunkTransfer] worker-{} join error: {}", worker_id, join_err);
+                        eprintln!(
+                            "[ChunkTransfer] worker-{} join error: {}",
+                            worker_id, join_err
+                        );
                     }
                 }
 
@@ -239,7 +242,9 @@ fn process_transfer_task(
             }))
         }
         TransferTask::PersistChunkManifest { file_hash, chunks } => {
-            with_db_conn(app_handle, |conn| persist_chunk_manifest(conn, &file_hash, &chunks))?;
+            with_db_conn(app_handle, |conn| {
+                persist_chunk_manifest(conn, &file_hash, &chunks)
+            })?;
             Ok(Some(TransferResult::ManifestPersisted { file_hash }))
         }
         TransferTask::StoreChunkAndCheckComplete {
@@ -292,7 +297,10 @@ fn unix_timestamp_secs() -> i64 {
         .as_secs() as i64
 }
 
-fn load_chunk_manifest(conn: &rusqlite::Connection, file_hash: &str) -> Result<Vec<ChunkInfo>, String> {
+fn load_chunk_manifest(
+    conn: &rusqlite::Connection,
+    file_hash: &str,
+) -> Result<Vec<ChunkInfo>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT chunk_hash, chunk_order, chunk_size FROM file_chunks WHERE file_hash = ?1 ORDER BY chunk_order",
@@ -336,7 +344,11 @@ fn persist_chunk_manifest(
     Ok(())
 }
 
-fn store_chunk_file(chunks_dir: &Path, chunk_hash: &str, chunk_data: &[u8]) -> Result<usize, String> {
+fn store_chunk_file(
+    chunks_dir: &Path,
+    chunk_hash: &str,
+    chunk_data: &[u8],
+) -> Result<usize, String> {
     std::fs::create_dir_all(chunks_dir)
         .map_err(|e| format!("failed to create chunk dir {:?}: {}", chunks_dir, e))?;
 
@@ -392,19 +404,25 @@ fn evaluate_file_completion(
 
 impl NetworkManager {
     fn touch_transfer_state(&mut self, file_hash: &str) -> &mut TransferState {
-        let state = self.transfer_states.entry(file_hash.to_string()).or_default();
+        let state = self
+            .transfer_states
+            .entry(file_hash.to_string())
+            .or_default();
         state.updated_at = std::time::Instant::now();
         state
     }
 
     pub(super) fn cleanup_stale_transfer_states(&mut self) {
         let now = std::time::Instant::now();
-        self.transfer_states.retain(|_, state| {
-            now.duration_since(state.updated_at) < TRANSFER_STATE_STALE_TTL
-        });
+        self.transfer_states
+            .retain(|_, state| now.duration_since(state.updated_at) < TRANSFER_STATE_STALE_TTL);
     }
 
-    async fn enqueue_transfer_task(&mut self, task: TransferTask, context: &str) -> Result<(), String> {
+    async fn enqueue_transfer_task(
+        &mut self,
+        task: TransferTask,
+        context: &str,
+    ) -> Result<(), String> {
         if !self.transfer_accepting_tasks.load(Ordering::SeqCst) {
             return Err(format!("Transfer queue stopped in {}", context));
         }
@@ -501,7 +519,11 @@ impl NetworkManager {
         }
     }
 
-    pub(super) async fn handle_chunk_request(&mut self, peer: PeerId, request: &DirectMessageRequest) {
+    pub(super) async fn handle_chunk_request(
+        &mut self,
+        peer: PeerId,
+        request: &DirectMessageRequest,
+    ) {
         if let Some(ref chunk_hash) = request.chunk_hash {
             println!("[ChunkTransfer] 📦 Chunk request for: {}", chunk_hash);
             if let Err(e) = self
@@ -582,11 +604,9 @@ impl NetworkManager {
     }
 
     pub(super) async fn handle_chunk_response(&mut self, request: &DirectMessageRequest) {
-        if let (Some(ref file_hash), Some(ref chunk_hash), Some(ref chunk_b64)) = (
-            &request.file_hash,
-            &request.chunk_hash,
-            &request.chunk_data,
-        ) {
+        if let (Some(ref file_hash), Some(ref chunk_hash), Some(ref chunk_b64)) =
+            (&request.file_hash, &request.chunk_hash, &request.chunk_data)
+        {
             let state = self.touch_transfer_state(file_hash);
             if !state.manifest_persisted {
                 state
@@ -744,13 +764,13 @@ mod tests {
         let chunks_path = temp.path().join("chunks");
 
         store_chunk_file(&chunks_path, "ca", b"1234567890").expect("write chunk a");
-        let complete = evaluate_file_completion(&conn, &chunks_path, "file-b")
-            .expect("completion check a");
+        let complete =
+            evaluate_file_completion(&conn, &chunks_path, "file-b").expect("completion check a");
         assert!(!complete);
 
         store_chunk_file(&chunks_path, "cb", b"123456789012").expect("write chunk b");
-        let complete = evaluate_file_completion(&conn, &chunks_path, "file-b")
-            .expect("completion check b");
+        let complete =
+            evaluate_file_completion(&conn, &chunks_path, "file-b").expect("completion check b");
         assert!(complete);
 
         let is_complete: i64 = conn

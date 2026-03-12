@@ -41,12 +41,12 @@ impl NetworkManager {
     }
 
     pub(super) async fn send_read_receipt(&mut self, target_peer_id: String, msg_ids: Vec<String>) {
-        println!("[READ_RECEIPT] 📤 Sending read receipt to {}", target_peer_id);
+        println!(
+            "[READ_RECEIPT] 📤 Sending read receipt to {}",
+            target_peer_id
+        );
 
-        if let Some(peer_id) = self
-            .resolve_peer_id(&target_peer_id, "READ_RECEIPT")
-            .await
-        {
+        if let Some(peer_id) = self.resolve_peer_id(&target_peer_id, "READ_RECEIPT").await {
             use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
             let request = DirectMessageRequest {
                 id: format!(

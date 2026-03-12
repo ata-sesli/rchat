@@ -6,7 +6,12 @@ impl NetworkManager {
         self.refresh_peer_mapping_cache().await;
 
         let control_topic = crate::network::gossip::control_topic();
-        if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&control_topic) {
+        if let Err(e) = self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&control_topic)
+        {
             eprintln!(
                 "[Gossipsub] Failed to subscribe to control topic {}: {:?}",
                 crate::network::gossip::CONTROL_TOPIC,
@@ -59,7 +64,8 @@ impl NetworkManager {
         // Aggressive punch interval - 500ms for continuous hole punching
         let mut punch_interval = tokio::time::interval(std::time::Duration::from_millis(500));
         // Cleanup stale transfer states every minute.
-        let mut transfer_cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut transfer_cleanup_interval =
+            tokio::time::interval(std::time::Duration::from_secs(60));
 
         loop {
             tokio::select! {

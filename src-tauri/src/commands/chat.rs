@@ -105,7 +105,8 @@ pub async fn create_group_chat(
 
     {
         let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
-        storage::db::upsert_chat(&conn, &chat_id, &resolved_name, true).map_err(|e| e.to_string())?;
+        storage::db::upsert_chat(&conn, &chat_id, &resolved_name, true)
+            .map_err(|e| e.to_string())?;
         storage::db::add_chat_member(&conn, &chat_id, "Me", "admin").map_err(|e| e.to_string())?;
     }
 
@@ -142,7 +143,8 @@ pub async fn join_group_chat(
 
     {
         let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
-        storage::db::upsert_chat(&conn, &chat_id, &resolved_name, true).map_err(|e| e.to_string())?;
+        storage::db::upsert_chat(&conn, &chat_id, &resolved_name, true)
+            .map_err(|e| e.to_string())?;
         storage::db::add_chat_member(&conn, &chat_id, "Me", "member").map_err(|e| e.to_string())?;
     }
 
@@ -190,7 +192,10 @@ pub async fn leave_group_chat(
 }
 
 #[tauri::command]
-pub async fn send_message_to_self(message: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn send_message_to_self(
+    message: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     println!("[Backend] send_message_to_self: {}", message);
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
 
@@ -244,7 +249,10 @@ pub async fn send_message(
         config.user.profile.alias.clone()
     };
 
-    let is_temporary = matches!(chat_kind, ChatKind::TemporaryDirect | ChatKind::TemporaryGroup);
+    let is_temporary = matches!(
+        chat_kind,
+        ChatKind::TemporaryDirect | ChatKind::TemporaryGroup
+    );
     let is_archived = matches!(chat_kind, ChatKind::Archived);
     if is_archived {
         return Err("Archived chats are read-only".to_string());
@@ -290,31 +298,35 @@ pub async fn send_message(
             match chat_kind {
                 ChatKind::Direct => {
                     if !storage::db::is_peer(&conn, &peer_id) {
-                        if let Err(e) = storage::db::add_peer(&conn, &peer_id, None, None, "local") {
+                        if let Err(e) = storage::db::add_peer(&conn, &peer_id, None, None, "local")
+                        {
                             eprintln!("[Backend] Failed to auto-add peer: {}", e);
+                        }
                     }
-                }
 
-                if !storage::db::chat_exists(&conn, &peer_id) {
-                    if let Err(e) = storage::db::create_chat(&conn, &peer_id, &peer_id, false) {
-                        eprintln!("[Backend] Failed to auto-create chat: {}", e);
+                    if !storage::db::chat_exists(&conn, &peer_id) {
+                        if let Err(e) = storage::db::create_chat(&conn, &peer_id, &peer_id, false) {
+                            eprintln!("[Backend] Failed to auto-create chat: {}", e);
+                        }
                     }
-                }
                 }
                 ChatKind::Group => {
                     if !storage::db::chat_exists(&conn, &peer_id) {
                         storage::db::upsert_chat(
                             &conn,
-                        &peer_id,
-                        &chat_kind::default_group_name(&peer_id),
-                        true,
-                    )
-                    .map_err(|e| e.to_string())?;
-                    storage::db::add_chat_member(&conn, &peer_id, "Me", "member")
+                            &peer_id,
+                            &chat_kind::default_group_name(&peer_id),
+                            true,
+                        )
                         .map_err(|e| e.to_string())?;
+                        storage::db::add_chat_member(&conn, &peer_id, "Me", "member")
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
-                }
-                ChatKind::SelfChat | ChatKind::TemporaryDirect | ChatKind::TemporaryGroup | ChatKind::Archived => {}
+                ChatKind::SelfChat
+                | ChatKind::TemporaryDirect
+                | ChatKind::TemporaryGroup
+                | ChatKind::Archived => {}
             }
 
             if let Err(e) = storage::db::insert_message(&conn, &msg) {
@@ -380,9 +392,16 @@ pub async fn get_chat_history(
     println!("[Backend] get_chat_history for: {}", chat_id);
 
     let chat_kind = chat_kind::parse_chat_kind(&chat_id);
-    if matches!(chat_kind, ChatKind::TemporaryDirect | ChatKind::TemporaryGroup) {
+    if matches!(
+        chat_kind,
+        ChatKind::TemporaryDirect | ChatKind::TemporaryGroup
+    ) {
         let temp_state = net_state.temporary_state.lock().await;
-        let messages = temp_state.messages.get(&chat_id).cloned().unwrap_or_default();
+        let messages = temp_state
+            .messages
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_default();
         return Ok(messages);
     }
 
@@ -417,7 +436,10 @@ pub async fn mark_messages_read(
     let chat_kind = chat_kind::parse_chat_kind(&chat_id);
 
     let marked_ids = {
-        if matches!(chat_kind, ChatKind::TemporaryDirect | ChatKind::TemporaryGroup) {
+        if matches!(
+            chat_kind,
+            ChatKind::TemporaryDirect | ChatKind::TemporaryGroup
+        ) {
             let mut temp_state = net_state.temporary_state.lock().await;
             let messages = temp_state.messages.entry(chat_id.clone()).or_default();
             let mut ids = Vec::new();
@@ -431,10 +453,10 @@ pub async fn mark_messages_read(
         } else {
             let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
             match chat_kind {
-                ChatKind::Group => {
-                    storage::db::mark_group_messages_read(&conn, &chat_id).map_err(|e| e.to_string())?
-                }
-                _ => storage::db::mark_messages_read(&conn, &chat_id, &chat_id).map_err(|e| e.to_string())?,
+                ChatKind::Group => storage::db::mark_group_messages_read(&conn, &chat_id)
+                    .map_err(|e| e.to_string())?,
+                _ => storage::db::mark_messages_read(&conn, &chat_id, &chat_id)
+                    .map_err(|e| e.to_string())?,
             }
         }
     };
@@ -493,7 +515,11 @@ pub async fn save_temporary_chat_to_archive(
         let Some(session) = temp_state.chats.get(&chat_id).cloned() else {
             return Err("Temporary chat not found".to_string());
         };
-        let messages = temp_state.messages.get(&chat_id).cloned().unwrap_or_default();
+        let messages = temp_state
+            .messages
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_default();
         if messages.is_empty() {
             return Err("No temporary messages to archive".to_string());
         }
@@ -506,11 +532,9 @@ pub async fn save_temporary_chat_to_archive(
         let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
 
         if conn
-            .query_row(
-                "SELECT 1 FROM envelopes WHERE id = 'archived'",
-                [],
-                |_| Ok(()),
-            )
+            .query_row("SELECT 1 FROM envelopes WHERE id = 'archived'", [], |_| {
+                Ok(())
+            })
             .is_err()
         {
             storage::db::create_envelope(&conn, "archived", "Archived", None)
@@ -533,9 +557,11 @@ pub async fn save_temporary_chat_to_archive(
 
             if let Some(file_hash) = &msg.file_hash {
                 let file_exists: bool = conn
-                    .query_row("SELECT 1 FROM files WHERE file_hash = ?1", [file_hash], |_| {
-                        Ok(true)
-                    })
+                    .query_row(
+                        "SELECT 1 FROM files WHERE file_hash = ?1",
+                        [file_hash],
+                        |_| Ok(true),
+                    )
                     .unwrap_or(false);
                 if !file_exists {
                     msg.text_content = Some(

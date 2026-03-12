@@ -1,6 +1,12 @@
 <script lang="ts">
   import { listen } from "@tauri-apps/api/event";
-  import { onMount } from "svelte";
+  import {
+    getCurrent,
+    isRegistered,
+    onOpenUrl,
+    register,
+  } from "@tauri-apps/plugin-deep-link";
+  import { onDestroy, onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
   import { api } from "$lib/tauri/api";
@@ -87,6 +93,8 @@
 
   // Unread message counts per chat
   let unreadCounts: Record<string, number> = {};
+  const seenDeepLinks = new Set<string>();
+  let unlistenOpenUrl: (() => void) | null = null;
 
   $: sortedPeers = computeSortedPeers(
     peers,
@@ -151,6 +159,33 @@
   }
 
   // Lifecycle
+  async function redeemTemporaryLinkAndNavigate(link: string): Promise<boolean> {
+    try {
+      const result = await api.redeemTemporaryInvite(link);
+      await refreshData();
+      goto(`/chat/${result.chat_id}`);
+      return true;
+    } catch (e) {
+      console.error("Failed to redeem temporary invite from deep link:", e);
+      return false;
+    }
+  }
+
+  async function handleDeepLinks(urls: string[] | null | undefined) {
+    if (!urls?.length) return;
+    for (const url of urls) {
+      const normalized = url.trim();
+      if (!normalized || seenDeepLinks.has(normalized)) continue;
+      seenDeepLinks.add(normalized);
+      if (normalized.startsWith("rchat://temp/")) {
+        const redeemed = await redeemTemporaryLinkAndNavigate(normalized);
+        if (!redeemed) {
+          seenDeepLinks.delete(normalized);
+        }
+      }
+    }
+  }
+
   onMount(async () => {
     try {
       await listen("auth-status", () => refreshData());
@@ -163,13 +198,7 @@
       window.addEventListener("open-temp-invite", async (event: Event) => {
         const link = (event as CustomEvent<{ link?: string }>).detail?.link;
         if (!link) return;
-        try {
-          const result = await api.redeemTemporaryInvite(link);
-          await refreshData();
-          goto(`/chat/${result.chat_id}`);
-        } catch (e) {
-          console.error("Failed to redeem temporary invite from deep link:", e);
-        }
+        await redeemTemporaryLinkAndNavigate(link);
       });
       await listen("local-peer-discovered", (event: any) => {
         const peer = event.payload;
@@ -232,8 +261,26 @@
       });
 
       await refreshData();
+      try {
+        if (!(await isRegistered("rchat"))) {
+          await register("rchat");
+        }
+      } catch {
+        // Not all platforms support dynamic registration.
+      }
+      await handleDeepLinks(await getCurrent());
+      unlistenOpenUrl = await onOpenUrl((urls) => {
+        void handleDeepLinks(urls);
+      });
     } catch (e) {
       console.error("Setup failed:", e);
+    }
+  });
+
+  onDestroy(() => {
+    if (unlistenOpenUrl) {
+      unlistenOpenUrl();
+      unlistenOpenUrl = null;
     }
   });
 

@@ -34,13 +34,36 @@
   let simpleSecondary = $state(DEFAULT_SECONDARY);
   let simpleText = $state(DEFAULT_TEXT);
 
-  let baseColor = $state("#64748b");
-  let primaryColor = $state(DEFAULT_PRIMARY);
-  let secondaryColor = $state(DEFAULT_SECONDARY);
-  let errorColor = $state("#ef4444");
-  let successColor = $state("#22c55e");
-  let infoColor = $state("#3b82f6");
-  let warningColor = $state("#f59e0b");
+  let sidebarColor = $state("#0f172a");
+  let chatSectionColor = $state("#020617");
+  let peerMessageColor = $state("#1e293b");
+  let userMessageColor = $state("#0d9488");
+  let editorTextColor = $state(DEFAULT_TEXT);
+
+  let semanticError = $state<ThemeConfig["error"]>({
+    "600": "#dc2626",
+    "500": "#ef4444",
+    "400": "#f87171",
+    "300": "#fca5a5",
+  });
+  let semanticSuccess = $state<ThemeConfig["success"]>({
+    "600": "#16a34a",
+    "500": "#22c55e",
+    "400": "#4ade80",
+    "300": "#86efac",
+  });
+  let semanticInfo = $state<ThemeConfig["info"]>({
+    "600": "#2563eb",
+    "500": "#3b82f6",
+    "400": "#60a5fa",
+    "300": "#93c5fd",
+  });
+  let semanticWarning = $state<ThemeConfig["warning"]>({
+    "600": "#d97706",
+    "500": "#f59e0b",
+    "400": "#fbbf24",
+    "300": "#fcd34d",
+  });
 
   const customPresets = $derived(presets.filter((preset) => preset.source === "custom"));
 
@@ -165,13 +188,15 @@
   }
 
   function loadColorInputsFromTheme(theme: ThemeConfig) {
-    baseColor = theme.base["500"];
-    primaryColor = theme.primary["500"];
-    secondaryColor = theme.secondary["500"];
-    errorColor = theme.error["500"];
-    successColor = theme.success["500"];
-    infoColor = theme.info["500"];
-    warningColor = theme.warning["500"];
+    sidebarColor = theme.base["900"];
+    chatSectionColor = theme.base["950"];
+    peerMessageColor = theme.base["800"];
+    userMessageColor = theme.primary["600"];
+    editorTextColor = theme.base["100"];
+    semanticError = { ...theme.error };
+    semanticSuccess = { ...theme.success };
+    semanticInfo = { ...theme.info };
+    semanticWarning = { ...theme.warning };
   }
 
   async function switchCreationMode(mode: CreationMode) {
@@ -296,21 +321,20 @@
 
     return JSON.stringify([
       ...base,
-      baseColor,
-      primaryColor,
-      secondaryColor,
-      errorColor,
-      successColor,
-      infoColor,
-      warningColor,
+      sidebarColor,
+      chatSectionColor,
+      peerMessageColor,
+      userMessageColor,
+      editorTextColor,
     ]);
   }
 
   $effect(() => {
     if (!editorOpen || creationMode !== "advanced") return;
 
-    draftTheme = buildAdvancedTheme();
-    applyThemeToCSS(draftTheme);
+    const nextTheme = buildAdvancedTheme();
+    draftTheme = nextTheme;
+    applyThemeToCSS(nextTheme);
   });
 
   $effect(() => {
@@ -361,83 +385,44 @@
     );
   }
 
-  function hexToHsl(hex: string): [number, number, number] {
-    const [r, g, b] = hexToRgb(hex).map((value) => value / 255);
-    const max = Math.max(r, g, b);
-    const min = Math.min(r, g, b);
-    let h = 0;
-    let s = 0;
-    const l = (max + min) / 2;
-
-    if (max !== min) {
-      const d = max - min;
-      s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-      switch (max) {
-        case r:
-          h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
-          break;
-        case g:
-          h = ((b - r) / d + 2) / 6;
-          break;
-        case b:
-          h = ((r - g) / d + 4) / 6;
-          break;
-      }
-    }
-
-    return [h * 360, s * 100, l * 100];
+  function blendHex(fromHex: string, toHex: string, ratio: number): string {
+    const t = Math.max(0, Math.min(1, ratio));
+    const [r1, g1, b1] = hexToRgb(fromHex);
+    const [r2, g2, b2] = hexToRgb(toHex);
+    return rgbToHex(r1 + (r2 - r1) * t, g1 + (g2 - g1) * t, b1 + (b2 - b1) * t);
   }
 
-  function hslToHex(h: number, s: number, l: number): string {
-    const sat = s / 100;
-    const light = l / 100;
-    const a = sat * Math.min(light, 1 - light);
-    const f = (n: number) => {
-      const k = (n + h / 30) % 12;
-      const color = light - a * Math.max(Math.min(k - 3, 9 - k, 1), -1);
-      return Math.round(255 * color)
-        .toString(16)
-        .padStart(2, "0");
-    };
-
-    return `#${f(0)}${f(8)}${f(4)}`;
-  }
-
-  function generateAccentShades(baseHex: string): ThemeConfig["primary"] {
-    const [h, s] = hexToHsl(baseHex);
+  function generateAccentFromAnchor(anchorHex: string, textHex: string): ThemeConfig["primary"] {
     return {
-      "600": hslToHex(h, Math.min(s + 10, 100), 40),
-      "500": hslToHex(h, s, 50),
-      "400": hslToHex(h, Math.max(s - 5, 0), 62),
-      "300": hslToHex(h, Math.max(s - 10, 0), 75),
-    };
-  }
-
-  function generateBaseShades(baseHex: string): ThemeConfig["base"] {
-    const [h, s] = hexToHsl(baseHex);
-    return {
-      "950": hslToHex(h, s, 3),
-      "900": hslToHex(h, s, 8),
-      "800": hslToHex(h, s, 15),
-      "700": hslToHex(h, s, 25),
-      "600": hslToHex(h, s, 35),
-      "500": hslToHex(h, s, 45),
-      "400": hslToHex(h, s, 60),
-      "300": hslToHex(h, s, 75),
-      "200": hslToHex(h, s, 88),
-      "100": hslToHex(h, s, 95),
+      "600": anchorHex,
+      "500": blendHex(anchorHex, textHex, 0.16),
+      "400": blendHex(anchorHex, textHex, 0.32),
+      "300": blendHex(anchorHex, textHex, 0.48),
     };
   }
 
   function buildAdvancedTheme(): ThemeConfig {
+    const secondarySeed = blendHex(sidebarColor, userMessageColor, 0.55);
+
     return {
-      base: generateBaseShades(baseColor),
-      primary: generateAccentShades(primaryColor),
-      secondary: generateAccentShades(secondaryColor),
-      error: generateAccentShades(errorColor),
-      success: generateAccentShades(successColor),
-      info: generateAccentShades(infoColor),
-      warning: generateAccentShades(warningColor),
+      base: {
+        "950": chatSectionColor,
+        "900": sidebarColor,
+        "800": peerMessageColor,
+        "700": blendHex(peerMessageColor, editorTextColor, 0.18),
+        "600": blendHex(peerMessageColor, editorTextColor, 0.32),
+        "500": blendHex(sidebarColor, editorTextColor, 0.38),
+        "400": blendHex(sidebarColor, editorTextColor, 0.54),
+        "300": blendHex(sidebarColor, editorTextColor, 0.7),
+        "200": blendHex(sidebarColor, editorTextColor, 0.86),
+        "100": editorTextColor,
+      },
+      primary: generateAccentFromAnchor(userMessageColor, editorTextColor),
+      secondary: generateAccentFromAnchor(secondarySeed, editorTextColor),
+      error: semanticError,
+      success: semanticSuccess,
+      info: semanticInfo,
+      warning: semanticWarning,
     };
   }
 
@@ -717,32 +702,24 @@
             {:else}
               <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
                 <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
-                  <div class="mb-2 text-xs text-theme-base-300">Base</div>
-                  <ColorPicker bind:hex={baseColor} />
+                  <div class="mb-2 text-xs text-theme-base-300">Left Sidebar Color</div>
+                  <ColorPicker bind:hex={sidebarColor} />
                 </div>
                 <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
-                  <div class="mb-2 text-xs text-theme-base-300">Primary</div>
-                  <ColorPicker bind:hex={primaryColor} />
+                  <div class="mb-2 text-xs text-theme-base-300">Chat Section Color</div>
+                  <ColorPicker bind:hex={chatSectionColor} />
                 </div>
                 <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
-                  <div class="mb-2 text-xs text-theme-base-300">Secondary</div>
-                  <ColorPicker bind:hex={secondaryColor} />
+                  <div class="mb-2 text-xs text-theme-base-300">Peer Message Box</div>
+                  <ColorPicker bind:hex={peerMessageColor} />
                 </div>
                 <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
-                  <div class="mb-2 text-xs text-theme-base-300">Error</div>
-                  <ColorPicker bind:hex={errorColor} />
+                  <div class="mb-2 text-xs text-theme-base-300">User Message Box</div>
+                  <ColorPicker bind:hex={userMessageColor} />
                 </div>
                 <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
-                  <div class="mb-2 text-xs text-theme-base-300">Success</div>
-                  <ColorPicker bind:hex={successColor} />
-                </div>
-                <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
-                  <div class="mb-2 text-xs text-theme-base-300">Info</div>
-                  <ColorPicker bind:hex={infoColor} />
-                </div>
-                <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3 md:col-span-2 xl:col-span-1">
-                  <div class="mb-2 text-xs text-theme-base-300">Warning</div>
-                  <ColorPicker bind:hex={warningColor} />
+                  <div class="mb-2 text-xs text-theme-base-300">Text Color</div>
+                  <ColorPicker bind:hex={editorTextColor} />
                 </div>
               </div>
             {/if}
@@ -750,14 +727,23 @@
 
           <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-3 space-y-3">
             <div class="text-xs uppercase tracking-wide text-theme-base-400">Live Preview</div>
-            <div class="rounded-lg border p-3" style={`background: ${draftTheme.base["900"]}; border-color: ${draftTheme.base["700"]};`}>
-              <div class="mb-3 text-sm font-semibold" style={`color: ${draftTheme.base["100"]};`}>Sample Chat</div>
-              <div class="space-y-2 text-xs">
-                <div class="max-w-[85%] rounded-xl rounded-bl-sm border px-3 py-2" style={`background: ${draftTheme.base["800"]}; border-color: ${draftTheme.base["700"]}; color: ${draftTheme.base["100"]};`}>
-                  Incoming message
+            <div class="rounded-lg border p-2" style={`background: ${draftTheme.base["900"]}; border-color: ${draftTheme.base["700"]};`}>
+              <div class="grid grid-cols-[72px_1fr] gap-2">
+                <div class="rounded-md p-2 text-[10px] font-semibold" style={`background: ${draftTheme.base["900"]}; color: ${draftTheme.base["100"]};`}>
+                  Sidebar
                 </div>
-                <div class="ml-auto max-w-[85%] rounded-xl rounded-br-sm px-3 py-2" style={`background: ${draftTheme.primary["600"]}; color: ${getContrastYIQ(draftTheme.primary["600"])};`}>
-                  Outgoing message
+                <div class="rounded-md p-3" style={`background: ${draftTheme.base["950"]};`}>
+                  <div class="mb-2 text-xs font-semibold" style={`color: ${draftTheme.base["100"]};`}>
+                    Chat Section
+                  </div>
+                  <div class="space-y-2 text-xs">
+                    <div class="max-w-[85%] rounded-xl rounded-bl-sm border px-3 py-2" style={`background: ${draftTheme.base["800"]}; border-color: ${draftTheme.base["700"]}; color: ${draftTheme.base["100"]};`}>
+                      Peer Message Box
+                    </div>
+                    <div class="ml-auto max-w-[85%] rounded-xl rounded-br-sm px-3 py-2" style={`background: ${draftTheme.primary["600"]}; color: ${getContrastYIQ(draftTheme.primary["600"])};`}>
+                      User Message Box
+                    </div>
+                  </div>
                 </div>
               </div>
               <div class="mt-3 flex gap-2 text-[11px]">

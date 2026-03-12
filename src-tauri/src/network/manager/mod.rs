@@ -1,7 +1,7 @@
-use futures::StreamExt;
 use crate::network::behaviour::{RChatBehaviour, RChatBehaviourEvent};
 use crate::network::command::NetworkCommand;
 use crate::network::gossip::GroupMessageEnvelope;
+use futures::StreamExt;
 use libp2p::{swarm::SwarmEvent, Multiaddr, PeerId, Swarm};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -148,9 +148,7 @@ fn build_incoming_dm_db_message(
     }
 }
 
-fn build_incoming_group_db_message(
-    envelope: &GroupMessageEnvelope,
-) -> crate::storage::db::Message {
+fn build_incoming_group_db_message(envelope: &GroupMessageEnvelope) -> crate::storage::db::Message {
     let text_content = match envelope.content_type {
         crate::network::gossip::GroupContentType::Text => envelope.text_content.clone(),
         crate::network::gossip::GroupContentType::Image => None,
@@ -290,30 +288,30 @@ impl NetworkManager {
         target_peer_id: &str,
         context: &str,
     ) -> Option<PeerId> {
-        let actual_peer_id_str = if let Some(mapped_peer_id) = self.temp_peer_by_chat_id.get(target_peer_id)
-        {
-            mapped_peer_id.clone()
-        } else if let Some(github_username) = target_peer_id.strip_prefix("gh:") {
-            if !self.peer_id_by_github.contains_key(github_username) {
-                self.refresh_peer_mapping_cache().await;
-            }
+        let actual_peer_id_str =
+            if let Some(mapped_peer_id) = self.temp_peer_by_chat_id.get(target_peer_id) {
+                mapped_peer_id.clone()
+            } else if let Some(github_username) = target_peer_id.strip_prefix("gh:") {
+                if !self.peer_id_by_github.contains_key(github_username) {
+                    self.refresh_peer_mapping_cache().await;
+                }
 
-            if let Some(peer_id_string) = self.peer_id_by_github.get(github_username) {
-                println!(
-                    "[{}] 🔄 Resolved GitHub user {} to PeerId {}",
-                    context, github_username, peer_id_string
-                );
-                peer_id_string.clone()
+                if let Some(peer_id_string) = self.peer_id_by_github.get(github_username) {
+                    println!(
+                        "[{}] 🔄 Resolved GitHub user {} to PeerId {}",
+                        context, github_username, peer_id_string
+                    );
+                    peer_id_string.clone()
+                } else {
+                    eprintln!(
+                        "[{}] ❌ No PeerId mapping found for GitHub user {}. Message queued.",
+                        context, github_username
+                    );
+                    return None;
+                }
             } else {
-                eprintln!(
-                    "[{}] ❌ No PeerId mapping found for GitHub user {}. Message queued.",
-                    context, github_username
-                );
-                return None;
-            }
-        } else {
-            target_peer_id.to_string()
-        };
+                target_peer_id.to_string()
+            };
 
         match actual_peer_id_str.parse::<PeerId>() {
             Ok(p) => Some(p),

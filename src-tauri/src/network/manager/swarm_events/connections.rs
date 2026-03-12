@@ -16,12 +16,7 @@ impl NetworkManager {
 
         let mut to_remove = Vec::new();
         for (name, (addr, _)) in self.active_punch_targets.iter() {
-            let target_ip = addr
-                .to_string()
-                .split('/')
-                .nth(2)
-                .unwrap_or("")
-                .to_string();
+            let target_ip = addr.to_string().split('/').nth(2).unwrap_or("").to_string();
             let connected_ip = remote_addr
                 .to_string()
                 .split('/')
@@ -85,11 +80,8 @@ impl NetworkManager {
                 let pending_ip = pending_addr.split('/').nth(2);
                 let remote_ip = remote_addr_str.split('/').nth(2);
                 if pending_ip == remote_ip && pending_ip.is_some() {
-                    matched_data = Some((
-                        pending_addr.clone(),
-                        inviter_user.clone(),
-                        my_user.clone(),
-                    ));
+                    matched_data =
+                        Some((pending_addr.clone(), inviter_user.clone(), my_user.clone()));
                     break;
                 }
             }
@@ -117,7 +109,10 @@ impl NetworkManager {
                     if let Err(e) = mgr.save(&config).await {
                         eprintln!("[DIAL] Failed to save GitHub peer mapping: {}", e);
                     } else {
-                        println!("[DIAL] ✅ Saved mapping: {} → {}", gh_user, peer_id_for_mapping);
+                        println!(
+                            "[DIAL] ✅ Saved mapping: {} → {}",
+                            gh_user, peer_id_for_mapping
+                        );
                     }
                 }
             });
@@ -162,7 +157,10 @@ impl NetworkManager {
                 addresses: vec![],
             };
             let _ = self.app_handle.emit("local-peer-discovered", peer_info);
-            println!("[HANDSHAKE] ✅ Emitted local-peer-discovered for {}", chat_id);
+            println!(
+                "[HANDSHAKE] ✅ Emitted local-peer-discovered for {}",
+                chat_id
+            );
         }
     }
 

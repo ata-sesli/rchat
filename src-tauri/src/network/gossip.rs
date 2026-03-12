@@ -68,7 +68,10 @@ pub fn topic_for_group_id(group_id: &str) -> Option<IdentTopic> {
         return Some(IdentTopic::new(format!("{}{}", GROUP_TOPIC_PREFIX, uuid)));
     }
     if let Some(uuid) = chat_kind::temp_group_uuid_from_chat_id(group_id) {
-        return Some(IdentTopic::new(format!("{}{}", TEMP_GROUP_TOPIC_PREFIX, uuid)));
+        return Some(IdentTopic::new(format!(
+            "{}{}",
+            TEMP_GROUP_TOPIC_PREFIX, uuid
+        )));
     }
     None
 }

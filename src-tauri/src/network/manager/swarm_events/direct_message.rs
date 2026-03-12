@@ -28,7 +28,12 @@ impl NetworkManager {
                             let status = self.handle_incoming_user_message(peer, &request).await;
                             match status {
                                 Ok(()) => {
-                                    self.send_status_response(channel, request.id, "delivered", None);
+                                    self.send_status_response(
+                                        channel,
+                                        request.id,
+                                        "delivered",
+                                        None,
+                                    );
                                 }
                                 Err(err) => {
                                     self.send_status_response(
@@ -42,18 +47,36 @@ impl NetworkManager {
                         }
                         DirectMessageKind::InviteHandshake => {
                             self.handle_invite_handshake(&request).await;
-                            self.send_status_response(channel, request.id.clone(), "delivered", None);
+                            self.send_status_response(
+                                channel,
+                                request.id.clone(),
+                                "delivered",
+                                None,
+                            );
                         }
                         DirectMessageKind::TempHandshake => {
                             self.handle_temp_handshake(peer, &request).await;
-                            self.send_status_response(channel, request.id.clone(), "delivered", None);
+                            self.send_status_response(
+                                channel,
+                                request.id.clone(),
+                                "delivered",
+                                None,
+                            );
                         }
                         DirectMessageKind::ReadReceipt => {
                             match self.handle_read_receipt(&request).await {
-                                Ok(_) => self.send_status_response(channel, request.id, "delivered", None),
-                                Err(err) => {
-                                    self.send_status_response(channel, request.id, "error", Some(err))
-                                }
+                                Ok(_) => self.send_status_response(
+                                    channel,
+                                    request.id,
+                                    "delivered",
+                                    None,
+                                ),
+                                Err(err) => self.send_status_response(
+                                    channel,
+                                    request.id,
+                                    "error",
+                                    Some(err),
+                                ),
                             }
                         }
                         DirectMessageKind::FileMetadataRequest => {
@@ -98,10 +121,13 @@ impl NetworkManager {
                                 let mut updated_runtime = false;
                                 {
                                     use tauri::Manager;
-                                    let network_state = self.app_handle.state::<crate::NetworkState>();
+                                    let network_state =
+                                        self.app_handle.state::<crate::NetworkState>();
                                     let mut temp_state = network_state.temporary_state.lock().await;
                                     for msgs in temp_state.messages.values_mut() {
-                                        if let Some(found) = msgs.iter_mut().find(|m| m.id == response.msg_id) {
+                                        if let Some(found) =
+                                            msgs.iter_mut().find(|m| m.id == response.msg_id)
+                                        {
                                             found.status = "delivered".to_string();
                                             updated_runtime = true;
                                             break;
@@ -215,7 +241,8 @@ impl NetworkManager {
                 let metadata_req = crate::network::direct_message::DirectMessageRequest {
                     id: format!("meta-req-{}", file_hash),
                     sender_id: self.swarm.local_peer_id().to_string(),
-                    msg_type: crate::network::direct_message::DirectMessageKind::FileMetadataRequest,
+                    msg_type:
+                        crate::network::direct_message::DirectMessageKind::FileMetadataRequest,
                     text_content: None,
                     file_hash: Some(file_hash.clone()),
                     timestamp: std::time::SystemTime::now()
@@ -271,7 +298,10 @@ impl NetworkManager {
                         if let Err(e) = mgr.save(&config).await {
                             eprintln!("[HANDSHAKE] Failed to save mapping: {}", e);
                         } else {
-                            println!("[HANDSHAKE] ✅ Saved mapping: {} → {}", gh_user, peer_id_str);
+                            println!(
+                                "[HANDSHAKE] ✅ Saved mapping: {} → {}",
+                                gh_user, peer_id_str
+                            );
                         }
                     }
                 });
@@ -288,7 +318,8 @@ impl NetworkManager {
                     );
                 }
                 if !crate::storage::db::chat_exists(&conn, &chat_id) {
-                    let _ = crate::storage::db::create_chat(&conn, &chat_id, &invitee_github, false);
+                    let _ =
+                        crate::storage::db::create_chat(&conn, &chat_id, &invitee_github, false);
                 }
                 println!("[HANDSHAKE] ✅ Created chat: {}", chat_id);
             }
@@ -307,7 +338,10 @@ impl NetworkManager {
                 addresses: vec![],
             };
             let _ = self.app_handle.emit("local-peer-discovered", peer_info);
-            println!("[HANDSHAKE] ✅ Emitted local-peer-discovered for {}", chat_id);
+            println!(
+                "[HANDSHAKE] ✅ Emitted local-peer-discovered for {}",
+                chat_id
+            );
         }
     }
 

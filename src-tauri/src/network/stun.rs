@@ -62,7 +62,10 @@ pub async fn discover_on_port(local_port: u16) -> StunResult {
     }
 
     if result.ipv4.is_none() {
-        eprintln!("[STUN] ❌ No external address discovered on port {}", local_port);
+        eprintln!(
+            "[STUN] ❌ No external address discovered on port {}",
+            local_port
+        );
     }
 
     result
@@ -120,8 +123,8 @@ fn query_stun_raw(socket: &UdpSocket, server: SocketAddr) -> Result<SocketAddr, 
                     // IPv4
                     let port =
                         u16::from_be_bytes([data[2], data[3]]) ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
-                    let ip =
-                        u32::from_be_bytes([data[4], data[5], data[6], data[7]]) ^ STUN_MAGIC_COOKIE;
+                    let ip = u32::from_be_bytes([data[4], data[5], data[6], data[7]])
+                        ^ STUN_MAGIC_COOKIE;
                     return Ok(SocketAddr::new(Ipv4Addr::from(ip).into(), port));
                 }
                 if family == 0x02 && attr_len >= 20 {

@@ -86,9 +86,7 @@ fn convert_to_webp_with_auto_downscale(image: DynamicImage) -> Result<Vec<u8>, S
         current = current.resize(next_w, next_h, FilterType::Lanczos3);
     }
 
-    Err(
-        "Converted WebP sticker is still larger than 1MB after auto-compression".to_string(),
-    )
+    Err("Converted WebP sticker is still larger than 1MB after auto-compression".to_string())
 }
 
 fn sticker_name_from_path(file_path: &str) -> String {
@@ -102,8 +100,8 @@ fn sticker_name_from_path(file_path: &str) -> String {
 }
 
 fn prepare_sticker_for_import(file_path: &str) -> Result<PreparedSticker, String> {
-    let input_data =
-        std::fs::read(file_path).map_err(|e| format!("Failed to read file '{}': {}", file_path, e))?;
+    let input_data = std::fs::read(file_path)
+        .map_err(|e| format!("Failed to read file '{}': {}", file_path, e))?;
 
     let ext = Path::new(file_path)
         .extension()
@@ -141,7 +139,11 @@ fn prepare_sticker_for_import(file_path: &str) -> Result<PreparedSticker, String
 }
 
 fn detect_audio_mime(file_path: &str) -> Option<&'static str> {
-    match file_path.rsplit('.').next().map(|ext| ext.to_ascii_lowercase()) {
+    match file_path
+        .rsplit('.')
+        .next()
+        .map(|ext| ext.to_ascii_lowercase())
+    {
         Some(ext) if ext == "mp3" => Some("audio/mpeg"),
         Some(ext) if ext == "m4a" => Some("audio/mp4"),
         Some(ext) if ext == "wav" => Some("audio/wav"),
@@ -207,8 +209,14 @@ pub async fn send_image_message(
 
     let file_hash = {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
-        storage::object::create(&conn, &file_data, file_name.as_deref(), Some(mime_type), None)
-            .map_err(|e| format!("Failed to store image: {}", e))?
+        storage::object::create(
+            &conn,
+            &file_data,
+            file_name.as_deref(),
+            Some(mime_type),
+            None,
+        )
+        .map_err(|e| format!("Failed to store image: {}", e))?
     };
 
     let timestamp = std::time::SystemTime::now()
@@ -220,7 +228,10 @@ pub async fn send_image_message(
     let msg_id = format!("{}-{}", timestamp, id_suffix);
 
     let chat_kind = chat_kind::parse_chat_kind(&peer_id);
-    let is_temporary = matches!(chat_kind, ChatKind::TemporaryDirect | ChatKind::TemporaryGroup);
+    let is_temporary = matches!(
+        chat_kind,
+        ChatKind::TemporaryDirect | ChatKind::TemporaryGroup
+    );
     let status = outgoing_status_for_chat(chat_kind)?;
     let chat_id = if matches!(chat_kind, ChatKind::SelfChat) {
         "self".to_string()
@@ -245,8 +256,13 @@ pub async fn send_image_message(
     } else {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
         if matches!(chat_kind, ChatKind::Group) && !storage::db::chat_exists(&conn, &peer_id) {
-            storage::db::upsert_chat(&conn, &peer_id, &chat_kind::default_group_name(&peer_id), true)
-                .map_err(|e| e.to_string())?;
+            storage::db::upsert_chat(
+                &conn,
+                &peer_id,
+                &chat_kind::default_group_name(&peer_id),
+                true,
+            )
+            .map_err(|e| e.to_string())?;
             storage::db::add_chat_member(&conn, &peer_id, "Me", "member")
                 .map_err(|e| e.to_string())?;
         }
@@ -300,7 +316,10 @@ pub async fn send_image_message(
 }
 
 #[tauri::command]
-pub async fn get_image_data(file_hash: String, state: State<'_, AppState>) -> Result<String, String> {
+pub async fn get_image_data(
+    file_hash: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
 
     let data = storage::object::load(&conn, &file_hash, None)
@@ -323,8 +342,8 @@ pub async fn get_image_data(file_hash: String, state: State<'_, AppState>) -> Re
 
 #[tauri::command]
 pub async fn get_image_from_path(file_path: String) -> Result<String, String> {
-    let data = std::fs::read(&file_path)
-        .map_err(|e| format!("Failed to read image file: {}", e))?;
+    let data =
+        std::fs::read(&file_path).map_err(|e| format!("Failed to read image file: {}", e))?;
 
     let mime_type = if file_path.ends_with(".png") {
         "image/png"
@@ -372,7 +391,8 @@ pub async fn send_document_message(
     println!("[Backend] Sending document to {}: {}", peer_id, file_path);
     let chat_kind = chat_kind::parse_chat_kind(&peer_id);
 
-    let file_data = std::fs::read(&file_path).map_err(|e| format!("Failed to read document: {}", e))?;
+    let file_data =
+        std::fs::read(&file_path).map_err(|e| format!("Failed to read document: {}", e))?;
 
     let file_name = std::path::Path::new(&file_path)
         .file_name()
@@ -407,7 +427,10 @@ pub async fn send_document_message(
     let id_suffix: u32 = rand::random();
     let msg_id = format!("{}-{}", timestamp, id_suffix);
 
-    let is_temporary = matches!(chat_kind, ChatKind::TemporaryDirect | ChatKind::TemporaryGroup);
+    let is_temporary = matches!(
+        chat_kind,
+        ChatKind::TemporaryDirect | ChatKind::TemporaryGroup
+    );
     let status = outgoing_status_for_chat(chat_kind)?;
     let chat_id = if matches!(chat_kind, ChatKind::SelfChat) {
         "self".to_string()
@@ -432,8 +455,13 @@ pub async fn send_document_message(
     } else {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
         if matches!(chat_kind, ChatKind::Group) && !storage::db::chat_exists(&conn, &peer_id) {
-            storage::db::upsert_chat(&conn, &peer_id, &chat_kind::default_group_name(&peer_id), true)
-                .map_err(|e| e.to_string())?;
+            storage::db::upsert_chat(
+                &conn,
+                &peer_id,
+                &chat_kind::default_group_name(&peer_id),
+                true,
+            )
+            .map_err(|e| e.to_string())?;
             storage::db::add_chat_member(&conn, &peer_id, "Me", "member")
                 .map_err(|e| e.to_string())?;
         }
@@ -479,7 +507,10 @@ pub async fn send_document_message(
         }
     }
 
-    println!("[Backend] Document message sent: hash={}, name={}", file_hash, file_name);
+    println!(
+        "[Backend] Document message sent: hash={}, name={}",
+        file_hash, file_name
+    );
     Ok(SentMediaResult {
         msg_id,
         file_hash,
@@ -514,7 +545,8 @@ pub async fn send_video_message(
     println!("[Backend] Sending video to {}: {}", peer_id, file_path);
     let chat_kind = chat_kind::parse_chat_kind(&peer_id);
 
-    let file_data = std::fs::read(&file_path).map_err(|e| format!("Failed to read video: {}", e))?;
+    let file_data =
+        std::fs::read(&file_path).map_err(|e| format!("Failed to read video: {}", e))?;
 
     let file_name = std::path::Path::new(&file_path)
         .file_name()
@@ -545,7 +577,10 @@ pub async fn send_video_message(
     let id_suffix: u32 = rand::random();
     let msg_id = format!("{}-{}", timestamp, id_suffix);
 
-    let is_temporary = matches!(chat_kind, ChatKind::TemporaryDirect | ChatKind::TemporaryGroup);
+    let is_temporary = matches!(
+        chat_kind,
+        ChatKind::TemporaryDirect | ChatKind::TemporaryGroup
+    );
     let status = outgoing_status_for_chat(chat_kind)?;
     let chat_id = if matches!(chat_kind, ChatKind::SelfChat) {
         "self".to_string()
@@ -570,8 +605,13 @@ pub async fn send_video_message(
     } else {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
         if matches!(chat_kind, ChatKind::Group) && !storage::db::chat_exists(&conn, &peer_id) {
-            storage::db::upsert_chat(&conn, &peer_id, &chat_kind::default_group_name(&peer_id), true)
-                .map_err(|e| e.to_string())?;
+            storage::db::upsert_chat(
+                &conn,
+                &peer_id,
+                &chat_kind::default_group_name(&peer_id),
+                true,
+            )
+            .map_err(|e| e.to_string())?;
             storage::db::add_chat_member(&conn, &peer_id, "Me", "member")
                 .map_err(|e| e.to_string())?;
         }
@@ -617,7 +657,10 @@ pub async fn send_video_message(
         }
     }
 
-    println!("[Backend] Video message sent: hash={}, name={}", file_hash, file_name);
+    println!(
+        "[Backend] Video message sent: hash={}, name={}",
+        file_hash, file_name
+    );
     Ok(SentMediaResult {
         msg_id,
         file_hash,
@@ -626,7 +669,10 @@ pub async fn send_video_message(
 }
 
 #[tauri::command]
-pub async fn get_video_data(file_hash: String, state: State<'_, AppState>) -> Result<String, String> {
+pub async fn get_video_data(
+    file_hash: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
 
     let data = storage::object::load(&conn, &file_hash, None)
@@ -657,7 +703,8 @@ pub async fn send_audio_message(
     println!("[Backend] Sending audio to {}: {}", peer_id, file_path);
     let chat_kind = chat_kind::parse_chat_kind(&peer_id);
 
-    let file_data = std::fs::read(&file_path).map_err(|e| format!("Failed to read audio: {}", e))?;
+    let file_data =
+        std::fs::read(&file_path).map_err(|e| format!("Failed to read audio: {}", e))?;
 
     let file_name = std::path::Path::new(&file_path)
         .file_name()
@@ -683,7 +730,10 @@ pub async fn send_audio_message(
     let id_suffix: u32 = rand::random();
     let msg_id = format!("{}-{}", timestamp, id_suffix);
 
-    let is_temporary = matches!(chat_kind, ChatKind::TemporaryDirect | ChatKind::TemporaryGroup);
+    let is_temporary = matches!(
+        chat_kind,
+        ChatKind::TemporaryDirect | ChatKind::TemporaryGroup
+    );
     let status = outgoing_status_for_chat(chat_kind)?;
     let chat_id = if matches!(chat_kind, ChatKind::SelfChat) {
         "self".to_string()
@@ -716,14 +766,22 @@ pub async fn send_audio_message(
 
             if !storage::db::chat_exists(&conn, &peer_id) {
                 if let Err(e) = storage::db::create_chat(&conn, &peer_id, &peer_id, false) {
-                    eprintln!("[Backend] Failed to auto-create chat for audio message: {}", e);
+                    eprintln!(
+                        "[Backend] Failed to auto-create chat for audio message: {}",
+                        e
+                    );
                 }
             }
         }
 
         if matches!(chat_kind, ChatKind::Group) && !storage::db::chat_exists(&conn, &peer_id) {
-            storage::db::upsert_chat(&conn, &peer_id, &chat_kind::default_group_name(&peer_id), true)
-                .map_err(|e| e.to_string())?;
+            storage::db::upsert_chat(
+                &conn,
+                &peer_id,
+                &chat_kind::default_group_name(&peer_id),
+                true,
+            )
+            .map_err(|e| e.to_string())?;
             storage::db::add_chat_member(&conn, &peer_id, "Me", "member")
                 .map_err(|e| e.to_string())?;
         }
@@ -769,7 +827,10 @@ pub async fn send_audio_message(
         }
     }
 
-    println!("[Backend] Audio message sent: hash={}, name={}", file_hash, file_name);
+    println!(
+        "[Backend] Audio message sent: hash={}, name={}",
+        file_hash, file_name
+    );
     Ok(SentMediaResult {
         msg_id,
         file_hash,
@@ -778,7 +839,10 @@ pub async fn send_audio_message(
 }
 
 #[tauri::command]
-pub async fn get_audio_data(file_hash: String, state: State<'_, AppState>) -> Result<String, String> {
+pub async fn get_audio_data(
+    file_hash: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
 
     let data = storage::object::load(&conn, &file_hash, None)
@@ -817,7 +881,9 @@ pub async fn save_audio_to_file(
 }
 
 #[tauri::command]
-pub async fn list_stickers(state: State<'_, AppState>) -> Result<Vec<storage::db::Sticker>, String> {
+pub async fn list_stickers(
+    state: State<'_, AppState>,
+) -> Result<Vec<storage::db::Sticker>, String> {
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
     storage::db::list_stickers(&conn).map_err(|e| e.to_string())
 }
@@ -839,8 +905,9 @@ pub async fn add_sticker(
     )
     .map_err(|e| format!("Failed to store sticker file: {}", e))?;
 
-    let inserted = storage::db::upsert_sticker(&conn, &file_hash, Some(&prepared.file_name), "local")
-        .map_err(|e| format!("Failed to register sticker: {}", e))?;
+    let inserted =
+        storage::db::upsert_sticker(&conn, &file_hash, Some(&prepared.file_name), "local")
+            .map_err(|e| format!("Failed to register sticker: {}", e))?;
 
     Ok(AddStickerResult {
         file_hash,
@@ -951,7 +1018,10 @@ pub async fn save_sticker_from_message(
     let name: String = conn
         .query_row(
             "SELECT COALESCE(file_name, ?2) FROM files WHERE file_hash = ?1",
-            rusqlite::params![&file_hash, format!("sticker-{}.webp", &file_hash[..8.min(file_hash.len())])],
+            rusqlite::params![
+                &file_hash,
+                format!("sticker-{}.webp", &file_hash[..8.min(file_hash.len())])
+            ],
             |row| row.get(0),
         )
         .unwrap_or_else(|_| format!("sticker-{}.webp", &file_hash[..8.min(file_hash.len())]));
@@ -982,7 +1052,10 @@ pub async fn send_sticker_message(
         .as_secs() as i64;
     let id_suffix: u32 = rand::random();
     let msg_id = format!("{}-{}", timestamp, id_suffix);
-    let is_temporary = matches!(chat_kind, ChatKind::TemporaryDirect | ChatKind::TemporaryGroup);
+    let is_temporary = matches!(
+        chat_kind,
+        ChatKind::TemporaryDirect | ChatKind::TemporaryGroup
+    );
     let status = outgoing_status_for_chat(chat_kind)?;
 
     let (file_name, chat_id) = {
@@ -1021,13 +1094,19 @@ pub async fn send_sticker_message(
             if matches!(chat_kind, ChatKind::Direct) {
                 if !storage::db::is_peer(&conn, &peer_id) {
                     if let Err(e) = storage::db::add_peer(&conn, &peer_id, None, None, "local") {
-                        eprintln!("[Backend] Failed to auto-add peer for sticker message: {}", e);
+                        eprintln!(
+                            "[Backend] Failed to auto-add peer for sticker message: {}",
+                            e
+                        );
                     }
                 }
 
                 if !storage::db::chat_exists(&conn, &peer_id) {
                     if let Err(e) = storage::db::create_chat(&conn, &peer_id, &peer_id, false) {
-                        eprintln!("[Backend] Failed to auto-create chat for sticker message: {}", e);
+                        eprintln!(
+                            "[Backend] Failed to auto-create chat for sticker message: {}",
+                            e
+                        );
                     }
                 }
             }
@@ -1122,7 +1201,8 @@ mod tests {
         let path = dir.path().join("sticker.txt");
         std::fs::write(&path, b"not-an-image").expect("write");
 
-        let err = prepare_sticker_for_import(path.to_str().expect("path")).expect_err("expected error");
+        let err =
+            prepare_sticker_for_import(path.to_str().expect("path")).expect_err("expected error");
         assert!(err.contains("Unsupported sticker format"));
     }
 
@@ -1136,7 +1216,8 @@ mod tests {
             .save_with_format(&path, image::ImageFormat::Png)
             .expect("save png");
 
-        let prepared = prepare_sticker_for_import(path.to_str().expect("path")).expect("prepare sticker");
+        let prepared =
+            prepare_sticker_for_import(path.to_str().expect("path")).expect("prepare sticker");
         assert!(prepared.converted);
         assert!(prepared.file_name.ends_with(".webp"));
         assert!(prepared.file_data.len() <= MAX_STICKER_SIZE_BYTES);
@@ -1149,7 +1230,8 @@ mod tests {
         let path = dir.path().join("too-big.webp");
         std::fs::write(&path, vec![0u8; MAX_STICKER_SIZE_BYTES + 1]).expect("write");
 
-        let err = prepare_sticker_for_import(path.to_str().expect("path")).expect_err("expected error");
+        let err =
+            prepare_sticker_for_import(path.to_str().expect("path")).expect_err("expected error");
         assert!(err.contains("exceeds 1MB"));
     }
 

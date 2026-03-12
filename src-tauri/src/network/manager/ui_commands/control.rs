@@ -109,13 +109,9 @@ impl NetworkManager {
         use tauri::Manager;
         let state = self.app_handle.state::<crate::AppState>();
         if let Ok(conn) = state.db_conn.lock() {
-            if let Err(e) = crate::storage::db::add_peer(
-                &conn,
-                &peer_id.to_string(),
-                None,
-                None,
-                "local",
-            ) {
+            if let Err(e) =
+                crate::storage::db::add_peer(&conn, &peer_id.to_string(), None, None, "local")
+            {
                 eprintln!("[Handshake] Failed to save peer: {}", e);
             } else {
                 println!("[Handshake] ✅ {} saved to peers table!", peer_id);

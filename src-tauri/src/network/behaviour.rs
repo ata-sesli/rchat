@@ -1,5 +1,6 @@
 use libp2p::{
-    dcutr, gossipsub, identify, identity::Keypair, kad, ping, relay, request_response, swarm::NetworkBehaviour,
+    dcutr, gossipsub, identify, identity::Keypair, kad, ping, relay, request_response,
+    swarm::NetworkBehaviour,
 };
 
 use super::direct_message::{DirectMessageRequest, DirectMessageResponse};
@@ -32,7 +33,7 @@ pub struct RChatBehaviour {
 impl RChatBehaviour {
     pub fn new(key: Keypair, relay_client: relay::client::Behaviour) -> Self {
         let peer_id = key.public().to_peer_id();
-        
+
         // 1. Gossipsub (Group Chat)
         let gossipsub_config = gossipsub::Config::default();
         let gossipsub = gossipsub::Behaviour::new(
@@ -40,18 +41,18 @@ impl RChatBehaviour {
             gossipsub_config,
         )
         .expect("Invalid gossipsub config");
-        
+
         // 2. Kademlia (Discovery)
         let store = kad::store::MemoryStore::new(peer_id);
         let kademlia = kad::Behaviour::new(peer_id, store);
-        
+
         // 3. MDNS (Local Discovery) - REPLACED by native mdns-sd (see network/mdns_sd.rs)
         // We use native OS mDNS service to avoid UDP port 5353 conflicts and VPN routing issues.
 
         // 4. Identify (Handshake)
         let identify =
             identify::Behaviour::new(identify::Config::new("rchat/1.0.0".into(), key.public()));
-        
+
         // 5. Ping (Health)
         let ping = ping::Behaviour::default();
 

@@ -72,7 +72,7 @@ pub struct DirectMessageRequest {
     pub file_hash: Option<String>,
     /// Unix timestamp
     pub timestamp: i64,
-    
+
     // === Chunk Transfer Fields ===
     /// Chunk hash (for chunk_request)
     pub chunk_hash: Option<String>,

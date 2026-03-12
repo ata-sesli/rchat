@@ -84,7 +84,12 @@ pub(super) fn start_persistence_workers(
                     } => {
                         let app_handle_for_work = app_handle.clone();
                         let result = tauri::async_runtime::spawn_blocking(move || {
-                            persist_incoming_direct_message(&app_handle_for_work, &request, &chat_id, &db_msg)
+                            persist_incoming_direct_message(
+                                &app_handle_for_work,
+                                &request,
+                                &chat_id,
+                                &db_msg,
+                            )
                         })
                         .await
                         .map_err(|e| e.to_string())
@@ -109,8 +114,12 @@ pub(super) fn start_persistence_workers(
                         let app_handle_for_work = app_handle.clone();
                         let result = tauri::async_runtime::spawn_blocking(move || {
                             with_db_conn(&app_handle_for_work, |conn| {
-                                crate::storage::db::update_message_status(&conn, &msg_id, "delivered")
-                                    .map_err(|e| e.to_string())
+                                crate::storage::db::update_message_status(
+                                    &conn,
+                                    &msg_id,
+                                    "delivered",
+                                )
+                                .map_err(|e| e.to_string())
                             })
                         })
                         .await
@@ -123,8 +132,10 @@ pub(super) fn start_persistence_workers(
                         let result = tauri::async_runtime::spawn_blocking(move || {
                             with_db_conn(&app_handle_for_work, |conn| {
                                 for msg_id in msg_ids {
-                                    crate::storage::db::update_message_status(&conn, &msg_id, "read")
-                                        .map_err(|e| e.to_string())?;
+                                    crate::storage::db::update_message_status(
+                                        &conn, &msg_id, "read",
+                                    )
+                                    .map_err(|e| e.to_string())?;
                                 }
                                 Ok(())
                             })
@@ -191,9 +202,11 @@ fn persist_incoming_direct_message(
         if request.msg_type.needs_file_transfer() {
             if let Some(ref file_hash) = request.file_hash {
                 let file_exists: bool = conn
-                    .query_row("SELECT 1 FROM files WHERE file_hash = ?1", [file_hash], |_| {
-                        Ok(true)
-                    })
+                    .query_row(
+                        "SELECT 1 FROM files WHERE file_hash = ?1",
+                        [file_hash],
+                        |_| Ok(true),
+                    )
                     .unwrap_or(false);
 
                 if !file_exists {
@@ -226,15 +239,22 @@ fn persist_incoming_group_message(
             .map_err(|e| e.to_string())?;
         crate::storage::db::add_chat_member(conn, &envelope.group_id, "Me", "member")
             .map_err(|e| e.to_string())?;
-        crate::storage::db::add_chat_member(conn, &envelope.group_id, &envelope.sender_id, "member")
-            .map_err(|e| e.to_string())?;
+        crate::storage::db::add_chat_member(
+            conn,
+            &envelope.group_id,
+            &envelope.sender_id,
+            "member",
+        )
+        .map_err(|e| e.to_string())?;
 
         if envelope.content_type.needs_file_transfer() {
             if let Some(ref file_hash) = envelope.file_hash {
                 let file_exists: bool = conn
-                    .query_row("SELECT 1 FROM files WHERE file_hash = ?1", [file_hash], |_| {
-                        Ok(true)
-                    })
+                    .query_row(
+                        "SELECT 1 FROM files WHERE file_hash = ?1",
+                        [file_hash],
+                        |_| Ok(true),
+                    )
                     .unwrap_or(false);
                 if !file_exists {
                     conn.execute(
@@ -251,7 +271,11 @@ fn persist_incoming_group_message(
 }
 
 impl NetworkManager {
-    async fn enqueue_persistence_task(&mut self, task: PersistenceTask, context: &str) -> Result<(), String> {
+    async fn enqueue_persistence_task(
+        &mut self,
+        task: PersistenceTask,
+        context: &str,
+    ) -> Result<(), String> {
         if !self.persistence_accepting_tasks.load(Ordering::SeqCst) {
             return Err(format!("Persistence queue stopped in {}", context));
         }
@@ -264,10 +288,15 @@ impl NetworkManager {
             );
         }
 
-        self.persistence_pending_tasks.fetch_add(1, Ordering::SeqCst);
+        self.persistence_pending_tasks
+            .fetch_add(1, Ordering::SeqCst);
         if let Err(e) = self.persistence_task_tx.send(task).await {
-            self.persistence_pending_tasks.fetch_sub(1, Ordering::SeqCst);
-            return Err(format!("Failed to enqueue persistence task in {}: {}", context, e));
+            self.persistence_pending_tasks
+                .fetch_sub(1, Ordering::SeqCst);
+            return Err(format!(
+                "Failed to enqueue persistence task in {}: {}",
+                context, e
+            ));
         }
 
         Ok(())
@@ -330,7 +359,10 @@ impl NetworkManager {
             .map_err(|_| "Persistence worker dropped delivered-status response".to_string())?
     }
 
-    pub(super) async fn persist_read_statuses(&mut self, msg_ids: Vec<String>) -> Result<(), String> {
+    pub(super) async fn persist_read_statuses(
+        &mut self,
+        msg_ids: Vec<String>,
+    ) -> Result<(), String> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         self.enqueue_persistence_task(
@@ -344,7 +376,8 @@ impl NetworkManager {
     }
 
     pub(super) fn shutdown_persistence_workers_gracefully(&mut self, timeout: std::time::Duration) {
-        self.persistence_accepting_tasks.store(false, Ordering::SeqCst);
+        self.persistence_accepting_tasks
+            .store(false, Ordering::SeqCst);
 
         let worker_count = self.persistence_worker_handles.len();
         let deadline = std::time::Instant::now() + timeout;
@@ -385,6 +418,7 @@ impl NetworkManager {
             }
         }
 
-        self.persistence_worker_shutdown.store(true, Ordering::SeqCst);
+        self.persistence_worker_shutdown
+            .store(true, Ordering::SeqCst);
     }
 }

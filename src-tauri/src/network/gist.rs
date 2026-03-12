@@ -1,11 +1,11 @@
-use anyhow::Result;
-use octocrab::{models::gists::Gist, Octocrab};
 use super::hks::{PublishedBlob, TrackedInvite};
 use super::invite::EncryptedInvite;
+use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use octocrab::{models::gists::Gist, Octocrab};
 use std::io::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -219,30 +219,32 @@ pub async fn publish_shadow_invite(token: &str, shadow: super::hks::ShadowInvite
     } else {
         default_blob()
     };
-    
+
     // 2. Add shadow invite to blob
     // Remove expired shadows first (2 minute TTL)
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    blob.shadow_invites.retain(|s| now.saturating_sub(s.created_at) < INVITE_TTL_SECS);
-    
+    blob.shadow_invites
+        .retain(|s| now.saturating_sub(s.created_at) < INVITE_TTL_SECS);
+
     // Remove any existing shadow for this target
-    blob.shadow_invites.retain(|s| s.target_username != shadow.target_username);
-    
+    blob.shadow_invites
+        .retain(|s| s.target_username != shadow.target_username);
+
     // Add new shadow
     blob.shadow_invites.push(shadow);
-    
+
     // 3. Serialize and update Gist
     let blob_b64 = serialize_blob(&blob)?;
-    
+
     if let Some(gist) = find_rchat_gist(token).await? {
         update_peer_info(token, &gist.id, blob_b64).await?;
     } else {
         create_peer_info(token, blob_b64).await?;
     }
-    
+
     Ok(())
 }
 
@@ -268,17 +270,17 @@ pub async fn get_friend_shadows(username: &str) -> Result<Vec<super::hks::Shadow
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            
+
             // Filter expired shadows
             let valid_shadows: Vec<_> = blob
                 .shadow_invites
                 .into_iter()
                 .filter(|s| now.saturating_sub(s.created_at) < INVITE_TTL_SECS)
                 .collect();
-            
+
             return Ok(valid_shadows);
         }
     }
-    
+
     Ok(vec![])
 }

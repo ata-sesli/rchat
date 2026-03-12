@@ -2,8 +2,8 @@ mod behaviour;
 pub mod command;
 pub mod direct_message;
 pub mod discovery;
-pub mod gossip;
 pub mod gist;
+pub mod gossip;
 pub mod hks;
 pub mod invite;
 mod manager;
@@ -87,7 +87,7 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
         .build();
 
     println!("[Backend] Swarm built. Listening...");
-    
+
     // Get a random available port first, then use it for both IPv4 and IPv6
     // This ensures mDNS advertises a port that works for both protocols
     let tcp_port = {
@@ -98,28 +98,37 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
         socket.local_addr()?.port()
     };
-    
-    println!("[Backend] Using TCP port {} and UDP port {} for both IPv4 and IPv6", tcp_port, udp_port);
-    
+
+    println!(
+        "[Backend] Using TCP port {} and UDP port {} for both IPv4 and IPv6",
+        tcp_port, udp_port
+    );
+
     // Do STUN discovery (socket closes after discovery)
     let stun_result = stun::discover_on_port(udp_port).await;
     let stun_external_port = stun_result.external_port;
     let stun_public_ip_v6 = stun_result.ipv6.map(|a| a.ip().to_string());
     let stun_public_ip = stun_result.ipv4.map(|a| a.ip().to_string());
-    
+
     if let Some(ext_port) = stun_external_port {
-        println!("[Backend] STUN external port: {} (local: {})", ext_port, udp_port);
+        println!(
+            "[Backend] STUN external port: {} (local: {})",
+            ext_port, udp_port
+        );
     }
-    
+
     // Bind QUIC to the SAME port (socket was closed after STUN discovery)
     // On most NATs, binding to the same local port gets the same external mapping
     swarm.listen_on(format!("/ip6/::/udp/{}/quic-v1", udp_port).parse()?)?;
     swarm.listen_on(format!("/ip6/::/tcp/{}", tcp_port).parse()?)?;
     swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", udp_port).parse()?)?;
     swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", tcp_port).parse()?)?;
-    
-    println!("[Backend] Swarm listeners started (QUIC on port {}, TCP on port {})", udp_port, tcp_port);
-    
+
+    println!(
+        "[Backend] Swarm listeners started (QUIC on port {}, TCP on port {})",
+        udp_port, tcp_port
+    );
+
     // NOTE: STUN socket closed, QUIC now owns the port
     // On most NATs, QUIC will get the same external port mapping
     // If the invite is used quickly, this should work

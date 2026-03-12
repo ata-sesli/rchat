@@ -9,8 +9,8 @@ mod storage;
 pub use app_state::{AppState, NetworkState};
 
 use crate::commands::auth::{
-    check_auth_status, init_vault, poll_github_auth, reset_vault, save_api_token, start_github_auth,
-    start_network, toggle_online_status, unlock_vault,
+    check_auth_status, init_vault, poll_github_auth, reset_vault, save_api_token,
+    start_github_auth, start_network, toggle_online_status, unlock_vault,
 };
 use crate::commands::chat::{
     create_group_chat, get_chat_history, get_chat_latest_times, get_chat_list, get_unread_counts,
@@ -26,24 +26,42 @@ use crate::commands::invite::{
     get_active_temporary_invite, redeem_and_connect, redeem_temporary_invite,
 };
 use crate::commands::media::{
-    add_sticker, add_stickers_batch, delete_sticker, get_image_data, get_image_from_path,
-    get_video_data, get_audio_data, list_stickers, save_audio_to_file, save_document_to_file,
+    add_sticker, add_stickers_batch, delete_sticker, get_audio_data, get_image_data,
+    get_image_from_path, get_video_data, list_stickers, save_audio_to_file, save_document_to_file,
     save_image_to_file, save_sticker_from_message, send_audio_message, send_document_message,
     send_image_message, send_sticker_message, send_video_message,
 };
 use crate::commands::network_control::{request_connection, set_fast_discovery};
 use crate::commands::peer_profile::{
-    add_friend, apply_preset, delete_peer, get_friends, get_peer_aliases, get_pinned_peers,
-    get_selected_preset, get_theme, get_trusted_peers, get_user_profile, list_theme_presets,
-    create_custom_theme, delete_custom_theme, generate_simple_theme, remove_friend, toggle_pin_peer,
-    update_custom_theme, update_theme, update_user_profile,
+    add_friend, apply_preset, create_custom_theme, delete_custom_theme, delete_peer,
+    generate_simple_theme, get_friends, get_peer_aliases, get_pinned_peers, get_selected_preset,
+    get_theme, get_trusted_peers, get_user_profile, list_theme_presets, remove_friend,
+    toggle_pin_peer, update_custom_theme, update_theme, update_user_profile,
 };
 use crate::storage::config::ConfigManager;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // Bring existing window to front when a second instance is invoked.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+
+            // Forward deep-link URLs from second-launch args to the running instance.
+            let urls: Vec<String> = args
+                .into_iter()
+                .filter(|arg| arg.starts_with("rchat://"))
+                .collect();
+            if !urls.is_empty() {
+                let _ = app.emit("deep-link://new-url", urls);
+            }
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -62,7 +80,8 @@ pub fn run() {
                 println!("Session not restored. Vault locked.");
             }
 
-            let db_connection = storage::db::connect_to_db().expect("Failed to initialize database");
+            let db_connection =
+                storage::db::connect_to_db().expect("Failed to initialize database");
 
             app.manage(AppState {
                 config_manager: tokio::sync::Mutex::new(config_manager),

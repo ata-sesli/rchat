@@ -244,13 +244,10 @@ pub async fn get_theme(state: State<'_, AppState>) -> Result<ThemeConfig, String
 }
 
 #[tauri::command]
-pub async fn update_theme(
-    theme: ThemeConfig,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn update_theme(theme: ThemeConfig, state: State<'_, AppState>) -> Result<(), String> {
     println!("[Backend] update_theme called");
-    let normalized_theme = storage::theme::validate_and_normalize_theme(&theme)
-        .map_err(|e| e.to_string())?;
+    let normalized_theme =
+        storage::theme::validate_and_normalize_theme(&theme).map_err(|e| e.to_string())?;
 
     let mgr = state.config_manager.lock().await;
     let mut config = mgr.load().await.map_err(|e| e.to_string())?;
@@ -323,7 +320,9 @@ pub async fn apply_preset(name: String, state: State<'_, AppState>) -> Result<Th
             .map(|entry| entry.theme.clone())
             .ok_or_else(|| format!("Custom theme '{}' not found", name))?
     } else {
-        theme_manager.load_preset(&name).map_err(|e| e.to_string())?
+        theme_manager
+            .load_preset(&name)
+            .map_err(|e| e.to_string())?
     };
 
     config.user.theme = theme.clone();
@@ -343,8 +342,8 @@ pub async fn create_custom_theme(
 ) -> Result<PresetInfo, String> {
     let normalized_name = validate_theme_name(&name)?;
     let normalized_description = trim_optional_description(description);
-    let normalized_theme = storage::theme::validate_and_normalize_theme(&theme)
-        .map_err(|e| e.to_string())?;
+    let normalized_theme =
+        storage::theme::validate_and_normalize_theme(&theme).map_err(|e| e.to_string())?;
 
     let now = now_unix_ts();
     let entry = CustomThemeEntry {
@@ -382,13 +381,18 @@ pub async fn update_custom_theme(
 
     let normalized_name = validate_theme_name(&name)?;
     let normalized_description = trim_optional_description(description);
-    let normalized_theme = storage::theme::validate_and_normalize_theme(&theme)
-        .map_err(|e| e.to_string())?;
+    let normalized_theme =
+        storage::theme::validate_and_normalize_theme(&theme).map_err(|e| e.to_string())?;
 
     let mgr = state.config_manager.lock().await;
     let mut config = mgr.load().await.map_err(|e| e.to_string())?;
 
-    let Some(index) = config.user.custom_themes.iter().position(|entry| entry.key == key) else {
+    let Some(index) = config
+        .user
+        .custom_themes
+        .iter()
+        .position(|entry| entry.key == key)
+    else {
         return Err("Custom theme not found".to_string());
     };
 

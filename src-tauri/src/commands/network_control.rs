@@ -1,12 +1,15 @@
 use tauri::State;
 
-use crate::network::command::NetworkCommand;
 use crate::network;
+use crate::network::command::NetworkCommand;
 use crate::NetworkState;
 
 /// Request connection to a local peer (triggers mutual handshake)
 #[tauri::command]
-pub async fn request_connection(peer_id: String, state: State<'_, NetworkState>) -> Result<(), String> {
+pub async fn request_connection(
+    peer_id: String,
+    state: State<'_, NetworkState>,
+) -> Result<(), String> {
     println!("[Backend] request_connection called for: {}", peer_id);
 
     let sender = state.sender.lock().await;

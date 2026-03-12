@@ -26,14 +26,14 @@ pub struct SystemConfig {
 // User Configuration, can be modified via UI.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FriendConfig {
-    pub username: String,                   // Gist ID / Username (unique ID)
+    pub username: String, // Gist ID / Username (unique ID)
     #[serde(default)]
-    pub alias: Option<String>,              // Display name / alias
-    pub x25519_pubkey: Option<String>,      // Base64
-    pub ed25519_pubkey: Option<String>,     // Base64
-    pub leaf_index: usize,                  // HKS Leaf Index
+    pub alias: Option<String>, // Display name / alias
+    pub x25519_pubkey: Option<String>, // Base64
+    pub ed25519_pubkey: Option<String>, // Base64
+    pub leaf_index: usize, // HKS Leaf Index
     pub encrypted_leaf_key: Option<String>, // Base64
-    pub nonce: Option<String>,              // Base64
+    pub nonce: Option<String>, // Base64
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

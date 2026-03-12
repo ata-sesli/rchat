@@ -145,7 +145,10 @@ impl Message {
             },
             "document" => MessageContent::Document {
                 file_hash: db_msg.file_hash.clone().unwrap_or_default(),
-                file_name: db_msg.text_content.clone().unwrap_or_else(|| "file".to_string()),
+                file_name: db_msg
+                    .text_content
+                    .clone()
+                    .unwrap_or_else(|| "file".to_string()),
                 caption: None,
                 metadata: cached_metadata,
             },
@@ -172,15 +175,29 @@ impl Message {
     pub fn to_db_row(&self) -> crate::storage::db::Message {
         let (content_type, text_content, file_hash) = match &self.content {
             MessageContent::Text { text } => ("text".to_string(), Some(text.clone()), None),
-            MessageContent::Photo { file_hash, caption, .. } => {
-                ("photo".to_string(), caption.clone(), Some(file_hash.clone()))
-            }
-            MessageContent::Video { file_hash, caption, .. } => {
-                ("video".to_string(), caption.clone(), Some(file_hash.clone()))
-            }
-            MessageContent::Document { file_hash, file_name, .. } => {
-                ("document".to_string(), Some(file_name.clone()), Some(file_hash.clone()))
-            }
+            MessageContent::Photo {
+                file_hash, caption, ..
+            } => (
+                "photo".to_string(),
+                caption.clone(),
+                Some(file_hash.clone()),
+            ),
+            MessageContent::Video {
+                file_hash, caption, ..
+            } => (
+                "video".to_string(),
+                caption.clone(),
+                Some(file_hash.clone()),
+            ),
+            MessageContent::Document {
+                file_hash,
+                file_name,
+                ..
+            } => (
+                "document".to_string(),
+                Some(file_name.clone()),
+                Some(file_hash.clone()),
+            ),
             MessageContent::Audio { file_hash, .. } => {
                 ("audio".to_string(), None, Some(file_hash.clone()))
             }
@@ -211,7 +228,9 @@ impl Message {
         match &self.content {
             MessageContent::Text { .. } => false,
             MessageContent::Photo { metadata, .. } => metadata.width.is_none(),
-            MessageContent::Video { metadata, .. } => metadata.width.is_none() && metadata.duration_secs.is_none(),
+            MessageContent::Video { metadata, .. } => {
+                metadata.width.is_none() && metadata.duration_secs.is_none()
+            }
             MessageContent::Document { metadata, .. } => metadata.size_bytes.is_none(),
             MessageContent::Audio { metadata, .. } => metadata.duration_secs.is_none(),
         }
@@ -310,7 +329,10 @@ mod tests {
     #[test]
     fn test_message_status_roundtrip() {
         assert_eq!(MessageStatus::from_str("pending"), MessageStatus::Pending);
-        assert_eq!(MessageStatus::from_str("delivered"), MessageStatus::Delivered);
+        assert_eq!(
+            MessageStatus::from_str("delivered"),
+            MessageStatus::Delivered
+        );
         assert_eq!(MessageStatus::from_str("read"), MessageStatus::Read);
         assert_eq!(MessageStatus::Pending.as_str(), "pending");
     }

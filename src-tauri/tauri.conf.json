@@ -22,6 +22,15 @@
       "devCsp": "default-src 'self' http://localhost:1420 http://127.0.0.1:1420; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; connect-src 'self' ws://localhost:1420 ws://127.0.0.1:1420 http://localhost:1420 http://127.0.0.1:1420 https://api.github.com https://github.com https://gist.githubusercontent.com https://avatars.githubusercontent.com; img-src 'self' data: blob: https://github.com https://avatars.githubusercontent.com; media-src 'self' data: blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval'; worker-src 'self' blob:;"
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "rchat"
+        ]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

@@ -37,7 +37,9 @@ pub async fn delete_envelope(id: String, state: State<'_, AppState>) -> Result<(
 }
 
 #[tauri::command]
-pub async fn get_envelopes(state: State<'_, AppState>) -> Result<Vec<storage::db::Envelope>, String> {
+pub async fn get_envelopes(
+    state: State<'_, AppState>,
+) -> Result<Vec<storage::db::Envelope>, String> {
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
     storage::db::get_envelopes(&conn).map_err(|e| e.to_string())
 }

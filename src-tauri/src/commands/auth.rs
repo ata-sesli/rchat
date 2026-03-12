@@ -62,7 +62,10 @@ pub async fn check_auth_status(state: State<'_, AppState>) -> Result<AuthStatus,
                             .get::<octocrab::models::Author, _, _>("/user", None::<&()>)
                             .await
                         {
-                            println!("[Backend] Migrating: fetched GitHub username {}", user.login);
+                            println!(
+                                "[Backend] Migrating: fetched GitHub username {}",
+                                user.login
+                            );
                             let mut updated_config = config.clone();
                             updated_config.system.github_username = Some(user.login);
                             let _ = mgr.save(&updated_config).await;

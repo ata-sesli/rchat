@@ -338,12 +338,30 @@ pub struct ThemePreset {
 
 const EMBEDDED_THEMES: &[(&str, &str)] = &[
     ("arctic_ice", include_str!("../../themes/arctic_ice.json")),
-    ("cyberpunk_glow", include_str!("../../themes/cyberpunk_glow.json")),
-    ("earthy_minimal", include_str!("../../themes/earthy_minimal.json")),
-    ("forest_night", include_str!("../../themes/forest_night.json")),
-    ("midnight_neon", include_str!("../../themes/midnight_neon.json")),
-    ("monochrome_pro", include_str!("../../themes/monochrome_pro.json")),
-    ("ocean_breeze", include_str!("../../themes/ocean_breeze.json")),
+    (
+        "cyberpunk_glow",
+        include_str!("../../themes/cyberpunk_glow.json"),
+    ),
+    (
+        "earthy_minimal",
+        include_str!("../../themes/earthy_minimal.json"),
+    ),
+    (
+        "forest_night",
+        include_str!("../../themes/forest_night.json"),
+    ),
+    (
+        "midnight_neon",
+        include_str!("../../themes/midnight_neon.json"),
+    ),
+    (
+        "monochrome_pro",
+        include_str!("../../themes/monochrome_pro.json"),
+    ),
+    (
+        "ocean_breeze",
+        include_str!("../../themes/ocean_breeze.json"),
+    ),
     ("rose_noir", include_str!("../../themes/rose_noir.json")),
     ("soft_pastel", include_str!("../../themes/soft_pastel.json")),
     ("solar_flare", include_str!("../../themes/solar_flare.json")),
@@ -365,9 +383,9 @@ impl ThemeManager {
         EMBEDDED_THEMES
             .iter()
             .filter_map(|(key, json)| {
-                serde_json::from_str::<ThemePreset>(json).ok().map(|preset| {
-                    (key.to_string(), preset.name, preset.description)
-                })
+                serde_json::from_str::<ThemePreset>(json)
+                    .ok()
+                    .map(|preset| (key.to_string(), preset.name, preset.description))
             })
             .collect()
     }
@@ -379,7 +397,7 @@ impl ThemeManager {
             .find(|(n, _)| *n == name)
             .map(|(_, json)| *json)
             .ok_or_else(|| anyhow::anyhow!("Theme preset '{}' not found", name))?;
-        
+
         let preset: ThemePreset = serde_json::from_str(json)?;
         Ok(self.preset_to_config(&preset))
     }

@@ -57,7 +57,7 @@ pub struct NetworkState {
     pub listening_addresses: Mutex<Vec<String>>, // Current libp2p listening addresses
     pub public_address_v6: Mutex<Option<String>>, // STUN-discovered IPv6
     pub public_address_v4: Mutex<Option<String>>, // STUN-discovered IPv4
-    pub stun_external_port: Mutex<Option<u16>>,   // NAT-mapped UDP port for QUIC invites
+    pub stun_external_port: Mutex<Option<u16>>, // NAT-mapped UDP port for QUIC invites
     pub temporary_state: Mutex<TemporaryRuntimeState>, // In-memory temporary chat sessions/invites
 }
 

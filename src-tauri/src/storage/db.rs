@@ -25,9 +25,9 @@ pub struct Message {
     pub content_type: String, // 'text', 'photo', 'video', 'document', 'audio'
     pub text_content: Option<String>,
     pub file_hash: Option<String>,
-    pub status: String, // 'pending', 'delivered', 'read'
+    pub status: String,                   // 'pending', 'delivered', 'read'
     pub content_metadata: Option<String>, // JSON: {"width": 1920, "height": 1080, ...}
-    pub sender_alias: Option<String>, // Sender's display name
+    pub sender_alias: Option<String>,     // Sender's display name
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -220,16 +220,10 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
     );
 
     // Migration: Add content_metadata column for cached computed attributes (width, height, duration, etc.)
-    let _ = conn.execute(
-        "ALTER TABLE messages ADD COLUMN content_metadata TEXT",
-        [],
-    );
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN content_metadata TEXT", []);
 
     // Migration: Add sender_alias column for display name from messages
-    let _ = conn.execute(
-        "ALTER TABLE messages ADD COLUMN sender_alias TEXT",
-        [],
-    );
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN sender_alias TEXT", []);
 
     // Migration: hard-cut legacy voice content type to canonical audio
     let _ = conn.execute(
@@ -238,7 +232,10 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
     );
 
     // Migration: Add source column to stickers table if missing
-    let _ = conn.execute("ALTER TABLE stickers ADD COLUMN source TEXT NOT NULL DEFAULT 'local'", []);
+    let _ = conn.execute(
+        "ALTER TABLE stickers ADD COLUMN source TEXT NOT NULL DEFAULT 'local'",
+        [],
+    );
 
     // 7. Envelopes
     // 7. Envelopes
@@ -338,8 +335,14 @@ fn seed_defaults(conn: &Connection) -> anyhow::Result<()> {
 }
 
 fn remove_legacy_general_data(conn: &Connection) -> anyhow::Result<()> {
-    conn.execute("DELETE FROM messages WHERE chat_id = 'General' OR peer_id = 'General'", [])?;
-    conn.execute("DELETE FROM chat_peers WHERE chat_id = 'General' OR peer_id = 'General'", [])?;
+    conn.execute(
+        "DELETE FROM messages WHERE chat_id = 'General' OR peer_id = 'General'",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM chat_peers WHERE chat_id = 'General' OR peer_id = 'General'",
+        [],
+    )?;
     conn.execute("DELETE FROM chat_envelopes WHERE chat_id = 'General'", [])?;
     conn.execute("DELETE FROM chats WHERE id = 'General'", [])?;
     conn.execute("DELETE FROM peers WHERE id = 'General'", [])?;
@@ -472,11 +475,17 @@ pub fn delete_group_chat(conn: &Connection, chat_id: &str) -> anyhow::Result<()>
     conn.execute("DELETE FROM messages WHERE chat_id = ?1", [chat_id])?;
     conn.execute("DELETE FROM chat_envelopes WHERE chat_id = ?1", [chat_id])?;
     conn.execute("DELETE FROM chat_peers WHERE chat_id = ?1", [chat_id])?;
-    conn.execute("DELETE FROM chats WHERE id = ?1 AND is_group = 1", [chat_id])?;
+    conn.execute(
+        "DELETE FROM chats WHERE id = ?1 AND is_group = 1",
+        [chat_id],
+    )?;
     Ok(())
 }
 
-pub fn get_joined_group_chat_ids(conn: &Connection, my_peer_id: &str) -> anyhow::Result<Vec<String>> {
+pub fn get_joined_group_chat_ids(
+    conn: &Connection,
+    my_peer_id: &str,
+) -> anyhow::Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT c.id
          FROM chats c
@@ -584,7 +593,11 @@ pub fn insert_message(conn: &Connection, msg: &Message) -> anyhow::Result<()> {
 }
 
 /// Update the cached content_metadata for a message (computed attributes like width, height, duration)
-pub fn update_content_metadata(conn: &Connection, msg_id: &str, metadata_json: &str) -> anyhow::Result<()> {
+pub fn update_content_metadata(
+    conn: &Connection,
+    msg_id: &str,
+    metadata_json: &str,
+) -> anyhow::Result<()> {
     conn.execute(
         "UPDATE messages SET content_metadata = ?1 WHERE id = ?2",
         [metadata_json, msg_id],
@@ -623,14 +636,16 @@ pub fn get_messages(conn: &Connection, chat_id: &str) -> anyhow::Result<Vec<Mess
 }
 
 /// Get the latest sender_alias for each peer from their messages
-pub fn get_peer_aliases(conn: &Connection) -> anyhow::Result<std::collections::HashMap<String, String>> {
+pub fn get_peer_aliases(
+    conn: &Connection,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
     let mut stmt = conn.prepare(
         "SELECT chat_id, sender_alias
          FROM messages
          WHERE sender_alias IS NOT NULL AND sender_alias != ''
            AND peer_id != 'Me'
          GROUP BY chat_id
-         HAVING MAX(timestamp)"
+         HAVING MAX(timestamp)",
     )?;
 
     let mut aliases = std::collections::HashMap::new();

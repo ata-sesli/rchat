@@ -62,5 +62,9 @@ tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 zeroize = { version = "1.8.2", features = ["derive"] }
+tauri-plugin-deep-link = "2"
 [dev-dependencies]
 tempfile = "3.23.0"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2"

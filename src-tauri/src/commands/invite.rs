@@ -53,7 +53,8 @@ fn temp_kind_label(kind: &TemporaryChatKind) -> String {
 }
 
 fn encode_temporary_payload(payload: &TemporaryInvitePayload) -> Result<String, String> {
-    let json = serde_json::to_vec(payload).map_err(|e| format!("Failed to encode payload: {}", e))?;
+    let json =
+        serde_json::to_vec(payload).map_err(|e| format!("Failed to encode payload: {}", e))?;
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder
         .write_all(&json)
@@ -181,9 +182,9 @@ pub async fn create_invite(
                         && !a.contains("::1")
                 })
                 .or_else(|| {
-                    addrs
-                        .iter()
-                        .find(|a| a.contains("/tcp/") && !a.contains("127.0.0.1") && !a.contains("::1"))
+                    addrs.iter().find(|a| {
+                        a.contains("/tcp/") && !a.contains("127.0.0.1") && !a.contains("::1")
+                    })
                 })
                 .or_else(|| addrs.first())
                 .cloned()
@@ -191,8 +192,9 @@ pub async fn create_invite(
         }
     };
 
-    let encrypted_invite = invite::generate_invite(&password, &my_username, &invitee, &my_address, 120)
-        .map_err(|e| format!("Failed to generate invite: {}", e))?;
+    let encrypted_invite =
+        invite::generate_invite(&password, &my_username, &invitee, &my_address, 120)
+            .map_err(|e| format!("Failed to generate invite: {}", e))?;
 
     let tracked = gist::track_invite(encrypted_invite);
 
@@ -283,7 +285,12 @@ pub async fn redeem_and_connect(
                 let mgr = app_state.config_manager.lock().await;
                 let mut config = mgr.load().await.map_err(|e| e.to_string())?;
 
-                if !config.user.friends.iter().any(|f| f.username == github_username) {
+                if !config
+                    .user
+                    .friends
+                    .iter()
+                    .any(|f| f.username == github_username)
+                {
                     config.user.friends.push(FriendConfig {
                         username: github_username.clone(),
                         alias: None,
@@ -378,7 +385,9 @@ pub async fn redeem_and_connect(
                             } else {
                                 println!("[Shadow] ✅ Published to Gist for {}", inviter);
 
-                                println!("[Shadow] ⏳ Waiting 2.5s for shadow invite propagation...");
+                                println!(
+                                    "[Shadow] ⏳ Waiting 2.5s for shadow invite propagation..."
+                                );
                                 tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
                                 println!(
@@ -523,11 +532,14 @@ pub async fn get_active_temporary_invite(
         }
     }
 
-    Ok(temp_state.active_invite.as_ref().map(|active| TemporaryInviteView {
-        deep_link: active.deep_link.clone(),
-        payload: active.payload.clone(),
-        remaining_seconds: active.payload.expires_at.saturating_sub(now),
-    }))
+    Ok(temp_state
+        .active_invite
+        .as_ref()
+        .map(|active| TemporaryInviteView {
+            deep_link: active.deep_link.clone(),
+            payload: active.payload.clone(),
+            remaining_seconds: active.payload.expires_at.saturating_sub(now),
+        }))
 }
 
 #[tauri::command]
@@ -614,7 +626,10 @@ pub async fn redeem_temporary_invite(
     entry.expires_at = expires_at;
     entry.peer_id = Some(payload.inviter_peer_id.clone());
     entry.archived = false;
-    temp_state.messages.entry(resolved_chat_id.clone()).or_default();
+    temp_state
+        .messages
+        .entry(resolved_chat_id.clone())
+        .or_default();
     drop(temp_state);
 
     {

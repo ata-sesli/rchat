@@ -151,16 +151,18 @@ pub async fn publish_peer_info(
         // Export
         let payload = addrs.join("\n");
         let blob = tree.export(&payload, &signing_key, &encryption_pubkey)?;
-        
+
         // Parse pending invitations from config
-        let invites: Vec<TrackedInvite> = if let Some(ref inv_list) = config.user.pending_invitations {
-            inv_list.iter()
-                .filter_map(|s| serde_json::from_str(s).ok())
-                .collect()
-        } else {
-            vec![]
-        };
-        
+        let invites: Vec<TrackedInvite> =
+            if let Some(ref inv_list) = config.user.pending_invitations {
+                inv_list
+                    .iter()
+                    .filter_map(|s| serde_json::from_str(s).ok())
+                    .collect()
+            } else {
+                vec![]
+            };
+
         (blob, invites)
     };
 
@@ -170,10 +172,13 @@ pub async fn publish_peer_info(
             Ok(mut blob) => {
                 blob.invitations = pending_invites;
                 gist::clean_expired_invitations(&mut blob);
-                println!("[Discovery] Publishing {} invitations", blob.invitations.len());
+                println!(
+                    "[Discovery] Publishing {} invitations",
+                    blob.invitations.len()
+                );
                 gist::serialize_blob(&blob).unwrap_or_else(|_| blob_content.clone())
             }
-            Err(_) => blob_content.clone()
+            Err(_) => blob_content.clone(),
         }
     } else {
         blob_content

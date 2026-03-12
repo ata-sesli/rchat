@@ -8,7 +8,10 @@ impl NetworkManager {
     pub async fn handle_swarm_event(&mut self, event: SwarmEvent<RChatBehaviourEvent>) {
         match event {
             SwarmEvent::Behaviour(behaviour_event) => match behaviour_event {
-                RChatBehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message { message, .. }) => {
+                RChatBehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message {
+                    message,
+                    ..
+                }) => {
                     self.handle_gossipsub_message(message).await;
                 }
                 RChatBehaviourEvent::DirectMessage(event) => {
@@ -40,7 +43,8 @@ impl NetworkManager {
                 num_established,
                 ..
             } => {
-                self.handle_connection_closed(peer_id, num_established).await;
+                self.handle_connection_closed(peer_id, num_established)
+                    .await;
             }
             SwarmEvent::NewListenAddr { address, .. } => {
                 self.handle_new_listen_addr(address);
@@ -61,7 +65,10 @@ impl NetworkManager {
                 }
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                eprintln!("[Swarm] ❌ Outgoing connection error to {:?}: {:?}", peer_id, error);
+                eprintln!(
+                    "[Swarm] ❌ Outgoing connection error to {:?}: {:?}",
+                    peer_id, error
+                );
             }
             SwarmEvent::ListenerError { listener_id, error } => {
                 eprintln!("[Swarm] ❌ Listener {:?} error: {:?}", listener_id, error);
