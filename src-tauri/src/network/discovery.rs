@@ -18,7 +18,7 @@ pub async fn discover_peers(sender: Sender<Multiaddr>, app: tauri::AppHandle) {
         interval.tick().await;
 
         // 1. Fetch Config (Friends + My Keys)
-        let (friends, my_secret, my_pubkey_b64, is_online) = {
+        let (friends, my_secret, my_pubkey_b64, github_sync_enabled) = {
             let state = app.state::<AppState>();
             let mgr = state.config_manager.lock().await;
             if let Ok(config) = mgr.load().await {
@@ -48,14 +48,14 @@ pub async fn discover_peers(sender: Sender<Multiaddr>, app: tauri::AppHandle) {
                     config.user.friends.clone(),
                     secret,
                     pubkey_b64,
-                    config.user.is_online,
+                    config.user.connectivity.github_sync_enabled,
                 )
             } else {
                 (vec![], None, None, false)
             }
         };
 
-        if !is_online {
+        if !github_sync_enabled {
             continue;
         }
 

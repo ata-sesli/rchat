@@ -135,6 +135,14 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
     // TODO: If NAT mapping expires, we'd need bidirectional punching
 
     let (ctx, crx) = mpsc::channel(32);
+    let connectivity_settings = {
+        let state = app_handle.state::<crate::AppState>();
+        let mgr = state.config_manager.lock().await;
+        mgr.load()
+            .await
+            .map(|c| c.user.connectivity.with_derived_mode())
+            .unwrap_or_default()
+    };
 
     // Store the sender in app state (with STUN results)
     let network_state = crate::NetworkState {
@@ -145,6 +153,9 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
         public_address_v4: tokio::sync::Mutex::new(stun_public_ip),
         stun_external_port: tokio::sync::Mutex::new(stun_external_port),
         temporary_state: tokio::sync::Mutex::new(crate::app_state::TemporaryRuntimeState::default()),
+        connected_chat_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+        voice_call_state: tokio::sync::Mutex::new(crate::app_state::VoiceCallState::default()),
+        connectivity: tokio::sync::Mutex::new(connectivity_settings),
     };
     app_handle.manage(network_state);
 

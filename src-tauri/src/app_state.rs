@@ -1,7 +1,7 @@
 use crate::network::command::NetworkCommand;
 use crate::storage::config::ConfigManager;
 use crate::storage::db::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
@@ -49,6 +49,52 @@ pub struct TemporaryRuntimeState {
     pub messages: HashMap<String, Vec<Message>>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceCallPhase {
+    Idle,
+    OutgoingRinging,
+    IncomingRinging,
+    Active,
+    Ending,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CallKind {
+    Voice,
+    Video,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VoiceCallState {
+    pub phase: VoiceCallPhase,
+    pub call_kind: Option<CallKind>,
+    pub call_id: Option<String>,
+    pub peer_id: Option<String>,
+    pub started_at: Option<i64>,
+    pub ring_expires_at: Option<i64>,
+    pub muted: bool,
+    pub camera_enabled: bool,
+    pub reason: Option<String>,
+}
+
+impl Default for VoiceCallState {
+    fn default() -> Self {
+        Self {
+            phase: VoiceCallPhase::Idle,
+            call_kind: None,
+            call_id: None,
+            peer_id: None,
+            started_at: None,
+            ring_expires_at: None,
+            muted: false,
+            camera_enabled: true,
+            reason: None,
+        }
+    }
+}
+
 // This struct holds the Sender channel.
 // We wrap it in Mutex so multiple UI threads can use it safely.
 pub struct NetworkState {
@@ -59,6 +105,9 @@ pub struct NetworkState {
     pub public_address_v4: Mutex<Option<String>>, // STUN-discovered IPv4
     pub stun_external_port: Mutex<Option<u16>>, // NAT-mapped UDP port for QUIC invites
     pub temporary_state: Mutex<TemporaryRuntimeState>, // In-memory temporary chat sessions/invites
+    pub connected_chat_ids: Mutex<HashSet<String>>, // Currently connected chats/peers
+    pub voice_call_state: Mutex<VoiceCallState>, // Runtime voice-call state for UI polling
+    pub connectivity: Mutex<crate::storage::config::ConnectivitySettings>, // Runtime connectivity controls
 }
 
 pub struct AppState {

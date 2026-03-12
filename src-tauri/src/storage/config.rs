@@ -42,6 +42,93 @@ pub struct UserProfile {
     pub avatar_path: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectivityMode {
+    Invisible,
+    Lan,
+    Reachable,
+    Custom,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ConnectivitySettings {
+    pub mode: ConnectivityMode,
+    pub mdns_enabled: bool,
+    pub github_sync_enabled: bool,
+    pub nat_keepalive_enabled: bool,
+    pub punch_assist_enabled: bool,
+}
+
+impl ConnectivitySettings {
+    pub fn invisible() -> Self {
+        Self {
+            mode: ConnectivityMode::Invisible,
+            mdns_enabled: false,
+            github_sync_enabled: false,
+            nat_keepalive_enabled: false,
+            punch_assist_enabled: false,
+        }
+    }
+
+    pub fn lan() -> Self {
+        Self {
+            mode: ConnectivityMode::Lan,
+            mdns_enabled: true,
+            github_sync_enabled: false,
+            nat_keepalive_enabled: false,
+            punch_assist_enabled: false,
+        }
+    }
+
+    pub fn reachable() -> Self {
+        Self {
+            mode: ConnectivityMode::Reachable,
+            mdns_enabled: true,
+            github_sync_enabled: true,
+            nat_keepalive_enabled: true,
+            punch_assist_enabled: true,
+        }
+    }
+
+    pub fn from_mode(mode: ConnectivityMode) -> Self {
+        match mode {
+            ConnectivityMode::Invisible => Self::invisible(),
+            ConnectivityMode::Lan => Self::lan(),
+            ConnectivityMode::Reachable => Self::reachable(),
+            ConnectivityMode::Custom => {
+                let mut settings = Self::reachable();
+                settings.mode = ConnectivityMode::Custom;
+                settings
+            }
+        }
+    }
+
+    pub fn derive_mode(&self) -> ConnectivityMode {
+        if *self == Self::invisible() {
+            ConnectivityMode::Invisible
+        } else if *self == Self::lan() {
+            ConnectivityMode::Lan
+        } else if *self == Self::reachable() {
+            ConnectivityMode::Reachable
+        } else {
+            ConnectivityMode::Custom
+        }
+    }
+
+    pub fn with_derived_mode(mut self) -> Self {
+        self.mode = self.derive_mode();
+        self
+    }
+}
+
+impl Default for ConnectivitySettings {
+    fn default() -> Self {
+        // Migration default: legacy users become reachable regardless of old is_online.
+        Self::reachable()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserConfig {
     pub dark_mode: bool,
@@ -58,6 +145,8 @@ pub struct UserConfig {
     pub pinned_peers: Vec<String>,
     #[serde(default)]
     pub is_online: bool, // Offline/Online switch
+    #[serde(default)]
+    pub connectivity: ConnectivitySettings,
     #[serde(default)]
     pub libp2p_keypair: Option<String>, // Base64-encoded protobuf keypair for persistent peer ID
     #[serde(default)]
@@ -85,6 +174,7 @@ impl Default for UserConfig {
             profile: UserProfile::default(),
             pinned_peers: vec![],
             is_online: false,
+            connectivity: ConnectivitySettings::default(),
             libp2p_keypair: None,
             pending_invitations: None,
             theme: ThemeConfig::default(),
@@ -355,6 +445,61 @@ struct ConfigWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connectivity_mode_derivation_matches_presets() {
+        assert_eq!(
+            ConnectivitySettings::invisible().derive_mode(),
+            ConnectivityMode::Invisible
+        );
+        assert_eq!(ConnectivitySettings::lan().derive_mode(), ConnectivityMode::Lan);
+        assert_eq!(
+            ConnectivitySettings::reachable().derive_mode(),
+            ConnectivityMode::Reachable
+        );
+
+        let custom = ConnectivitySettings {
+            mode: ConnectivityMode::Reachable,
+            mdns_enabled: true,
+            github_sync_enabled: true,
+            nat_keepalive_enabled: false,
+            punch_assist_enabled: true,
+        };
+        assert_eq!(custom.derive_mode(), ConnectivityMode::Custom);
+    }
+
+    #[test]
+    fn connectivity_defaults_to_reachable_for_legacy_config() {
+        let legacy = r##"{
+          "dark_mode": true,
+          "timeout": 0,
+          "identity_private_key": null,
+          "identity_public_key": null,
+          "encryption_private_key": null,
+          "friends": [],
+          "hks_nodes": [],
+          "profile": { "alias": null, "avatar_path": null },
+          "pinned_peers": [],
+          "is_online": false,
+          "libp2p_keypair": null,
+          "pending_invitations": null,
+          "theme": {
+            "base": {"950":"#0b0f14","900":"#111827","800":"#1f2937","700":"#374151","600":"#4b5563","500":"#6b7280","400":"#9ca3af","300":"#d1d5db","200":"#e5e7eb","100":"#f3f4f6"},
+            "primary": {"600":"#0d9488","500":"#14b8a6","400":"#2dd4bf","300":"#5eead4"},
+            "secondary": {"600":"#7c3aed","500":"#8b5cf6","400":"#a78bfa","300":"#c4b5fd"},
+            "error": {"600":"#dc2626","500":"#ef4444","400":"#f87171","300":"#fca5a5"},
+            "success": {"600":"#16a34a","500":"#22c55e","400":"#4ade80","300":"#86efac"},
+            "info": {"600":"#2563eb","500":"#3b82f6","400":"#60a5fa","300":"#93c5fd"},
+            "warning": {"600":"#d97706","500":"#f59e0b","400":"#fbbf24","300":"#fcd34d"}
+          },
+          "selected_preset": null,
+          "custom_themes": [],
+          "github_peer_mapping": {}
+        }"##;
+
+        let parsed: UserConfig = serde_json::from_str(legacy).expect("legacy user config parses");
+        assert_eq!(parsed.connectivity, ConnectivitySettings::reachable());
+    }
 
     #[test]
     fn test_crypto_verification() {

@@ -1,6 +1,20 @@
 use super::*;
 
 impl NetworkManager {
+    fn is_persisted_chat_message_id(msg_id: &str) -> bool {
+        let mut parts = msg_id.split('-');
+        let Some(ts) = parts.next() else {
+            return false;
+        };
+        let Some(rand) = parts.next() else {
+            return false;
+        };
+        if parts.next().is_some() {
+            return false;
+        }
+        ts.parse::<i64>().is_ok() && rand.parse::<u32>().is_ok()
+    }
+
     pub(super) async fn handle_direct_message_event(
         &mut self,
         event: libp2p::request_response::Event<
@@ -63,6 +77,28 @@ impl NetworkManager {
                                 None,
                             );
                         }
+                        DirectMessageKind::CallOffer
+                        | DirectMessageKind::CallOfferVideo
+                        | DirectMessageKind::CallAccept
+                        | DirectMessageKind::CallAcceptVideo
+                        | DirectMessageKind::CallReject
+                        | DirectMessageKind::CallBusy
+                        | DirectMessageKind::CallEnd => {
+                            match self.handle_call_signal(peer, &request).await {
+                                Ok(()) => self.send_status_response(
+                                    channel,
+                                    request.id.clone(),
+                                    "delivered",
+                                    None,
+                                ),
+                                Err(err) => self.send_status_response(
+                                    channel,
+                                    request.id.clone(),
+                                    "error",
+                                    Some(err),
+                                ),
+                            }
+                        }
                         DirectMessageKind::ReadReceipt => {
                             match self.handle_read_receipt(&request).await {
                                 Ok(_) => self.send_status_response(
@@ -106,7 +142,9 @@ impl NetworkManager {
                         request_id, response.status, response.msg_id
                     );
 
-                    if response.status == "delivered" {
+                    if response.status == "delivered"
+                        && Self::is_persisted_chat_message_id(&response.msg_id)
+                    {
                         match self.persist_delivered_status(response.msg_id.clone()).await {
                             Ok(()) => {
                                 let _ = self.app_handle.emit(
@@ -279,6 +317,7 @@ impl NetworkManager {
 
             let chat_id = format!("gh:{}", invitee_github);
             self.cache_peer_mapping(&invitee_github, &invitee_peer_id);
+            self.mark_connected_chat_id(chat_id.clone()).await;
 
             use tauri::Manager;
             let state = self.app_handle.state::<crate::AppState>();

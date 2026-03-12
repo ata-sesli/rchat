@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
   import {
     BaseDirectory,
@@ -11,7 +12,12 @@
   import { appCacheDir, join } from "@tauri-apps/api/path";
   import MessageBubble from "./MessageBubble.svelte";
   import StickerPicker from "./StickerPicker.svelte";
-  import { api, type SentMediaResult } from "$lib/tauri/api";
+  import {
+    api,
+    type VideoChunkType,
+    type SentMediaResult,
+    type VoiceCallState,
+  } from "$lib/tauri/api";
   import { getChatKind } from "$lib/chatKind";
 
   // Types
@@ -51,6 +57,19 @@
   export let onVideoSent = (_result: SentMediaResult, _fileName: string) => {};
   export let onAudioSent = (_result: SentMediaResult, _fileName: string) => {};
   export let onStickerSent = (_result: SentMediaResult) => {};
+  export let voiceCallState: VoiceCallState = {
+    phase: "idle",
+    muted: false,
+  };
+  export let canStartVoiceCall = false;
+  export let canStartVideoCall = false;
+  export let onStartVoiceCall = () => {};
+  export let onStartVideoCall = () => {};
+  export let onEndVoiceCall = (_callId: string) => {};
+  export let onEndVideoCall = (_callId: string) => {};
+  export let onToggleVoiceMute = (_callId: string, _muted: boolean) => {};
+  export let onToggleVideoMute = (_callId: string, _muted: boolean) => {};
+  export let onToggleVideoCamera = (_callId: string, _enabled: boolean) => {};
 
   type RecorderState = "idle" | "recording" | "recorded_pending" | "sending";
   const RECORDING_TMP_DIR = "recordings/tmp";
@@ -72,10 +91,479 @@
   let recordingStartedAtMs = 0;
   let recordingTicker: ReturnType<typeof setInterval> | null = null;
   let discardWhenStopping = false;
+  let callClockSec = 0;
+  let callClockTimer: ReturnType<typeof setInterval> | null = null;
+  let videoFrameUnlisten: (() => void) | null = null;
+  let localVideoEl: HTMLVideoElement | null = null;
+  let remoteVideoCanvasEl: HTMLCanvasElement | null = null;
+  let remoteVideoCanvasCtx: CanvasRenderingContext2D | null = null;
+  let localVideoStream: MediaStream | null = null;
+  let localVideoEncoder: any | null = null;
+  let localVideoTrackReader: ReadableStreamDefaultReader<any> | null = null;
+  let localVideoCaptureLoopRunning = false;
+  let localVideoSeq = 0;
+  let localVideoMime = "video/webm;codecs=vp8";
+  let localVideoCodec = "vp8";
+  let remoteVideoDecoder: any | null = null;
+  let remoteVideoDecoderCodec: string | null = null;
+  let remoteExpectedSeq: number | null = null;
+  let remotePendingFrames = new Map<number, IncomingFrame>();
+  let remoteVideoStateError: string | null = null;
+  let videoCallSupported = true;
+  let videoCallUnsupportedReason: string | null = null;
+
+  const REMOTE_REORDER_WINDOW = 6;
+
+  type IncomingFrame = {
+    call_id: string;
+    seq: number;
+    timestamp: number;
+    mime: string;
+    codec: string;
+    chunk_type: VideoChunkType;
+    payload: Uint8Array;
+  };
 
   // Refs
   let chatContainer: HTMLElement;
   let textarea: HTMLTextAreaElement;
+
+  $: isRegularDmChat = chatKind === "dm";
+  $: callMatchesActivePeer =
+    voiceCallState.phase !== "idle" && voiceCallState.peer_id === activePeer;
+  $: callBusyOnOtherChat =
+    voiceCallState.phase !== "idle" && voiceCallState.peer_id !== activePeer;
+  $: canShowCallButton = isRegularDmChat;
+  $: canPressVoiceCallButton = canStartVoiceCall && voiceCallState.phase === "idle";
+  $: activeCallId = voiceCallState.call_id ?? null;
+  $: activeCallKind = voiceCallState.call_kind ?? "voice";
+  $: activeCallCameraEnabled = voiceCallState.camera_enabled ?? true;
+  $: ringCountdownSec =
+    voiceCallState.ring_expires_at && voiceCallState.phase !== "active"
+      ? Math.max(0, voiceCallState.ring_expires_at - callClockSec)
+      : 0;
+  $: callDurationSec =
+    voiceCallState.started_at && voiceCallState.phase === "active"
+      ? Math.max(0, callClockSec - voiceCallState.started_at)
+      : 0;
+
+  $: {
+    const needsClock = voiceCallState.phase !== "idle";
+    if (needsClock && !callClockTimer) {
+      callClockSec = Math.floor(Date.now() / 1000);
+      callClockTimer = setInterval(() => {
+        callClockSec = Math.floor(Date.now() / 1000);
+      }, 1000);
+    } else if (!needsClock && callClockTimer) {
+      clearInterval(callClockTimer);
+      callClockTimer = null;
+    }
+  }
+
+  $: isVideoCallActiveInThisChat =
+    callMatchesActivePeer &&
+    voiceCallState.phase === "active" &&
+    activeCallKind === "video";
+  $: setLocalVideoElementStream();
+  $: canPressVideoCallButton =
+    canStartVideoCall && voiceCallState.phase === "idle" && videoCallSupported;
+
+  function detectVideoCallSupport(): { supported: boolean; reason: string | null } {
+    if (typeof window === "undefined") {
+      return { supported: false, reason: "Video calls are not available in this environment." };
+    }
+    const w = window as any;
+    if (!navigator?.mediaDevices?.getUserMedia) {
+      return { supported: false, reason: "Camera capture is unavailable on this device." };
+    }
+    if (!w.VideoEncoder || !w.VideoDecoder || !w.EncodedVideoChunk) {
+      return { supported: false, reason: "WebCodecs is not supported by this client." };
+    }
+    if (!w.MediaStreamTrackProcessor) {
+      return { supported: false, reason: "Track processing API is unavailable on this client." };
+    }
+    return { supported: true, reason: null };
+  }
+
+  function normalizeBinaryPayload(rawPayload: unknown): Uint8Array | null {
+    if (!rawPayload) return null;
+    if (rawPayload instanceof Uint8Array) return rawPayload;
+    if (rawPayload instanceof ArrayBuffer) return new Uint8Array(rawPayload);
+    if (ArrayBuffer.isView(rawPayload)) {
+      const view = rawPayload as ArrayBufferView;
+      return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    }
+    if (Array.isArray(rawPayload)) return Uint8Array.from(rawPayload as number[]);
+    return null;
+  }
+
+  function setLocalVideoElementStream() {
+    if (!localVideoEl) return;
+    if ("srcObject" in localVideoEl) {
+      localVideoEl.srcObject = localVideoStream;
+    }
+  }
+
+  function resetRemoteVideoDecodeState() {
+    remotePendingFrames.clear();
+    remoteExpectedSeq = null;
+    remoteVideoDecoderCodec = null;
+    if (remoteVideoDecoder) {
+      try {
+        remoteVideoDecoder.close();
+      } catch (e) {
+        console.debug("Remote decoder close skipped:", e);
+      }
+      remoteVideoDecoder = null;
+    }
+    if (remoteVideoCanvasCtx && remoteVideoCanvasEl) {
+      remoteVideoCanvasCtx.clearRect(
+        0,
+        0,
+        remoteVideoCanvasEl.width,
+        remoteVideoCanvasEl.height,
+      );
+    }
+  }
+
+  function ensureRemoteCanvasContext(): CanvasRenderingContext2D | null {
+    if (!remoteVideoCanvasEl) return null;
+    if (!remoteVideoCanvasCtx) {
+      remoteVideoCanvasCtx = remoteVideoCanvasEl.getContext("2d");
+    }
+    return remoteVideoCanvasCtx;
+  }
+
+  function renderDecodedFrame(videoFrame: any) {
+    try {
+      const ctx = ensureRemoteCanvasContext();
+      if (!ctx || !remoteVideoCanvasEl) {
+        videoFrame.close();
+        return;
+      }
+      if (
+        remoteVideoCanvasEl.width !== videoFrame.displayWidth ||
+        remoteVideoCanvasEl.height !== videoFrame.displayHeight
+      ) {
+        remoteVideoCanvasEl.width = videoFrame.displayWidth;
+        remoteVideoCanvasEl.height = videoFrame.displayHeight;
+      }
+      ctx.drawImage(
+        videoFrame,
+        0,
+        0,
+        remoteVideoCanvasEl.width,
+        remoteVideoCanvasEl.height,
+      );
+      videoFrame.close();
+    } catch (e) {
+      console.error("Failed to render decoded frame:", e);
+      remoteVideoStateError = "Remote video decode failed.";
+      try {
+        videoFrame.close();
+      } catch {
+        // no-op
+      }
+    }
+  }
+
+  async function ensureRemoteVideoDecoder(codec: string): Promise<boolean> {
+    if (!videoCallSupported) {
+      remoteVideoStateError = videoCallUnsupportedReason || "Video calls are unsupported.";
+      return false;
+    }
+
+    const decoderCtor = (window as any).VideoDecoder;
+    if (!decoderCtor) {
+      remoteVideoStateError = "WebCodecs video decoder is unavailable.";
+      return false;
+    }
+
+    if (remoteVideoDecoder && remoteVideoDecoderCodec === codec) {
+      return true;
+    }
+
+    resetRemoteVideoDecodeState();
+    remoteVideoStateError = null;
+    try {
+      const config = { codec, optimizeForLatency: true };
+      if (decoderCtor.isConfigSupported) {
+        const support = await decoderCtor.isConfigSupported(config);
+        if (!support?.supported) {
+          remoteVideoStateError = `Remote codec is not supported (${codec}).`;
+          return false;
+        }
+      }
+
+      remoteVideoDecoder = new decoderCtor({
+        output: (frame: any) => renderDecodedFrame(frame),
+        error: (err: unknown) => {
+          console.error("Remote video decoder error:", err);
+          remoteVideoStateError = "Remote decoder error.";
+        },
+      });
+      remoteVideoDecoder.configure(config);
+      remoteVideoDecoderCodec = codec;
+      return true;
+    } catch (e) {
+      console.error("Failed to initialize remote video decoder:", e);
+      remoteVideoStateError = "Remote decoder init failed.";
+      return false;
+    }
+  }
+
+  async function decodeIncomingFrame(frame: IncomingFrame) {
+    if (!(await ensureRemoteVideoDecoder(frame.codec))) {
+      return;
+    }
+    try {
+      const chunkCtor = (window as any).EncodedVideoChunk;
+      const encoded = new chunkCtor({
+        type: frame.chunk_type,
+        timestamp: frame.timestamp,
+        data: frame.payload,
+      });
+      remoteVideoDecoder.decode(encoded);
+    } catch (e) {
+      console.error("Failed to decode incoming video frame:", e);
+    }
+  }
+
+  async function flushIncomingFrameQueue() {
+    if (remoteExpectedSeq === null) return;
+    while (remotePendingFrames.has(remoteExpectedSeq)) {
+      const next = remotePendingFrames.get(remoteExpectedSeq);
+      if (!next) break;
+      remotePendingFrames.delete(remoteExpectedSeq);
+      await decodeIncomingFrame(next);
+      remoteExpectedSeq += 1;
+    }
+  }
+
+  async function handleIncomingVideoFrame(eventPayload: any) {
+    if (!eventPayload || !activeCallId) return;
+    if (eventPayload.call_id !== activeCallId) return;
+    if (!callMatchesActivePeer || activeCallKind !== "video") return;
+
+    const payload = normalizeBinaryPayload(eventPayload.payload);
+    if (!payload) return;
+
+    const seq = Number(eventPayload.seq ?? 0);
+    const chunkType: VideoChunkType =
+      String(eventPayload.chunk_type || "delta") === "key" ? "key" : "delta";
+    const frame: IncomingFrame = {
+      call_id: String(eventPayload.call_id),
+      seq,
+      timestamp: Number(eventPayload.timestamp ?? 0),
+      mime: String(eventPayload.mime || "video/webm;codecs=vp8"),
+      codec: String(eventPayload.codec || "vp8"),
+      chunk_type: chunkType,
+      payload,
+    };
+
+    if (remoteExpectedSeq === null) {
+      remoteExpectedSeq = frame.seq;
+    }
+    if (frame.seq < remoteExpectedSeq) {
+      return;
+    }
+    if (frame.seq > remoteExpectedSeq + REMOTE_REORDER_WINDOW) {
+      remoteExpectedSeq = frame.seq - REMOTE_REORDER_WINDOW;
+    }
+
+    remotePendingFrames.set(frame.seq, frame);
+    if (remotePendingFrames.size > REMOTE_REORDER_WINDOW * 2) {
+      const sorted = [...remotePendingFrames.keys()].sort((a, b) => a - b);
+      const minSeq = sorted[0];
+      if (remoteExpectedSeq !== null && minSeq > remoteExpectedSeq) {
+        remoteExpectedSeq = minSeq;
+      }
+    }
+    await flushIncomingFrameQueue();
+  }
+
+  async function chooseEncoderConfig(): Promise<{
+    codec: string;
+    mime: string;
+    config: any;
+  } | null> {
+    const encoderCtor = (window as any).VideoEncoder;
+    if (!encoderCtor) return null;
+
+    const candidates = [
+      { codec: "vp8", mime: "video/webm;codecs=vp8" },
+      { codec: "avc1.42E01E", mime: "video/mp4;codecs=avc1.42E01E" },
+    ];
+
+    for (const candidate of candidates) {
+      const config = {
+        codec: candidate.codec,
+        width: 640,
+        height: 360,
+        framerate: 8,
+        bitrate: 480_000,
+        latencyMode: "realtime",
+      };
+      try {
+        if (encoderCtor.isConfigSupported) {
+          const support = await encoderCtor.isConfigSupported(config);
+          if (!support?.supported) continue;
+        }
+        return { codec: candidate.codec, mime: candidate.mime, config };
+      } catch {
+        // try next
+      }
+    }
+
+    return null;
+  }
+
+  function stopLocalVideoCapture() {
+    localVideoCaptureLoopRunning = false;
+    if (localVideoTrackReader) {
+      try {
+        void localVideoTrackReader.cancel();
+      } catch (e) {
+        console.error("Failed stopping video track reader:", e);
+      }
+      localVideoTrackReader = null;
+    }
+    if (localVideoEncoder) {
+      try {
+        localVideoEncoder.flush?.();
+        localVideoEncoder.close?.();
+      } catch (e) {
+        console.error("Failed stopping local video encoder:", e);
+      }
+      localVideoEncoder = null;
+    }
+    if (localVideoStream) {
+      for (const track of localVideoStream.getTracks()) {
+        track.stop();
+      }
+      localVideoStream = null;
+    }
+    setLocalVideoElementStream();
+  }
+
+  async function startLocalVideoCapture() {
+    if (!activeCallId || activeCallKind !== "video") return;
+    if (localVideoEncoder || localVideoStream) return;
+    if (voiceCallState.phase !== "active" || !callMatchesActivePeer) return;
+    if (!activeCallCameraEnabled) return;
+    if (!videoCallSupported) {
+      remoteVideoStateError = videoCallUnsupportedReason || "WebCodecs unsupported.";
+      await onEndVideoCall(activeCallId);
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 640, max: 640 },
+          height: { ideal: 360, max: 360 },
+          frameRate: { ideal: 8, max: 10 },
+        },
+        audio: false,
+      });
+      localVideoStream = stream;
+      setLocalVideoElementStream();
+      localVideoSeq = 0;
+      const selected = await chooseEncoderConfig();
+      if (!selected) {
+        throw new Error("No supported low-latency encoder config.");
+      }
+      localVideoMime = selected.mime;
+      localVideoCodec = selected.codec;
+
+      const videoTrack = stream.getVideoTracks()[0];
+      if (!videoTrack) {
+        throw new Error("No video track available from camera.");
+      }
+
+      const processorCtor = (window as any).MediaStreamTrackProcessor;
+      const encoderCtor = (window as any).VideoEncoder;
+      const processor = new processorCtor({ track: videoTrack });
+      localVideoTrackReader = processor.readable.getReader();
+
+      localVideoEncoder = new encoderCtor({
+        output: (chunk: any) => {
+          if (
+            !activeCallId ||
+            !callMatchesActivePeer ||
+            activeCallKind !== "video" ||
+            voiceCallState.phase !== "active" ||
+            !activeCallCameraEnabled
+          ) {
+            return;
+          }
+          try {
+            const bytes = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(bytes);
+            const chunkType: VideoChunkType = chunk.type === "key" ? "key" : "delta";
+            void api
+              .sendVideoCallChunk(
+                activeCallId,
+                localVideoSeq,
+                Number(chunk.timestamp ?? Math.floor(performance.now() * 1000)),
+                localVideoMime,
+                localVideoCodec,
+                chunkType,
+                bytes,
+              )
+              .catch((err) => {
+                console.error("Failed to send encoded video chunk:", err);
+              });
+            localVideoSeq += 1;
+          } catch (e) {
+            console.error("Failed to package encoded chunk:", e);
+          }
+        },
+        error: (err: unknown) => {
+          console.error("Local video encoder error:", err);
+        },
+      });
+
+      localVideoEncoder.configure(selected.config);
+      localVideoCaptureLoopRunning = true;
+      let frameCount = 0;
+      while (localVideoCaptureLoopRunning && localVideoTrackReader) {
+        const { value: videoFrame, done } = await localVideoTrackReader.read();
+        if (done || !videoFrame) break;
+        try {
+          if (!activeCallCameraEnabled) {
+            videoFrame.close();
+            continue;
+          }
+          const forceKeyFrame = frameCount % 24 === 0;
+          localVideoEncoder.encode(videoFrame, { keyFrame: forceKeyFrame });
+          frameCount += 1;
+        } finally {
+          videoFrame.close();
+        }
+      }
+    } catch (e) {
+      console.error("Failed to start local video capture:", e);
+      remoteVideoStateError = "Camera access failed for this call.";
+      if (activeCallId) {
+        await onEndVideoCall(activeCallId);
+      }
+    }
+  }
+
+  $: {
+    const shouldCaptureVideo =
+      isVideoCallActiveInThisChat && activeCallCameraEnabled;
+    if (shouldCaptureVideo) {
+      void startLocalVideoCapture();
+    } else if (localVideoEncoder || localVideoStream) {
+      stopLocalVideoCapture();
+    }
+  }
+
+  $: if (!isVideoCallActiveInThisChat) {
+    resetRemoteVideoDecodeState();
+  }
 
   // Expose scrollToBottom
   export async function scrollToBottom() {
@@ -731,14 +1219,24 @@
     }
   }
 
-  onMount(() => {
+  onMount(async () => {
+    const support = detectVideoCallSupport();
+    videoCallSupported = support.supported;
+    videoCallUnsupportedReason = support.reason;
     if (!canUseRecorderApi()) {
       recorderDisabledReason = "Recording is not supported on this device.";
     }
     void cleanupStaleTempRecordings();
+    videoFrameUnlisten = await listen("video-call-frame", (event: any) => {
+      void handleIncomingVideoFrame(event.payload);
+    });
   });
 
   onDestroy(() => {
+    if (callClockTimer) {
+      clearInterval(callClockTimer);
+      callClockTimer = null;
+    }
     stopRecordingTicker();
     if (recorderState === "recording") {
       discardWhenStopping = true;
@@ -747,6 +1245,12 @@
     stopRecordingStream();
     clearRecordedPreviewUrl();
     void cleanupTempRecording();
+    stopLocalVideoCapture();
+    resetRemoteVideoDecodeState();
+    if (videoFrameUnlisten) {
+      videoFrameUnlisten();
+      videoFrameUnlisten = null;
+    }
   });
 
   // Auto-scroll when messages change
@@ -757,7 +1261,7 @@
 
 <!-- Chat Header -->
 <div
-  class="h-16 flex items-center px-6 border-b border-slate-800/50 bg-slate-900/10 backdrop-blur-sm"
+  class="h-16 flex items-center justify-between px-6 border-b border-slate-800/50 bg-slate-900/10 backdrop-blur-sm gap-4"
 >
   <div class="flex items-center gap-3">
     <span class="text-xl font-bold text-theme-base-100">
@@ -778,7 +1282,133 @@
       ></div>
     {/if}
   </div>
+
+  <div class="flex items-center gap-3">
+    {#if callMatchesActivePeer}
+      <div class="rounded-lg border border-theme-base-700 bg-theme-base-900/60 px-3 py-1.5 text-xs text-theme-base-200 flex items-center gap-2">
+        {#if voiceCallState.phase === "outgoing_ringing"}
+          <span>{activeCallKind === "video" ? "Video calling…" : "Calling…"} {formatDuration(ringCountdownSec)}</span>
+        {:else if voiceCallState.phase === "incoming_ringing"}
+          <span>Incoming {activeCallKind === "video" ? "video " : ""}call… {formatDuration(ringCountdownSec)}</span>
+        {:else if voiceCallState.phase === "active"}
+          <span>
+            {activeCallKind === "video" ? "In video call" : "In call"} • {formatDuration(callDurationSec)}
+          </span>
+          <button
+            onclick={() => activeCallId && (
+              activeCallKind === "video"
+                ? onToggleVideoMute(activeCallId, !voiceCallState.muted)
+                : onToggleVoiceMute(activeCallId, !voiceCallState.muted)
+            )}
+            class="rounded-md px-2 py-1 text-[11px] bg-theme-base-800 hover:bg-theme-base-700 text-theme-base-200"
+            title={voiceCallState.muted ? "Unmute microphone" : "Mute microphone"}
+          >
+            {voiceCallState.muted ? "Unmute" : "Mute"}
+          </button>
+          {#if activeCallKind === "video"}
+            <button
+              onclick={() => activeCallId && onToggleVideoCamera(activeCallId, !activeCallCameraEnabled)}
+              class="rounded-md px-2 py-1 text-[11px] bg-theme-base-800 hover:bg-theme-base-700 text-theme-base-200"
+              title={activeCallCameraEnabled ? "Turn camera off" : "Turn camera on"}
+            >
+              {activeCallCameraEnabled ? "Camera off" : "Camera on"}
+            </button>
+          {/if}
+        {:else if voiceCallState.phase === "ending"}
+          <span>Ending call…</span>
+        {/if}
+      </div>
+    {:else if callBusyOnOtherChat}
+      <div class="rounded-lg border border-theme-base-700 bg-theme-base-900/60 px-3 py-1.5 text-xs text-theme-base-300">
+        {activeCallKind === "video" ? "Video call" : "Call"} in progress with {voiceCallState.peer_id}
+      </div>
+    {/if}
+
+    {#if canShowCallButton}
+      {#if callMatchesActivePeer && activeCallId}
+        <button
+          onclick={() =>
+            activeCallKind === "video"
+              ? onEndVideoCall(activeCallId)
+              : onEndVoiceCall(activeCallId)}
+          class="p-2 rounded-lg bg-theme-error-500/20 text-theme-error-400 hover:bg-theme-error-500/30 transition-colors"
+          title="End call"
+          aria-label="End call"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            class="h-5 w-5"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+          >
+            <path d="M21 15.46l-5.27-2.11a1 1 0 00-1.14.27l-1.86 2.28a15.05 15.05 0 01-6.63-6.63l2.28-1.86a1 1 0 00.27-1.14L8.54 3A1 1 0 007.6 2H4a1 1 0 00-1 1c0 10.49 8.51 19 19 19a1 1 0 001-1v-3.6a1 1 0 00-.63-.94z" />
+          </svg>
+        </button>
+      {:else}
+        <button
+          onclick={onStartVoiceCall}
+          class="p-2 rounded-lg border border-theme-base-700 text-theme-base-300 hover:text-white hover:bg-theme-base-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          disabled={!canPressVoiceCallButton}
+          title={canPressVoiceCallButton ? "Start voice call" : "Peer is not connected or another call is active"}
+          aria-label="Start voice call"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            class="h-5 w-5"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+          >
+            <path d="M6.62 10.79a15.09 15.09 0 006.59 6.59l2.2-2.2a1 1 0 011.01-.24 11.72 11.72 0 003.68.59 1 1 0 011 1V20a1 1 0 01-1 1C10.52 21 3 13.48 3 4a1 1 0 011-1h3.47a1 1 0 011 1 11.72 11.72 0 00.59 3.68 1 1 0 01-.24 1.01z" />
+          </svg>
+        </button>
+        <button
+          onclick={onStartVideoCall}
+          class="p-2 rounded-lg border border-theme-base-700 text-theme-base-300 hover:text-white hover:bg-theme-base-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          disabled={!canPressVideoCallButton}
+          title={canPressVideoCallButton
+            ? "Start video call"
+            : (videoCallUnsupportedReason || "Peer is not connected or another call is active")}
+          aria-label="Start video call"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            class="h-5 w-5"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+          >
+            <path d="M17 10.5V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-4.5l4 4v-11l-4 4z" />
+          </svg>
+        </button>
+      {/if}
+    {/if}
+  </div>
 </div>
+
+{#if isVideoCallActiveInThisChat}
+  <div class="px-6 pt-3">
+    <div class="relative rounded-xl border border-theme-base-700 bg-theme-base-900/70 overflow-hidden h-36 flex items-center justify-center">
+      {#if remoteVideoStateError}
+        <div class="text-xs text-theme-base-300 px-3 text-center">{remoteVideoStateError}</div>
+      {:else}
+        <canvas bind:this={remoteVideoCanvasEl} class="w-full h-full object-cover"></canvas>
+      {/if}
+
+      <div class="absolute bottom-2 right-2 w-28 h-20 rounded-lg border border-theme-base-700 bg-black/60 overflow-hidden flex items-center justify-center">
+        {#if activeCallCameraEnabled}
+          <video
+            bind:this={localVideoEl}
+            autoplay
+            muted
+            playsinline
+            class="w-full h-full object-cover"
+          ></video>
+        {:else}
+          <span class="text-[11px] text-theme-base-300">Camera off</span>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
 
 <!-- Messages -->
 <div

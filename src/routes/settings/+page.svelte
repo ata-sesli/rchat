@@ -4,12 +4,14 @@
   import SettingsPeers from "../../components/settings/SettingsPeers.svelte";
   import SettingsStickers from "../../components/settings/SettingsStickers.svelte";
   import SettingsTheme from "../../components/settings/SettingsTheme.svelte";
+  import SettingsConnectivity from "../../components/settings/SettingsConnectivity.svelte";
   import SettingsAbout from "../../components/settings/SettingsAbout.svelte";
 
   type View =
     | "menu"
     | "profile"
     | "add-peers"
+    | "connectivity"
     | "stickers"
     | "set-theme"
     | "about";
@@ -43,6 +45,8 @@
     <SettingsProfile onback={goBack} />
   {:else if currentView === "add-peers"}
     <SettingsPeers onback={goBack} />
+  {:else if currentView === "connectivity"}
+    <SettingsConnectivity onback={goBack} />
   {:else if currentView === "stickers"}
     <SettingsStickers onback={goBack} />
   {:else if currentView === "set-theme"}

@@ -69,6 +69,54 @@ impl NetworkManager {
                 )
                 .await;
             }
+            NetworkCommand::StartVoiceCall { peer_id } => {
+                self.handle_start_voice_call(peer_id).await;
+            }
+            NetworkCommand::AcceptVoiceCall { call_id } => {
+                self.handle_accept_voice_call(call_id).await;
+            }
+            NetworkCommand::RejectVoiceCall { call_id } => {
+                self.handle_reject_voice_call(call_id).await;
+            }
+            NetworkCommand::EndVoiceCall { call_id } => {
+                self.handle_end_voice_call(call_id).await;
+            }
+            NetworkCommand::SetVoiceCallMuted { call_id, muted } => {
+                self.handle_set_voice_call_muted(call_id, muted).await;
+            }
+            NetworkCommand::StartVideoCall { peer_id } => {
+                self.handle_start_video_call(peer_id).await;
+            }
+            NetworkCommand::AcceptVideoCall { call_id } => {
+                self.handle_accept_video_call(call_id).await;
+            }
+            NetworkCommand::RejectVideoCall { call_id } => {
+                self.handle_reject_video_call(call_id).await;
+            }
+            NetworkCommand::EndVideoCall { call_id } => {
+                self.handle_end_video_call(call_id).await;
+            }
+            NetworkCommand::SetVideoCallMuted { call_id, muted } => {
+                self.handle_set_video_call_muted(call_id, muted).await;
+            }
+            NetworkCommand::SetVideoCallCameraEnabled { call_id, enabled } => {
+                self.handle_set_video_call_camera_enabled(call_id, enabled)
+                    .await;
+            }
+            NetworkCommand::SendVideoCallChunk {
+                call_id,
+                seq,
+                timestamp,
+                mime,
+                codec,
+                chunk_type,
+                payload,
+            } => {
+                self.handle_send_video_call_chunk(
+                    call_id, seq, timestamp, mime, codec, chunk_type, payload,
+                )
+                    .await;
+            }
         }
     }
 }

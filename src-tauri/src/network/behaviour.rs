@@ -3,6 +3,8 @@ use libp2p::{
     swarm::NetworkBehaviour,
 };
 
+use crate::live::video::protocol::{VideoFrameRequest, VideoFrameResponse};
+use crate::live::voice::protocol::{VoiceFrameRequest, VoiceFrameResponse};
 use super::direct_message::{DirectMessageRequest, DirectMessageResponse};
 
 #[derive(NetworkBehaviour)]
@@ -22,6 +24,11 @@ pub struct RChatBehaviour {
     // The "Direct Line" - For 1:1 chat messages
     pub direct_message:
         request_response::cbor::Behaviour<DirectMessageRequest, DirectMessageResponse>,
+
+    // Dedicated voice-call media transport
+    pub voice_call: request_response::cbor::Behaviour<VoiceFrameRequest, VoiceFrameResponse>,
+    // Dedicated video-call media transport
+    pub video_call: request_response::cbor::Behaviour<VideoFrameRequest, VideoFrameResponse>,
 
     // Circuit Relay Client - for NAT traversal via public relays
     pub relay_client: relay::client::Behaviour,
@@ -65,6 +72,24 @@ impl RChatBehaviour {
             request_response::Config::default(),
         );
 
+        // 6b. Request-Response (Voice Frames)
+        let voice_call = request_response::cbor::Behaviour::new(
+            [(
+                libp2p::StreamProtocol::new("/rchat/call/audio/1.0.0"),
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default(),
+        );
+
+        // 6c. Request-Response (Video Frames)
+        let video_call = request_response::cbor::Behaviour::new(
+            [(
+                libp2p::StreamProtocol::new(crate::live::video::video::VIDEO_PROTOCOL),
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default(),
+        );
+
         // 7. DCUtR (Hole Punching)
         let dcutr = dcutr::Behaviour::new(peer_id);
 
@@ -74,6 +99,8 @@ impl RChatBehaviour {
             identify,
             ping,
             direct_message,
+            voice_call,
+            video_call,
             relay_client,
             dcutr,
         }

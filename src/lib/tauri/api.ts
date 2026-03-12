@@ -3,6 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 export const COMMANDS = {
   saveApiToken: "save_api_token",
   checkAuthStatus: "check_auth_status",
+  getConnectivitySettings: "get_connectivity_settings",
+  setConnectivityMode: "set_connectivity_mode",
+  updateConnectivitySettings: "update_connectivity_settings",
   toggleOnlineStatus: "toggle_online_status",
   initVault: "init_vault",
   unlockVault: "unlock_vault",
@@ -72,6 +75,20 @@ export const COMMANDS = {
   redeemTemporaryInvite: "redeem_temporary_invite",
   getActiveTemporaryInvite: "get_active_temporary_invite",
   cancelTemporaryInvite: "cancel_temporary_invite",
+  startVoiceCall: "start_voice_call",
+  acceptVoiceCall: "accept_voice_call",
+  rejectVoiceCall: "reject_voice_call",
+  endVoiceCall: "end_voice_call",
+  setVoiceCallMuted: "set_voice_call_muted",
+  startVideoCall: "start_video_call",
+  acceptVideoCall: "accept_video_call",
+  rejectVideoCall: "reject_video_call",
+  endVideoCall: "end_video_call",
+  setVideoCallMuted: "set_video_call_muted",
+  setVideoCallCameraEnabled: "set_video_call_camera_enabled",
+  sendVideoCallChunk: "send_video_call_chunk",
+  getVoiceCallState: "get_voice_call_state",
+  getConnectedChatIds: "get_connected_chat_ids",
 } as const;
 
 export type FriendConfig = {
@@ -89,6 +106,24 @@ export type AuthStatus = {
   is_unlocked: boolean;
   is_github_connected: boolean;
   is_online: boolean;
+  connectivity: ConnectivitySettings;
+};
+
+export type ConnectivityMode = "invisible" | "lan" | "reachable" | "custom";
+
+export type ConnectivitySettings = {
+  mode: ConnectivityMode;
+  mdns_enabled: boolean;
+  github_sync_enabled: boolean;
+  nat_keepalive_enabled: boolean;
+  punch_assist_enabled: boolean;
+};
+
+export type ConnectivitySettingsPatch = {
+  mdns_enabled?: boolean;
+  github_sync_enabled?: boolean;
+  nat_keepalive_enabled?: boolean;
+  punch_assist_enabled?: boolean;
 };
 
 export type UserProfile = {
@@ -193,6 +228,28 @@ export type SentMediaResult = {
   file_name?: string | null;
 };
 
+export type VoiceCallPhase =
+  | "idle"
+  | "outgoing_ringing"
+  | "incoming_ringing"
+  | "active"
+  | "ending";
+
+export type CallKind = "voice" | "video";
+export type VideoChunkType = "key" | "delta";
+
+export type VoiceCallState = {
+  phase: VoiceCallPhase;
+  call_kind?: CallKind | null;
+  call_id?: string | null;
+  peer_id?: string | null;
+  started_at?: number | null;
+  ring_expires_at?: number | null;
+  muted: boolean;
+  camera_enabled?: boolean;
+  reason?: string | null;
+};
+
 export type StickerItem = {
   file_hash: string;
   name?: string | null;
@@ -229,6 +286,18 @@ export type GithubAuthState = {
 type CommandSpec = {
   [COMMANDS.saveApiToken]: { args: { token: string }; result: void };
   [COMMANDS.checkAuthStatus]: { args?: undefined; result: AuthStatus };
+  [COMMANDS.getConnectivitySettings]: {
+    args?: undefined;
+    result: ConnectivitySettings;
+  };
+  [COMMANDS.setConnectivityMode]: {
+    args: { mode: ConnectivityMode };
+    result: ConnectivitySettings;
+  };
+  [COMMANDS.updateConnectivitySettings]: {
+    args: { patch: ConnectivitySettingsPatch };
+    result: ConnectivitySettings;
+  };
   [COMMANDS.toggleOnlineStatus]: { args: { online: boolean }; result: void };
   [COMMANDS.initVault]: { args: { password: string }; result: void };
   [COMMANDS.unlockVault]: { args: { password: string }; result: void };
@@ -406,6 +475,40 @@ type CommandSpec = {
     result: TemporaryInviteView | null;
   };
   [COMMANDS.cancelTemporaryInvite]: { args?: undefined; result: void };
+  [COMMANDS.startVoiceCall]: { args: { peer_id: string }; result: void };
+  [COMMANDS.acceptVoiceCall]: { args: { call_id: string }; result: void };
+  [COMMANDS.rejectVoiceCall]: { args: { call_id: string }; result: void };
+  [COMMANDS.endVoiceCall]: { args: { call_id: string }; result: void };
+  [COMMANDS.setVoiceCallMuted]: {
+    args: { call_id: string; muted: boolean };
+    result: void;
+  };
+  [COMMANDS.startVideoCall]: { args: { peer_id: string }; result: void };
+  [COMMANDS.acceptVideoCall]: { args: { call_id: string }; result: void };
+  [COMMANDS.rejectVideoCall]: { args: { call_id: string }; result: void };
+  [COMMANDS.endVideoCall]: { args: { call_id: string }; result: void };
+  [COMMANDS.setVideoCallMuted]: {
+    args: { call_id: string; muted: boolean };
+    result: void;
+  };
+  [COMMANDS.setVideoCallCameraEnabled]: {
+    args: { call_id: string; enabled: boolean };
+    result: void;
+  };
+  [COMMANDS.sendVideoCallChunk]: {
+    args: {
+      call_id: string;
+      seq: number;
+      timestamp: number;
+      mime: string;
+      codec: string;
+      chunk_type: VideoChunkType;
+      payload: Uint8Array;
+    };
+    result: void;
+  };
+  [COMMANDS.getVoiceCallState]: { args?: undefined; result: VoiceCallState };
+  [COMMANDS.getConnectedChatIds]: { args?: undefined; result: string[] };
 };
 
 type KnownCommand = keyof CommandSpec;
@@ -461,6 +564,11 @@ export const api = {
   saveApiToken: (token: string) =>
     invokeCommand(COMMANDS.saveApiToken, { token }),
   checkAuthStatus: () => invokeCommand(COMMANDS.checkAuthStatus),
+  getConnectivitySettings: () => invokeCommand(COMMANDS.getConnectivitySettings),
+  setConnectivityMode: (mode: ConnectivityMode) =>
+    invokeCommand(COMMANDS.setConnectivityMode, { mode }),
+  updateConnectivitySettings: (patch: ConnectivitySettingsPatch) =>
+    invokeCommand(COMMANDS.updateConnectivitySettings, { patch }),
   toggleOnlineStatus: (online: boolean) =>
     invokeCommand(COMMANDS.toggleOnlineStatus, { online }),
   initVault: (password: string) => invokeCommand(COMMANDS.initVault, { password }),
@@ -630,4 +738,49 @@ export const api = {
     } as unknown as CommandSpec[typeof COMMANDS.redeemTemporaryInvite]["args"]),
   getActiveTemporaryInvite: () => invokeCommand(COMMANDS.getActiveTemporaryInvite),
   cancelTemporaryInvite: () => invokeCommand(COMMANDS.cancelTemporaryInvite),
+  startVoiceCall: (peerId: string) =>
+    invokeCommand(COMMANDS.startVoiceCall, { peer_id: peerId }),
+  acceptVoiceCall: (callId: string) =>
+    invokeCommand(COMMANDS.acceptVoiceCall, { call_id: callId }),
+  rejectVoiceCall: (callId: string) =>
+    invokeCommand(COMMANDS.rejectVoiceCall, { call_id: callId }),
+  endVoiceCall: (callId: string) =>
+    invokeCommand(COMMANDS.endVoiceCall, { call_id: callId }),
+  setVoiceCallMuted: (callId: string, muted: boolean) =>
+    invokeCommand(COMMANDS.setVoiceCallMuted, { call_id: callId, muted }),
+  startVideoCall: (peerId: string) =>
+    invokeCommand(COMMANDS.startVideoCall, { peer_id: peerId }),
+  acceptVideoCall: (callId: string) =>
+    invokeCommand(COMMANDS.acceptVideoCall, { call_id: callId }),
+  rejectVideoCall: (callId: string) =>
+    invokeCommand(COMMANDS.rejectVideoCall, { call_id: callId }),
+  endVideoCall: (callId: string) =>
+    invokeCommand(COMMANDS.endVideoCall, { call_id: callId }),
+  setVideoCallMuted: (callId: string, muted: boolean) =>
+    invokeCommand(COMMANDS.setVideoCallMuted, { call_id: callId, muted }),
+  setVideoCallCameraEnabled: (callId: string, enabled: boolean) =>
+    invokeCommand(COMMANDS.setVideoCallCameraEnabled, {
+      call_id: callId,
+      enabled,
+    }),
+  sendVideoCallChunk: (
+    callId: string,
+    seq: number,
+    timestamp: number,
+    mime: string,
+    codec: string,
+    chunkType: VideoChunkType,
+    payload: Uint8Array,
+  ) =>
+    invokeCommand(COMMANDS.sendVideoCallChunk, {
+      call_id: callId,
+      seq,
+      timestamp,
+      mime,
+      codec,
+      chunk_type: chunkType,
+      payload,
+    }),
+  getVoiceCallState: () => invokeCommand(COMMANDS.getVoiceCallState),
+  getConnectedChatIds: () => invokeCommand(COMMANDS.getConnectedChatIds),
 };

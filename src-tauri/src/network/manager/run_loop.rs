@@ -66,6 +66,11 @@ impl NetworkManager {
         // Cleanup stale transfer states every minute.
         let mut transfer_cleanup_interval =
             tokio::time::interval(std::time::Duration::from_secs(60));
+        // Voice-call tick: ring timeout + outgoing frame pump.
+        let mut voice_call_tick = tokio::time::interval(std::time::Duration::from_millis(20));
+        // Ensure mDNS runtime reflects current connectivity settings.
+        let mut mdns_reconcile_interval =
+            tokio::time::interval(std::time::Duration::from_secs(2));
 
         loop {
             tokio::select! {
@@ -79,19 +84,30 @@ impl NetworkManager {
                 _ = nat_keepalive_interval.tick() => {
                     // Dial a dummy address to send outbound UDP and keep NAT mapping alive
                     // The dial will fail, but the outbound packet is enough for NAT
-                    let _ = self.swarm.dial(nat_keepalive_addr.clone());
-                    // Don't log every time to avoid spam, but occasionally log
+                    if self.is_nat_keepalive_enabled() {
+                        let _ = self.swarm.dial(nat_keepalive_addr.clone());
+                    }
                 }
                 _ = shadow_poll_interval.tick() => {
                     // Poll for shadow invites from invitees
-                    self.poll_shadow_invites().await;
+                    if self.is_punch_assist_enabled() {
+                        self.poll_shadow_invites().await;
+                    }
                 }
                 _ = punch_interval.tick() => {
                     // Continuously punch all active targets
-                    self.punch_active_targets();
+                    if self.is_punch_assist_enabled() {
+                        self.punch_active_targets();
+                    }
                 }
                 _ = transfer_cleanup_interval.tick() => {
                     self.cleanup_stale_transfer_states();
+                }
+                _ = voice_call_tick.tick() => {
+                    self.tick_voice_call().await;
+                }
+                _ = mdns_reconcile_interval.tick() => {
+                    self.reconcile_mdns_runtime();
                 }
                 Some(cmd) = self.crx.recv() => {
                     self.dispatch_command(cmd).await;
@@ -114,6 +130,10 @@ impl NetworkManager {
         }
     }
     async fn publish_listeners(&mut self) {
+        if !self.is_github_sync_enabled() {
+            return;
+        }
+
         use tauri::Manager;
         let listeners: Vec<String> = self.swarm.listeners().map(|l| l.to_string()).collect();
         if listeners.is_empty() {
@@ -124,7 +144,10 @@ impl NetworkManager {
         let (token, is_online) = {
             let mgr = state.config_manager.lock().await;
             if let Ok(config) = mgr.load().await {
-                (config.system.github_token.clone(), config.user.is_online)
+                (
+                    config.system.github_token.clone(),
+                    config.user.connectivity.github_sync_enabled,
+                )
             } else {
                 (None, false)
             }

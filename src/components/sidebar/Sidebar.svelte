@@ -1,6 +1,7 @@
 <script lang="ts">
   import { fade } from "svelte/transition";
   import { flip } from "svelte/animate";
+  import type { ConnectivityMode, ConnectivitySettings } from "$lib/tauri/api";
   import EnvelopeItem from "./EnvelopeItem.svelte";
   import { getChatKind } from "$lib/chatKind";
 
@@ -24,11 +25,17 @@
     dragOverEnvelopeId = null as string | null,
     isDragging = false,
     draggingPeer = null as string | null,
-    isOnline = false,
+    connectivitySettings = {
+      mode: "reachable",
+      mdns_enabled: true,
+      github_sync_enabled: true,
+      nat_keepalive_enabled: true,
+      punch_assist_enabled: true,
+    } as ConnectivitySettings,
     localPeers = [] as { peer_id: string; addresses: string[] }[],
     unreadCounts = {} as Record<string, number>,
     // Callbacks
-    ontoggleOnline = () => {},
+    onselectConnectivityMode = (_mode: ConnectivityMode) => {},
     ontoggleSidebar = () => {},
     onopenSettings = () => {},
     onselectPeer = (peer: string) => {},
@@ -90,6 +97,21 @@
 
   function openEnvelopeModal() {
     onopenEnvelopeModal();
+  }
+
+  function modeLabel(mode: ConnectivityMode): string {
+    switch (mode) {
+      case "invisible":
+        return "Invisible";
+      case "lan":
+        return "LAN";
+      case "reachable":
+        return "Reachable";
+      case "custom":
+        return "Custom";
+      default:
+        return "Unknown";
+    }
   }
 
   function toggleCreateMenu() {
@@ -199,25 +221,30 @@
 
     {#if isSidebarOpen}
       <div class="relative animate-fade-in-up space-y-2">
-        <!-- Offline/Online Switch -->
+        <!-- Connectivity Mode -->
         <div class="flex items-center justify-between px-1 mb-2">
           <span
             class="text-xs font-semibold uppercase tracking-wider text-theme-base-500"
           >
-            {isOnline ? "Online" : "Offline"}
+            Connectivity
           </span>
-          <button
-            onclick={() => {
-              console.log("Sidebar: Toggle clicked");
-              ontoggleOnline();
-            }}
-            class={`w-10 h-5 rounded-full relative transition-colors duration-300 z-50 cursor-pointer ${isOnline ? "bg-theme-primary-500" : "bg-theme-base-700"}`}
-            title={isOnline ? "Go Offline" : "Go Online"}
+          <select
+            value={connectivitySettings.mode}
+            onchange={(e) =>
+              onselectConnectivityMode(
+                (e.currentTarget as HTMLSelectElement).value as ConnectivityMode,
+              )}
+            class="text-xs bg-theme-base-800 border border-theme-base-700 rounded-md px-2 py-1 text-theme-base-200 focus:outline-none focus:border-theme-base-500"
+            title="Connectivity mode"
           >
-            <div
-              class={`absolute top-1 w-3 h-3 rounded-full bg-white transition-all duration-300 shadow-sm pointer-events-none ${isOnline ? "left-6" : "left-1"}`}
-            ></div>
-          </button>
+            <option value="invisible">Invisible</option>
+            <option value="lan">LAN</option>
+            <option value="reachable">Reachable</option>
+            <option value="custom" disabled>Custom</option>
+          </select>
+        </div>
+        <div class="px-1 -mt-1 mb-2 text-[11px] text-theme-base-500">
+          Mode: {modeLabel(connectivitySettings.mode)}
         </div>
 
         <div class="flex gap-2">

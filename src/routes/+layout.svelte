@@ -9,7 +9,12 @@
   import { onDestroy, onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
-  import { api } from "$lib/tauri/api";
+  import {
+    api,
+    type ConnectivityMode,
+    type ConnectivitySettings,
+    type VoiceCallState,
+  } from "$lib/tauri/api";
   import { defaultGroupName, getChatKind } from "$lib/chatKind";
   import "../app.css"; // Ensure global styles are loaded
 
@@ -35,7 +40,13 @@
     avatar_path: null as string | null,
   };
   let searchQuery = "";
-  let isOnline = false;
+  let connectivitySettings: ConnectivitySettings = {
+    mode: "reachable",
+    mdns_enabled: true,
+    github_sync_enabled: true,
+    nat_keepalive_enabled: true,
+    punch_assist_enabled: true,
+  };
 
   // Active peer is derived from route params
   $: activePeer = $page.params.id || "";
@@ -95,6 +106,47 @@
   let unreadCounts: Record<string, number> = {};
   const seenDeepLinks = new Set<string>();
   let unlistenOpenUrl: (() => void) | null = null;
+  let unlistenVoiceCallState: (() => void) | null = null;
+  let voiceCallState: VoiceCallState = { phase: "idle", muted: false };
+  let videoCallSupported = true;
+  let videoCallUnsupportedReason: string | null = null;
+  const autoRejectedUnsupportedVideoCalls = new Set<string>();
+
+  function detectVideoCallSupport(): { supported: boolean; reason: string | null } {
+    if (typeof window === "undefined") {
+      return { supported: false, reason: "Unavailable in this environment." };
+    }
+    if (!navigator?.mediaDevices?.getUserMedia) {
+      return { supported: false, reason: "Camera capture is unavailable on this device." };
+    }
+    const w = window as any;
+    if (!w.VideoEncoder || !w.VideoDecoder || !w.EncodedVideoChunk || !w.MediaStreamTrackProcessor) {
+      return { supported: false, reason: "WebCodecs video support is unavailable on this client." };
+    }
+    return { supported: true, reason: null };
+  }
+
+  $: {
+    const incomingUnsupportedVideoCallId =
+      voiceCallState.phase === "incoming_ringing" &&
+      voiceCallState.call_kind === "video" &&
+      voiceCallState.call_id &&
+      !videoCallSupported
+        ? voiceCallState.call_id
+        : null;
+    if (
+      incomingUnsupportedVideoCallId &&
+      !autoRejectedUnsupportedVideoCalls.has(incomingUnsupportedVideoCallId)
+    ) {
+      autoRejectedUnsupportedVideoCalls.add(incomingUnsupportedVideoCallId);
+      void api.rejectVideoCall(incomingUnsupportedVideoCallId).catch((e) => {
+        console.error("Failed to auto-reject unsupported incoming video call:", e);
+      });
+    }
+    if (voiceCallState.phase === "idle" && autoRejectedUnsupportedVideoCalls.size > 32) {
+      autoRejectedUnsupportedVideoCalls.clear();
+    }
+  }
 
   $: sortedPeers = computeSortedPeers(
     peers,
@@ -187,6 +239,9 @@
   }
 
   onMount(async () => {
+    const support = detectVideoCallSupport();
+    videoCallSupported = support.supported;
+    videoCallUnsupportedReason = support.reason;
     try {
       await listen("auth-status", () => refreshData());
       window.addEventListener("open-chat", async (event: Event) => {
@@ -252,6 +307,11 @@
         console.log("[Layout] Profile updated, refreshing...");
         refreshData();
       });
+      window.addEventListener("connectivity-updated", (event: Event) => {
+        const next = (event as CustomEvent<ConnectivitySettings>).detail;
+        if (!next) return;
+        connectivitySettings = next;
+      });
 
       // Force repaint on resize to fix WebKit rendering bug
       window.addEventListener("resize", () => {
@@ -261,6 +321,17 @@
       });
 
       await refreshData();
+      try {
+        voiceCallState = await api.getVoiceCallState();
+      } catch (e) {
+        console.warn("Voice call state unavailable yet:", e);
+      }
+      unlistenVoiceCallState = await listen<VoiceCallState>(
+        "voice-call-state-updated",
+        (event) => {
+          voiceCallState = event.payload;
+        },
+      );
       try {
         if (!(await isRegistered("rchat"))) {
           await register("rchat");
@@ -282,7 +353,44 @@
       unlistenOpenUrl();
       unlistenOpenUrl = null;
     }
+    if (unlistenVoiceCallState) {
+      unlistenVoiceCallState();
+      unlistenVoiceCallState = null;
+    }
   });
+
+  async function acceptIncomingCall() {
+    if (!voiceCallState.call_id) return;
+    try {
+      if (voiceCallState.call_kind === "video") {
+        if (!videoCallSupported) {
+          await api.rejectVideoCall(voiceCallState.call_id);
+          return;
+        }
+        await api.acceptVideoCall(voiceCallState.call_id);
+      } else {
+        await api.acceptVoiceCall(voiceCallState.call_id);
+      }
+      if (voiceCallState.peer_id) {
+        goto(`/chat/${voiceCallState.peer_id}`);
+      }
+    } catch (e) {
+      console.error("Failed to accept call:", e);
+    }
+  }
+
+  async function rejectIncomingCall() {
+    if (!voiceCallState.call_id) return;
+    try {
+      if (voiceCallState.call_kind === "video") {
+        await api.rejectVideoCall(voiceCallState.call_id);
+      } else {
+        await api.rejectVoiceCall(voiceCallState.call_id);
+      }
+    } catch (e) {
+      console.error("Failed to reject call:", e);
+    }
+  }
 
   async function refreshData() {
     try {
@@ -293,7 +401,7 @@
       console.log("[Layout] Ensuring network is started...");
       await api.startNetwork();
 
-      isOnline = auth.is_online; // Sync state
+      connectivitySettings = auth.connectivity;
 
       const chatList = await api.getChatList();
       const nextPeers: string[] = [];
@@ -335,15 +443,11 @@
     }
   }
 
-  async function handleToggleOnline() {
-    console.log("Layout: handleToggleOnline called. Current:", isOnline);
+  async function handleSetConnectivityMode(mode: ConnectivityMode) {
     try {
-      const newState = !isOnline;
-      await api.toggleOnlineStatus(newState);
-      isOnline = newState;
-      console.log("Layout: Toggled to", newState);
+      connectivitySettings = await api.setConnectivityMode(mode);
     } catch (e) {
-      console.error("Toggle online failed:", e);
+      console.error("Connectivity mode update failed:", e);
     }
   }
 
@@ -603,10 +707,10 @@
       {dragOverEnvelopeId}
       {isDragging}
       {draggingPeer}
-      {isOnline}
+      {connectivitySettings}
       {localPeers}
       {unreadCounts}
-      ontoggleOnline={handleToggleOnline}
+      onselectConnectivityMode={handleSetConnectivityMode}
       ontoggleSidebar={() => (isSidebarOpen = !isSidebarOpen)}
       onopenSettings={() => goto("/settings")}
       onselectPeer={handleSelectPeer}
@@ -714,6 +818,39 @@
         {currentEnvelope}
         onaction={handleContextAction}
       />
+
+      {#if voiceCallState.phase === "incoming_ringing" && voiceCallState.call_id}
+        <div class="fixed inset-0 z-[120] flex items-center justify-center bg-black/45">
+          <div class="w-full max-w-sm rounded-2xl border border-theme-base-700 bg-theme-base-900 p-5 shadow-2xl">
+            <div class="text-sm text-theme-base-400 mb-1">
+              Incoming {voiceCallState.call_kind === "video" ? "video" : "voice"} call
+            </div>
+            <div class="text-lg font-semibold text-theme-base-100 mb-4 truncate">
+              {voiceCallState.peer_id || "Unknown peer"}
+            </div>
+            {#if voiceCallState.call_kind === "video" && !videoCallSupported}
+              <div class="text-xs text-theme-base-400 mb-3">
+                {videoCallUnsupportedReason || "Video calls are not supported on this client."}
+              </div>
+            {/if}
+            <div class="flex gap-2 justify-end">
+              <button
+                onclick={rejectIncomingCall}
+                class="px-4 py-2 rounded-lg bg-theme-base-800 hover:bg-theme-base-700 text-theme-base-200"
+              >
+                Reject
+              </button>
+              <button
+                onclick={acceptIncomingCall}
+                class="px-4 py-2 rounded-lg bg-theme-success-600 hover:bg-theme-success-500 text-white"
+                disabled={voiceCallState.call_kind === "video" && !videoCallSupported}
+              >
+                Accept
+              </button>
+            </div>
+          </div>
+        </div>
+      {/if}
     </section>
   </main>
 </ThemeProvider>

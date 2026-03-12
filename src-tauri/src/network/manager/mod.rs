@@ -17,6 +17,10 @@ mod run_loop;
 mod swarm_events;
 mod transfer;
 mod ui_commands;
+#[path = "../../live/video/manager.rs"]
+mod video_call;
+#[path = "../../live/voice/manager.rs"]
+mod voice_call;
 
 #[cfg(test)]
 mod tests;
@@ -25,6 +29,84 @@ mod tests;
 pub struct LocalPeer {
     pub peer_id: String,
     pub addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveCallPhase {
+    OutgoingRinging,
+    IncomingRinging,
+    Active,
+}
+
+#[derive(Clone)]
+struct ActiveCall {
+    call_id: String,
+    kind: crate::app_state::CallKind,
+    peer_chat_id: String,
+    remote_peer_id: PeerId,
+    phase: ActiveCallPhase,
+    ring_deadline: Option<std::time::Instant>,
+    ring_expires_at: Option<i64>,
+    started_at: Option<i64>,
+    muted: bool,
+    camera_enabled: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct PeerTransportState {
+    quic_connections: usize,
+    tcp_connections: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+struct PeerTransportRegistry {
+    by_peer: HashMap<PeerId, PeerTransportState>,
+}
+
+impl PeerTransportRegistry {
+    fn is_quic_addr(addr: &Multiaddr) -> bool {
+        let raw = addr.to_string();
+        raw.contains("/quic-v1") || raw.contains("/quic/")
+    }
+
+    fn is_tcp_addr(addr: &Multiaddr) -> bool {
+        addr.to_string().contains("/tcp/")
+    }
+
+    fn record_connected(&mut self, peer_id: PeerId, remote_addr: &Multiaddr) {
+        let state = self.by_peer.entry(peer_id).or_default();
+        if Self::is_quic_addr(remote_addr) {
+            state.quic_connections = state.quic_connections.saturating_add(1);
+        } else if Self::is_tcp_addr(remote_addr) {
+            state.tcp_connections = state.tcp_connections.saturating_add(1);
+        }
+    }
+
+    fn record_disconnected(&mut self, peer_id: PeerId, remote_addr: &Multiaddr) -> bool {
+        let Some(state) = self.by_peer.get_mut(&peer_id) else {
+            return false;
+        };
+        let had_quic = state.quic_connections > 0;
+
+        if Self::is_quic_addr(remote_addr) {
+            state.quic_connections = state.quic_connections.saturating_sub(1);
+        } else if Self::is_tcp_addr(remote_addr) {
+            state.tcp_connections = state.tcp_connections.saturating_sub(1);
+        }
+
+        let has_quic = state.quic_connections > 0;
+        if state.quic_connections == 0 && state.tcp_connections == 0 {
+            self.by_peer.remove(&peer_id);
+        }
+        had_quic && !has_quic
+    }
+
+    fn has_quic(&self, peer_id: &PeerId) -> bool {
+        self.by_peer
+            .get(peer_id)
+            .map(|state| state.quic_connections > 0)
+            .unwrap_or(false)
+    }
 }
 
 pub struct NetworkManager {
@@ -67,6 +149,8 @@ pub struct NetworkManager {
     temp_peer_by_chat_id: HashMap<String, String>,
     // Reverse temporary routing cache: peer id -> temp chat id
     temp_chat_by_peer_id: HashMap<String, String>,
+    // Connection transport capability registry per peer.
+    peer_transport_registry: PeerTransportRegistry,
     // Transfer per-file ordering/emit state.
     transfer_states: HashMap<String, transfer::TransferState>,
     // Transfer worker queue sender.
@@ -93,6 +177,16 @@ pub struct NetworkManager {
     persistence_inflight_tasks: Arc<AtomicUsize>,
     // Worker handles owned by manager for lifecycle control.
     persistence_worker_handles: Vec<tauri::async_runtime::JoinHandle<()>>,
+    // Current DM call runtime state (single-call invariant across voice+video).
+    active_call: Option<ActiveCall>,
+    // Backend audio engine for current active call.
+    voice_audio_engine: Option<crate::live::voice::voice::VoiceAudioEngine>,
+    // Captured local PCM16 frames from audio engine.
+    voice_capture_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>>,
+    // Sequence number for outgoing voice frames.
+    voice_next_seq: u32,
+    // Sequence-aware jitter buffer for inbound voice frames.
+    voice_jitter_buffer: crate::live::voice::jitter::VoiceJitterBuffer,
 }
 
 fn build_incoming_dm_db_message(
@@ -242,6 +336,7 @@ impl NetworkManager {
             github_by_peer_id: HashMap::new(),
             temp_peer_by_chat_id: HashMap::new(),
             temp_chat_by_peer_id: HashMap::new(),
+            peer_transport_registry: PeerTransportRegistry::default(),
             transfer_states: HashMap::new(),
             transfer_task_tx,
             transfer_result_rx,
@@ -256,6 +351,11 @@ impl NetworkManager {
             persistence_pending_tasks,
             persistence_inflight_tasks,
             persistence_worker_handles,
+            active_call: None,
+            voice_audio_engine: None,
+            voice_capture_rx: None,
+            voice_next_seq: 0,
+            voice_jitter_buffer: crate::live::voice::jitter::VoiceJitterBuffer::new(),
         }
     }
 
@@ -359,6 +459,77 @@ impl NetworkManager {
         let chat_id = self.temp_chat_by_peer_id.remove(peer_id)?;
         self.temp_peer_by_chat_id.remove(&chat_id);
         Some(chat_id)
+    }
+
+    pub(super) async fn mark_connected_chat_id(&mut self, chat_id: String) {
+        let state = self.app_handle.state::<crate::NetworkState>();
+        let mut connected = state.connected_chat_ids.lock().await;
+        connected.insert(chat_id);
+    }
+
+    pub(super) async fn unmark_connected_chat_id(&mut self, chat_id: &str) {
+        let state = self.app_handle.state::<crate::NetworkState>();
+        let mut connected = state.connected_chat_ids.lock().await;
+        connected.remove(chat_id);
+    }
+
+    pub(super) async fn set_voice_call_state(
+        &mut self,
+        mut next: crate::app_state::VoiceCallState,
+        reason: Option<String>,
+    ) {
+        if reason.is_some() {
+            next.reason = reason;
+        }
+        let state = self.app_handle.state::<crate::NetworkState>();
+        {
+            let mut shared = state.voice_call_state.lock().await;
+            *shared = next.clone();
+        }
+        let _ = self.app_handle.emit("voice-call-state-updated", next);
+    }
+
+    pub(super) fn note_peer_transport_connected(&mut self, peer_id: PeerId, remote_addr: &Multiaddr) {
+        self.peer_transport_registry
+            .record_connected(peer_id, remote_addr);
+    }
+
+    pub(super) fn note_peer_transport_disconnected(
+        &mut self,
+        peer_id: PeerId,
+        remote_addr: &Multiaddr,
+    ) -> bool {
+        self.peer_transport_registry
+            .record_disconnected(peer_id, remote_addr)
+    }
+
+    pub(super) fn peer_has_quic_path(&self, peer_id: &PeerId) -> bool {
+        self.peer_transport_registry.has_quic(peer_id)
+    }
+
+    pub(super) fn current_connectivity_settings(&self) -> crate::storage::config::ConnectivitySettings {
+        let state = self.app_handle.state::<crate::NetworkState>();
+        let settings = match state.connectivity.try_lock() {
+            Ok(settings) => settings.clone(),
+            Err(_) => crate::storage::config::ConnectivitySettings::default(),
+        };
+        settings
+    }
+
+    pub(super) fn is_mdns_enabled(&self) -> bool {
+        self.current_connectivity_settings().mdns_enabled
+    }
+
+    pub(super) fn is_github_sync_enabled(&self) -> bool {
+        self.current_connectivity_settings().github_sync_enabled
+    }
+
+    pub(super) fn is_nat_keepalive_enabled(&self) -> bool {
+        self.current_connectivity_settings().nat_keepalive_enabled
+    }
+
+    pub(super) fn is_punch_assist_enabled(&self) -> bool {
+        self.current_connectivity_settings().punch_assist_enabled
     }
 }
 

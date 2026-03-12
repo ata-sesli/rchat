@@ -9,6 +9,7 @@ impl NetworkManager {
         println!("[Swarm] Connected to {}", peer_id);
 
         let remote_addr = endpoint.get_remote_address().clone();
+        self.note_peer_transport_connected(peer_id, &remote_addr);
         self.local_peers
             .entry(peer_id)
             .or_insert_with(Vec::new)
@@ -35,6 +36,10 @@ impl NetworkManager {
 
         let remote_addr_str = remote_addr.to_string();
         let peer_id_str = peer_id.to_string();
+        self.mark_connected_chat_id(peer_id_str.clone()).await;
+        if let Some(username) = self.github_by_peer_id.get(&peer_id_str).cloned() {
+            self.mark_connected_chat_id(format!("gh:{}", username)).await;
+        }
 
         if let Some(chat_id) = self.temp_chat_by_peer_id.get(&peer_id_str).cloned() {
             use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
@@ -94,6 +99,8 @@ impl NetworkManager {
                 inviter_github_user, peer_id_str
             );
             self.cache_peer_mapping(&inviter_github_user, &peer_id_str);
+            self.mark_connected_chat_id(format!("gh:{}", inviter_github_user))
+                .await;
 
             let app_handle = self.app_handle.clone();
             let gh_user = inviter_github_user.clone();
@@ -164,15 +171,38 @@ impl NetworkManager {
         }
     }
 
-    pub(super) async fn handle_connection_closed(&mut self, peer_id: PeerId, num_established: u32) {
+    pub(super) async fn handle_connection_closed(
+        &mut self,
+        peer_id: PeerId,
+        num_established: u32,
+        endpoint: libp2p::core::ConnectedPoint,
+    ) {
         println!("[Swarm] Disconnected from {}", peer_id);
+        let remote_addr = endpoint.get_remote_address().clone();
+        let quic_path_lost = self.note_peer_transport_disconnected(peer_id, &remote_addr);
+        if quic_path_lost {
+            let end_video_call = self
+                .active_call
+                .as_ref()
+                .map(|call| {
+                    call.kind == crate::app_state::CallKind::Video && call.remote_peer_id == peer_id
+                })
+                .unwrap_or(false);
+            if end_video_call {
+                self.transition_to_idle(Some("quic_path_lost".to_string()))
+                    .await;
+            }
+        }
 
         if num_established == 0 {
+            self.handle_peer_disconnect_for_voice_call(&peer_id).await;
             if self.local_peers.remove(&peer_id).is_some() {
                 println!("[Swarm] Peer {} fully disconnected, notifying UI", peer_id);
 
                 let peer_id_str = peer_id.to_string();
+                self.unmark_connected_chat_id(&peer_id_str).await;
                 if let Some(chat_id) = self.remove_temporary_by_peer_id(&peer_id_str) {
+                    self.unmark_connected_chat_id(&chat_id).await;
                     let _ = self.app_handle.emit(
                         "temporary-chat-ended",
                         serde_json::json!({
@@ -184,6 +214,8 @@ impl NetworkManager {
                 }
 
                 if let Some(username) = self.github_by_peer_id.get(&peer_id_str).cloned() {
+                    self.unmark_connected_chat_id(&format!("gh:{}", username))
+                        .await;
                     let _ = self
                         .app_handle
                         .emit("local-peer-expired", format!("gh:{}", username));
@@ -192,6 +224,8 @@ impl NetworkManager {
 
                 self.refresh_peer_mapping_cache().await;
                 if let Some(username) = self.github_by_peer_id.get(&peer_id_str).cloned() {
+                    self.unmark_connected_chat_id(&format!("gh:{}", username))
+                        .await;
                     let _ = self
                         .app_handle
                         .emit("local-peer-expired", format!("gh:{}", username));
@@ -199,6 +233,79 @@ impl NetworkManager {
                     let _ = self.app_handle.emit("local-peer-expired", peer_id_str);
                 }
             }
+        }
+    }
+
+    fn try_start_mdns_on_port(&mut self, port: u16) {
+        if self.mdns_started || port == 0 {
+            return;
+        }
+
+        println!(
+            "[NetworkManager] Found QUIC listen port: {}, starting mDNS...",
+            port
+        );
+        let peer_id = *self.swarm.local_peer_id();
+
+        let user_alias = {
+            use tauri::Manager;
+            let state = self.app_handle.state::<crate::AppState>();
+            state
+                .config_manager
+                .try_lock()
+                .ok()
+                .and_then(|mgr| mgr.load_sync().ok())
+                .and_then(|c| c.user.profile.alias.clone())
+        };
+
+        if let Err(e) = crate::network::mdns::start_mdns_service(
+            peer_id,
+            port,
+            self.mdns_tx.clone(),
+            user_alias,
+        )
+        .map(|handle| {
+            self.mdns_handle = Some(handle);
+        }) {
+            eprintln!("[NetworkManager] Failed to start mDNS: {}", e);
+        } else {
+            self.mdns_started = true;
+            println!("[NetworkManager] mDNS started (advertising + browsing)");
+        }
+    }
+
+    pub(crate) fn reconcile_mdns_runtime(&mut self) {
+        let mdns_enabled = self.is_mdns_enabled();
+
+        if !mdns_enabled {
+            if self.mdns_started {
+                if let Some(mut handle) = self.mdns_handle.take() {
+                    handle.stop();
+                }
+                self.mdns_started = false;
+
+                let expired_peers: Vec<String> =
+                    self.local_peers.keys().map(|p| p.to_string()).collect();
+                self.local_peers.clear();
+                for peer_id in expired_peers {
+                    let _ = self.app_handle.emit("local-peer-expired", peer_id);
+                }
+            }
+            return;
+        }
+
+        if self.mdns_started {
+            return;
+        }
+
+        let listen_port = self
+            .swarm
+            .listeners()
+            .find(|addr| addr.to_string().contains("/udp/") && addr.to_string().contains("quic"))
+            .and_then(crate::network::get_port_from_multiaddr);
+
+        if let Some(port) = listen_port {
+            self.try_start_mdns_on_port(port);
         }
     }
 
@@ -218,44 +325,12 @@ impl NetworkManager {
             });
         }
 
-        if !self.mdns_started
+        if self.is_mdns_enabled()
             && address.to_string().contains("/udp/")
             && address.to_string().contains("quic")
         {
             if let Some(port) = crate::network::get_port_from_multiaddr(&address) {
-                if port != 0 {
-                    println!(
-                        "[NetworkManager] Found QUIC listen port: {}, starting mDNS...",
-                        port
-                    );
-                    let peer_id = *self.swarm.local_peer_id();
-
-                    let user_alias = {
-                        use tauri::Manager;
-                        let state = self.app_handle.state::<crate::AppState>();
-                        state
-                            .config_manager
-                            .try_lock()
-                            .ok()
-                            .and_then(|mgr| mgr.load_sync().ok())
-                            .and_then(|c| c.user.profile.alias.clone())
-                    };
-
-                    if let Err(e) = crate::network::mdns::start_mdns_service(
-                        peer_id,
-                        port,
-                        self.mdns_tx.clone(),
-                        user_alias,
-                    )
-                    .map(|handle| {
-                        self.mdns_handle = Some(handle);
-                    }) {
-                        eprintln!("[NetworkManager] Failed to start mDNS: {}", e);
-                    } else {
-                        self.mdns_started = true;
-                        println!("[NetworkManager] mDNS started (advertising + browsing)");
-                    }
-                }
+                self.try_start_mdns_on_port(port);
             }
         }
     }

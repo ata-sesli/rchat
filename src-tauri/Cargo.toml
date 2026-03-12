@@ -63,6 +63,7 @@ tauri-plugin-fs = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 zeroize = { version = "1.8.2", features = ["derive"] }
 tauri-plugin-deep-link = "2"
+cpal = "0.15.3"
 [dev-dependencies]
 tempfile = "3.23.0"
 

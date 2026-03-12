@@ -28,6 +28,13 @@ pub enum DirectMessageKind {
     ChunkResponse,
     InviteHandshake,
     TempHandshake,
+    CallOffer,
+    CallOfferVideo,
+    CallAccept,
+    CallAcceptVideo,
+    CallReject,
+    CallBusy,
+    CallEnd,
 }
 
 impl DirectMessageKind {
@@ -46,6 +53,13 @@ impl DirectMessageKind {
             Self::ChunkResponse => "chunk_response",
             Self::InviteHandshake => "invite_handshake",
             Self::TempHandshake => "temp_handshake",
+            Self::CallOffer => "call_offer",
+            Self::CallOfferVideo => "call_offer_video",
+            Self::CallAccept => "call_accept",
+            Self::CallAcceptVideo => "call_accept_video",
+            Self::CallReject => "call_reject",
+            Self::CallBusy => "call_busy",
+            Self::CallEnd => "call_end",
         }
     }
 
@@ -122,6 +136,13 @@ mod tests {
             (DirectMessageKind::ChunkResponse, "\"chunk_response\""),
             (DirectMessageKind::InviteHandshake, "\"invite_handshake\""),
             (DirectMessageKind::TempHandshake, "\"temp_handshake\""),
+            (DirectMessageKind::CallOffer, "\"call_offer\""),
+            (DirectMessageKind::CallOfferVideo, "\"call_offer_video\""),
+            (DirectMessageKind::CallAccept, "\"call_accept\""),
+            (DirectMessageKind::CallAcceptVideo, "\"call_accept_video\""),
+            (DirectMessageKind::CallReject, "\"call_reject\""),
+            (DirectMessageKind::CallBusy, "\"call_busy\""),
+            (DirectMessageKind::CallEnd, "\"call_end\""),
         ];
 
         for (kind, expected_json) in kinds {

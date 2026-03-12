@@ -2,6 +2,7 @@ mod app_state;
 mod chat;
 mod chat_kind;
 mod commands;
+mod live;
 mod network;
 mod oauth;
 mod storage;
@@ -9,8 +10,15 @@ mod storage;
 pub use app_state::{AppState, NetworkState};
 
 use crate::commands::auth::{
-    check_auth_status, init_vault, poll_github_auth, reset_vault, save_api_token,
-    start_github_auth, start_network, toggle_online_status, unlock_vault,
+    check_auth_status, get_connectivity_settings, init_vault, poll_github_auth, reset_vault,
+    save_api_token, set_connectivity_mode, start_github_auth, start_network,
+    toggle_online_status, unlock_vault, update_connectivity_settings,
+};
+use crate::commands::call::{
+    accept_video_call, accept_voice_call, end_video_call, end_voice_call, get_connected_chat_ids,
+    get_voice_call_state, reject_video_call, reject_voice_call, send_video_call_chunk,
+    set_video_call_camera_enabled, set_video_call_muted, set_voice_call_muted, start_video_call,
+    start_voice_call,
 };
 use crate::commands::chat::{
     create_group_chat, get_chat_history, get_chat_latest_times, get_chat_list, get_unread_counts,
@@ -95,6 +103,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             save_api_token,
             check_auth_status,
+            get_connectivity_settings,
+            set_connectivity_mode,
+            update_connectivity_settings,
             toggle_online_status,
             init_vault,
             unlock_vault,
@@ -164,6 +175,20 @@ pub fn run() {
             join_group_chat,
             leave_group_chat,
             save_temporary_chat_to_archive,
+            start_voice_call,
+            accept_voice_call,
+            reject_voice_call,
+            end_voice_call,
+            set_voice_call_muted,
+            start_video_call,
+            accept_video_call,
+            reject_video_call,
+            end_video_call,
+            set_video_call_muted,
+            set_video_call_camera_enabled,
+            send_video_call_chunk,
+            get_voice_call_state,
+            get_connected_chat_ids,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

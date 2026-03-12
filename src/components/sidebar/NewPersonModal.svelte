@@ -390,7 +390,7 @@
           {:else if step === "local-scan"}
             Local Network
           {:else if step === "online"}
-            Online (GitHub)
+            Internet Discovery
           {:else if step === "temporary-chat"}
             Temporary Chat
           {:else if step === "create-invite-user" || step === "create-invite-code"}
@@ -468,7 +468,7 @@
               </svg>
             </div>
             <div class="flex-1">
-              <div class="font-semibold text-white">Online (GitHub)</div>
+              <div class="font-semibold text-white">Internet Discovery</div>
               <div class="text-sm text-theme-base-400">
                 Connect with anyone globally
               </div>
@@ -583,7 +583,7 @@
         </div>
       {/if}
 
-      <!-- Step 2b: Online - Choice Menu -->
+      <!-- Step 2b: Internet Discovery - Choice Menu -->
       {#if step === "online"}
         <p class="text-sm text-theme-base-400">
           Connect with anyone globally via encrypted invitations.

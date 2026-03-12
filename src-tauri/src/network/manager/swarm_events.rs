@@ -17,6 +17,12 @@ impl NetworkManager {
                 RChatBehaviourEvent::DirectMessage(event) => {
                     self.handle_direct_message_event(event).await;
                 }
+                RChatBehaviourEvent::VoiceCall(event) => {
+                    self.handle_voice_frame_event(event).await;
+                }
+                RChatBehaviourEvent::VideoCall(event) => {
+                    self.handle_video_frame_event(event).await;
+                }
                 RChatBehaviourEvent::Identify(_) => {}
                 RChatBehaviourEvent::Ping(_) => {}
                 RChatBehaviourEvent::Kademlia(_) => {}
@@ -41,9 +47,10 @@ impl NetworkManager {
             SwarmEvent::ConnectionClosed {
                 peer_id,
                 num_established,
+                endpoint,
                 ..
             } => {
-                self.handle_connection_closed(peer_id, num_established)
+                self.handle_connection_closed(peer_id, num_established, endpoint)
                     .await;
             }
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -90,6 +97,10 @@ impl NetworkManager {
     }
 
     pub(super) fn handle_mdns_peer(&mut self, peer: crate::network::mdns::MdnsPeer) {
+        if !self.is_mdns_enabled() {
+            return;
+        }
+
         println!("[NetworkManager] Received mDNS peer: {}", peer.peer_id);
 
         // Parse peer ID

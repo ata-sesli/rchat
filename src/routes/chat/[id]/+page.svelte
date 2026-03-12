@@ -3,7 +3,7 @@
   import { onMount, onDestroy } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import ChatArea from "../../../components/chat/ChatArea.svelte";
-  import { api, type DbMessage } from "$lib/tauri/api";
+  import { api, type DbMessage, type VoiceCallState } from "$lib/tauri/api";
   import { getChatKind } from "$lib/chatKind";
 
   // Types
@@ -33,6 +33,11 @@
   let showAttachments = false;
   let unlisten: () => void;
   let unlistenStatus: () => void;
+  let unlistenVoiceCall: () => void;
+  let unlistenPeerDiscovered: () => void;
+  let unlistenPeerExpired: () => void;
+  let voiceCallState: VoiceCallState = { phase: "idle", muted: false };
+  let connectedChatIds = new Set<string>();
 
   // Cache for status updates that arrive before we've swapped tempId → msgId
   let pendingStatusCache: Record<string, string> = {};
@@ -116,6 +121,29 @@
       }
     });
 
+    try {
+      voiceCallState = await api.getVoiceCallState();
+      connectedChatIds = new Set(await api.getConnectedChatIds());
+    } catch (e) {
+      console.warn("Voice call state unavailable:", e);
+    }
+
+    unlistenVoiceCall = await listen<VoiceCallState>("voice-call-state-updated", (event) => {
+      voiceCallState = event.payload;
+    });
+    unlistenPeerDiscovered = await listen("local-peer-discovered", (event: any) => {
+      const chatId = event.payload?.peer_id;
+      if (!chatId) return;
+      connectedChatIds = new Set([...connectedChatIds, chatId]);
+    });
+    unlistenPeerExpired = await listen("local-peer-expired", (event: any) => {
+      const chatId = String(event.payload ?? "");
+      if (!chatId) return;
+      const next = new Set(connectedChatIds);
+      next.delete(chatId);
+      connectedChatIds = next;
+    });
+
     // Listen for message status updates (e.g., delivered -> read)
     unlistenStatus = await listen("message-status-updated", (event: any) => {
       const { msg_id, status } = event.payload;
@@ -140,6 +168,9 @@
   onDestroy(() => {
     if (unlisten) unlisten();
     if (unlistenStatus) unlistenStatus();
+    if (unlistenVoiceCall) unlistenVoiceCall();
+    if (unlistenPeerDiscovered) unlistenPeerDiscovered();
+    if (unlistenPeerExpired) unlistenPeerExpired();
   });
 
   async function handleSendMessage(text: string) {
@@ -211,6 +242,58 @@
     {peerAlias}
     {messages}
     {userProfile}
+    voiceCallState={voiceCallState}
+    canStartVoiceCall={activeChatKind === "dm" && connectedChatIds.has(activePeer) && voiceCallState.phase === "idle"}
+    canStartVideoCall={activeChatKind === "dm" && connectedChatIds.has(activePeer) && voiceCallState.phase === "idle"}
+    onStartVoiceCall={async () => {
+      try {
+        await api.startVoiceCall(activePeer);
+      } catch (e) {
+        console.error("Failed to start voice call:", e);
+      }
+    }}
+    onStartVideoCall={async () => {
+      try {
+        await api.startVideoCall(activePeer);
+      } catch (e) {
+        console.error("Failed to start video call:", e);
+      }
+    }}
+    onEndVoiceCall={async (callId) => {
+      try {
+        await api.endVoiceCall(callId);
+      } catch (e) {
+        console.error("Failed to end voice call:", e);
+      }
+    }}
+    onEndVideoCall={async (callId) => {
+      try {
+        await api.endVideoCall(callId);
+      } catch (e) {
+        console.error("Failed to end video call:", e);
+      }
+    }}
+    onToggleVoiceMute={async (callId, muted) => {
+      try {
+        await api.setVoiceCallMuted(callId, muted);
+      } catch (e) {
+        console.error("Failed to toggle mute:", e);
+      }
+    }}
+    onToggleVideoMute={async (callId, muted) => {
+      try {
+        await api.setVideoCallMuted(callId, muted);
+      } catch (e) {
+        console.error("Failed to toggle video-call mute:", e);
+      }
+    }}
+    onToggleVideoCamera={async (callId, enabled) => {
+      try {
+        await api.setVideoCallCameraEnabled(callId, enabled);
+      } catch (e) {
+        console.error("Failed to toggle camera:", e);
+      }
+    }}
     bind:message={messageInput}
     bind:showAttachments
     onsend={handleSendMessage}
