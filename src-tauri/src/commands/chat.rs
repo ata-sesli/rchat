@@ -7,6 +7,39 @@ use crate::network::gossip::{GroupContentType, GroupMessageEnvelope};
 use crate::storage;
 use crate::{AppState, NetworkState};
 
+async fn mapped_github_chat_id_for_peer(
+    app_state: &State<'_, AppState>,
+    peer_id: &str,
+) -> Option<String> {
+    let mgr = app_state.config_manager.lock().await;
+    let Ok(config) = mgr.load().await else {
+        return None;
+    };
+    config
+        .user
+        .github_peer_mapping
+        .iter()
+        .find_map(|(github, mapped_peer)| {
+            if mapped_peer == peer_id {
+                Some(format!("gh:{}", github))
+            } else {
+                None
+            }
+        })
+}
+
+async fn resolve_peer_id_for_chat(
+    app_state: &State<'_, AppState>,
+    chat_id: &str,
+) -> Option<String> {
+    let github_username = chat_id.strip_prefix("gh:")?;
+    let mgr = app_state.config_manager.lock().await;
+    let Ok(config) = mgr.load().await else {
+        return None;
+    };
+    config.user.github_peer_mapping.get(github_username).cloned()
+}
+
 #[derive(serde::Serialize)]
 pub struct GroupChatResult {
     pub chat_id: String,
@@ -36,7 +69,35 @@ pub async fn get_chat_latest_times(
         }
     }
 
-    Ok(result)
+    let mapped_chat_ids_by_peer: std::collections::HashMap<String, String> = {
+        let mgr = state.config_manager.lock().await;
+        match mgr.load().await {
+            Ok(config) => config
+                .user
+                .github_peer_mapping
+                .into_iter()
+                .map(|(github, peer_id)| (peer_id, format!("gh:{}", github)))
+                .collect(),
+            Err(_) => std::collections::HashMap::new(),
+        }
+    };
+    let mut canonical = std::collections::HashMap::new();
+    for (chat_id, ts) in result {
+        let key = mapped_chat_ids_by_peer
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or(chat_id);
+        canonical
+            .entry(key)
+            .and_modify(|existing: &mut i64| {
+                if ts > *existing {
+                    *existing = ts;
+                }
+            })
+            .or_insert(ts);
+    }
+
+    Ok(canonical)
 }
 
 #[tauri::command]
@@ -88,7 +149,45 @@ pub async fn get_chat_list(
         seen.insert(chat_id.clone());
     }
 
-    Ok(items)
+    let mapped_chat_ids_by_peer: std::collections::HashMap<String, String> = {
+        let mgr = state.config_manager.lock().await;
+        match mgr.load().await {
+            Ok(config) => config
+                .user
+                .github_peer_mapping
+                .into_iter()
+                .map(|(github, peer_id)| (peer_id, format!("gh:{}", github)))
+                .collect(),
+            Err(_) => std::collections::HashMap::new(),
+        }
+    };
+    let mut deduped: Vec<storage::db::ChatListItem> = Vec::with_capacity(items.len());
+    let mut by_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for mut item in items {
+        if !item.is_group {
+            if let Some(mapped_chat_id) = mapped_chat_ids_by_peer.get(&item.id) {
+                item.id = mapped_chat_id.clone();
+            }
+        }
+
+        if let Some(existing_idx) = by_id.get(&item.id).copied() {
+            // Prefer non-empty/non-default names when collapsing duplicate direct rows.
+            let existing_name = deduped[existing_idx].name.trim().to_string();
+            let candidate_name = item.name.trim().to_string();
+            let existing_is_default =
+                existing_name.is_empty() || existing_name == deduped[existing_idx].id;
+            let candidate_is_default = candidate_name.is_empty() || candidate_name == item.id;
+            if existing_is_default && !candidate_is_default {
+                deduped[existing_idx] = item;
+            }
+            continue;
+        }
+
+        by_id.insert(item.id.clone(), deduped.len());
+        deduped.push(item);
+    }
+
+    Ok(deduped)
 }
 
 #[tauri::command]
@@ -241,7 +340,14 @@ pub async fn send_message(
 ) -> Result<String, String> {
     println!("[Backend] send_message to {}: {}", peer_id, message);
 
-    let chat_kind = chat_kind::parse_chat_kind(&peer_id);
+    let canonical_peer_id = if matches!(chat_kind::parse_chat_kind(&peer_id), ChatKind::Direct) {
+        mapped_github_chat_id_for_peer(&app_state, &peer_id)
+            .await
+            .unwrap_or_else(|| peer_id.clone())
+    } else {
+        peer_id.clone()
+    };
+    let chat_kind = chat_kind::parse_chat_kind(&canonical_peer_id);
 
     let my_alias = {
         let mgr = app_state.config_manager.lock().await;
@@ -277,7 +383,7 @@ pub async fn send_message(
         let chat_id = if matches!(chat_kind, ChatKind::SelfChat) {
             "self".to_string()
         } else {
-            peer_id.clone()
+            canonical_peer_id.clone()
         };
 
         let msg = storage::db::Message {
@@ -297,29 +403,35 @@ pub async fn send_message(
             let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
             match chat_kind {
                 ChatKind::Direct => {
-                    if !storage::db::is_peer(&conn, &peer_id) {
-                        if let Err(e) = storage::db::add_peer(&conn, &peer_id, None, None, "local")
+                    if !storage::db::is_peer(&conn, &canonical_peer_id) {
+                        if let Err(e) =
+                            storage::db::add_peer(&conn, &canonical_peer_id, None, None, "local")
                         {
                             eprintln!("[Backend] Failed to auto-add peer: {}", e);
                         }
                     }
 
-                    if !storage::db::chat_exists(&conn, &peer_id) {
-                        if let Err(e) = storage::db::create_chat(&conn, &peer_id, &peer_id, false) {
+                    if !storage::db::chat_exists(&conn, &canonical_peer_id) {
+                        if let Err(e) = storage::db::create_chat(
+                            &conn,
+                            &canonical_peer_id,
+                            &canonical_peer_id,
+                            false,
+                        ) {
                             eprintln!("[Backend] Failed to auto-create chat: {}", e);
                         }
                     }
                 }
                 ChatKind::Group => {
-                    if !storage::db::chat_exists(&conn, &peer_id) {
+                    if !storage::db::chat_exists(&conn, &canonical_peer_id) {
                         storage::db::upsert_chat(
                             &conn,
-                            &peer_id,
-                            &chat_kind::default_group_name(&peer_id),
+                            &canonical_peer_id,
+                            &chat_kind::default_group_name(&canonical_peer_id),
                             true,
                         )
                         .map_err(|e| e.to_string())?;
-                        storage::db::add_chat_member(&conn, &peer_id, "Me", "member")
+                        storage::db::add_chat_member(&conn, &canonical_peer_id, "Me", "member")
                             .map_err(|e| e.to_string())?;
                     }
                 }
@@ -342,10 +454,19 @@ pub async fn send_message(
         let mut temp_state = net_state.temporary_state.lock().await;
         temp_state
             .messages
-            .entry(peer_id.clone())
+            .entry(canonical_peer_id.clone())
             .or_default()
             .push(outgoing_msg);
     }
+
+    let direct_target_peer_id = if matches!(chat_kind, ChatKind::Direct | ChatKind::TemporaryDirect)
+    {
+        resolve_peer_id_for_chat(&app_state, &canonical_peer_id)
+            .await
+            .unwrap_or_else(|| canonical_peer_id.clone())
+    } else {
+        canonical_peer_id.clone()
+    };
 
     let tx = net_state.sender.lock().await;
 
@@ -353,7 +474,7 @@ pub async fn send_message(
         ChatKind::SelfChat => {}
         ChatKind::Direct | ChatKind::TemporaryDirect => {
             tx.send(NetworkCommand::SendDirectText {
-                target_peer_id: peer_id,
+                target_peer_id: direct_target_peer_id,
                 msg_id: msg_id.clone(),
                 timestamp,
                 sender_alias: my_alias,
@@ -365,7 +486,7 @@ pub async fn send_message(
         ChatKind::Group | ChatKind::TemporaryGroup => {
             let envelope = GroupMessageEnvelope {
                 id: msg_id.clone(),
-                group_id: peer_id.clone(),
+                group_id: canonical_peer_id.clone(),
                 sender_id: "Me".to_string(),
                 sender_alias: my_alias,
                 timestamp,
@@ -391,7 +512,14 @@ pub async fn get_chat_history(
 ) -> Result<Vec<storage::db::Message>, String> {
     println!("[Backend] get_chat_history for: {}", chat_id);
 
-    let chat_kind = chat_kind::parse_chat_kind(&chat_id);
+    let resolved_chat_id = if matches!(chat_kind::parse_chat_kind(&chat_id), ChatKind::Direct) {
+        mapped_github_chat_id_for_peer(&state, &chat_id)
+            .await
+            .unwrap_or(chat_id.clone())
+    } else {
+        chat_id.clone()
+    };
+    let chat_kind = chat_kind::parse_chat_kind(&resolved_chat_id);
     if matches!(
         chat_kind,
         ChatKind::TemporaryDirect | ChatKind::TemporaryGroup
@@ -399,14 +527,15 @@ pub async fn get_chat_history(
         let temp_state = net_state.temporary_state.lock().await;
         let messages = temp_state
             .messages
-            .get(&chat_id)
+            .get(&resolved_chat_id)
             .cloned()
             .unwrap_or_default();
         return Ok(messages);
     }
 
     let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
-    let mut messages = storage::db::get_messages(&conn, &chat_id).map_err(|e| e.to_string())?;
+    let mut messages =
+        storage::db::get_messages(&conn, &resolved_chat_id).map_err(|e| e.to_string())?;
 
     for db_msg in &mut messages {
         if (db_msg.content_type == "photo" || db_msg.content_type == "image")
@@ -433,7 +562,14 @@ pub async fn mark_messages_read(
 ) -> Result<Vec<String>, String> {
     println!("[Backend] mark_messages_read for chat: {}", chat_id);
 
-    let chat_kind = chat_kind::parse_chat_kind(&chat_id);
+    let resolved_chat_id = if matches!(chat_kind::parse_chat_kind(&chat_id), ChatKind::Direct) {
+        mapped_github_chat_id_for_peer(&state, &chat_id)
+            .await
+            .unwrap_or(chat_id.clone())
+    } else {
+        chat_id.clone()
+    };
+    let chat_kind = chat_kind::parse_chat_kind(&resolved_chat_id);
 
     let marked_ids = {
         if matches!(
@@ -441,7 +577,7 @@ pub async fn mark_messages_read(
             ChatKind::TemporaryDirect | ChatKind::TemporaryGroup
         ) {
             let mut temp_state = net_state.temporary_state.lock().await;
-            let messages = temp_state.messages.entry(chat_id.clone()).or_default();
+            let messages = temp_state.messages.entry(resolved_chat_id.clone()).or_default();
             let mut ids = Vec::new();
             for message in messages.iter_mut() {
                 if message.peer_id != "Me" && message.status != "read" {
@@ -451,12 +587,20 @@ pub async fn mark_messages_read(
             }
             ids
         } else {
-            let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
             match chat_kind {
-                ChatKind::Group => storage::db::mark_group_messages_read(&conn, &chat_id)
-                    .map_err(|e| e.to_string())?,
-                _ => storage::db::mark_messages_read(&conn, &chat_id, &chat_id)
-                    .map_err(|e| e.to_string())?,
+                ChatKind::Group => {
+                    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+                    storage::db::mark_group_messages_read(&conn, &resolved_chat_id)
+                        .map_err(|e| e.to_string())?
+                }
+                _ => {
+                    let sender_id = resolve_peer_id_for_chat(&state, &resolved_chat_id)
+                        .await
+                        .unwrap_or_else(|| resolved_chat_id.clone());
+                    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+                    storage::db::mark_messages_read(&conn, &resolved_chat_id, &sender_id)
+                        .map_err(|e| e.to_string())?
+                }
             }
         }
     };
@@ -464,10 +608,13 @@ pub async fn mark_messages_read(
     println!("[Backend] Marked {} messages as read", marked_ids.len());
 
     if !marked_ids.is_empty() && matches!(chat_kind, ChatKind::Direct | ChatKind::TemporaryDirect) {
+        let target_peer_id = resolve_peer_id_for_chat(&state, &resolved_chat_id)
+            .await
+            .unwrap_or_else(|| resolved_chat_id.clone());
         let tx = net_state.sender.lock().await;
         if let Err(e) = tx
             .send(NetworkCommand::SendReadReceipt {
-                target_peer_id: chat_id,
+                target_peer_id,
                 msg_ids: marked_ids.clone(),
             })
             .await
@@ -489,9 +636,33 @@ pub async fn get_unread_counts(
     my_peer_id: String,
     state: State<'_, AppState>,
 ) -> Result<std::collections::HashMap<String, i64>, String> {
-    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
-    let counts = storage::db::get_unread_counts(&conn, &my_peer_id).map_err(|e| e.to_string())?;
-    Ok(counts)
+    let counts = {
+        let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+        storage::db::get_unread_counts(&conn, &my_peer_id).map_err(|e| e.to_string())?
+    };
+
+    let mapped_chat_ids_by_peer: std::collections::HashMap<String, String> = {
+        let mgr = state.config_manager.lock().await;
+        match mgr.load().await {
+            Ok(config) => config
+                .user
+                .github_peer_mapping
+                .into_iter()
+                .map(|(github, peer_id)| (peer_id, format!("gh:{}", github)))
+                .collect(),
+            Err(_) => std::collections::HashMap::new(),
+        }
+    };
+
+    let mut canonical = std::collections::HashMap::new();
+    for (chat_id, count) in counts {
+        let key = mapped_chat_ids_by_peer
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or(chat_id);
+        *canonical.entry(key).or_insert(0) += count;
+    }
+    Ok(canonical)
 }
 
 #[tauri::command]

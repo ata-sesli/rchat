@@ -38,6 +38,7 @@
   let unlistenPeerExpired: () => void;
   let voiceCallState: VoiceCallState = { phase: "idle", muted: false };
   let connectedChatIds = new Set<string>();
+  let activeConversationIds = new Set<string>();
 
   // Cache for status updates that arrive before we've swapped tempId → msgId
   let pendingStatusCache: Record<string, string> = {};
@@ -47,10 +48,14 @@
 
   async function loadChatHistory(peerId: string) {
     if (!peerId) return;
+    activeConversationIds = new Set([peerId]);
     try {
       // Map "Me" in URL to "self" for DB
       const chatId = peerId === "Me" ? "self" : peerId;
       const history = await api.getChatHistory(chatId);
+      const canonicalChatId = history[0]?.chat_id || chatId;
+      const canonicalUiPeer = canonicalChatId === "self" ? "Me" : canonicalChatId;
+      activeConversationIds = new Set([peerId, canonicalUiPeer]);
 
       messages = history.map((m) => ({
         id: m.id,
@@ -100,7 +105,7 @@
       let relatedPeer = msg.chat_id;
       if (relatedPeer === "self") relatedPeer = "Me";
 
-      if (relatedPeer === activePeer) {
+      if (activeConversationIds.has(relatedPeer)) {
         const newMsg: Message = {
           id: msg.id,
           sender: msg.peer_id === "Me" ? "Me" : msg.sender_alias || msg.peer_id,

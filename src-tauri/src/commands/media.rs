@@ -176,6 +176,53 @@ async fn store_outgoing_temp_message(
         .push(msg);
 }
 
+async fn canonical_direct_chat_id(
+    app_state: &State<'_, AppState>,
+    peer_id: &str,
+) -> String {
+    if !matches!(chat_kind::parse_chat_kind(peer_id), ChatKind::Direct) || peer_id.starts_with("gh:")
+    {
+        return peer_id.to_string();
+    }
+
+    let mgr = app_state.config_manager.lock().await;
+    let Ok(config) = mgr.load().await else {
+        return peer_id.to_string();
+    };
+    config
+        .user
+        .github_peer_mapping
+        .iter()
+        .find_map(|(github, mapped_peer)| {
+            if mapped_peer == peer_id {
+                Some(format!("gh:{}", github))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| peer_id.to_string())
+}
+
+async fn resolve_direct_target_peer_id(
+    app_state: &State<'_, AppState>,
+    chat_id: &str,
+) -> String {
+    let Some(github_username) = chat_id.strip_prefix("gh:") else {
+        return chat_id.to_string();
+    };
+
+    let mgr = app_state.config_manager.lock().await;
+    let Ok(config) = mgr.load().await else {
+        return chat_id.to_string();
+    };
+    config
+        .user
+        .github_peer_mapping
+        .get(github_username)
+        .cloned()
+        .unwrap_or_else(|| chat_id.to_string())
+}
+
 #[tauri::command]
 pub async fn send_image_message(
     peer_id: String,
@@ -187,6 +234,7 @@ pub async fn send_image_message(
         "[Backend] send_image_message: to {} from {}",
         peer_id, file_path
     );
+    let canonical_peer_id = canonical_direct_chat_id(&app_state, &peer_id).await;
 
     let file_data = std::fs::read(&file_path).map_err(|e| format!("Failed to read file: {}", e))?;
 
@@ -227,7 +275,7 @@ pub async fn send_image_message(
     let id_suffix: u32 = rand::random();
     let msg_id = format!("{}-{}", timestamp, id_suffix);
 
-    let chat_kind = chat_kind::parse_chat_kind(&peer_id);
+    let chat_kind = chat_kind::parse_chat_kind(&canonical_peer_id);
     let is_temporary = matches!(
         chat_kind,
         ChatKind::TemporaryDirect | ChatKind::TemporaryGroup
@@ -236,7 +284,7 @@ pub async fn send_image_message(
     let chat_id = if matches!(chat_kind, ChatKind::SelfChat) {
         "self".to_string()
     } else {
-        peer_id.clone()
+        canonical_peer_id.clone()
     };
     let message = storage::db::Message {
         id: msg_id.clone(),
@@ -255,15 +303,17 @@ pub async fn send_image_message(
         store_outgoing_temp_message(&net_state, &chat_id, message).await;
     } else {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
-        if matches!(chat_kind, ChatKind::Group) && !storage::db::chat_exists(&conn, &peer_id) {
+        if matches!(chat_kind, ChatKind::Group)
+            && !storage::db::chat_exists(&conn, &canonical_peer_id)
+        {
             storage::db::upsert_chat(
                 &conn,
-                &peer_id,
-                &chat_kind::default_group_name(&peer_id),
+                &canonical_peer_id,
+                &chat_kind::default_group_name(&canonical_peer_id),
                 true,
             )
             .map_err(|e| e.to_string())?;
-            storage::db::add_chat_member(&conn, &peer_id, "Me", "member")
+            storage::db::add_chat_member(&conn, &canonical_peer_id, "Me", "member")
                 .map_err(|e| e.to_string())?;
         }
         if let Err(e) = storage::db::insert_message(&conn, &message) {
@@ -273,13 +323,14 @@ pub async fn send_image_message(
     }
 
     if !matches!(chat_kind, ChatKind::SelfChat) {
+        let direct_target_peer_id = resolve_direct_target_peer_id(&app_state, &canonical_peer_id).await;
         let tx = net_state.sender.lock().await;
         match chat_kind {
             ChatKind::SelfChat => {}
             ChatKind::Direct | ChatKind::TemporaryDirect => {
                 tx.send(NetworkCommand::SendDirectMedia {
                     kind: DirectMediaKind::Image,
-                    target_peer_id: peer_id.clone(),
+                    target_peer_id: direct_target_peer_id,
                     file_hash: file_hash.clone(),
                     file_name: None,
                     msg_id: msg_id.clone(),
@@ -291,7 +342,7 @@ pub async fn send_image_message(
             ChatKind::Group | ChatKind::TemporaryGroup => {
                 let envelope = GroupMessageEnvelope {
                     id: msg_id.clone(),
-                    group_id: peer_id.clone(),
+                    group_id: canonical_peer_id.clone(),
                     sender_id: "Me".to_string(),
                     sender_alias: None,
                     timestamp,
@@ -389,7 +440,8 @@ pub async fn send_document_message(
     net_state: State<'_, NetworkState>,
 ) -> Result<SentMediaResult, String> {
     println!("[Backend] Sending document to {}: {}", peer_id, file_path);
-    let chat_kind = chat_kind::parse_chat_kind(&peer_id);
+    let canonical_peer_id = canonical_direct_chat_id(&app_state, &peer_id).await;
+    let chat_kind = chat_kind::parse_chat_kind(&canonical_peer_id);
 
     let file_data =
         std::fs::read(&file_path).map_err(|e| format!("Failed to read document: {}", e))?;
@@ -435,7 +487,7 @@ pub async fn send_document_message(
     let chat_id = if matches!(chat_kind, ChatKind::SelfChat) {
         "self".to_string()
     } else {
-        peer_id.clone()
+        canonical_peer_id.clone()
     };
     let message = storage::db::Message {
         id: msg_id.clone(),
@@ -454,15 +506,17 @@ pub async fn send_document_message(
         store_outgoing_temp_message(&net_state, &chat_id, message).await;
     } else {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
-        if matches!(chat_kind, ChatKind::Group) && !storage::db::chat_exists(&conn, &peer_id) {
+        if matches!(chat_kind, ChatKind::Group)
+            && !storage::db::chat_exists(&conn, &canonical_peer_id)
+        {
             storage::db::upsert_chat(
                 &conn,
-                &peer_id,
-                &chat_kind::default_group_name(&peer_id),
+                &canonical_peer_id,
+                &chat_kind::default_group_name(&canonical_peer_id),
                 true,
             )
             .map_err(|e| e.to_string())?;
-            storage::db::add_chat_member(&conn, &peer_id, "Me", "member")
+            storage::db::add_chat_member(&conn, &canonical_peer_id, "Me", "member")
                 .map_err(|e| e.to_string())?;
         }
 
@@ -473,13 +527,14 @@ pub async fn send_document_message(
     }
 
     if !matches!(chat_kind, ChatKind::SelfChat) {
+        let direct_target_peer_id = resolve_direct_target_peer_id(&app_state, &canonical_peer_id).await;
         let tx = net_state.sender.lock().await;
         match chat_kind {
             ChatKind::SelfChat => {}
             ChatKind::Direct | ChatKind::TemporaryDirect => {
                 tx.send(NetworkCommand::SendDirectMedia {
                     kind: DirectMediaKind::Document,
-                    target_peer_id: peer_id.clone(),
+                    target_peer_id: direct_target_peer_id,
                     file_hash: file_hash.clone(),
                     file_name: Some(file_name.clone()),
                     msg_id: msg_id.clone(),
@@ -491,7 +546,7 @@ pub async fn send_document_message(
             ChatKind::Group | ChatKind::TemporaryGroup => {
                 let envelope = GroupMessageEnvelope {
                     id: msg_id.clone(),
-                    group_id: peer_id.clone(),
+                    group_id: canonical_peer_id.clone(),
                     sender_id: "Me".to_string(),
                     sender_alias: None,
                     timestamp,
@@ -543,7 +598,8 @@ pub async fn send_video_message(
     net_state: State<'_, NetworkState>,
 ) -> Result<SentMediaResult, String> {
     println!("[Backend] Sending video to {}: {}", peer_id, file_path);
-    let chat_kind = chat_kind::parse_chat_kind(&peer_id);
+    let canonical_peer_id = canonical_direct_chat_id(&app_state, &peer_id).await;
+    let chat_kind = chat_kind::parse_chat_kind(&canonical_peer_id);
 
     let file_data =
         std::fs::read(&file_path).map_err(|e| format!("Failed to read video: {}", e))?;
@@ -585,7 +641,7 @@ pub async fn send_video_message(
     let chat_id = if matches!(chat_kind, ChatKind::SelfChat) {
         "self".to_string()
     } else {
-        peer_id.clone()
+        canonical_peer_id.clone()
     };
     let message = storage::db::Message {
         id: msg_id.clone(),
@@ -604,15 +660,17 @@ pub async fn send_video_message(
         store_outgoing_temp_message(&net_state, &chat_id, message).await;
     } else {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
-        if matches!(chat_kind, ChatKind::Group) && !storage::db::chat_exists(&conn, &peer_id) {
+        if matches!(chat_kind, ChatKind::Group)
+            && !storage::db::chat_exists(&conn, &canonical_peer_id)
+        {
             storage::db::upsert_chat(
                 &conn,
-                &peer_id,
-                &chat_kind::default_group_name(&peer_id),
+                &canonical_peer_id,
+                &chat_kind::default_group_name(&canonical_peer_id),
                 true,
             )
             .map_err(|e| e.to_string())?;
-            storage::db::add_chat_member(&conn, &peer_id, "Me", "member")
+            storage::db::add_chat_member(&conn, &canonical_peer_id, "Me", "member")
                 .map_err(|e| e.to_string())?;
         }
 
@@ -623,13 +681,14 @@ pub async fn send_video_message(
     }
 
     if !matches!(chat_kind, ChatKind::SelfChat) {
+        let direct_target_peer_id = resolve_direct_target_peer_id(&app_state, &canonical_peer_id).await;
         let tx = net_state.sender.lock().await;
         match chat_kind {
             ChatKind::SelfChat => {}
             ChatKind::Direct | ChatKind::TemporaryDirect => {
                 tx.send(NetworkCommand::SendDirectMedia {
                     kind: DirectMediaKind::Video,
-                    target_peer_id: peer_id.clone(),
+                    target_peer_id: direct_target_peer_id,
                     file_hash: file_hash.clone(),
                     file_name: Some(file_name.clone()),
                     msg_id: msg_id.clone(),
@@ -641,7 +700,7 @@ pub async fn send_video_message(
             ChatKind::Group | ChatKind::TemporaryGroup => {
                 let envelope = GroupMessageEnvelope {
                     id: msg_id.clone(),
-                    group_id: peer_id.clone(),
+                    group_id: canonical_peer_id.clone(),
                     sender_id: "Me".to_string(),
                     sender_alias: None,
                     timestamp,
@@ -701,7 +760,8 @@ pub async fn send_audio_message(
     net_state: State<'_, NetworkState>,
 ) -> Result<SentMediaResult, String> {
     println!("[Backend] Sending audio to {}: {}", peer_id, file_path);
-    let chat_kind = chat_kind::parse_chat_kind(&peer_id);
+    let canonical_peer_id = canonical_direct_chat_id(&app_state, &peer_id).await;
+    let chat_kind = chat_kind::parse_chat_kind(&canonical_peer_id);
 
     let file_data =
         std::fs::read(&file_path).map_err(|e| format!("Failed to read audio: {}", e))?;
@@ -738,7 +798,7 @@ pub async fn send_audio_message(
     let chat_id = if matches!(chat_kind, ChatKind::SelfChat) {
         "self".to_string()
     } else {
-        peer_id.clone()
+        canonical_peer_id.clone()
     };
     let message = storage::db::Message {
         id: msg_id.clone(),
@@ -757,32 +817,17 @@ pub async fn send_audio_message(
         store_outgoing_temp_message(&net_state, &chat_id, message).await;
     } else {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
-        if matches!(chat_kind, ChatKind::Direct) {
-            if !storage::db::is_peer(&conn, &peer_id) {
-                if let Err(e) = storage::db::add_peer(&conn, &peer_id, None, None, "local") {
-                    eprintln!("[Backend] Failed to auto-add peer for audio message: {}", e);
-                }
-            }
-
-            if !storage::db::chat_exists(&conn, &peer_id) {
-                if let Err(e) = storage::db::create_chat(&conn, &peer_id, &peer_id, false) {
-                    eprintln!(
-                        "[Backend] Failed to auto-create chat for audio message: {}",
-                        e
-                    );
-                }
-            }
-        }
-
-        if matches!(chat_kind, ChatKind::Group) && !storage::db::chat_exists(&conn, &peer_id) {
+        if matches!(chat_kind, ChatKind::Group)
+            && !storage::db::chat_exists(&conn, &canonical_peer_id)
+        {
             storage::db::upsert_chat(
                 &conn,
-                &peer_id,
-                &chat_kind::default_group_name(&peer_id),
+                &canonical_peer_id,
+                &chat_kind::default_group_name(&canonical_peer_id),
                 true,
             )
             .map_err(|e| e.to_string())?;
-            storage::db::add_chat_member(&conn, &peer_id, "Me", "member")
+            storage::db::add_chat_member(&conn, &canonical_peer_id, "Me", "member")
                 .map_err(|e| e.to_string())?;
         }
 
@@ -793,13 +838,14 @@ pub async fn send_audio_message(
     }
 
     if !matches!(chat_kind, ChatKind::SelfChat) {
+        let direct_target_peer_id = resolve_direct_target_peer_id(&app_state, &canonical_peer_id).await;
         let tx = net_state.sender.lock().await;
         match chat_kind {
             ChatKind::SelfChat => {}
             ChatKind::Direct | ChatKind::TemporaryDirect => {
                 tx.send(NetworkCommand::SendDirectMedia {
                     kind: DirectMediaKind::Audio,
-                    target_peer_id: peer_id.clone(),
+                    target_peer_id: direct_target_peer_id,
                     file_hash: file_hash.clone(),
                     file_name: Some(file_name.clone()),
                     msg_id: msg_id.clone(),
@@ -811,7 +857,7 @@ pub async fn send_audio_message(
             ChatKind::Group | ChatKind::TemporaryGroup => {
                 let envelope = GroupMessageEnvelope {
                     id: msg_id.clone(),
-                    group_id: peer_id.clone(),
+                    group_id: canonical_peer_id.clone(),
                     sender_id: "Me".to_string(),
                     sender_alias: None,
                     timestamp,
@@ -1044,7 +1090,8 @@ pub async fn send_sticker_message(
     app_state: State<'_, AppState>,
     net_state: State<'_, NetworkState>,
 ) -> Result<SentMediaResult, String> {
-    let chat_kind = chat_kind::parse_chat_kind(&peer_id);
+    let canonical_peer_id = canonical_direct_chat_id(&app_state, &peer_id).await;
+    let chat_kind = chat_kind::parse_chat_kind(&canonical_peer_id);
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1087,39 +1134,21 @@ pub async fn send_sticker_message(
         let chat_id = if matches!(chat_kind, ChatKind::SelfChat) {
             "self".to_string()
         } else {
-            peer_id.clone()
+            canonical_peer_id.clone()
         };
 
         if !is_temporary {
-            if matches!(chat_kind, ChatKind::Direct) {
-                if !storage::db::is_peer(&conn, &peer_id) {
-                    if let Err(e) = storage::db::add_peer(&conn, &peer_id, None, None, "local") {
-                        eprintln!(
-                            "[Backend] Failed to auto-add peer for sticker message: {}",
-                            e
-                        );
-                    }
-                }
-
-                if !storage::db::chat_exists(&conn, &peer_id) {
-                    if let Err(e) = storage::db::create_chat(&conn, &peer_id, &peer_id, false) {
-                        eprintln!(
-                            "[Backend] Failed to auto-create chat for sticker message: {}",
-                            e
-                        );
-                    }
-                }
-            }
-
-            if matches!(chat_kind, ChatKind::Group) && !storage::db::chat_exists(&conn, &peer_id) {
+            if matches!(chat_kind, ChatKind::Group)
+                && !storage::db::chat_exists(&conn, &canonical_peer_id)
+            {
                 storage::db::upsert_chat(
                     &conn,
-                    &peer_id,
-                    &chat_kind::default_group_name(&peer_id),
+                    &canonical_peer_id,
+                    &chat_kind::default_group_name(&canonical_peer_id),
                     true,
                 )
                 .map_err(|e| e.to_string())?;
-                storage::db::add_chat_member(&conn, &peer_id, "Me", "member")
+                storage::db::add_chat_member(&conn, &canonical_peer_id, "Me", "member")
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -1149,13 +1178,14 @@ pub async fn send_sticker_message(
     }
 
     if !matches!(chat_kind, ChatKind::SelfChat) {
+        let direct_target_peer_id = resolve_direct_target_peer_id(&app_state, &canonical_peer_id).await;
         let tx = net_state.sender.lock().await;
         match chat_kind {
             ChatKind::SelfChat => {}
             ChatKind::Direct | ChatKind::TemporaryDirect => {
                 tx.send(NetworkCommand::SendDirectMedia {
                     kind: DirectMediaKind::Sticker,
-                    target_peer_id: peer_id.clone(),
+                    target_peer_id: direct_target_peer_id,
                     file_hash: file_hash.clone(),
                     file_name: None,
                     msg_id: msg_id.clone(),
@@ -1167,7 +1197,7 @@ pub async fn send_sticker_message(
             ChatKind::Group | ChatKind::TemporaryGroup => {
                 let envelope = GroupMessageEnvelope {
                     id: msg_id.clone(),
-                    group_id: peer_id.clone(),
+                    group_id: canonical_peer_id.clone(),
                     sender_id: "Me".to_string(),
                     sender_alias: None,
                     timestamp,
