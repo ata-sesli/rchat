@@ -335,13 +335,7 @@ pub async fn redeem_and_connect(
             }
 
             {
-                let mut conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
-
-                let _ = storage::db::migrate_single_legacy_github_chat_id(
-                    &mut conn,
-                    &github_username,
-                    &resolved_peer_id,
-                );
+                let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
 
                 if !storage::db::is_peer(&conn, &chat_id) {
                     storage::db::add_peer(&conn, &chat_id, Some(&github_username), None, "github")

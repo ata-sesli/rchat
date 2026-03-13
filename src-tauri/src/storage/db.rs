@@ -598,17 +598,6 @@ fn migrate_legacy_github_chat_id_inner(
     Ok(())
 }
 
-pub fn migrate_single_legacy_github_chat_id(
-    conn: &mut Connection,
-    github_username: &str,
-    peer_id: &str,
-) -> anyhow::Result<()> {
-    let tx = conn.transaction()?;
-    migrate_legacy_github_chat_id_inner(&tx, github_username, peer_id)?;
-    tx.commit()?;
-    Ok(())
-}
-
 pub fn migrate_legacy_github_chat_ids(
     conn: &mut Connection,
     github_peer_mapping: &std::collections::HashMap<String, String>,
@@ -1520,8 +1509,11 @@ mod tests {
         };
         insert_message(&conn, &msg).expect("legacy message");
 
-        migrate_single_legacy_github_chat_id(&mut conn, "professional-tester", peer_id)
-            .expect("migration");
+        let mapping = std::collections::HashMap::from([(
+            "professional-tester".to_string(),
+            peer_id.to_string(),
+        )]);
+        migrate_legacy_github_chat_ids(&mut conn, &mapping).expect("migration");
 
         assert!(!chat_exists(&conn, legacy_chat_id));
         assert!(chat_exists(&conn, &canonical_chat_id));

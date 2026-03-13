@@ -751,27 +751,16 @@ impl NetworkManager {
             if let Some(mapped_peer_id) = self.temp_peer_by_chat_id.get(target_peer_id) {
                 mapped_peer_id.clone()
             } else if target_peer_id.starts_with("gh:") || target_peer_id.starts_with("lh:") {
-                if let Some(peer_id_string) = crate::chat_identity::resolve_peer_id_for_direct_chat_id(
-                    target_peer_id,
-                    &self.peer_id_by_github,
-                ) {
+                if let Some(peer_id_string) =
+                    crate::chat_identity::resolve_peer_id_for_direct_chat_id(target_peer_id)
+                {
                     peer_id_string
                 } else {
-                    self.refresh_peer_mapping_cache().await;
-                    if let Some(peer_id_string) =
-                        crate::chat_identity::resolve_peer_id_for_direct_chat_id(
-                            target_peer_id,
-                            &self.peer_id_by_github,
-                        )
-                    {
-                        peer_id_string
-                    } else {
-                        eprintln!(
-                            "[{}] ❌ No PeerId mapping found for chat {}. Message queued.",
-                            context, target_peer_id
-                        );
-                        return None;
-                    }
+                    eprintln!(
+                        "[{}] ❌ Invalid canonical direct chat id {}. Message queued.",
+                        context, target_peer_id
+                    );
+                    return None;
                 }
             } else {
                 target_peer_id.to_string()

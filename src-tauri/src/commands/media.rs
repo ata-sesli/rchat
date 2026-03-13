@@ -310,18 +310,11 @@ async fn canonical_direct_chat_id(
 }
 
 async fn resolve_direct_target_peer_id(
-    app_state: &State<'_, AppState>,
+    _app_state: &State<'_, AppState>,
     chat_id: &str,
 ) -> String {
-    let mgr = app_state.config_manager.lock().await;
-    let Ok(config) = mgr.load().await else {
-        return chat_id.to_string();
-    };
-    crate::chat_identity::resolve_peer_id_for_direct_chat_id(
-        chat_id,
-        &config.user.github_peer_mapping,
-    )
-    .unwrap_or_else(|| chat_id.to_string())
+    crate::chat_identity::resolve_peer_id_for_direct_chat_id(chat_id)
+        .unwrap_or_else(|| chat_id.to_string())
 }
 
 #[tauri::command]

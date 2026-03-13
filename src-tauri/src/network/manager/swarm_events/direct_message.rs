@@ -348,12 +348,7 @@ impl NetworkManager {
                 });
             }
 
-            if let Ok(mut conn) = state.db_conn.lock() {
-                let _ = crate::storage::db::migrate_single_legacy_github_chat_id(
-                    &mut conn,
-                    &invitee_github,
-                    &invitee_peer_id,
-                );
+            if let Ok(conn) = state.db_conn.lock() {
                 if !crate::storage::db::is_peer(&conn, &chat_id) {
                     let _ = crate::storage::db::add_peer(
                         &conn,

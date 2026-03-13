@@ -204,13 +204,6 @@ impl NetworkManager {
                     if let Err(e) = mgr.save(&config).await {
                         eprintln!("[DIAL] Failed to save GitHub peer mapping: {}", e);
                     } else {
-                        if let Ok(mut conn) = state.db_conn.lock() {
-                            let _ = crate::storage::db::migrate_single_legacy_github_chat_id(
-                                &mut conn,
-                                &gh_user,
-                                &peer_id_for_mapping,
-                            );
-                        }
                         println!(
                             "[DIAL] ✅ Saved mapping: {} → {}",
                             gh_user, peer_id_for_mapping

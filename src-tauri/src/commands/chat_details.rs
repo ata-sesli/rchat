@@ -41,12 +41,9 @@ fn ensure_dm_chat(chat_id: &str) -> Result<(), String> {
     }
 }
 
-async fn resolve_dm_peer_id(chat_id: &str, app_state: &State<'_, AppState>) -> Result<String, String> {
+async fn resolve_dm_peer_id(chat_id: &str, _app_state: &State<'_, AppState>) -> Result<String, String> {
     ensure_dm_chat(chat_id)?;
-
-    let mgr = app_state.config_manager.lock().await;
-    let config = mgr.load().await.map_err(|e| e.to_string())?;
-    crate::chat_identity::resolve_peer_id_for_direct_chat_id(chat_id, &config.user.github_peer_mapping)
+    crate::chat_identity::resolve_peer_id_for_direct_chat_id(chat_id)
         .ok_or_else(|| format!("No active peer mapping found for {}", chat_id))
 }
 
@@ -54,11 +51,6 @@ fn avatar_url_for_chat(chat_id: &str) -> Option<String> {
     if let Some(parsed) = crate::chat_identity::parse_scoped_direct_chat_id(chat_id) {
         if matches!(parsed.scope, crate::chat_identity::DirectChatScope::Github) {
             return Some(format!("https://github.com/{}.png?size=96", parsed.name));
-        }
-    }
-    if let Some(username) = chat_id.strip_prefix("gh:") {
-        if !username.contains('-') {
-            return Some(format!("https://github.com/{}.png?size=96", username));
         }
     }
     None

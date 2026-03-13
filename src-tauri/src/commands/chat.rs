@@ -19,17 +19,10 @@ async fn mapped_github_chat_id_for_peer(
 }
 
 async fn resolve_peer_id_for_chat(
-    app_state: &State<'_, AppState>,
+    _app_state: &State<'_, AppState>,
     chat_id: &str,
 ) -> Option<String> {
-    let mgr = app_state.config_manager.lock().await;
-    let Ok(config) = mgr.load().await else {
-        return None;
-    };
-    crate::chat_identity::resolve_peer_id_for_direct_chat_id(
-        chat_id,
-        &config.user.github_peer_mapping,
-    )
+    crate::chat_identity::resolve_peer_id_for_direct_chat_id(chat_id)
 }
 
 async fn canonical_direct_chat_id_for_target(
@@ -114,10 +107,7 @@ pub async fn get_chat_latest_times(
                 .flat_map(|(github, peer_id)| {
                     let canonical =
                         crate::chat_identity::build_github_chat_id(&github, &peer_id);
-                    vec![
-                        (peer_id, canonical.clone()),
-                        (format!("gh:{}", github), canonical),
-                    ]
+                    vec![(peer_id, canonical)]
                 })
                 .collect(),
             Err(_) => std::collections::HashMap::new(),
@@ -201,10 +191,7 @@ pub async fn get_chat_list(
                 .flat_map(|(github, peer_id)| {
                     let canonical =
                         crate::chat_identity::build_github_chat_id(&github, &peer_id);
-                    vec![
-                        (peer_id, canonical.clone()),
-                        (format!("gh:{}", github), canonical),
-                    ]
+                    vec![(peer_id, canonical)]
                 })
                 .collect(),
             Err(_) => std::collections::HashMap::new(),
@@ -725,10 +712,7 @@ pub async fn get_unread_counts(
                 .flat_map(|(github, peer_id)| {
                     let canonical =
                         crate::chat_identity::build_github_chat_id(&github, &peer_id);
-                    vec![
-                        (peer_id, canonical.clone()),
-                        (format!("gh:{}", github), canonical),
-                    ]
+                    vec![(peer_id, canonical)]
                 })
                 .collect(),
             Err(_) => std::collections::HashMap::new(),

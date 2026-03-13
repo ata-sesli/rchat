@@ -100,41 +100,12 @@ pub fn extract_peer_id_from_chat_id(chat_id: &str) -> Option<String> {
 }
 
 pub fn extract_name_from_chat_id(chat_id: &str) -> Option<String> {
-    if let Some(parsed) = parse_scoped_direct_chat_id(chat_id) {
-        return Some(parsed.name);
-    }
-
-    if let Some(name) = chat_id.strip_prefix(GITHUB_CHAT_PREFIX) {
-        let trimmed = name.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-
-    if let Some(name) = chat_id.strip_prefix(LOCAL_CHAT_PREFIX) {
-        let trimmed = name.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-
-    None
+    parse_scoped_direct_chat_id(chat_id).map(|parsed| parsed.name)
 }
 
-pub fn resolve_peer_id_for_direct_chat_id(
-    chat_id: &str,
-    github_peer_mapping: &HashMap<String, String>,
-) -> Option<String> {
+pub fn resolve_peer_id_for_direct_chat_id(chat_id: &str) -> Option<String> {
     if let Some(peer_id) = extract_peer_id_from_chat_id(chat_id) {
         return Some(peer_id);
-    }
-
-    if let Some(legacy_username) = chat_id.strip_prefix(GITHUB_CHAT_PREFIX) {
-        return github_peer_mapping.get(legacy_username).cloned();
-    }
-
-    if chat_id.parse::<PeerId>().is_ok() {
-        return Some(chat_id.to_string());
     }
 
     None
@@ -177,12 +148,10 @@ mod tests {
     }
 
     #[test]
-    fn resolves_legacy_gh_chat_ids_with_mapping() {
-        let mut mapping = HashMap::new();
-        mapping.insert("professional-tester".to_string(), PEER_ID.to_string());
+    fn does_not_accept_legacy_gh_chat_id() {
         assert_eq!(
-            resolve_peer_id_for_direct_chat_id("gh:professional-tester", &mapping),
-            Some(PEER_ID.to_string())
+            resolve_peer_id_for_direct_chat_id("gh:professional-tester"),
+            None
         );
     }
 }

@@ -34,18 +34,12 @@ export function extractPeerIdFromChatId(chatId: string): string | null {
 export function githubUsernameFromChatId(chatId: string): string | null {
   const parsed = parseScopedDirectChatId(chatId);
   if (parsed?.scope === "gh") return parsed.name;
-  if (chatId.startsWith("gh:")) {
-    const legacy = chatId.slice(3);
-    return legacy || null;
-  }
   return null;
 }
 
 export function displayNameFromChatId(chatId: string): string {
   const parsed = parseScopedDirectChatId(chatId);
   if (parsed) return parsed.name;
-  if (chatId.startsWith("gh:")) return chatId.slice(3);
-  if (chatId.startsWith("lh:")) return chatId.slice(3);
   return chatId;
 }
 
