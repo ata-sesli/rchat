@@ -36,6 +36,9 @@ pub struct InvitePayload {
     pub ip_address: String,
     /// Unix timestamp for expiration check
     pub ttl_timestamp: u64,
+    /// Inviter's libp2p peer id for canonical DM chat identity.
+    #[serde(default)]
+    pub inviter_peer_id: Option<String>,
 }
 
 // ============================================================================
@@ -224,6 +227,7 @@ pub fn generate_invite(
     inviter: &str,
     invitee: &str,
     ip_address: &str,
+    inviter_peer_id: &str,
     ttl_secs: u64,
 ) -> Result<EncryptedInvite> {
     // 1. Generate Harvester Key
@@ -239,6 +243,7 @@ pub fn generate_invite(
         target_username: invitee.trim().to_lowercase(),
         ip_address: ip_address.to_string(),
         ttl_timestamp: now + ttl_secs,
+        inviter_peer_id: Some(inviter_peer_id.to_string()),
     };
 
     // 3. Encrypt
@@ -446,19 +451,38 @@ mod tests {
         let inviter = "Alice";
         let invitee = "Bob";
 
-        let invite = generate_invite(password, inviter, invitee, "192.168.1.100", 3600).unwrap();
+        let invite = generate_invite(
+            password,
+            inviter,
+            invitee,
+            "192.168.1.100",
+            "12D3KooWLk1GoEB3MbHbRLHTxXrvNGSxC2UALaCuKAgKuYXkXazU",
+            3600,
+        )
+        .unwrap();
 
         let result = process_invites(&[invite], password, inviter, invitee).unwrap();
 
         assert!(result.is_some());
         let (payload, _) = result.unwrap();
         assert_eq!(payload.ip_address, "192.168.1.100");
+        assert_eq!(
+            payload.inviter_peer_id.as_deref(),
+            Some("12D3KooWLk1GoEB3MbHbRLHTxXrvNGSxC2UALaCuKAgKuYXkXazU")
+        );
     }
 
     #[test]
     fn test_wrong_password_fails() {
-        let invite =
-            generate_invite("12345678901234", "Alice", "Bob", "192.168.1.100", 3600).unwrap();
+        let invite = generate_invite(
+            "12345678901234",
+            "Alice",
+            "Bob",
+            "192.168.1.100",
+            "12D3KooWLk1GoEB3MbHbRLHTxXrvNGSxC2UALaCuKAgKuYXkXazU",
+            3600,
+        )
+        .unwrap();
 
         let result = process_invites(&[invite], "wrongpassword1", "Alice", "Bob").unwrap();
 
@@ -468,8 +492,15 @@ mod tests {
 
     #[test]
     fn test_wrong_username_fails() {
-        let invite =
-            generate_invite("12345678901234", "Alice", "Bob", "192.168.1.100", 3600).unwrap();
+        let invite = generate_invite(
+            "12345678901234",
+            "Alice",
+            "Bob",
+            "192.168.1.100",
+            "12D3KooWLk1GoEB3MbHbRLHTxXrvNGSxC2UALaCuKAgKuYXkXazU",
+            3600,
+        )
+        .unwrap();
 
         let result = process_invites(&[invite], "12345678901234", "Alice", "Charlie").unwrap();
 

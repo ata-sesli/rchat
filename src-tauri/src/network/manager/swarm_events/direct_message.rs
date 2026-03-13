@@ -236,7 +236,9 @@ impl NetworkManager {
         peer: PeerId,
         request: &crate::network::direct_message::DirectMessageRequest,
     ) -> Result<(), String> {
-        let chat_id = self.resolve_chat_id_for_sender(&request.sender_id).await;
+        let chat_id = self
+            .resolve_chat_id_for_sender(&request.sender_id, request.sender_alias.as_deref())
+            .await;
         println!(
             "[DM] Using chat_id: {} for sender {}",
             chat_id, request.sender_id
@@ -315,7 +317,7 @@ impl NetworkManager {
                 invitee_github, invitee_peer_id
             );
 
-            let chat_id = format!("gh:{}", invitee_github);
+            let chat_id = crate::chat_identity::build_github_chat_id(&invitee_github, &invitee_peer_id);
             self.cache_peer_mapping(&invitee_github, &invitee_peer_id);
             self.mark_connected_chat_id(chat_id.clone()).await;
 
@@ -346,7 +348,12 @@ impl NetworkManager {
                 });
             }
 
-            if let Ok(conn) = state.db_conn.lock() {
+            if let Ok(mut conn) = state.db_conn.lock() {
+                let _ = crate::storage::db::migrate_single_legacy_github_chat_id(
+                    &mut conn,
+                    &invitee_github,
+                    &invitee_peer_id,
+                );
                 if !crate::storage::db::is_peer(&conn, &chat_id) {
                     let _ = crate::storage::db::add_peer(
                         &conn,

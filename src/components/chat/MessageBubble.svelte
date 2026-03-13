@@ -6,6 +6,7 @@
   import VideoViewer from "./VideoViewer.svelte";
   import { api } from "$lib/tauri/api";
   import { getChatKind } from "$lib/chatKind";
+  import { githubUsernameFromChatId } from "$lib/chatIdentity";
 
   export let msg: {
     sender: string;
@@ -309,7 +310,7 @@
           </div>
         {:else}
           <img
-            src={`https://github.com/${activePeer.startsWith("gh:") ? activePeer.slice(3) : activePeer}.png?size=32`}
+            src={`https://github.com/${githubUsernameFromChatId(activePeer) || activePeer}.png?size=32`}
             class="w-8 h-8 rounded-full bg-theme-secondary-500 shadow-lg shadow-purple-500/20 border-2 border-theme-base-950"
             onerror={(e) =>
               ((e.currentTarget as HTMLImageElement).src =

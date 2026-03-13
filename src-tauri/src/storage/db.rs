@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 // use std::path::Path; // Unused
 use anyhow::Context;
 use directories::ProjectDirs;
@@ -403,6 +403,278 @@ fn remove_legacy_general_data(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn merge_chat_connection_stats(
+    tx: &rusqlite::Transaction<'_>,
+    from_chat_id: &str,
+    to_chat_id: &str,
+) -> anyhow::Result<()> {
+    let from_stats = get_chat_connection_stats(tx, from_chat_id)?;
+    let to_stats = get_chat_connection_stats(tx, to_chat_id)?;
+
+    let first_connected_at = match (from_stats.first_connected_at, to_stats.first_connected_at) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    let last_connected_at = match (from_stats.last_connected_at, to_stats.last_connected_at) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    let reconnect_count = from_stats.reconnect_count.saturating_add(to_stats.reconnect_count);
+
+    tx.execute(
+        "INSERT INTO chat_connection_stats (chat_id, first_connected_at, last_connected_at, reconnect_count)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(chat_id) DO UPDATE SET
+             first_connected_at = excluded.first_connected_at,
+             last_connected_at = excluded.last_connected_at,
+             reconnect_count = excluded.reconnect_count",
+        rusqlite::params![
+            to_chat_id,
+            first_connected_at,
+            last_connected_at,
+            reconnect_count
+        ],
+    )?;
+
+    if from_chat_id != to_chat_id {
+        tx.execute(
+            "DELETE FROM chat_connection_stats WHERE chat_id = ?1",
+            [from_chat_id],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn migrate_chat_id_references(
+    tx: &rusqlite::Transaction<'_>,
+    old_chat_id: &str,
+    new_chat_id: &str,
+) -> anyhow::Result<()> {
+    if old_chat_id == new_chat_id {
+        return Ok(());
+    }
+
+    let old_chat_row = tx
+        .query_row(
+            "SELECT name, is_group, encryption_key FROM chats WHERE id = ?1",
+            [old_chat_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((old_name, old_is_group, old_encryption_key)) = old_chat_row else {
+        return Ok(());
+    };
+
+    let new_chat_exists = chat_exists(tx, new_chat_id);
+    if !new_chat_exists {
+        tx.execute(
+            "INSERT INTO chats (id, name, is_group, encryption_key) VALUES (?1, ?2, ?3, ?4)",
+            (
+                new_chat_id,
+                old_name,
+                old_is_group,
+                old_encryption_key.clone(),
+            ),
+        )?;
+    }
+
+    tx.execute(
+        "UPDATE messages SET chat_id = ?1 WHERE chat_id = ?2",
+        (new_chat_id, old_chat_id),
+    )?;
+
+    tx.execute(
+        "INSERT OR IGNORE INTO chat_peers (chat_id, peer_id, role, joined_at)
+         SELECT ?1, peer_id, role, joined_at
+         FROM chat_peers
+         WHERE chat_id = ?2",
+        (new_chat_id, old_chat_id),
+    )?;
+    tx.execute("DELETE FROM chat_peers WHERE chat_id = ?1", [old_chat_id])?;
+
+    let old_envelope = tx
+        .query_row(
+            "SELECT envelope_id FROM chat_envelopes WHERE chat_id = ?1",
+            [old_chat_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let new_envelope_exists = tx
+        .query_row(
+            "SELECT 1 FROM chat_envelopes WHERE chat_id = ?1",
+            [new_chat_id],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if let Some(envelope_id) = old_envelope {
+        if !new_envelope_exists {
+            tx.execute(
+                "INSERT OR REPLACE INTO chat_envelopes (chat_id, envelope_id) VALUES (?1, ?2)",
+                (new_chat_id, envelope_id),
+            )?;
+        }
+        tx.execute("DELETE FROM chat_envelopes WHERE chat_id = ?1", [old_chat_id])?;
+    }
+
+    merge_chat_connection_stats(tx, old_chat_id, new_chat_id)?;
+    tx.execute("DELETE FROM chats WHERE id = ?1", [old_chat_id])?;
+    Ok(())
+}
+
+fn migrate_peer_id_reference(
+    tx: &rusqlite::Transaction<'_>,
+    old_peer_id: &str,
+    new_peer_id: &str,
+) -> anyhow::Result<()> {
+    if old_peer_id == new_peer_id {
+        return Ok(());
+    }
+
+    let old_peer = tx
+        .query_row(
+            "SELECT alias, last_seen, public_key, method FROM peers WHERE id = ?1",
+            [old_peer_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((alias, last_seen, public_key, method)) = old_peer else {
+        return Ok(());
+    };
+
+    if !is_peer(tx, new_peer_id) {
+        tx.execute(
+            "INSERT INTO peers (id, alias, last_seen, public_key, method) VALUES (?1, ?2, ?3, ?4, ?5)",
+            (new_peer_id, alias, last_seen, public_key, method),
+        )?;
+    }
+
+    tx.execute(
+        "UPDATE messages SET peer_id = ?1 WHERE peer_id = ?2",
+        (new_peer_id, old_peer_id),
+    )?;
+
+    tx.execute(
+        "INSERT OR IGNORE INTO chat_peers (chat_id, peer_id, role, joined_at)
+         SELECT chat_id, ?1, role, joined_at
+         FROM chat_peers
+         WHERE peer_id = ?2",
+        (new_peer_id, old_peer_id),
+    )?;
+    tx.execute("DELETE FROM chat_peers WHERE peer_id = ?1", [old_peer_id])?;
+    tx.execute("DELETE FROM peers WHERE id = ?1", [old_peer_id])?;
+    Ok(())
+}
+
+fn migrate_legacy_github_chat_id_inner(
+    tx: &rusqlite::Transaction<'_>,
+    github_username: &str,
+    peer_id: &str,
+) -> anyhow::Result<()> {
+    let old_chat_id = format!("gh:{}", github_username);
+    let new_chat_id = crate::chat_identity::build_github_chat_id(github_username, peer_id);
+
+    migrate_chat_id_references(tx, &old_chat_id, &new_chat_id)?;
+    migrate_peer_id_reference(tx, &old_chat_id, &new_chat_id)?;
+
+    Ok(())
+}
+
+pub fn migrate_single_legacy_github_chat_id(
+    conn: &mut Connection,
+    github_username: &str,
+    peer_id: &str,
+) -> anyhow::Result<()> {
+    let tx = conn.transaction()?;
+    migrate_legacy_github_chat_id_inner(&tx, github_username, peer_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn migrate_legacy_github_chat_ids(
+    conn: &mut Connection,
+    github_peer_mapping: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<()> {
+    if github_peer_mapping.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    for (github_username, peer_id) in github_peer_mapping {
+        migrate_legacy_github_chat_id_inner(&tx, github_username, peer_id)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn find_existing_local_chat_id_for_peer(
+    conn: &Connection,
+    peer_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id
+         FROM chats
+         WHERE is_group = 0
+           AND id LIKE ?1
+         ORDER BY id ASC
+         LIMIT 1",
+    )?;
+    stmt.query_row([format!("lh:%-{}", peer_id)], |row| row.get(0))
+        .optional()
+        .map_err(Into::into)
+}
+
+pub fn find_existing_github_chat_id_for_peer(
+    conn: &Connection,
+    peer_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id
+         FROM chats
+         WHERE is_group = 0
+           AND id LIKE ?1
+         ORDER BY id ASC
+         LIMIT 1",
+    )?;
+    stmt.query_row([format!("gh:%-{}", peer_id)], |row| row.get(0))
+        .optional()
+        .map_err(Into::into)
+}
+
+pub fn find_existing_direct_chat_id_for_peer(
+    conn: &Connection,
+    peer_id: &str,
+) -> anyhow::Result<Option<String>> {
+    if let Some(gh) = find_existing_github_chat_id_for_peer(conn, peer_id)? {
+        return Ok(Some(gh));
+    }
+    if let Some(lh) = find_existing_local_chat_id_for_peer(conn, peer_id)? {
+        return Ok(Some(lh));
+    }
+    if chat_exists(conn, peer_id) {
+        return Ok(Some(peer_id.to_string()));
+    }
+    Ok(None)
+}
+
 // --- Peer Functions ---
 
 /// Add a new peer to the database (used after handshake)
@@ -587,7 +859,10 @@ pub fn get_chat_list(conn: &Connection) -> anyhow::Result<Vec<ChatListItem>> {
     })?;
     for row in peer_rows {
         let (peer_id, alias) = row?;
-        if !seen_ids.contains(&peer_id) {
+        let has_scoped_direct_chat = seen_ids.iter().any(|id| {
+            (id.starts_with("gh:") || id.starts_with("lh:")) && id.ends_with(&format!("-{}", peer_id))
+        });
+        if !seen_ids.contains(&peer_id) && !has_scoped_direct_chat {
             items.push(ChatListItem {
                 id: peer_id.clone(),
                 name: alias,
@@ -1215,5 +1490,44 @@ mod tests {
         assert_eq!(second.first_connected_at, Some(10));
         assert_eq!(second.last_connected_at, Some(20));
         assert_eq!(second.reconnect_count, 1);
+    }
+
+    #[test]
+    fn migrates_legacy_github_chat_id_to_canonical_format() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        create_tables(&conn).expect("schema");
+
+        let legacy_chat_id = "gh:professional-tester";
+        let peer_id = "12D3KooWLk1GoEB3MbHbRLHTxXrvNGSxC2UALaCuKAgKuYXkXazU";
+        let canonical_chat_id =
+            crate::chat_identity::build_github_chat_id("professional-tester", peer_id);
+
+        add_peer(&conn, legacy_chat_id, Some("professional-tester"), None, "github")
+            .expect("legacy peer");
+        create_chat(&conn, legacy_chat_id, "professional-tester", false).expect("legacy chat");
+
+        let msg = Message {
+            id: "msg-1".to_string(),
+            chat_id: legacy_chat_id.to_string(),
+            peer_id: "Me".to_string(),
+            timestamp: 1,
+            content_type: "text".to_string(),
+            text_content: Some("hello".to_string()),
+            file_hash: None,
+            status: "delivered".to_string(),
+            content_metadata: None,
+            sender_alias: None,
+        };
+        insert_message(&conn, &msg).expect("legacy message");
+
+        migrate_single_legacy_github_chat_id(&mut conn, "professional-tester", peer_id)
+            .expect("migration");
+
+        assert!(!chat_exists(&conn, legacy_chat_id));
+        assert!(chat_exists(&conn, &canonical_chat_id));
+        assert!(is_peer(&conn, &canonical_chat_id));
+        let migrated_messages = get_messages(&conn, &canonical_chat_id).expect("messages");
+        assert_eq!(migrated_messages.len(), 1);
+        assert_eq!(migrated_messages[0].id, "msg-1");
     }
 }

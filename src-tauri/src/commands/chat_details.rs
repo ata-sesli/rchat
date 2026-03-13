@@ -44,23 +44,22 @@ fn ensure_dm_chat(chat_id: &str) -> Result<(), String> {
 async fn resolve_dm_peer_id(chat_id: &str, app_state: &State<'_, AppState>) -> Result<String, String> {
     ensure_dm_chat(chat_id)?;
 
-    if let Some(gh_username) = chat_id.strip_prefix("gh:") {
-        let mgr = app_state.config_manager.lock().await;
-        let config = mgr.load().await.map_err(|e| e.to_string())?;
-        return config
-            .user
-            .github_peer_mapping
-            .get(gh_username)
-            .cloned()
-            .ok_or_else(|| format!("No active peer mapping found for {}", gh_username));
-    }
-
-    Ok(chat_id.to_string())
+    let mgr = app_state.config_manager.lock().await;
+    let config = mgr.load().await.map_err(|e| e.to_string())?;
+    crate::chat_identity::resolve_peer_id_for_direct_chat_id(chat_id, &config.user.github_peer_mapping)
+        .ok_or_else(|| format!("No active peer mapping found for {}", chat_id))
 }
 
 fn avatar_url_for_chat(chat_id: &str) -> Option<String> {
+    if let Some(parsed) = crate::chat_identity::parse_scoped_direct_chat_id(chat_id) {
+        if matches!(parsed.scope, crate::chat_identity::DirectChatScope::Github) {
+            return Some(format!("https://github.com/{}.png?size=96", parsed.name));
+        }
+    }
     if let Some(username) = chat_id.strip_prefix("gh:") {
-        return Some(format!("https://github.com/{}.png?size=96", username));
+        if !username.contains('-') {
+            return Some(format!("https://github.com/{}.png?size=96", username));
+        }
     }
     None
 }
@@ -83,9 +82,7 @@ pub async fn get_chat_details_overview(
         let peer_name = crate::storage::db::get_chat_name(&conn, &chat_id)
             .map_err(|e| e.to_string())?
             .or_else(|| {
-                chat_id
-                    .strip_prefix("gh:")
-                    .map(|username| username.to_string())
+                crate::chat_identity::extract_name_from_chat_id(&chat_id)
             })
             .unwrap_or_else(|| chat_id.clone());
 

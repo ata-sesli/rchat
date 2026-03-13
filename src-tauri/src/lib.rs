@@ -1,5 +1,6 @@
 mod app_state;
 mod chat;
+mod chat_identity;
 mod chat_kind;
 mod commands;
 mod live;

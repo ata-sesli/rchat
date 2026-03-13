@@ -65,13 +65,60 @@ impl NetworkManager {
             self.record_chat_reconnection(&peer_id_str, connected_at);
         }
         if let Some(username) = self.github_by_peer_id.get(&peer_id_str).cloned() {
-            let chat_id = format!("gh:{}", username);
+            let chat_id = crate::chat_identity::build_github_chat_id(&username, &peer_id_str);
             self.mark_connected_chat_id(chat_id.clone()).await;
             let transitioned = self
                 .note_chat_connection_established(&chat_id, &remote_addr_str, connected_at)
                 .await;
             if transitioned {
                 self.record_chat_reconnection(&chat_id, connected_at);
+            }
+        } else {
+            use tauri::Manager;
+            let state = self.app_handle.state::<crate::AppState>();
+            let local_chat_id = if let Ok(conn) = state.db_conn.lock() {
+                let local_chat_id = crate::storage::db::find_existing_local_chat_id_for_peer(
+                    &conn,
+                    &peer_id_str,
+                )
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| {
+                    let local_name = crate::storage::db::get_peer_alias(&conn, &peer_id_str)
+                        .ok()
+                        .flatten()
+                        .filter(|name| !name.trim().is_empty() && name != &peer_id_str)
+                        .unwrap_or_else(|| "peer".to_string());
+                    crate::chat_identity::build_local_chat_id(&local_name, &peer_id_str)
+                });
+
+                let local_name = crate::chat_identity::extract_name_from_chat_id(&local_chat_id)
+                    .unwrap_or_else(|| "peer".to_string());
+                let _ = crate::storage::db::add_peer(
+                    &conn,
+                    &local_chat_id,
+                    Some(&local_name),
+                    None,
+                    "local",
+                );
+                let _ = crate::storage::db::create_chat(&conn, &local_chat_id, &local_name, false);
+                Some(local_chat_id)
+            } else {
+                None
+            };
+
+            if let Some(local_chat_id) = local_chat_id {
+                self.mark_connected_chat_id(local_chat_id.clone()).await;
+                let transitioned = self
+                    .note_chat_connection_established(
+                        &local_chat_id,
+                        &remote_addr_str,
+                        connected_at,
+                    )
+                    .await;
+                if transitioned {
+                    self.record_chat_reconnection(&local_chat_id, connected_at);
+                }
             }
         }
 
@@ -133,9 +180,9 @@ impl NetworkManager {
                 inviter_github_user, peer_id_str
             );
             self.cache_peer_mapping(&inviter_github_user, &peer_id_str);
-            self.mark_connected_chat_id(format!("gh:{}", inviter_github_user))
-                .await;
-            let chat_id = format!("gh:{}", inviter_github_user);
+            let chat_id =
+                crate::chat_identity::build_github_chat_id(&inviter_github_user, &peer_id_str);
+            self.mark_connected_chat_id(chat_id.clone()).await;
             let transitioned = self
                 .note_chat_connection_established(&chat_id, &remote_addr_str, connected_at)
                 .await;
@@ -157,6 +204,13 @@ impl NetworkManager {
                     if let Err(e) = mgr.save(&config).await {
                         eprintln!("[DIAL] Failed to save GitHub peer mapping: {}", e);
                     } else {
+                        if let Ok(mut conn) = state.db_conn.lock() {
+                            let _ = crate::storage::db::migrate_single_legacy_github_chat_id(
+                                &mut conn,
+                                &gh_user,
+                                &peer_id_for_mapping,
+                            );
+                        }
                         println!(
                             "[DIAL] ✅ Saved mapping: {} → {}",
                             gh_user, peer_id_for_mapping
@@ -199,7 +253,6 @@ impl NetworkManager {
                 .send_request(&peer_id, handshake);
             println!("[HANDSHAKE] ✅ Handshake sent to {}", peer_id);
 
-            let chat_id = format!("gh:{}", inviter_github_user);
             let peer_info = LocalPeer {
                 peer_id: chat_id.clone(),
                 addresses: vec![],
@@ -257,24 +310,38 @@ impl NetworkManager {
                 }
 
                 if let Some(username) = self.github_by_peer_id.get(&peer_id_str).cloned() {
-                    let chat_id = format!("gh:{}", username);
+                    let chat_id =
+                        crate::chat_identity::build_github_chat_id(&username, &peer_id_str);
                     self.unmark_connected_chat_id(&chat_id).await;
                     self.note_chat_connection_closed(&chat_id).await;
-                    let _ = self
-                        .app_handle
-                        .emit("local-peer-expired", format!("gh:{}", username));
+                    let _ = self.app_handle.emit("local-peer-expired", chat_id);
                     return;
                 }
 
                 self.refresh_peer_mapping_cache().await;
                 if let Some(username) = self.github_by_peer_id.get(&peer_id_str).cloned() {
-                    let chat_id = format!("gh:{}", username);
+                    let chat_id =
+                        crate::chat_identity::build_github_chat_id(&username, &peer_id_str);
                     self.unmark_connected_chat_id(&chat_id).await;
                     self.note_chat_connection_closed(&chat_id).await;
-                    let _ = self
-                        .app_handle
-                        .emit("local-peer-expired", format!("gh:{}", username));
+                    let _ = self.app_handle.emit("local-peer-expired", chat_id);
                 } else {
+                    use tauri::Manager;
+                    let local_chat_id = if let Ok(conn) =
+                        self.app_handle.state::<crate::AppState>().db_conn.lock()
+                    {
+                        crate::storage::db::find_existing_local_chat_id_for_peer(&conn, &peer_id_str)
+                            .ok()
+                            .flatten()
+                    } else {
+                        None
+                    };
+                    if let Some(local_chat_id) = local_chat_id {
+                        self.unmark_connected_chat_id(&local_chat_id).await;
+                        self.note_chat_connection_closed(&local_chat_id).await;
+                        let _ = self.app_handle.emit("local-peer-expired", local_chat_id);
+                        return;
+                    }
                     let _ = self.app_handle.emit("local-peer-expired", peer_id_str);
                 }
             }

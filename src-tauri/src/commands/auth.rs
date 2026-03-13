@@ -238,6 +238,18 @@ pub async fn start_network(app_handle: tauri::AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
+    {
+        let app_state = app_handle.state::<AppState>();
+        let github_peer_mapping = {
+            let mgr = app_state.config_manager.lock().await;
+            let config = mgr.load().await.map_err(|e| e.to_string())?;
+            config.user.github_peer_mapping
+        };
+        let mut conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
+        crate::storage::db::migrate_legacy_github_chat_ids(&mut conn, &github_peer_mapping)
+            .map_err(|e| e.to_string())?;
+    }
+
     match network::init(app_handle.clone()).await {
         Ok(_) => {
             println!("[Backend] Network started successfully!");

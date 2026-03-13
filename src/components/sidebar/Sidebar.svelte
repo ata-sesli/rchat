@@ -4,6 +4,11 @@
   import type { ConnectivityMode, ConnectivitySettings } from "$lib/tauri/api";
   import EnvelopeItem from "./EnvelopeItem.svelte";
   import { getChatKind } from "$lib/chatKind";
+  import {
+    directPeerKey,
+    displayNameFromChatId,
+    githubUsernameFromChatId,
+  } from "$lib/chatIdentity";
 
   // Props with callbacks
   let {
@@ -207,13 +212,18 @@
   function displayName(chatId: string) {
     if (chatId === "Me") return "Me (You)";
     if (chatNames[chatId]?.trim()) return chatNames[chatId];
-    return peerAliases[chatId] || (chatId.startsWith("gh:") ? chatId.slice(3) : chatId);
+    return peerAliases[chatId] || displayNameFromChatId(chatId);
   }
 
   function isPeerOnline(peerId: string) {
     if (peerId === "Me") return true;
     if (isGroupChat(peerId)) return true;
-    return connectedChatIds.has(peerId);
+    const targetKey = directPeerKey(peerId) || peerId;
+    for (const connectedId of connectedChatIds) {
+        const connectedKey = directPeerKey(connectedId) || connectedId;
+        if (connectedKey === targetKey) return true;
+    }
+    return false;
   }
 
   function closeMenusOnWindowClick() {
@@ -546,7 +556,7 @@
                 <div
                   class="w-10 h-10 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white font-bold shadow-md ring-2 ring-transparent group-hover:ring-slate-700 transition-all"
                 >
-                  {(peer.startsWith("gh:") ? peer.slice(3) : peer)
+                  {displayNameFromChatId(peer)
                     .slice(0, 2)
                     .toUpperCase()}
                 </div>
@@ -668,7 +678,7 @@
               </div>
             {:else}
               <img
-                src={`https://github.com/${peer.startsWith("gh:") ? peer.slice(3) : peer}.png?size=40`}
+                src={`https://github.com/${githubUsernameFromChatId(peer) || peer}.png?size=40`}
                 alt={peer}
                 class="w-full h-full object-cover"
                 draggable="false"

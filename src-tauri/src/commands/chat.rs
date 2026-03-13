@@ -15,29 +15,64 @@ async fn mapped_github_chat_id_for_peer(
     let Ok(config) = mgr.load().await else {
         return None;
     };
-    config
-        .user
-        .github_peer_mapping
-        .iter()
-        .find_map(|(github, mapped_peer)| {
-            if mapped_peer == peer_id {
-                Some(format!("gh:{}", github))
-            } else {
-                None
-            }
-        })
+    crate::chat_identity::github_chat_id_for_peer_id(peer_id, &config.user.github_peer_mapping)
 }
 
 async fn resolve_peer_id_for_chat(
     app_state: &State<'_, AppState>,
     chat_id: &str,
 ) -> Option<String> {
-    let github_username = chat_id.strip_prefix("gh:")?;
     let mgr = app_state.config_manager.lock().await;
     let Ok(config) = mgr.load().await else {
         return None;
     };
-    config.user.github_peer_mapping.get(github_username).cloned()
+    crate::chat_identity::resolve_peer_id_for_direct_chat_id(
+        chat_id,
+        &config.user.github_peer_mapping,
+    )
+}
+
+async fn canonical_direct_chat_id_for_target(
+    app_state: &State<'_, AppState>,
+    direct_id: &str,
+) -> String {
+    if !matches!(chat_kind::parse_chat_kind(direct_id), ChatKind::Direct) {
+        return direct_id.to_string();
+    }
+    if direct_id.starts_with("gh:") || direct_id.starts_with("lh:") {
+        return direct_id.to_string();
+    }
+
+    if let Some(mapped) = mapped_github_chat_id_for_peer(app_state, direct_id).await {
+        return mapped;
+    }
+
+    let local_name = {
+        let conn = match app_state.db_conn.lock() {
+            Ok(conn) => conn,
+            Err(_) => {
+                return crate::chat_identity::build_local_chat_id("peer", direct_id);
+            }
+        };
+
+        if let Ok(Some(existing_lh)) = storage::db::find_existing_local_chat_id_for_peer(&conn, direct_id) {
+            return existing_lh;
+        }
+
+        storage::db::get_peer_alias(&conn, direct_id)
+            .ok()
+            .flatten()
+            .filter(|name| !name.trim().is_empty() && name != direct_id)
+            .unwrap_or_else(|| "peer".to_string())
+    };
+
+    crate::chat_identity::build_local_chat_id(&local_name, direct_id)
+}
+
+fn default_direct_chat_name(chat_id: &str) -> String {
+    crate::chat_identity::extract_name_from_chat_id(chat_id)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "peer".to_string())
 }
 
 #[derive(serde::Serialize)]
@@ -76,7 +111,14 @@ pub async fn get_chat_latest_times(
                 .user
                 .github_peer_mapping
                 .into_iter()
-                .map(|(github, peer_id)| (peer_id, format!("gh:{}", github)))
+                .flat_map(|(github, peer_id)| {
+                    let canonical =
+                        crate::chat_identity::build_github_chat_id(&github, &peer_id);
+                    vec![
+                        (peer_id, canonical.clone()),
+                        (format!("gh:{}", github), canonical),
+                    ]
+                })
                 .collect(),
             Err(_) => std::collections::HashMap::new(),
         }
@@ -156,7 +198,14 @@ pub async fn get_chat_list(
                 .user
                 .github_peer_mapping
                 .into_iter()
-                .map(|(github, peer_id)| (peer_id, format!("gh:{}", github)))
+                .flat_map(|(github, peer_id)| {
+                    let canonical =
+                        crate::chat_identity::build_github_chat_id(&github, &peer_id);
+                    vec![
+                        (peer_id, canonical.clone()),
+                        (format!("gh:{}", github), canonical),
+                    ]
+                })
                 .collect(),
             Err(_) => std::collections::HashMap::new(),
         }
@@ -341,13 +390,19 @@ pub async fn send_message(
     println!("[Backend] send_message to {}: {}", peer_id, message);
 
     let canonical_peer_id = if matches!(chat_kind::parse_chat_kind(&peer_id), ChatKind::Direct) {
-        mapped_github_chat_id_for_peer(&app_state, &peer_id)
-            .await
-            .unwrap_or_else(|| peer_id.clone())
+        canonical_direct_chat_id_for_target(&app_state, &peer_id).await
     } else {
         peer_id.clone()
     };
     let chat_kind = chat_kind::parse_chat_kind(&canonical_peer_id);
+    let resolved_direct_peer_id = if matches!(chat_kind, ChatKind::Direct | ChatKind::TemporaryDirect)
+    {
+        resolve_peer_id_for_chat(&app_state, &canonical_peer_id)
+            .await
+            .unwrap_or_else(|| canonical_peer_id.clone())
+    } else {
+        canonical_peer_id.clone()
+    };
 
     let my_alias = {
         let mgr = app_state.config_manager.lock().await;
@@ -405,17 +460,42 @@ pub async fn send_message(
                 ChatKind::Direct => {
                     if !storage::db::is_peer(&conn, &canonical_peer_id) {
                         if let Err(e) =
-                            storage::db::add_peer(&conn, &canonical_peer_id, None, None, "local")
+                            storage::db::add_peer(
+                                &conn,
+                                &canonical_peer_id,
+                                Some(&default_direct_chat_name(&canonical_peer_id)),
+                                None,
+                                if canonical_peer_id.starts_with("gh:") {
+                                    "github"
+                                } else {
+                                    "local"
+                                },
+                            )
                         {
                             eprintln!("[Backend] Failed to auto-add peer: {}", e);
                         }
+                    }
+                    if resolved_direct_peer_id != canonical_peer_id
+                        && !storage::db::is_peer(&conn, &resolved_direct_peer_id)
+                    {
+                        let _ = storage::db::add_peer(
+                            &conn,
+                            &resolved_direct_peer_id,
+                            Some(&default_direct_chat_name(&canonical_peer_id)),
+                            None,
+                            if canonical_peer_id.starts_with("gh:") {
+                                "github"
+                            } else {
+                                "local"
+                            },
+                        );
                     }
 
                     if !storage::db::chat_exists(&conn, &canonical_peer_id) {
                         if let Err(e) = storage::db::create_chat(
                             &conn,
                             &canonical_peer_id,
-                            &canonical_peer_id,
+                            &default_direct_chat_name(&canonical_peer_id),
                             false,
                         ) {
                             eprintln!("[Backend] Failed to auto-create chat: {}", e);
@@ -461,9 +541,7 @@ pub async fn send_message(
 
     let direct_target_peer_id = if matches!(chat_kind, ChatKind::Direct | ChatKind::TemporaryDirect)
     {
-        resolve_peer_id_for_chat(&app_state, &canonical_peer_id)
-            .await
-            .unwrap_or_else(|| canonical_peer_id.clone())
+        resolved_direct_peer_id
     } else {
         canonical_peer_id.clone()
     };
@@ -513,9 +591,7 @@ pub async fn get_chat_history(
     println!("[Backend] get_chat_history for: {}", chat_id);
 
     let resolved_chat_id = if matches!(chat_kind::parse_chat_kind(&chat_id), ChatKind::Direct) {
-        mapped_github_chat_id_for_peer(&state, &chat_id)
-            .await
-            .unwrap_or(chat_id.clone())
+        canonical_direct_chat_id_for_target(&state, &chat_id).await
     } else {
         chat_id.clone()
     };
@@ -563,9 +639,7 @@ pub async fn mark_messages_read(
     println!("[Backend] mark_messages_read for chat: {}", chat_id);
 
     let resolved_chat_id = if matches!(chat_kind::parse_chat_kind(&chat_id), ChatKind::Direct) {
-        mapped_github_chat_id_for_peer(&state, &chat_id)
-            .await
-            .unwrap_or(chat_id.clone())
+        canonical_direct_chat_id_for_target(&state, &chat_id).await
     } else {
         chat_id.clone()
     };
@@ -648,7 +722,14 @@ pub async fn get_unread_counts(
                 .user
                 .github_peer_mapping
                 .into_iter()
-                .map(|(github, peer_id)| (peer_id, format!("gh:{}", github)))
+                .flat_map(|(github, peer_id)| {
+                    let canonical =
+                        crate::chat_identity::build_github_chat_id(&github, &peer_id);
+                    vec![
+                        (peer_id, canonical.clone()),
+                        (format!("gh:{}", github), canonical),
+                    ]
+                })
                 .collect(),
             Err(_) => std::collections::HashMap::new(),
         }

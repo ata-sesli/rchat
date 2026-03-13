@@ -169,6 +169,25 @@ impl NetworkManager {
         let peer_id_res = peer.peer_id.parse::<PeerId>();
         match peer_id_res {
             Ok(peer_id) => {
+                let discovered_name = peer
+                    .alias
+                    .clone()
+                    .or(peer.device_name.clone())
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "peer".to_string());
+
+                use tauri::Manager;
+                if let Ok(conn) = self.app_handle.state::<crate::AppState>().db_conn.lock() {
+                    let _ = crate::storage::db::add_peer(
+                        &conn,
+                        &peer.peer_id,
+                        Some(&discovered_name),
+                        None,
+                        "local",
+                    );
+                }
+
                 // Skip if already connected to this peer
                 if self.swarm.is_connected(&peer_id) {
                     // Still emit/update discovery so frontend local-scan can show connected peers

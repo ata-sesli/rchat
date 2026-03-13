@@ -187,16 +187,43 @@ fn persist_incoming_direct_message(
     db_msg: &crate::storage::db::Message,
 ) -> Result<(), String> {
     with_db_conn(app_handle, |conn| {
+        let sender_name = request
+            .sender_alias
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                crate::chat_identity::extract_name_from_chat_id(chat_id)
+                    .filter(|name| !name.trim().is_empty())
+            })
+            .unwrap_or_else(|| "peer".to_string());
+
         let peer_exists = crate::storage::db::is_peer(conn, &request.sender_id);
         if !peer_exists {
-            crate::storage::db::add_peer(conn, &request.sender_id, None, None, "direct")
+            crate::storage::db::add_peer(
+                conn,
+                &request.sender_id,
+                Some(&sender_name),
+                None,
+                "direct",
+            )
                 .map_err(|e| e.to_string())?;
         }
 
         let chat_exists = crate::storage::db::chat_exists(conn, chat_id);
         if !chat_exists {
-            crate::storage::db::create_chat(conn, chat_id, &request.sender_id, false)
+            crate::storage::db::create_chat(conn, chat_id, &sender_name, false)
                 .map_err(|e| e.to_string())?;
+        } else if let Ok(existing_name) = crate::storage::db::get_chat_name(conn, chat_id) {
+            if existing_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty() && *name != chat_id)
+                .is_none()
+            {
+                let _ = crate::storage::db::upsert_chat(conn, chat_id, &sender_name, false);
+            }
         }
 
         if request.msg_type.needs_file_transfer() {

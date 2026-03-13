@@ -257,7 +257,9 @@ impl NetworkManager {
         peer: PeerId,
         request: &DirectMessageRequest,
     ) -> Result<(), String> {
-        let incoming_chat_id = self.resolve_chat_id_for_sender(&request.sender_id).await;
+        let incoming_chat_id = self
+            .resolve_chat_id_for_sender(&request.sender_id, request.sender_alias.as_deref())
+            .await;
 
         match request.msg_type {
             DirectMessageKind::CallOffer | DirectMessageKind::CallOfferVideo => {

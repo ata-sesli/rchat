@@ -163,6 +163,12 @@ pub async fn create_invite(
     };
 
     let net_state = app.state::<NetworkState>();
+    let local_peer_id = net_state
+        .local_peer_id
+        .lock()
+        .await
+        .clone()
+        .ok_or("Network peer id not available. Is the network started?")?;
     let my_address = {
         let v4_stun = net_state.public_address_v4.lock().await.clone();
         let stun_port = net_state.stun_external_port.lock().await.clone();
@@ -192,9 +198,15 @@ pub async fn create_invite(
         }
     };
 
-    let encrypted_invite =
-        invite::generate_invite(&password, &my_username, &invitee, &my_address, 120)
-            .map_err(|e| format!("Failed to generate invite: {}", e))?;
+    let encrypted_invite = invite::generate_invite(
+        &password,
+        &my_username,
+        &invitee,
+        &my_address,
+        &local_peer_id,
+        120,
+    )
+    .map_err(|e| format!("Failed to generate invite: {}", e))?;
 
     let tracked = gist::track_invite(encrypted_invite);
 
@@ -279,7 +291,25 @@ pub async fn redeem_and_connect(
     match result {
         Some((payload, _index)) => {
             let github_username = inviter.clone();
-            let chat_id = format!("gh:{}", github_username);
+            let existing_peer_id = {
+                let mgr = app_state.config_manager.lock().await;
+                mgr.load()
+                    .await
+                    .ok()
+                    .and_then(|config| config.user.github_peer_mapping.get(&github_username).cloned())
+            };
+            let invite_peer_id = payload.inviter_peer_id.clone().and_then(|candidate| {
+                if candidate.parse::<libp2p::PeerId>().is_ok() {
+                    Some(candidate)
+                } else {
+                    None
+                }
+            });
+            let resolved_peer_id = existing_peer_id.or(invite_peer_id).ok_or_else(|| {
+                "Invitation is missing inviter peer id. Ask the inviter to generate a new invite."
+                    .to_string()
+            })?;
+            let chat_id = crate::chat_identity::build_github_chat_id(&github_username, &resolved_peer_id);
 
             {
                 let mgr = app_state.config_manager.lock().await;
@@ -305,7 +335,13 @@ pub async fn redeem_and_connect(
             }
 
             {
-                let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
+                let mut conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
+
+                let _ = storage::db::migrate_single_legacy_github_chat_id(
+                    &mut conn,
+                    &github_username,
+                    &resolved_peer_id,
+                );
 
                 if !storage::db::is_peer(&conn, &chat_id) {
                     storage::db::add_peer(&conn, &chat_id, Some(&github_username), None, "github")

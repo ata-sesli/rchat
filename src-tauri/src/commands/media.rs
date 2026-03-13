@@ -205,12 +205,27 @@ fn ensure_persisted_outgoing_chat(
     match chat_kind {
         ChatKind::Direct => {
             if !storage::db::is_peer(conn, canonical_chat_id) {
-                storage::db::add_peer(conn, canonical_chat_id, None, None, "local")
-                    .map_err(|e| e.to_string())?;
+                storage::db::add_peer(
+                    conn,
+                    canonical_chat_id,
+                    Some(&default_direct_chat_name(canonical_chat_id)),
+                    None,
+                    if canonical_chat_id.starts_with("gh:") {
+                        "github"
+                    } else {
+                        "local"
+                    },
+                )
+                .map_err(|e| e.to_string())?;
             }
 
             if !storage::db::chat_exists(conn, canonical_chat_id) {
-                storage::db::create_chat(conn, canonical_chat_id, canonical_chat_id, false)
+                storage::db::create_chat(
+                    conn,
+                    canonical_chat_id,
+                    &default_direct_chat_name(canonical_chat_id),
+                    false,
+                )
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -236,6 +251,12 @@ fn ensure_persisted_outgoing_chat(
     Ok(())
 }
 
+fn default_direct_chat_name(chat_id: &str) -> String {
+    crate::chat_identity::extract_name_from_chat_id(chat_id)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "peer".to_string())
+}
+
 async fn store_outgoing_temp_message(
     net_state: &State<'_, NetworkState>,
     chat_id: &str,
@@ -253,47 +274,54 @@ async fn canonical_direct_chat_id(
     app_state: &State<'_, AppState>,
     peer_id: &str,
 ) -> String {
-    if !matches!(chat_kind::parse_chat_kind(peer_id), ChatKind::Direct) || peer_id.starts_with("gh:")
-    {
+    if !matches!(chat_kind::parse_chat_kind(peer_id), ChatKind::Direct) {
+        return peer_id.to_string();
+    }
+    if peer_id.starts_with("gh:") || peer_id.starts_with("lh:") {
         return peer_id.to_string();
     }
 
     let mgr = app_state.config_manager.lock().await;
     let Ok(config) = mgr.load().await else {
-        return peer_id.to_string();
+        return crate::chat_identity::build_local_chat_id("peer", peer_id);
     };
-    config
-        .user
-        .github_peer_mapping
-        .iter()
-        .find_map(|(github, mapped_peer)| {
-            if mapped_peer == peer_id {
-                Some(format!("gh:{}", github))
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| peer_id.to_string())
+    if let Some(mapped) =
+        crate::chat_identity::github_chat_id_for_peer_id(peer_id, &config.user.github_peer_mapping)
+    {
+        return mapped;
+    }
+
+    let conn = match app_state.db_conn.lock() {
+        Ok(conn) => conn,
+        Err(_) => return crate::chat_identity::build_local_chat_id("peer", peer_id),
+    };
+
+    if let Ok(Some(existing_lh)) = storage::db::find_existing_local_chat_id_for_peer(&conn, peer_id)
+    {
+        return existing_lh;
+    }
+
+    let local_name = storage::db::get_peer_alias(&conn, peer_id)
+        .ok()
+        .flatten()
+        .filter(|name| !name.trim().is_empty() && name != peer_id)
+        .unwrap_or_else(|| "peer".to_string());
+    crate::chat_identity::build_local_chat_id(&local_name, peer_id)
 }
 
 async fn resolve_direct_target_peer_id(
     app_state: &State<'_, AppState>,
     chat_id: &str,
 ) -> String {
-    let Some(github_username) = chat_id.strip_prefix("gh:") else {
-        return chat_id.to_string();
-    };
-
     let mgr = app_state.config_manager.lock().await;
     let Ok(config) = mgr.load().await else {
         return chat_id.to_string();
     };
-    config
-        .user
-        .github_peer_mapping
-        .get(github_username)
-        .cloned()
-        .unwrap_or_else(|| chat_id.to_string())
+    crate::chat_identity::resolve_peer_id_for_direct_chat_id(
+        chat_id,
+        &config.user.github_peer_mapping,
+    )
+    .unwrap_or_else(|| chat_id.to_string())
 }
 
 #[tauri::command]

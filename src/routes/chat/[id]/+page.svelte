@@ -5,6 +5,7 @@
   import ChatArea from "../../../components/chat/ChatArea.svelte";
   import { api, type DbMessage, type VoiceCallState } from "$lib/tauri/api";
   import { getChatKind } from "$lib/chatKind";
+  import { extractPeerIdFromChatId } from "$lib/chatIdentity";
 
   // Types
   type Message = {
@@ -38,6 +39,19 @@
   let voiceCallState: VoiceCallState = { phase: "idle", muted: false };
   let connectedChatIds = new Set<string>();
   let activeConversationIds = new Set<string>();
+
+  function peerKey(chatId: string): string {
+    const normalized = chatId === "self" ? "Me" : chatId;
+    return extractPeerIdFromChatId(normalized) || normalized;
+  }
+
+  function isChatConnected(chatId: string): boolean {
+    const target = peerKey(chatId);
+    for (const connectedId of connectedChatIds) {
+      if (peerKey(connectedId) === target) return true;
+    }
+    return false;
+  }
 
   // Cache for status updates that arrive before we've swapped tempId → msgId
   let pendingStatusCache: Record<string, string> = {};
@@ -103,8 +117,9 @@
 
       let relatedPeer = msg.chat_id;
       if (relatedPeer === "self") relatedPeer = "Me";
+      const relatedPeerKey = peerKey(relatedPeer);
 
-      if (activeConversationIds.has(relatedPeer)) {
+      if (activeConversationIds.has(relatedPeer) || peerKey(activePeer) === relatedPeerKey) {
         const newMsg: Message = {
           id: msg.id,
           sender: msg.peer_id === "Me" ? "Me" : msg.sender_alias || msg.peer_id,
@@ -240,8 +255,8 @@
     {messages}
     {userProfile}
     voiceCallState={voiceCallState}
-    canStartVoiceCall={activeChatKind === "dm" && connectedChatIds.has(activePeer) && voiceCallState.phase === "idle"}
-    canStartVideoCall={activeChatKind === "dm" && connectedChatIds.has(activePeer) && voiceCallState.phase === "idle"}
+    canStartVoiceCall={activeChatKind === "dm" && isChatConnected(activePeer) && voiceCallState.phase === "idle"}
+    canStartVideoCall={activeChatKind === "dm" && isChatConnected(activePeer) && voiceCallState.phase === "idle"}
     onStartVoiceCall={async () => {
       try {
         await api.startVoiceCall(activePeer);

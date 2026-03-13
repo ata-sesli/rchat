@@ -750,23 +750,28 @@ impl NetworkManager {
         let actual_peer_id_str =
             if let Some(mapped_peer_id) = self.temp_peer_by_chat_id.get(target_peer_id) {
                 mapped_peer_id.clone()
-            } else if let Some(github_username) = target_peer_id.strip_prefix("gh:") {
-                if !self.peer_id_by_github.contains_key(github_username) {
-                    self.refresh_peer_mapping_cache().await;
-                }
-
-                if let Some(peer_id_string) = self.peer_id_by_github.get(github_username) {
-                    println!(
-                        "[{}] 🔄 Resolved GitHub user {} to PeerId {}",
-                        context, github_username, peer_id_string
-                    );
-                    peer_id_string.clone()
+            } else if target_peer_id.starts_with("gh:") || target_peer_id.starts_with("lh:") {
+                if let Some(peer_id_string) = crate::chat_identity::resolve_peer_id_for_direct_chat_id(
+                    target_peer_id,
+                    &self.peer_id_by_github,
+                ) {
+                    peer_id_string
                 } else {
-                    eprintln!(
-                        "[{}] ❌ No PeerId mapping found for GitHub user {}. Message queued.",
-                        context, github_username
-                    );
-                    return None;
+                    self.refresh_peer_mapping_cache().await;
+                    if let Some(peer_id_string) =
+                        crate::chat_identity::resolve_peer_id_for_direct_chat_id(
+                            target_peer_id,
+                            &self.peer_id_by_github,
+                        )
+                    {
+                        peer_id_string
+                    } else {
+                        eprintln!(
+                            "[{}] ❌ No PeerId mapping found for chat {}. Message queued.",
+                            context, target_peer_id
+                        );
+                        return None;
+                    }
                 }
             } else {
                 target_peer_id.to_string()
@@ -784,18 +789,45 @@ impl NetworkManager {
         }
     }
 
-    pub(super) async fn resolve_chat_id_for_sender(&mut self, sender_peer_id: &str) -> String {
+    pub(super) async fn resolve_chat_id_for_sender(
+        &mut self,
+        sender_peer_id: &str,
+        sender_alias: Option<&str>,
+    ) -> String {
         if let Some(temp_chat_id) = self.temp_chat_by_peer_id.get(sender_peer_id) {
             return temp_chat_id.clone();
         }
 
         if let Some(gh_user) = self.github_by_peer_id.get(sender_peer_id) {
-            return format!("gh:{}", gh_user);
+            return crate::chat_identity::build_github_chat_id(gh_user, sender_peer_id);
         }
 
         self.refresh_peer_mapping_cache().await;
         if let Some(gh_user) = self.github_by_peer_id.get(sender_peer_id) {
-            return format!("gh:{}", gh_user);
+            return crate::chat_identity::build_github_chat_id(gh_user, sender_peer_id);
+        }
+
+        use tauri::Manager;
+        let state = self.app_handle.state::<crate::AppState>();
+        if let Ok(conn) = state.db_conn.lock() {
+            if let Ok(Some(existing_chat_id)) =
+                crate::storage::db::find_existing_direct_chat_id_for_peer(&conn, sender_peer_id)
+            {
+                return existing_chat_id;
+            }
+
+            let discovered_name = sender_alias
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    crate::storage::db::get_peer_alias(&conn, sender_peer_id)
+                        .ok()
+                        .flatten()
+                        .filter(|name| !name.trim().is_empty() && name != sender_peer_id)
+                })
+                .unwrap_or_else(|| "peer".to_string());
+            return crate::chat_identity::build_local_chat_id(&discovered_name, sender_peer_id);
         }
 
         sender_peer_id.to_string()
