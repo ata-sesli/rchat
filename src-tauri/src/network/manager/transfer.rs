@@ -16,6 +16,8 @@ pub(super) struct TransferState {
     pub manifest_persisted: bool,
     pub buffered_chunks: Vec<(String, String)>,
     pub completion_emitted: bool,
+    pub expected_chunks: usize,
+    pub stored_chunk_results: usize,
     pub updated_at: std::time::Instant,
 }
 
@@ -25,6 +27,8 @@ impl Default for TransferState {
             manifest_persisted: false,
             buffered_chunks: Vec::new(),
             completion_emitted: false,
+            expected_chunks: 0,
+            stored_chunk_results: 0,
             updated_at: std::time::Instant::now(),
         }
     }
@@ -68,7 +72,6 @@ pub(super) enum TransferResult {
         file_hash: String,
         chunk_hash: String,
         chunk_size: usize,
-        is_complete: bool,
     },
 }
 
@@ -257,15 +260,11 @@ fn process_transfer_task(
                 .map_err(|e| format!("Failed to decode chunk data: {}", e))?;
 
             let chunk_size = store_chunk_file(&chunks_dir(), &chunk_hash, &chunk_data)?;
-            let is_complete = with_db_conn(app_handle, |conn| {
-                evaluate_file_completion(conn, &chunks_dir(), &file_hash)
-            })?;
 
             Ok(Some(TransferResult::ChunkStored {
                 file_hash,
                 chunk_hash,
                 chunk_size,
-                is_complete,
             }))
         }
         TransferTask::Shutdown => Ok(None),
@@ -477,20 +476,52 @@ impl NetworkManager {
                 file_hash,
                 chunk_hash,
                 chunk_size,
-                is_complete,
             } => {
                 println!(
                     "[ChunkTransfer] 💾 Stored chunk {} ({} bytes)",
                     chunk_hash, chunk_size
                 );
-                let state = self.touch_transfer_state(&file_hash);
-                if is_complete && !state.completion_emitted {
-                    state.completion_emitted = true;
-                    let _ = self.app_handle.emit(
-                        "file-transfer-complete",
-                        serde_json::json!({ "file_hash": file_hash }),
-                    );
-                    self.transfer_states.remove(&file_hash);
+                let should_finalize = {
+                    let state = self.touch_transfer_state(&file_hash);
+                    state.stored_chunk_results = state.stored_chunk_results.saturating_add(1);
+                    if state.expected_chunks > 0 {
+                        println!(
+                            "[ChunkTransfer] Progress: {}/{} chunks",
+                            state.stored_chunk_results, state.expected_chunks
+                        );
+                    }
+                    state.expected_chunks > 0
+                        && state.stored_chunk_results >= state.expected_chunks
+                        && !state.completion_emitted
+                };
+
+                if should_finalize {
+                    match with_db_conn(&self.app_handle, |conn| {
+                        evaluate_file_completion(conn, &chunks_dir(), &file_hash)
+                    }) {
+                        Ok(true) => {
+                            if let Some(state) = self.transfer_states.get_mut(&file_hash) {
+                                state.completion_emitted = true;
+                            }
+                            let _ = self.app_handle.emit(
+                                "file-transfer-complete",
+                                serde_json::json!({ "file_hash": file_hash }),
+                            );
+                            self.transfer_states.remove(&file_hash);
+                        }
+                        Ok(false) => {
+                            eprintln!(
+                                "[ChunkTransfer] ⚠️ Completion check failed after all chunk results for {}",
+                                file_hash
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[ChunkTransfer] ❌ Completion check error for {}: {}",
+                                file_hash, e
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -559,6 +590,9 @@ impl NetworkManager {
                 let state = self.touch_transfer_state(file_hash);
                 state.manifest_persisted = false;
                 state.completion_emitted = false;
+                state.expected_chunks = chunks.len();
+                state.stored_chunk_results = 0;
+                state.buffered_chunks.clear();
             }
 
             if let Err(e) = self
@@ -796,5 +830,24 @@ mod tests {
         assert_eq!(flushed.len(), 2);
         assert_eq!(flushed[0].0, "h1");
         assert_eq!(flushed[1].0, "h2");
+    }
+
+    #[test]
+    fn completion_gate_waits_for_all_chunk_results() {
+        let mut state = TransferState {
+            expected_chunks: 3,
+            ..TransferState::default()
+        };
+
+        state.stored_chunk_results += 1;
+        assert!(state.stored_chunk_results < state.expected_chunks);
+        assert!(!state.completion_emitted);
+
+        state.stored_chunk_results += 1;
+        assert!(state.stored_chunk_results < state.expected_chunks);
+        assert!(!state.completion_emitted);
+
+        state.stored_chunk_results += 1;
+        assert!(state.stored_chunk_results >= state.expected_chunks);
     }
 }
