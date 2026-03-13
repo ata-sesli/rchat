@@ -109,7 +109,30 @@ impl NetworkManager {
             Ok(peer_id) => {
                 // Skip if already connected to this peer
                 if self.swarm.is_connected(&peer_id) {
-                    return; // Already connected, no need to dial
+                    // Still emit/update discovery so frontend local-scan can show connected peers
+                    // even when they were connected before the modal/listener was opened.
+                    for addr_str in peer.addresses {
+                        if addr_str.contains("0.0.0.0") {
+                            continue;
+                        }
+                        if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+                            let entry = self.local_peers.entry(peer_id).or_insert_with(Vec::new);
+                            if !entry.iter().any(|existing| existing == &addr) {
+                                entry.push(addr);
+                            }
+                        }
+                    }
+
+                    let peer_info = LocalPeer {
+                        peer_id: peer.peer_id.clone(),
+                        addresses: self
+                            .local_peers
+                            .get(&peer_id)
+                            .map(|a| a.iter().map(|m| m.to_string()).collect())
+                            .unwrap_or_default(),
+                    };
+                    let _ = self.app_handle.emit("local-peer-discovered", peer_info);
+                    return;
                 }
 
                 // 1. Add to known peers
@@ -129,10 +152,10 @@ impl NetworkManager {
                         }
 
                         // 3. Track it
-                        self.local_peers
-                            .entry(peer_id)
-                            .or_insert_with(Vec::new)
-                            .push(addr);
+                        let entry = self.local_peers.entry(peer_id).or_insert_with(Vec::new);
+                        if !entry.iter().any(|existing| existing == &addr) {
+                            entry.push(addr);
+                        }
 
                         // 4. Add to Gossipsub
                         self.swarm
