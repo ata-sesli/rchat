@@ -23,6 +23,7 @@ impl NetworkManager {
         endpoint: libp2p::core::ConnectedPoint,
     ) {
         println!("[Swarm] Connected to {}", peer_id);
+        self.note_mdns_dial_success(peer_id);
 
         let remote_addr = endpoint.get_remote_address().clone();
         self.note_peer_transport_connected(peer_id, &remote_addr);

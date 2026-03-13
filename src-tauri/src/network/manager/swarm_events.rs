@@ -72,9 +72,27 @@ impl NetworkManager {
                 }
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                if let Some(peer) = peer_id {
+                    self.note_mdns_dial_failure(peer);
+                } else if self.mdns_dial_inflight.len() == 1 {
+                    if let Some(peer) = self.mdns_dial_inflight.keys().next().cloned() {
+                        self.note_mdns_dial_failure(peer);
+                    }
+                }
                 eprintln!(
                     "[Swarm] ❌ Outgoing connection error to {:?}: {:?}",
                     peer_id, error
+                );
+            }
+            SwarmEvent::IncomingConnectionError {
+                local_addr,
+                send_back_addr,
+                error,
+                ..
+            } => {
+                eprintln!(
+                    "[Swarm] ❌ Incoming connection error from {} to {}: {:?}",
+                    send_back_addr, local_addr, error
                 );
             }
             SwarmEvent::ListenerError { listener_id, error } => {
@@ -135,6 +153,22 @@ impl NetworkManager {
                     return;
                 }
 
+                if !self.can_start_mdns_dial(peer_id) {
+                    // Still refresh local peer list in UI even when dial is debounced/backed off.
+                    let peer_info = LocalPeer {
+                        peer_id: peer.peer_id.clone(),
+                        addresses: self
+                            .local_peers
+                            .get(&peer_id)
+                            .map(|a| a.iter().map(|m| m.to_string()).collect())
+                            .unwrap_or_default(),
+                    };
+                    let _ = self.app_handle.emit("local-peer-discovered", peer_info);
+                    return;
+                }
+
+                let mut dial_started = false;
+
                 // 1. Add to known peers
                 for addr_str in peer.addresses {
                     // Filter out invalid 0.0.0.0 addresses
@@ -145,10 +179,13 @@ impl NetworkManager {
 
                     if let Ok(addr) = addr_str.parse::<Multiaddr>() {
                         println!("[NetworkManager] Dialing mDNS peer {} at {}", peer_id, addr);
+                        self.note_mdns_dial_started(peer_id);
+                        dial_started = true;
 
                         // 2. Explicitly Dial
                         if let Err(e) = self.swarm.dial(addr.clone()) {
                             eprintln!("[NetworkManager] Dial failed: {}", e);
+                            self.note_mdns_dial_failure(peer_id);
                         }
 
                         // 3. Track it
@@ -162,7 +199,14 @@ impl NetworkManager {
                             .behaviour_mut()
                             .gossipsub
                             .add_explicit_peer(&peer_id);
+
+                        // One active dial attempt per peer is enough.
+                        break;
                     }
+                }
+
+                if !dial_started {
+                    self.note_mdns_dial_failure(peer_id);
                 }
 
                 // 5. Emit event to UI

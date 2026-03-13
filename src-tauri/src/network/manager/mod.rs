@@ -127,6 +127,12 @@ pub struct NetworkManager {
     mdns_handle: Option<crate::network::mdns::MdnsServiceHandle>,
     // Track local peers discovered via mDNS
     local_peers: HashMap<PeerId, Vec<Multiaddr>>,
+    // Per-peer in-flight mDNS dial timestamps.
+    mdns_dial_inflight: HashMap<PeerId, std::time::Instant>,
+    // Per-peer next-allowed mDNS dial instant (debounce + backoff).
+    mdns_backoff_until: HashMap<PeerId, std::time::Instant>,
+    // Per-peer consecutive mDNS dial failures.
+    mdns_dial_failures: HashMap<PeerId, u32>,
     // Track our outgoing connection requests (peers we pressed Connect on)
     pending_requests: HashSet<PeerId>,
     // Track incoming connection requests from others
@@ -290,6 +296,10 @@ fn build_incoming_group_db_message(envelope: &GroupMessageEnvelope) -> crate::st
 }
 
 impl NetworkManager {
+    const MDNS_DIAL_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
+    const MDNS_DIAL_INFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+    const MDNS_DIAL_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
     pub fn new(
         swarm: Swarm<RChatBehaviour>,
         crx: Receiver<NetworkCommand>,
@@ -326,6 +336,9 @@ impl NetworkManager {
             mdns_handle: None,
             app_handle,
             local_peers: HashMap::new(),
+            mdns_dial_inflight: HashMap::new(),
+            mdns_backoff_until: HashMap::new(),
+            mdns_dial_failures: HashMap::new(),
             pending_requests: HashSet::new(),
             incoming_requests: HashSet::new(),
             pending_github_mappings: HashMap::new(),
@@ -357,6 +370,57 @@ impl NetworkManager {
             voice_next_seq: 0,
             voice_jitter_buffer: crate::live::voice::jitter::VoiceJitterBuffer::new(),
         }
+    }
+
+    fn prune_stale_mdns_dials(&mut self, now: std::time::Instant) {
+        self.mdns_dial_inflight
+            .retain(|_, started| now.duration_since(*started) <= Self::MDNS_DIAL_INFLIGHT_TIMEOUT);
+        self.mdns_backoff_until.retain(|_, until| *until > now);
+    }
+
+    pub(super) fn can_start_mdns_dial(&mut self, peer_id: PeerId) -> bool {
+        let now = std::time::Instant::now();
+        self.prune_stale_mdns_dials(now);
+
+        if self.swarm.is_connected(&peer_id) {
+            return false;
+        }
+        if self.mdns_dial_inflight.contains_key(&peer_id) {
+            return false;
+        }
+        if let Some(until) = self.mdns_backoff_until.get(&peer_id) {
+            if *until > now {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(super) fn note_mdns_dial_started(&mut self, peer_id: PeerId) {
+        let now = std::time::Instant::now();
+        self.mdns_dial_inflight.insert(peer_id, now);
+        self.mdns_backoff_until
+            .insert(peer_id, now + Self::MDNS_DIAL_DEBOUNCE);
+    }
+
+    pub(super) fn note_mdns_dial_success(&mut self, peer_id: PeerId) {
+        self.mdns_dial_inflight.remove(&peer_id);
+        self.mdns_backoff_until.remove(&peer_id);
+        self.mdns_dial_failures.remove(&peer_id);
+    }
+
+    pub(super) fn note_mdns_dial_failure(&mut self, peer_id: PeerId) {
+        let now = std::time::Instant::now();
+        self.mdns_dial_inflight.remove(&peer_id);
+        let attempts = self.mdns_dial_failures.entry(peer_id).or_insert(0);
+        *attempts = attempts.saturating_add(1);
+        let pow = std::cmp::min(*attempts, 5);
+        let secs = 1u64 << pow;
+        let backoff = std::cmp::min(
+            std::time::Duration::from_secs(secs),
+            Self::MDNS_DIAL_MAX_BACKOFF,
+        );
+        self.mdns_backoff_until.insert(peer_id, now + backoff);
     }
 
     pub(super) fn cache_peer_mapping(&mut self, github_username: &str, peer_id: &str) {
