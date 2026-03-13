@@ -129,6 +129,19 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
         udp_port, tcp_port
     );
 
+    let listener_snapshot: Vec<String> = swarm.listeners().map(|l| l.to_string()).collect();
+    let quic_port_bound = is_quic_udp_port_bound(&listener_snapshot, udp_port);
+    let effective_stun_external_port = if quic_port_bound {
+        stun_external_port
+    } else {
+        eprintln!(
+            "[Backend] ⚠️ QUIC listener verification mismatch for expected UDP port {}. \
+             Marking STUN external port unreliable (degraded invite mode). listeners={:?}",
+            udp_port, listener_snapshot
+        );
+        None
+    };
+
     // NOTE: STUN socket closed, QUIC now owns the port
     // On most NATs, QUIC will get the same external port mapping
     // If the invite is used quickly, this should work
@@ -151,7 +164,7 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
         listening_addresses: tokio::sync::Mutex::new(vec![]),
         public_address_v6: tokio::sync::Mutex::new(stun_public_ip_v6),
         public_address_v4: tokio::sync::Mutex::new(stun_public_ip),
-        stun_external_port: tokio::sync::Mutex::new(stun_external_port),
+        stun_external_port: tokio::sync::Mutex::new(effective_stun_external_port),
         temporary_state: tokio::sync::Mutex::new(crate::app_state::TemporaryRuntimeState::default()),
         connected_chat_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         chat_connections: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -199,4 +212,39 @@ fn get_port_from_multiaddr(addr: &libp2p::Multiaddr) -> Option<u16> {
         }
     }
     None
+}
+
+fn is_quic_udp_port_bound(listeners: &[String], expected_udp_port: u16) -> bool {
+    listeners.iter().any(|raw| {
+        if !raw.contains("/udp/") || !raw.contains("quic") {
+            return false;
+        }
+        raw.parse::<libp2p::Multiaddr>()
+            .ok()
+            .and_then(|addr| get_port_from_multiaddr(&addr))
+            == Some(expected_udp_port)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_quic_udp_port_bound;
+
+    #[test]
+    fn quic_udp_port_bound_matches_expected_port() {
+        let listeners = vec![
+            "/ip4/0.0.0.0/tcp/45667".to_string(),
+            "/ip4/0.0.0.0/udp/43386/quic-v1".to_string(),
+        ];
+        assert!(is_quic_udp_port_bound(&listeners, 43386));
+    }
+
+    #[test]
+    fn quic_udp_port_bound_detects_mismatch() {
+        let listeners = vec![
+            "/ip4/0.0.0.0/tcp/45667".to_string(),
+            "/ip4/0.0.0.0/udp/43387/quic-v1".to_string(),
+        ];
+        assert!(!is_quic_udp_port_bound(&listeners, 43386));
+    }
 }

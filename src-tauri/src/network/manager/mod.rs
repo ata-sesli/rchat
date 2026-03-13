@@ -25,6 +25,8 @@ mod voice_call;
 #[cfg(test)]
 mod tests;
 
+const NAT_KEEPALIVE_ADDR: &str = "/ip4/1.1.1.1/udp/9/quic-v1";
+
 #[derive(Clone, Serialize)]
 pub struct LocalPeer {
     pub peer_id: String,
@@ -109,6 +111,75 @@ impl PeerTransportRegistry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OutgoingDialSource {
+    NatKeepalive,
+    Mdns,
+    Gist,
+    Punch,
+    Unknown,
+}
+
+impl OutgoingDialSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NatKeepalive => "nat_keepalive",
+            Self::Mdns => "mdns",
+            Self::Gist => "gist",
+            Self::Punch => "punch",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RecentDial {
+    source: OutgoingDialSource,
+    at: std::time::Instant,
+}
+
+fn extract_candidate_multiaddr_from_error_debug(error_debug: &str) -> Option<String> {
+    let start = error_debug.find("/ip")?;
+    let tail = &error_debug[start..];
+    let end = tail
+        .find(',')
+        .or_else(|| tail.find(')'))
+        .unwrap_or(tail.len());
+    let candidate = tail[..end].trim();
+    if candidate.is_empty() {
+        return None;
+    }
+    candidate.parse::<Multiaddr>().ok().map(|_| candidate.to_string())
+}
+
+fn classify_outgoing_error_source(
+    error_debug: &str,
+    candidate_addr: Option<&str>,
+    recent_dials: &HashMap<String, RecentDial>,
+    peer_present: bool,
+    peer_known_mdns: bool,
+    peer_inflight_mdns: bool,
+    now: std::time::Instant,
+) -> OutgoingDialSource {
+    if error_debug.contains(NAT_KEEPALIVE_ADDR) {
+        return OutgoingDialSource::NatKeepalive;
+    }
+
+    if let Some(addr) = candidate_addr {
+        if let Some(recent) = recent_dials.get(addr) {
+            if now.duration_since(recent.at) <= std::time::Duration::from_secs(30) {
+                return recent.source;
+            }
+        }
+    }
+
+    if peer_present && (peer_known_mdns || peer_inflight_mdns) {
+        return OutgoingDialSource::Mdns;
+    }
+
+    OutgoingDialSource::Unknown
+}
+
 pub struct NetworkManager {
     // The P2P Node itself
     swarm: Swarm<RChatBehaviour>,
@@ -133,6 +204,8 @@ pub struct NetworkManager {
     mdns_backoff_until: HashMap<PeerId, std::time::Instant>,
     // Per-peer consecutive mDNS dial failures.
     mdns_dial_failures: HashMap<PeerId, u32>,
+    // Recent dial origins keyed by multiaddr string for error attribution.
+    recent_dials: HashMap<String, RecentDial>,
     // Track our outgoing connection requests (peers we pressed Connect on)
     pending_requests: HashSet<PeerId>,
     // Track incoming connection requests from others
@@ -299,6 +372,7 @@ impl NetworkManager {
     const MDNS_DIAL_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
     const MDNS_DIAL_INFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
     const MDNS_DIAL_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+    const RECENT_DIAL_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
     pub fn new(
         swarm: Swarm<RChatBehaviour>,
@@ -339,6 +413,7 @@ impl NetworkManager {
             mdns_dial_inflight: HashMap::new(),
             mdns_backoff_until: HashMap::new(),
             mdns_dial_failures: HashMap::new(),
+            recent_dials: HashMap::new(),
             pending_requests: HashSet::new(),
             incoming_requests: HashSet::new(),
             pending_github_mappings: HashMap::new(),
@@ -376,6 +451,77 @@ impl NetworkManager {
         self.mdns_dial_inflight
             .retain(|_, started| now.duration_since(*started) <= Self::MDNS_DIAL_INFLIGHT_TIMEOUT);
         self.mdns_backoff_until.retain(|_, until| *until > now);
+        self.recent_dials
+            .retain(|_, recent| now.duration_since(recent.at) <= Self::RECENT_DIAL_TTL);
+    }
+
+    pub(super) fn record_outgoing_dial(&mut self, addr: &Multiaddr, source: OutgoingDialSource) {
+        let now = std::time::Instant::now();
+        self.recent_dials.insert(
+            addr.to_string(),
+            RecentDial {
+                source,
+                at: now,
+            },
+        );
+        self.prune_stale_mdns_dials(now);
+    }
+
+    pub(super) fn classify_outgoing_error(
+        &mut self,
+        peer_id: Option<PeerId>,
+        error_debug: &str,
+    ) -> (OutgoingDialSource, Option<String>) {
+        let now = std::time::Instant::now();
+        self.prune_stale_mdns_dials(now);
+        let candidate_addr = extract_candidate_multiaddr_from_error_debug(error_debug);
+        let (peer_present, peer_known_mdns, peer_inflight_mdns) = if let Some(peer) = peer_id {
+            (
+                true,
+                self.local_peers.contains_key(&peer),
+                self.mdns_dial_inflight.contains_key(&peer),
+            )
+        } else {
+            (false, false, false)
+        };
+        let source = classify_outgoing_error_source(
+            error_debug,
+            candidate_addr.as_deref(),
+            &self.recent_dials,
+            peer_present,
+            peer_known_mdns,
+            peer_inflight_mdns,
+            now,
+        );
+        (source, candidate_addr)
+    }
+
+    pub(super) fn log_mdns_dial_skip(&mut self, peer_id: PeerId) {
+        let now = std::time::Instant::now();
+        self.prune_stale_mdns_dials(now);
+
+        if self.swarm.is_connected(&peer_id) {
+            println!("[mDNS] Dial skipped for {}: already connected", peer_id);
+            return;
+        }
+        if let Some(started) = self.mdns_dial_inflight.get(&peer_id) {
+            let elapsed_ms = now.duration_since(*started).as_millis();
+            println!(
+                "[mDNS] Dial skipped for {}: in-flight ({}ms elapsed)",
+                peer_id, elapsed_ms
+            );
+            return;
+        }
+        if let Some(until) = self.mdns_backoff_until.get(&peer_id) {
+            if *until > now {
+                let remaining = until.duration_since(now).as_secs_f32();
+                let attempts = self.mdns_dial_failures.get(&peer_id).copied().unwrap_or(0);
+                println!(
+                    "[mDNS] Dial skipped for {}: backoff active (attempt {}, retry in {:.1}s)",
+                    peer_id, attempts, remaining
+                );
+            }
+        }
     }
 
     pub(super) fn can_start_mdns_dial(&mut self, peer_id: PeerId) -> bool {
@@ -421,6 +567,12 @@ impl NetworkManager {
             Self::MDNS_DIAL_MAX_BACKOFF,
         );
         self.mdns_backoff_until.insert(peer_id, now + backoff);
+        println!(
+            "[mDNS] Dial failure recorded for {}: attempt {}, next retry in {:.1}s",
+            peer_id,
+            *attempts,
+            backoff.as_secs_f32()
+        );
     }
 
     pub(super) fn cache_peer_mapping(&mut self, github_username: &str, peer_id: &str) {

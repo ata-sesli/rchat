@@ -73,10 +73,20 @@ impl NetworkManager {
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 let error_debug = format!("{:?}", error);
-                let is_nat_keepalive_error =
-                    error_debug.contains("/ip4/1.1.1.1/udp/9/quic-v1");
+                let (source, candidate_addr) = self.classify_outgoing_error(peer_id, &error_debug);
 
-                if !is_nat_keepalive_error {
+                if source == OutgoingDialSource::NatKeepalive {
+                    // Expected timeout for dummy keepalive dial.
+                    return;
+                }
+
+                let should_apply_mdns_failure = source == OutgoingDialSource::Mdns
+                    || (source == OutgoingDialSource::Unknown
+                        && peer_id
+                            .map(|peer| self.mdns_dial_inflight.contains_key(&peer))
+                            .unwrap_or(false));
+
+                if should_apply_mdns_failure {
                     if let Some(peer) = peer_id {
                         self.note_mdns_dial_failure(peer);
                     } else if self.mdns_dial_inflight.len() == 1 {
@@ -85,9 +95,37 @@ impl NetworkManager {
                         }
                     }
                 }
+
+                let known_addrs = peer_id
+                    .and_then(|peer| self.local_peers.get(&peer))
+                    .map(|addrs| {
+                        addrs
+                            .iter()
+                            .map(|a| a.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                let backoff_state = peer_id
+                    .and_then(|peer| self.mdns_backoff_until.get(&peer).copied())
+                    .map(|until| {
+                        let now = std::time::Instant::now();
+                        if until > now {
+                            format!("{:.1}s", until.duration_since(now).as_secs_f32())
+                        } else {
+                            "0.0s".to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+
                 eprintln!(
-                    "[Swarm] ❌ Outgoing connection error to {:?}: {:?}",
-                    peer_id, error
+                    "[Swarm] ❌ Outgoing connection error: source={}, peer={:?}, candidate_addr={}, mdns_known_addrs=[{}], mdns_backoff_remaining={}, error={:?}",
+                    source.as_str(),
+                    peer_id,
+                    candidate_addr.as_deref().unwrap_or("-"),
+                    known_addrs,
+                    backoff_state,
+                    error
                 );
             }
             SwarmEvent::IncomingConnectionError {
@@ -160,6 +198,7 @@ impl NetworkManager {
                 }
 
                 if !self.can_start_mdns_dial(peer_id) {
+                    self.log_mdns_dial_skip(peer_id);
                     // Still refresh local peer list in UI even when dial is debounced/backed off.
                     let peer_info = LocalPeer {
                         peer_id: peer.peer_id.clone(),
@@ -186,6 +225,7 @@ impl NetworkManager {
                     if let Ok(addr) = addr_str.parse::<Multiaddr>() {
                         println!("[NetworkManager] Dialing mDNS peer {} at {}", peer_id, addr);
                         self.note_mdns_dial_started(peer_id);
+                        self.record_outgoing_dial(&addr, OutgoingDialSource::Mdns);
                         dial_started = true;
 
                         // 2. Explicitly Dial

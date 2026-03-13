@@ -1,7 +1,11 @@
-use super::{build_incoming_dm_db_message, build_incoming_group_db_message, PeerTransportRegistry};
+use super::{
+    build_incoming_dm_db_message, build_incoming_group_db_message, classify_outgoing_error_source,
+    OutgoingDialSource, PeerTransportRegistry, RecentDial,
+};
 use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
 use crate::network::gossip::{GroupContentType, GroupMessageEnvelope};
 use libp2p::Multiaddr;
+use std::collections::HashMap;
 
 fn incoming_request(
     kind: DirectMessageKind,
@@ -176,4 +180,77 @@ fn peer_transport_registry_handles_multiple_quic_connections() {
     let lost_after_second_close = registry.record_disconnected(peer, &quic_b);
     assert!(lost_after_second_close);
     assert!(!registry.has_quic(&peer));
+}
+
+#[test]
+fn outgoing_error_classifier_marks_nat_keepalive() {
+    let now = std::time::Instant::now();
+    let recent = HashMap::<String, RecentDial>::new();
+    let source = classify_outgoing_error_source(
+        "Transport([(/ip4/1.1.1.1/udp/9/quic-v1, Other(...))])",
+        Some("/ip4/1.1.1.1/udp/9/quic-v1"),
+        &recent,
+        true,
+        true,
+        true,
+        now,
+    );
+    assert_eq!(source, OutgoingDialSource::NatKeepalive);
+}
+
+#[test]
+fn outgoing_error_classifier_uses_recent_mdns_dial_context() {
+    let now = std::time::Instant::now();
+    let mut recent = HashMap::<String, RecentDial>::new();
+    recent.insert(
+        "/ip4/192.168.1.10/udp/7777/quic-v1".to_string(),
+        RecentDial {
+            source: OutgoingDialSource::Mdns,
+            at: now,
+        },
+    );
+
+    let source = classify_outgoing_error_source(
+        "Transport([(/ip4/192.168.1.10/udp/7777/quic-v1, Other(...))])",
+        Some("/ip4/192.168.1.10/udp/7777/quic-v1"),
+        &recent,
+        false,
+        false,
+        false,
+        now,
+    );
+    assert_eq!(source, OutgoingDialSource::Mdns);
+}
+
+#[test]
+fn outgoing_error_classifier_returns_unknown_without_context() {
+    let now = std::time::Instant::now();
+    let recent = HashMap::<String, RecentDial>::new();
+    let source = classify_outgoing_error_source(
+        "Transport([(/ip4/203.0.113.4/udp/9000/quic-v1, Other(...))])",
+        Some("/ip4/203.0.113.4/udp/9000/quic-v1"),
+        &recent,
+        false,
+        false,
+        false,
+        now,
+    );
+    assert_eq!(source, OutgoingDialSource::Unknown);
+}
+
+#[test]
+fn keepalive_classification_does_not_trigger_mdns_classification() {
+    let now = std::time::Instant::now();
+    let recent = HashMap::<String, RecentDial>::new();
+    let source = classify_outgoing_error_source(
+        "Transport([(/ip4/1.1.1.1/udp/9/quic-v1, Other(Custom { kind: Other, error: HandshakeTimedOut }))])",
+        None,
+        &recent,
+        true,
+        true,
+        true,
+        now,
+    );
+    assert_ne!(source, OutgoingDialSource::Mdns);
+    assert_eq!(source, OutgoingDialSource::NatKeepalive);
 }

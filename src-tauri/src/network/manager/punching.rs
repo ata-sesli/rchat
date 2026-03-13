@@ -112,8 +112,15 @@ impl NetworkManager {
         }
 
         // Punch all remaining active targets
-        for (name, (addr, start)) in &self.active_punch_targets {
-            let attempt = (now.duration_since(*start).as_millis() / 500) + 1;
+        let punch_targets: Vec<(String, Multiaddr, std::time::Instant)> = self
+            .active_punch_targets
+            .iter()
+            .map(|(name, (addr, start))| (name.clone(), addr.clone(), *start))
+            .collect();
+
+        for (name, addr, start) in punch_targets {
+            let attempt = (now.duration_since(start).as_millis() / 500) + 1;
+            self.record_outgoing_dial(&addr, OutgoingDialSource::Punch);
             let _ = self.swarm.dial(addr.clone());
             // Only log every 10th attempt to reduce spam
             if attempt % 10 == 1 || attempt <= 3 {

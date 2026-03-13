@@ -89,6 +89,8 @@ impl NetworkManager {
                     // Dial a dummy address to send outbound UDP and keep NAT mapping alive
                     // The dial will fail, but the outbound packet is enough for NAT
                     if self.is_nat_keepalive_enabled() {
+                        println!("[NAT] KeepAlive sent to 1.1.1.1");
+                        self.record_outgoing_dial(&nat_keepalive_addr, OutgoingDialSource::NatKeepalive);
                         let _ = self.swarm.dial(nat_keepalive_addr.clone());
                     }
                 }
@@ -119,6 +121,7 @@ impl NetworkManager {
                 Some(addr) = self.disc_rx.recv() => {
                     // Start dialing the peer found from Gist
                     println!("Using Gist Peer: {}", addr);
+                    self.record_outgoing_dial(&addr, OutgoingDialSource::Gist);
                     let _ = self.swarm.dial(addr);
                 }
                 Some(peer) = self.mdns_rx.recv() => {
