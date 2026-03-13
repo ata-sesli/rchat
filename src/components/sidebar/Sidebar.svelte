@@ -55,6 +55,20 @@
     ondragMove = (e: PointerEvent) => {},
     ondragEnd = (e: PointerEvent) => {},
   } = $props();
+  let showConnectivityMenu = $state(false);
+
+  type ConnectivityOption = {
+    mode: ConnectivityMode;
+    label: string;
+    icon: "invisible" | "lan" | "reachable" | "custom";
+  };
+
+  const CONNECTIVITY_OPTIONS: ConnectivityOption[] = [
+    { mode: "invisible", label: "Invisible", icon: "invisible" },
+    { mode: "lan", label: "LAN", icon: "lan" },
+    { mode: "reachable", label: "Reachable", icon: "reachable" },
+    { mode: "custom", label: "Custom", icon: "custom" },
+  ];
 
   // Event handlers that call callbacks
   function toggleSidebar() {
@@ -114,6 +128,47 @@
     }
   }
 
+  function iconForMode(mode: ConnectivityMode): ConnectivityOption["icon"] {
+    switch (mode) {
+      case "invisible":
+        return "invisible";
+      case "lan":
+        return "lan";
+      case "reachable":
+        return "reachable";
+      case "custom":
+        return "custom";
+      default:
+        return "custom";
+    }
+  }
+
+  function modeIcon(mode: ConnectivityOption["icon"]): string {
+    switch (mode) {
+      case "invisible":
+        return "M3 5.5l2.2 2.2A8.1 8.1 0 012 12c1.8 3.3 5.2 5.5 9 5.5 1.8 0 3.5-.5 5-1.4l2.5 2.4 1.4-1.4L4.4 4.1 3 5.5zm7.5 3.3l2.7 2.7a2.8 2.8 0 01-2.7-2.7zm.5-2.8A6 6 0 0119 12a8.4 8.4 0 01-2.4 3l-1.5-1.5A4.5 4.5 0 009.5 8l-1.7-1.7A8.7 8.7 0 0111 6z";
+      case "lan":
+        return "M12 18.5l2.3-2.3a3.3 3.3 0 00-4.6 0L12 18.5zm4.6-4.6l1.4-1.4a8 8 0 00-11.4 0l1.4 1.4a6 6 0 018.6 0zM20 10.5l1.4-1.4a13 13 0 00-18.8 0L4 10.5a11 11 0 0116 0z";
+      case "reachable":
+        return "M12 2a10 10 0 100 20 10 10 0 000-20zm7.7 9h-3.1a15 15 0 00-1.4-5 8 8 0 014.5 5zM12 4c1.1 1.4 2 3.4 2.4 5.9H9.6C10 7.4 10.9 5.4 12 4zM6.8 11h-3a8 8 0 014.4-5 15 15 0 00-1.4 5zM3.8 13h3a15 15 0 001.4 5 8 8 0 01-4.4-5zm8.2 7c-1.1-1.4-2-3.4-2.4-5.9h4.8c-.4 2.5-1.3 4.5-2.4 5.9zm3.2-2a15 15 0 001.4-5h3.1a8 8 0 01-4.5 5z";
+      case "custom":
+        return "M4 7h9v2H4V7zm0 8h6v2H4v-2zm11-8h5v2h-5V7zm-2 8h7v2h-7v-2zM11 5h2v6h-2V5zm0 8h2v6h-2v-6z";
+    }
+  }
+
+  function toggleConnectivityMenu(e: MouseEvent) {
+    e.stopPropagation();
+    showConnectivityMenu = !showConnectivityMenu;
+  }
+
+  function selectConnectivityMode(mode: ConnectivityMode) {
+    showConnectivityMenu = false;
+    if (mode === "custom") return;
+    if (mode !== connectivitySettings.mode) {
+      onselectConnectivityMode(mode);
+    }
+  }
+
   function toggleCreateMenu() {
     ontoggleCreateMenu();
   }
@@ -160,7 +215,13 @@
     if (isGroupChat(peerId)) return true;
     return localPeers.some((p) => p.peer_id === peerId);
   }
+
+  function closeMenusOnWindowClick() {
+    showConnectivityMenu = false;
+  }
 </script>
+
+<svelte:window onclick={closeMenusOnWindowClick} />
 
 <aside
   class={`flex flex-col bg-theme-base-900 border-r border-slate-800/50 transition-all duration-300 ease-in-out overflow-hidden h-full select-none
@@ -228,23 +289,68 @@
           >
             Connectivity
           </span>
-          <select
-            value={connectivitySettings.mode}
-            onchange={(e) =>
-              onselectConnectivityMode(
-                (e.currentTarget as HTMLSelectElement).value as ConnectivityMode,
-              )}
-            class="text-xs bg-theme-base-800 border border-theme-base-700 rounded-md px-2 py-1 text-theme-base-200 focus:outline-none focus:border-theme-base-500"
-            title="Connectivity mode"
-          >
-            <option value="invisible">Invisible</option>
-            <option value="lan">LAN</option>
-            <option value="reachable">Reachable</option>
-            <option value="custom" disabled>Custom</option>
-          </select>
-        </div>
-        <div class="px-1 -mt-1 mb-2 text-[11px] text-theme-base-500">
-          Mode: {modeLabel(connectivitySettings.mode)}
+          <div class="relative">
+            <button
+              onclick={toggleConnectivityMenu}
+              class="flex items-center gap-2 text-xs bg-theme-base-800 border border-theme-base-700 rounded-md px-2.5 py-1.5 text-theme-base-200 hover:border-theme-base-500 transition-colors"
+              title="Connectivity mode"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                class="w-3.5 h-3.5 shrink-0"
+                viewBox="0 0 24 24"
+                fill="currentColor"
+              >
+                <path d={modeIcon(iconForMode(connectivitySettings.mode))} />
+              </svg>
+              <span>{modeLabel(connectivitySettings.mode)}</span>
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                class={`w-3 h-3 transition-transform ${showConnectivityMenu ? "rotate-180" : ""}`}
+                viewBox="0 0 20 20"
+                fill="currentColor"
+              >
+                <path
+                  fill-rule="evenodd"
+                  d="M5.23 7.21a.75.75 0 011.06.02L10 11.17l3.71-3.94a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z"
+                  clip-rule="evenodd"
+                />
+              </svg>
+            </button>
+            {#if showConnectivityMenu}
+              <div
+                class="absolute right-0 top-full mt-2 w-44 rounded-lg border border-theme-base-700 bg-theme-base-900 shadow-2xl z-50 p-1"
+                onmousedown={(e) => e.stopPropagation()}
+                role="menu"
+                aria-label="Connectivity modes"
+                tabindex="-1"
+              >
+                {#each CONNECTIVITY_OPTIONS as option}
+                  <button
+                    class={`w-full text-left text-xs rounded-md px-2 py-2 flex items-center gap-2 transition-colors ${
+                      connectivitySettings.mode === option.mode
+                        ? "bg-theme-base-700 text-theme-base-100"
+                        : option.mode === "custom"
+                          ? "text-theme-base-500"
+                          : "text-theme-base-300 hover:bg-theme-base-800 hover:text-theme-base-100"
+                    }`}
+                    onclick={() => selectConnectivityMode(option.mode)}
+                    disabled={option.mode === "custom"}
+                  >
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      class="w-3.5 h-3.5 shrink-0"
+                      viewBox="0 0 24 24"
+                      fill="currentColor"
+                    >
+                      <path d={modeIcon(option.icon)} />
+                    </svg>
+                    <span>{option.label}</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
         </div>
 
         <div class="flex gap-2">
