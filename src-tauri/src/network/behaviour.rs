@@ -3,6 +3,7 @@ use libp2p::{
     swarm::NetworkBehaviour,
 };
 
+use crate::live::broadcast::protocol::{BroadcastFrameRequest, BroadcastFrameResponse};
 use crate::live::video::protocol::{VideoFrameRequest, VideoFrameResponse};
 use crate::live::voice::protocol::{VoiceFrameRequest, VoiceFrameResponse};
 use super::direct_message::{DirectMessageRequest, DirectMessageResponse};
@@ -29,6 +30,8 @@ pub struct RChatBehaviour {
     pub voice_call: request_response::cbor::Behaviour<VoiceFrameRequest, VoiceFrameResponse>,
     // Dedicated video-call media transport
     pub video_call: request_response::cbor::Behaviour<VideoFrameRequest, VideoFrameResponse>,
+    // Dedicated DM screen-broadcast media transport
+    pub broadcast: request_response::cbor::Behaviour<BroadcastFrameRequest, BroadcastFrameResponse>,
 
     // Circuit Relay Client - for NAT traversal via public relays
     pub relay_client: relay::client::Behaviour,
@@ -90,6 +93,15 @@ impl RChatBehaviour {
             request_response::Config::default(),
         );
 
+        // 6d. Request-Response (Broadcast Frames)
+        let broadcast = request_response::cbor::Behaviour::new(
+            [(
+                libp2p::StreamProtocol::new(crate::live::broadcast::broadcast::BROADCAST_PROTOCOL),
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default(),
+        );
+
         // 7. DCUtR (Hole Punching)
         let dcutr = dcutr::Behaviour::new(peer_id);
 
@@ -101,6 +113,7 @@ impl RChatBehaviour {
             direct_message,
             voice_call,
             video_call,
+            broadcast,
             relay_client,
             dcutr,
         }

@@ -192,10 +192,93 @@ pub async fn send_video_call_chunk(
 }
 
 #[tauri::command]
+pub async fn start_screen_broadcast(
+    peer_id: String,
+    state: State<'_, NetworkState>,
+) -> Result<(), String> {
+    ensure_dm_connected(&peer_id, &state, "Screen broadcast").await?;
+
+    let sender = state.sender.lock().await;
+    sender
+        .send(NetworkCommand::StartScreenBroadcast { peer_id })
+        .await
+        .map_err(|e| format!("Failed to start screen broadcast: {}", e))
+}
+
+#[tauri::command]
+pub async fn accept_screen_broadcast(
+    session_id: String,
+    state: State<'_, NetworkState>,
+) -> Result<(), String> {
+    let sender = state.sender.lock().await;
+    sender
+        .send(NetworkCommand::AcceptScreenBroadcast { session_id })
+        .await
+        .map_err(|e| format!("Failed to accept screen broadcast: {}", e))
+}
+
+#[tauri::command]
+pub async fn reject_screen_broadcast(
+    session_id: String,
+    state: State<'_, NetworkState>,
+) -> Result<(), String> {
+    let sender = state.sender.lock().await;
+    sender
+        .send(NetworkCommand::RejectScreenBroadcast { session_id })
+        .await
+        .map_err(|e| format!("Failed to reject screen broadcast: {}", e))
+}
+
+#[tauri::command]
+pub async fn end_screen_broadcast(
+    session_id: String,
+    state: State<'_, NetworkState>,
+) -> Result<(), String> {
+    let sender = state.sender.lock().await;
+    sender
+        .send(NetworkCommand::EndScreenBroadcast { session_id })
+        .await
+        .map_err(|e| format!("Failed to end screen broadcast: {}", e))
+}
+
+#[tauri::command]
+pub async fn send_screen_broadcast_chunk(
+    session_id: String,
+    seq: u32,
+    timestamp: i64,
+    mime: String,
+    codec: String,
+    chunk_type: String,
+    payload: Vec<u8>,
+    state: State<'_, NetworkState>,
+) -> Result<(), String> {
+    let sender = state.sender.lock().await;
+    sender
+        .send(NetworkCommand::SendScreenBroadcastChunk {
+            session_id,
+            seq,
+            timestamp,
+            mime,
+            codec,
+            chunk_type,
+            payload,
+        })
+        .await
+        .map_err(|e| format!("Failed to send screen broadcast chunk: {}", e))
+}
+
+#[tauri::command]
 pub async fn get_voice_call_state(
     state: State<'_, NetworkState>,
 ) -> Result<crate::app_state::VoiceCallState, String> {
     Ok(state.voice_call_state.lock().await.clone())
+}
+
+#[tauri::command]
+pub async fn get_broadcast_state(
+    state: State<'_, NetworkState>,
+) -> Result<crate::app_state::BroadcastState, String> {
+    Ok(state.broadcast_state.lock().await.clone())
 }
 
 #[tauri::command]

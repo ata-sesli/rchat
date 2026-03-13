@@ -14,6 +14,8 @@
   import StickerPicker from "./StickerPicker.svelte";
   import {
     api,
+    type BroadcastChunkType,
+    type BroadcastState,
     type VideoChunkType,
     type SentMediaResult,
     type VoiceCallState,
@@ -61,12 +63,19 @@
     phase: "idle",
     muted: false,
   };
+  export let broadcastState: BroadcastState = {
+    phase: "idle",
+    is_host: false,
+  };
   export let canStartVoiceCall = false;
   export let canStartVideoCall = false;
+  export let canStartScreenBroadcast = false;
   export let onStartVoiceCall = () => {};
   export let onStartVideoCall = () => {};
+  export let onStartScreenBroadcast = () => {};
   export let onEndVoiceCall = (_callId: string) => {};
   export let onEndVideoCall = (_callId: string) => {};
+  export let onEndScreenBroadcast = (_sessionId: string) => {};
   export let onToggleVoiceMute = (_callId: string, _muted: boolean) => {};
   export let onToggleVideoMute = (_callId: string, _muted: boolean) => {};
   export let onToggleVideoCamera = (_callId: string, _enabled: boolean) => {};
@@ -94,6 +103,7 @@
   let callClockSec = 0;
   let callClockTimer: ReturnType<typeof setInterval> | null = null;
   let videoFrameUnlisten: (() => void) | null = null;
+  let broadcastFrameUnlisten: (() => void) | null = null;
   let localVideoEl: HTMLVideoElement | null = null;
   let remoteVideoCanvasEl: HTMLCanvasElement | null = null;
   let remoteVideoCanvasCtx: CanvasRenderingContext2D | null = null;
@@ -111,6 +121,8 @@
   let remoteVideoStateError: string | null = null;
   let videoCallSupported = true;
   let videoCallUnsupportedReason: string | null = null;
+  let screenBroadcastSupported = true;
+  let screenBroadcastUnsupportedReason: string | null = null;
 
   const REMOTE_REORDER_WINDOW = 6;
 
@@ -164,9 +176,26 @@
     callMatchesActivePeer &&
     voiceCallState.phase === "active" &&
     activeCallKind === "video";
+  $: broadcastMatchesActivePeer =
+    broadcastState.phase !== "idle" && broadcastState.peer_id === activePeer;
+  $: broadcastBusyOnOtherChat =
+    broadcastState.phase !== "idle" && broadcastState.peer_id !== activePeer;
+  $: activeBroadcastSessionId = broadcastState.session_id ?? null;
+  $: isBroadcastActiveInThisChat =
+    broadcastMatchesActivePeer && broadcastState.phase === "active";
+  $: isBroadcastHostInThisChat =
+    isBroadcastActiveInThisChat && broadcastState.is_host;
+  $: isBroadcastViewerInThisChat =
+    isBroadcastActiveInThisChat && !broadcastState.is_host;
+  $: broadcastRingCountdownSec =
+    broadcastState.ring_expires_at && broadcastState.phase !== "active"
+      ? Math.max(0, broadcastState.ring_expires_at - callClockSec)
+      : 0;
   $: setLocalVideoElementStream();
   $: canPressVideoCallButton =
     canStartVideoCall && voiceCallState.phase === "idle" && videoCallSupported;
+  $: canPressScreenBroadcastButton =
+    canStartScreenBroadcast && screenBroadcastSupported;
 
   function detectVideoCallSupport(): { supported: boolean; reason: string | null } {
     if (typeof window === "undefined") {
@@ -181,6 +210,23 @@
     }
     if (!w.MediaStreamTrackProcessor) {
       return { supported: false, reason: "Track processing API is unavailable on this client." };
+    }
+    return { supported: true, reason: null };
+  }
+
+  function detectScreenBroadcastSupport(): {
+    supported: boolean;
+    reason: string | null;
+  } {
+    const base = detectVideoCallSupport();
+    if (!base.supported) {
+      return base;
+    }
+    if (!navigator?.mediaDevices?.getDisplayMedia) {
+      return {
+        supported: false,
+        reason: "Screen capture is unavailable on this client.",
+      };
     }
     return { supported: true, reason: null };
   }
@@ -202,6 +248,16 @@
     if ("srcObject" in localVideoEl) {
       localVideoEl.srcObject = localVideoStream;
     }
+  }
+
+  function activeRemoteSessionId(): string | null {
+    if (isVideoCallActiveInThisChat) {
+      return activeCallId;
+    }
+    if (isBroadcastViewerInThisChat) {
+      return activeBroadcastSessionId;
+    }
+    return null;
   }
 
   function resetRemoteVideoDecodeState() {
@@ -341,9 +397,10 @@
   }
 
   async function handleIncomingVideoFrame(eventPayload: any) {
-    if (!eventPayload || !activeCallId) return;
-    if (eventPayload.call_id !== activeCallId) return;
-    if (!callMatchesActivePeer || activeCallKind !== "video") return;
+    const sessionId = activeRemoteSessionId();
+    if (!eventPayload || !sessionId) return;
+    if (eventPayload.call_id !== sessionId) return;
+    if (!isVideoCallActiveInThisChat && !isBroadcastViewerInThisChat) return;
 
     const payload = normalizeBinaryPayload(eventPayload.payload);
     if (!payload) return;
@@ -380,6 +437,20 @@
       }
     }
     await flushIncomingFrameQueue();
+  }
+
+  async function handleIncomingBroadcastFrame(eventPayload: any) {
+    if (!eventPayload) return;
+    const normalized = {
+      call_id: eventPayload.session_id,
+      seq: eventPayload.seq,
+      timestamp: eventPayload.timestamp,
+      mime: eventPayload.mime,
+      codec: eventPayload.codec,
+      chunk_type: eventPayload.chunk_type as BroadcastChunkType,
+      payload: eventPayload.payload,
+    };
+    await handleIncomingVideoFrame(normalized);
   }
 
   async function chooseEncoderConfig(): Promise<{
@@ -447,25 +518,44 @@
   }
 
   async function startLocalVideoCapture() {
-    if (!activeCallId || activeCallKind !== "video") return;
+    const isVideoCallMode = isVideoCallActiveInThisChat;
+    const isBroadcastMode = isBroadcastHostInThisChat;
+    if (!isVideoCallMode && !isBroadcastMode) return;
     if (localVideoEncoder || localVideoStream) return;
-    if (voiceCallState.phase !== "active" || !callMatchesActivePeer) return;
-    if (!activeCallCameraEnabled) return;
-    if (!videoCallSupported) {
-      remoteVideoStateError = videoCallUnsupportedReason || "WebCodecs unsupported.";
-      await onEndVideoCall(activeCallId);
+    const sessionId = isVideoCallMode ? activeCallId : activeBroadcastSessionId;
+    if (!sessionId) return;
+
+    if (isVideoCallMode) {
+      if (voiceCallState.phase !== "active" || !callMatchesActivePeer) return;
+      if (!activeCallCameraEnabled) return;
+      if (!videoCallSupported) {
+        remoteVideoStateError = videoCallUnsupportedReason || "WebCodecs unsupported.";
+        await onEndVideoCall(sessionId);
+        return;
+      }
+    } else if (!screenBroadcastSupported) {
+      remoteVideoStateError =
+        screenBroadcastUnsupportedReason || "Screen share is unsupported.";
+      await onEndScreenBroadcast(sessionId);
       return;
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 640, max: 640 },
-          height: { ideal: 360, max: 360 },
-          frameRate: { ideal: 8, max: 10 },
-        },
-        audio: false,
-      });
+      const stream = isVideoCallMode
+        ? await navigator.mediaDevices.getUserMedia({
+            video: {
+              width: { ideal: 640, max: 640 },
+              height: { ideal: 360, max: 360 },
+              frameRate: { ideal: 8, max: 10 },
+            },
+            audio: false,
+          })
+        : await navigator.mediaDevices.getDisplayMedia({
+            video: {
+              frameRate: { ideal: 8, max: 12 },
+            },
+            audio: false,
+          });
       localVideoStream = stream;
       setLocalVideoElementStream();
       localVideoSeq = 0;
@@ -478,7 +568,14 @@
 
       const videoTrack = stream.getVideoTracks()[0];
       if (!videoTrack) {
-        throw new Error("No video track available from camera.");
+        throw new Error("No video track available.");
+      }
+      if (isBroadcastMode) {
+        videoTrack.onended = () => {
+          if (activeBroadcastSessionId) {
+            void onEndScreenBroadcast(activeBroadcastSessionId);
+          }
+        };
       }
 
       const processorCtor = (window as any).MediaStreamTrackProcessor;
@@ -488,32 +585,35 @@
 
       localVideoEncoder = new encoderCtor({
         output: (chunk: any) => {
-          if (
-            !activeCallId ||
-            !callMatchesActivePeer ||
-            activeCallKind !== "video" ||
-            voiceCallState.phase !== "active" ||
-            !activeCallCameraEnabled
-          ) {
+          if (!sessionId) {
             return;
           }
           try {
             const bytes = new Uint8Array(chunk.byteLength);
             chunk.copyTo(bytes);
             const chunkType: VideoChunkType = chunk.type === "key" ? "key" : "delta";
-            void api
-              .sendVideoCallChunk(
-                activeCallId,
-                localVideoSeq,
-                Number(chunk.timestamp ?? Math.floor(performance.now() * 1000)),
-                localVideoMime,
-                localVideoCodec,
-                chunkType,
-                bytes,
-              )
-              .catch((err) => {
-                console.error("Failed to send encoded video chunk:", err);
-              });
+            const sendPromise = isVideoCallMode
+              ? api.sendVideoCallChunk(
+                  sessionId,
+                  localVideoSeq,
+                  Number(chunk.timestamp ?? Math.floor(performance.now() * 1000)),
+                  localVideoMime,
+                  localVideoCodec,
+                  chunkType,
+                  bytes,
+                )
+              : api.sendScreenBroadcastChunk(
+                  sessionId,
+                  localVideoSeq,
+                  Number(chunk.timestamp ?? Math.floor(performance.now() * 1000)),
+                  localVideoMime,
+                  localVideoCodec,
+                  chunkType as BroadcastChunkType,
+                  bytes,
+                );
+            void sendPromise.catch((err) => {
+              console.error("Failed to send encoded video chunk:", err);
+            });
             localVideoSeq += 1;
           } catch (e) {
             console.error("Failed to package encoded chunk:", e);
@@ -531,7 +631,7 @@
         const { value: videoFrame, done } = await localVideoTrackReader.read();
         if (done || !videoFrame) break;
         try {
-          if (!activeCallCameraEnabled) {
+          if (isVideoCallMode && !activeCallCameraEnabled) {
             videoFrame.close();
             continue;
           }
@@ -544,16 +644,23 @@
       }
     } catch (e) {
       console.error("Failed to start local video capture:", e);
-      remoteVideoStateError = "Camera access failed for this call.";
-      if (activeCallId) {
-        await onEndVideoCall(activeCallId);
+      remoteVideoStateError = isVideoCallMode
+        ? "Camera access failed for this call."
+        : "Screen capture failed.";
+      if (sessionId) {
+        if (isVideoCallMode) {
+          await onEndVideoCall(sessionId);
+        } else {
+          await onEndScreenBroadcast(sessionId);
+        }
       }
     }
   }
 
   $: {
     const shouldCaptureVideo =
-      isVideoCallActiveInThisChat && activeCallCameraEnabled;
+      (isVideoCallActiveInThisChat && activeCallCameraEnabled) ||
+      isBroadcastHostInThisChat;
     if (shouldCaptureVideo) {
       void startLocalVideoCapture();
     } else if (localVideoEncoder || localVideoStream) {
@@ -561,7 +668,7 @@
     }
   }
 
-  $: if (!isVideoCallActiveInThisChat) {
+  $: if (!isVideoCallActiveInThisChat && !isBroadcastViewerInThisChat) {
     resetRemoteVideoDecodeState();
   }
 
@@ -1223,12 +1330,18 @@
     const support = detectVideoCallSupport();
     videoCallSupported = support.supported;
     videoCallUnsupportedReason = support.reason;
+    const broadcastSupport = detectScreenBroadcastSupport();
+    screenBroadcastSupported = broadcastSupport.supported;
+    screenBroadcastUnsupportedReason = broadcastSupport.reason;
     if (!canUseRecorderApi()) {
       recorderDisabledReason = "Recording is not supported on this device.";
     }
     void cleanupStaleTempRecordings();
     videoFrameUnlisten = await listen("video-call-frame", (event: any) => {
       void handleIncomingVideoFrame(event.payload);
+    });
+    broadcastFrameUnlisten = await listen("broadcast-frame", (event: any) => {
+      void handleIncomingBroadcastFrame(event.payload);
     });
   });
 
@@ -1250,6 +1363,10 @@
     if (videoFrameUnlisten) {
       videoFrameUnlisten();
       videoFrameUnlisten = null;
+    }
+    if (broadcastFrameUnlisten) {
+      broadcastFrameUnlisten();
+      broadcastFrameUnlisten = null;
     }
   });
 
@@ -1324,6 +1441,24 @@
       </div>
     {/if}
 
+    {#if broadcastMatchesActivePeer}
+      <div class="rounded-lg border border-theme-base-700 bg-theme-base-900/60 px-3 py-1.5 text-xs text-theme-base-200 flex items-center gap-2">
+        {#if broadcastState.phase === "outgoing_ringing"}
+          <span>Starting screen share… {formatDuration(broadcastRingCountdownSec)}</span>
+        {:else if broadcastState.phase === "incoming_ringing"}
+          <span>Incoming screen share… {formatDuration(broadcastRingCountdownSec)}</span>
+        {:else if broadcastState.phase === "active"}
+          <span>{broadcastState.is_host ? "Sharing your screen" : "Watching screen share"}</span>
+        {:else if broadcastState.phase === "ending"}
+          <span>Ending screen share…</span>
+        {/if}
+      </div>
+    {:else if broadcastBusyOnOtherChat}
+      <div class="rounded-lg border border-theme-base-700 bg-theme-base-900/60 px-3 py-1.5 text-xs text-theme-base-300">
+        Screen share active with {broadcastState.peer_id}
+      </div>
+    {/if}
+
     {#if canShowCallButton}
       {#if callMatchesActivePeer && activeCallId}
         <button
@@ -1380,6 +1515,33 @@
           </svg>
         </button>
       {/if}
+
+      {#if broadcastMatchesActivePeer && activeBroadcastSessionId}
+        <button
+          onclick={() => onEndScreenBroadcast(activeBroadcastSessionId)}
+          class="p-2 rounded-lg bg-theme-error-500/20 text-theme-error-400 hover:bg-theme-error-500/30 transition-colors"
+          title="Stop screen share"
+          aria-label="Stop screen share"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M4 6a2 2 0 012-2h8a2 2 0 012 2v1.586l4-2.4A1 1 0 0121 6v12a1 1 0 01-1.514.857L15 16.2V18a2 2 0 01-2 2H6a2 2 0 01-2-2V6z" />
+          </svg>
+        </button>
+      {:else}
+        <button
+          onclick={onStartScreenBroadcast}
+          class="p-2 rounded-lg border border-theme-base-700 text-theme-base-300 hover:text-white hover:bg-theme-base-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          disabled={!canPressScreenBroadcastButton}
+          title={canPressScreenBroadcastButton
+            ? "Share screen"
+            : (screenBroadcastUnsupportedReason || "Screen share is unavailable right now")}
+          aria-label="Share screen"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M3 4a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5v2h2a1 1 0 110 2H8a1 1 0 110-2h2v-2H5a2 2 0 01-2-2V4zm2 0v8h14V4H5z" />
+          </svg>
+        </button>
+      {/if}
     {/if}
   </div>
 </div>
@@ -1406,6 +1568,34 @@
           <span class="text-[11px] text-theme-base-300">Camera off</span>
         {/if}
       </div>
+    </div>
+  </div>
+{/if}
+
+{#if isBroadcastActiveInThisChat}
+  <div class="px-6 pt-3">
+    <div class="relative rounded-xl border border-theme-base-700 bg-theme-base-900/70 overflow-hidden h-36 flex items-center justify-center">
+      {#if isBroadcastHostInThisChat}
+        {#if localVideoStream}
+          <video
+            bind:this={localVideoEl}
+            autoplay
+            muted
+            playsinline
+            class="w-full h-full object-cover"
+          ></video>
+        {:else}
+          <div class="text-xs text-theme-base-300 px-3 text-center">
+            Waiting for display capture…
+          </div>
+        {/if}
+      {:else if remoteVideoStateError}
+        <div class="text-xs text-theme-base-300 px-3 text-center">
+          {remoteVideoStateError}
+        </div>
+      {:else}
+        <canvas bind:this={remoteVideoCanvasEl} class="w-full h-full object-cover"></canvas>
+      {/if}
     </div>
   </div>
 {/if}
@@ -1894,7 +2084,7 @@
       bind:value={message}
       onkeydown={handleKeydown}
       oninput={handleInput}
-      placeholder={isArchivedChat ? "Archived chat is read-only" : `Message ${activePeer}...`}
+      placeholder={isArchivedChat ? "Archived chat is read-only" : "Type message..."}
       rows="1"
       class="flex-1 bg-transparent text-theme-base-100 placeholder:text-theme-base-600 px-4 py-2.5 focus:outline-none min-w-0 resize-none overflow-hidden max-h-32 self-end mb-1"
       readonly={isArchivedChat}

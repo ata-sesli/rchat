@@ -169,6 +169,7 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
         connected_chat_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         chat_connections: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         voice_call_state: tokio::sync::Mutex::new(crate::app_state::VoiceCallState::default()),
+        broadcast_state: tokio::sync::Mutex::new(crate::app_state::BroadcastState::default()),
         connectivity: tokio::sync::Mutex::new(connectivity_settings),
     };
     app_handle.manage(network_state);

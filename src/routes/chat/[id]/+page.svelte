@@ -3,7 +3,12 @@
   import { onMount, onDestroy } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import ChatArea from "../../../components/chat/ChatArea.svelte";
-  import { api, type DbMessage, type VoiceCallState } from "$lib/tauri/api";
+  import {
+    api,
+    type BroadcastState,
+    type DbMessage,
+    type VoiceCallState,
+  } from "$lib/tauri/api";
   import { getChatKind } from "$lib/chatKind";
   import { extractPeerIdFromChatId } from "$lib/chatIdentity";
 
@@ -35,8 +40,10 @@
   let unlisten: () => void;
   let unlistenStatus: () => void;
   let unlistenVoiceCall: () => void;
+  let unlistenBroadcast: () => void;
   let unlistenConnectedChatIds: () => void;
   let voiceCallState: VoiceCallState = { phase: "idle", muted: false };
+  let broadcastState: BroadcastState = { phase: "idle", is_host: false };
   let connectedChatIds = new Set<string>();
   let activeConversationIds = new Set<string>();
 
@@ -55,6 +62,14 @@
 
   // Cache for status updates that arrive before we've swapped tempId → msgId
   let pendingStatusCache: Record<string, string> = {};
+  $: canStartScreenBroadcast =
+    activeChatKind === "dm" &&
+    isChatConnected(activePeer) &&
+    broadcastState.phase === "idle" &&
+    (voiceCallState.phase === "idle" ||
+      (voiceCallState.phase === "active" &&
+        voiceCallState.call_kind === "voice" &&
+        voiceCallState.peer_id === activePeer));
 
   // Reactive loading
   $: loadChatHistory(activePeer);
@@ -142,6 +157,7 @@
 
     try {
       voiceCallState = await api.getVoiceCallState();
+      broadcastState = await api.getBroadcastState();
       connectedChatIds = new Set(await api.getConnectedChatIds());
     } catch (e) {
       console.warn("Voice call state unavailable:", e);
@@ -149,6 +165,9 @@
 
     unlistenVoiceCall = await listen<VoiceCallState>("voice-call-state-updated", (event) => {
       voiceCallState = event.payload;
+    });
+    unlistenBroadcast = await listen<BroadcastState>("broadcast-state-updated", (event) => {
+      broadcastState = event.payload;
     });
     unlistenConnectedChatIds = await listen("connected-chat-ids-updated", (event: any) => {
       const ids = Array.isArray(event.payload) ? event.payload : [];
@@ -182,6 +201,7 @@
     if (unlisten) unlisten();
     if (unlistenStatus) unlistenStatus();
     if (unlistenVoiceCall) unlistenVoiceCall();
+    if (unlistenBroadcast) unlistenBroadcast();
     if (unlistenConnectedChatIds) unlistenConnectedChatIds();
   });
 
@@ -255,8 +275,10 @@
     {messages}
     {userProfile}
     voiceCallState={voiceCallState}
+    broadcastState={broadcastState}
     canStartVoiceCall={activeChatKind === "dm" && isChatConnected(activePeer) && voiceCallState.phase === "idle"}
-    canStartVideoCall={activeChatKind === "dm" && isChatConnected(activePeer) && voiceCallState.phase === "idle"}
+    canStartVideoCall={activeChatKind === "dm" && isChatConnected(activePeer) && voiceCallState.phase === "idle" && broadcastState.phase === "idle"}
+    {canStartScreenBroadcast}
     onStartVoiceCall={async () => {
       try {
         await api.startVoiceCall(activePeer);
@@ -271,6 +293,13 @@
         console.error("Failed to start video call:", e);
       }
     }}
+    onStartScreenBroadcast={async () => {
+      try {
+        await api.startScreenBroadcast(activePeer);
+      } catch (e) {
+        console.error("Failed to start screen broadcast:", e);
+      }
+    }}
     onEndVoiceCall={async (callId) => {
       try {
         await api.endVoiceCall(callId);
@@ -283,6 +312,13 @@
         await api.endVideoCall(callId);
       } catch (e) {
         console.error("Failed to end video call:", e);
+      }
+    }}
+    onEndScreenBroadcast={async (sessionId) => {
+      try {
+        await api.endScreenBroadcast(sessionId);
+      } catch (e) {
+        console.error("Failed to end screen broadcast:", e);
       }
     }}
     onToggleVoiceMute={async (callId, muted) => {

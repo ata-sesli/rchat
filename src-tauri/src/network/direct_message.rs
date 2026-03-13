@@ -35,6 +35,11 @@ pub enum DirectMessageKind {
     CallReject,
     CallBusy,
     CallEnd,
+    BroadcastOffer,
+    BroadcastAccept,
+    BroadcastReject,
+    BroadcastBusy,
+    BroadcastEnd,
 }
 
 impl DirectMessageKind {
@@ -60,6 +65,11 @@ impl DirectMessageKind {
             Self::CallReject => "call_reject",
             Self::CallBusy => "call_busy",
             Self::CallEnd => "call_end",
+            Self::BroadcastOffer => "broadcast_offer",
+            Self::BroadcastAccept => "broadcast_accept",
+            Self::BroadcastReject => "broadcast_reject",
+            Self::BroadcastBusy => "broadcast_busy",
+            Self::BroadcastEnd => "broadcast_end",
         }
     }
 
@@ -143,6 +153,11 @@ mod tests {
             (DirectMessageKind::CallReject, "\"call_reject\""),
             (DirectMessageKind::CallBusy, "\"call_busy\""),
             (DirectMessageKind::CallEnd, "\"call_end\""),
+            (DirectMessageKind::BroadcastOffer, "\"broadcast_offer\""),
+            (DirectMessageKind::BroadcastAccept, "\"broadcast_accept\""),
+            (DirectMessageKind::BroadcastReject, "\"broadcast_reject\""),
+            (DirectMessageKind::BroadcastBusy, "\"broadcast_busy\""),
+            (DirectMessageKind::BroadcastEnd, "\"broadcast_end\""),
         ];
 
         for (kind, expected_json) in kinds {

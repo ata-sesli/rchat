@@ -283,6 +283,7 @@ impl NetworkManager {
 
         if num_established == 0 {
             self.handle_peer_disconnect_for_voice_call(&peer_id).await;
+            self.handle_peer_disconnect_for_broadcast(&peer_id).await;
             if self.local_peers.remove(&peer_id).is_some() {
                 println!("[Swarm] Peer {} fully disconnected, notifying UI", peer_id);
 

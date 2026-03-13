@@ -99,6 +99,26 @@ impl NetworkManager {
                                 ),
                             }
                         }
+                        DirectMessageKind::BroadcastOffer
+                        | DirectMessageKind::BroadcastAccept
+                        | DirectMessageKind::BroadcastReject
+                        | DirectMessageKind::BroadcastBusy
+                        | DirectMessageKind::BroadcastEnd => {
+                            match self.handle_broadcast_signal(peer, &request).await {
+                                Ok(()) => self.send_status_response(
+                                    channel,
+                                    request.id.clone(),
+                                    "delivered",
+                                    None,
+                                ),
+                                Err(err) => self.send_status_response(
+                                    channel,
+                                    request.id.clone(),
+                                    "error",
+                                    Some(err),
+                                ),
+                            }
+                        }
                         DirectMessageKind::ReadReceipt => {
                             match self.handle_read_receipt(&request).await {
                                 Ok(_) => self.send_status_response(

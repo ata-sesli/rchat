@@ -93,6 +93,12 @@ export const COMMANDS = {
   setVideoCallCameraEnabled: "set_video_call_camera_enabled",
   sendVideoCallChunk: "send_video_call_chunk",
   getVoiceCallState: "get_voice_call_state",
+  startScreenBroadcast: "start_screen_broadcast",
+  acceptScreenBroadcast: "accept_screen_broadcast",
+  rejectScreenBroadcast: "reject_screen_broadcast",
+  endScreenBroadcast: "end_screen_broadcast",
+  sendScreenBroadcastChunk: "send_screen_broadcast_chunk",
+  getBroadcastState: "get_broadcast_state",
   getConnectedChatIds: "get_connected_chat_ids",
 } as const;
 
@@ -296,6 +302,13 @@ export type VoiceCallPhase =
 
 export type CallKind = "voice" | "video";
 export type VideoChunkType = "key" | "delta";
+export type BroadcastPhase =
+  | "idle"
+  | "outgoing_ringing"
+  | "incoming_ringing"
+  | "active"
+  | "ending";
+export type BroadcastChunkType = "key" | "delta";
 
 export type VoiceCallState = {
   phase: VoiceCallPhase;
@@ -306,6 +319,16 @@ export type VoiceCallState = {
   ring_expires_at?: number | null;
   muted: boolean;
   camera_enabled?: boolean;
+  reason?: string | null;
+};
+
+export type BroadcastState = {
+  phase: BroadcastPhase;
+  session_id?: string | null;
+  peer_id?: string | null;
+  started_at?: number | null;
+  ring_expires_at?: number | null;
+  is_host: boolean;
   reason?: string | null;
 };
 
@@ -592,6 +615,32 @@ type CommandSpec = {
     result: void;
   };
   [COMMANDS.getVoiceCallState]: { args?: undefined; result: VoiceCallState };
+  [COMMANDS.startScreenBroadcast]: { args: { peer_id: string }; result: void };
+  [COMMANDS.acceptScreenBroadcast]: {
+    args: { session_id: string };
+    result: void;
+  };
+  [COMMANDS.rejectScreenBroadcast]: {
+    args: { session_id: string };
+    result: void;
+  };
+  [COMMANDS.endScreenBroadcast]: {
+    args: { session_id: string };
+    result: void;
+  };
+  [COMMANDS.sendScreenBroadcastChunk]: {
+    args: {
+      session_id: string;
+      seq: number;
+      timestamp: number;
+      mime: string;
+      codec: string;
+      chunk_type: BroadcastChunkType;
+      payload: Uint8Array;
+    };
+    result: void;
+  };
+  [COMMANDS.getBroadcastState]: { args?: undefined; result: BroadcastState };
   [COMMANDS.getConnectedChatIds]: { args?: undefined; result: string[] };
 };
 
@@ -886,5 +935,32 @@ export const api = {
       payload,
     }),
   getVoiceCallState: () => invokeCommand(COMMANDS.getVoiceCallState),
+  startScreenBroadcast: (peerId: string) =>
+    invokeCommand(COMMANDS.startScreenBroadcast, { peer_id: peerId }),
+  acceptScreenBroadcast: (sessionId: string) =>
+    invokeCommand(COMMANDS.acceptScreenBroadcast, { session_id: sessionId }),
+  rejectScreenBroadcast: (sessionId: string) =>
+    invokeCommand(COMMANDS.rejectScreenBroadcast, { session_id: sessionId }),
+  endScreenBroadcast: (sessionId: string) =>
+    invokeCommand(COMMANDS.endScreenBroadcast, { session_id: sessionId }),
+  sendScreenBroadcastChunk: (
+    sessionId: string,
+    seq: number,
+    timestamp: number,
+    mime: string,
+    codec: string,
+    chunkType: BroadcastChunkType,
+    payload: Uint8Array,
+  ) =>
+    invokeCommand(COMMANDS.sendScreenBroadcastChunk, {
+      session_id: sessionId,
+      seq,
+      timestamp,
+      mime,
+      codec,
+      chunk_type: chunkType,
+      payload,
+    }),
+  getBroadcastState: () => invokeCommand(COMMANDS.getBroadcastState),
   getConnectedChatIds: () => invokeCommand(COMMANDS.getConnectedChatIds),
 };

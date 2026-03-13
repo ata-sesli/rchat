@@ -11,6 +11,7 @@
   import { page } from "$app/stores";
   import {
     api,
+    type BroadcastState,
     type ConnectivityMode,
     type ConnectivitySettings,
     type VoiceCallState,
@@ -111,10 +112,15 @@
   const seenDeepLinks = new Set<string>();
   let unlistenOpenUrl: (() => void) | null = null;
   let unlistenVoiceCallState: (() => void) | null = null;
+  let unlistenBroadcastState: (() => void) | null = null;
   let voiceCallState: VoiceCallState = { phase: "idle", muted: false };
+  let broadcastState: BroadcastState = { phase: "idle", is_host: false };
   let videoCallSupported = true;
   let videoCallUnsupportedReason: string | null = null;
+  let screenBroadcastSupported = true;
+  let screenBroadcastUnsupportedReason: string | null = null;
   const autoRejectedUnsupportedVideoCalls = new Set<string>();
+  const autoRejectedUnsupportedBroadcasts = new Set<string>();
 
   function detectVideoCallSupport(): { supported: boolean; reason: string | null } {
     if (typeof window === "undefined") {
@@ -126,6 +132,18 @@
     const w = window as any;
     if (!w.VideoEncoder || !w.VideoDecoder || !w.EncodedVideoChunk || !w.MediaStreamTrackProcessor) {
       return { supported: false, reason: "WebCodecs video support is unavailable on this client." };
+    }
+    return { supported: true, reason: null };
+  }
+
+  function detectScreenBroadcastSupport(): {
+    supported: boolean;
+    reason: string | null;
+  } {
+    const base = detectVideoCallSupport();
+    if (!base.supported) return base;
+    if (!navigator?.mediaDevices?.getDisplayMedia) {
+      return { supported: false, reason: "Screen capture is unavailable on this client." };
     }
     return { supported: true, reason: null };
   }
@@ -149,6 +167,30 @@
     }
     if (voiceCallState.phase === "idle" && autoRejectedUnsupportedVideoCalls.size > 32) {
       autoRejectedUnsupportedVideoCalls.clear();
+    }
+  }
+
+  $: {
+    const incomingUnsupportedBroadcastId =
+      broadcastState.phase === "incoming_ringing" &&
+      broadcastState.session_id &&
+      !screenBroadcastSupported
+        ? broadcastState.session_id
+        : null;
+    if (
+      incomingUnsupportedBroadcastId &&
+      !autoRejectedUnsupportedBroadcasts.has(incomingUnsupportedBroadcastId)
+    ) {
+      autoRejectedUnsupportedBroadcasts.add(incomingUnsupportedBroadcastId);
+      void api.rejectScreenBroadcast(incomingUnsupportedBroadcastId).catch((e) => {
+        console.error(
+          "Failed to auto-reject unsupported incoming screen share:",
+          e,
+        );
+      });
+    }
+    if (broadcastState.phase === "idle" && autoRejectedUnsupportedBroadcasts.size > 32) {
+      autoRejectedUnsupportedBroadcasts.clear();
     }
   }
 
@@ -246,6 +288,9 @@
     const support = detectVideoCallSupport();
     videoCallSupported = support.supported;
     videoCallUnsupportedReason = support.reason;
+    const broadcastSupport = detectScreenBroadcastSupport();
+    screenBroadcastSupported = broadcastSupport.supported;
+    screenBroadcastUnsupportedReason = broadcastSupport.reason;
     try {
       await listen("auth-status", () => refreshData());
       window.addEventListener("open-chat", async (event: Event) => {
@@ -333,6 +378,7 @@
       await refreshData();
       try {
         voiceCallState = await api.getVoiceCallState();
+        broadcastState = await api.getBroadcastState();
       } catch (e) {
         console.warn("Voice call state unavailable yet:", e);
       }
@@ -340,6 +386,12 @@
         "voice-call-state-updated",
         (event) => {
           voiceCallState = event.payload;
+        },
+      );
+      unlistenBroadcastState = await listen<BroadcastState>(
+        "broadcast-state-updated",
+        (event) => {
+          broadcastState = event.payload;
         },
       );
       try {
@@ -366,6 +418,10 @@
     if (unlistenVoiceCallState) {
       unlistenVoiceCallState();
       unlistenVoiceCallState = null;
+    }
+    if (unlistenBroadcastState) {
+      unlistenBroadcastState();
+      unlistenBroadcastState = null;
     }
   });
 
@@ -399,6 +455,27 @@
       }
     } catch (e) {
       console.error("Failed to reject call:", e);
+    }
+  }
+
+  async function acceptIncomingBroadcast() {
+    if (!broadcastState.session_id) return;
+    try {
+      await api.acceptScreenBroadcast(broadcastState.session_id);
+      if (broadcastState.peer_id) {
+        goto(`/chat/${broadcastState.peer_id}`);
+      }
+    } catch (e) {
+      console.error("Failed to accept screen share:", e);
+    }
+  }
+
+  async function rejectIncomingBroadcast() {
+    if (!broadcastState.session_id) return;
+    try {
+      await api.rejectScreenBroadcast(broadcastState.session_id);
+    } catch (e) {
+      console.error("Failed to reject screen share:", e);
     }
   }
 
@@ -873,6 +950,44 @@
                 onclick={acceptIncomingCall}
                 class="px-4 py-2 rounded-lg bg-theme-success-600 hover:bg-theme-success-500 text-white"
                 disabled={voiceCallState.call_kind === "video" && !videoCallSupported}
+              >
+                Accept
+              </button>
+            </div>
+          </div>
+        </div>
+      {/if}
+
+      {#if broadcastState.phase === "incoming_ringing" && broadcastState.session_id}
+        <div class="fixed inset-0 z-[120] flex items-center justify-center bg-black/45">
+          <div class="w-full max-w-sm rounded-2xl border border-theme-base-700 bg-theme-base-900 p-5 shadow-2xl">
+            <div class="text-sm text-theme-base-400 mb-1">
+              Incoming screen share
+            </div>
+            <div class="text-lg font-semibold text-theme-base-100 mb-2 truncate">
+              {broadcastState.peer_id || "Unknown peer"}
+            </div>
+            {#if !screenBroadcastSupported}
+              <div class="text-xs text-theme-base-400 mb-2">
+                {screenBroadcastUnsupportedReason || "Screen share is not supported on this client."}
+              </div>
+            {/if}
+            <div class="text-xs text-theme-base-400 mb-4">
+              {#if broadcastState.ring_expires_at}
+                Expires in {Math.max(0, broadcastState.ring_expires_at - Math.floor(Date.now() / 1000))}s
+              {/if}
+            </div>
+            <div class="flex gap-2 justify-end">
+              <button
+                onclick={rejectIncomingBroadcast}
+                class="px-4 py-2 rounded-lg bg-theme-base-800 hover:bg-theme-base-700 text-theme-base-200"
+              >
+                Reject
+              </button>
+              <button
+                onclick={acceptIncomingBroadcast}
+                class="px-4 py-2 rounded-lg bg-theme-success-600 hover:bg-theme-success-500 text-white"
+                disabled={!screenBroadcastSupported}
               >
                 Accept
               </button>

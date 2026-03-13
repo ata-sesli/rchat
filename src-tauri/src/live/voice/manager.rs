@@ -108,6 +108,16 @@ impl NetworkManager {
     }
 
     pub(super) async fn handle_start_voice_call(&mut self, peer_chat_id: String) {
+        if let Some(session) = self.active_broadcast.as_ref() {
+            if session.phase != ActiveBroadcastPhase::Active
+                || session.peer_chat_id != peer_chat_id
+            {
+                self.push_idle_call_state(Some("broadcast_conflict".to_string()))
+                    .await;
+                return;
+            }
+        }
+
         if self.active_call.is_some() {
             return;
         }
@@ -275,6 +285,22 @@ impl NetworkManager {
                 {
                     self.send_call_signal(peer, DirectMessageKind::CallReject, &request.id);
                     return Ok(());
+                }
+                if request.msg_type == DirectMessageKind::CallOfferVideo
+                    && self.active_broadcast.is_some()
+                {
+                    self.send_call_signal(peer, DirectMessageKind::CallBusy, &request.id);
+                    return Ok(());
+                }
+                if request.msg_type == DirectMessageKind::CallOffer {
+                    if let Some(session) = self.active_broadcast.as_ref() {
+                        let same_peer_active = session.phase == ActiveBroadcastPhase::Active
+                            && session.peer_chat_id == incoming_chat_id;
+                        if !same_peer_active {
+                            self.send_call_signal(peer, DirectMessageKind::CallBusy, &request.id);
+                            return Ok(());
+                        }
+                    }
                 }
 
                 if self.active_call.is_some() {

@@ -1,18 +1,54 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
+  import { onDestroy, onMount } from "svelte";
   import { api, type ThemeConfig } from "$lib/tauri/api";
 
   let themeLoaded = false;
+  let unlistenAuthStatus: (() => void) | null = null;
 
-  onMount(async () => {
+  async function loadTheme(context: string) {
     try {
       const theme = await api.getTheme();
       applyTheme(theme);
-      themeLoaded = true;
     } catch (e) {
-      console.error("[ThemeProvider] Failed to load theme:", e);
-      themeLoaded = true; // Use CSS defaults
+      console.error(`[ThemeProvider] Failed to load theme (${context}):`, e);
     }
+  }
+
+  onMount(async () => {
+    await loadTheme("mount");
+    themeLoaded = true;
+
+    // Theme can be requested before vault/config is ready; retry on auth unlock.
+    unlistenAuthStatus = await listen<{ unlocked?: boolean }>(
+      "auth-status",
+      async (event) => {
+        if (event.payload?.unlocked) {
+          await loadTheme("auth-status");
+        }
+      }
+    );
+
+    const onFocus = () => {
+      void loadTheme("focus");
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void loadTheme("visibility");
+      }
+    };
+
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    onDestroy(() => {
+      if (unlistenAuthStatus) {
+        unlistenAuthStatus();
+        unlistenAuthStatus = null;
+      }
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    });
   });
 
   function applyTheme(theme: ThemeConfig) {
@@ -85,7 +121,7 @@
 
   // Export function for external theme updates
   export function refreshTheme() {
-    api.getTheme().then(applyTheme);
+    void loadTheme("refresh");
   }
 </script>
 

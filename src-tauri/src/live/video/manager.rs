@@ -18,6 +18,12 @@ impl NetworkManager {
     }
 
     pub(super) async fn handle_start_video_call(&mut self, peer_chat_id: String) {
+        if self.active_broadcast.is_some() {
+            self.push_idle_call_state(Some("broadcast_conflict".to_string()))
+                .await;
+            return;
+        }
+
         if self.active_call.is_some() {
             self.push_idle_call_state(Some("busy".to_string())).await;
             return;

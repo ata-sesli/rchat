@@ -17,6 +17,8 @@ mod run_loop;
 mod swarm_events;
 mod transfer;
 mod ui_commands;
+#[path = "../../live/broadcast/manager.rs"]
+mod broadcast;
 #[path = "../../live/video/manager.rs"]
 mod video_call;
 #[path = "../../live/voice/manager.rs"]
@@ -52,6 +54,25 @@ struct ActiveCall {
     started_at: Option<i64>,
     muted: bool,
     camera_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveBroadcastPhase {
+    OutgoingRinging,
+    IncomingRinging,
+    Active,
+}
+
+#[derive(Clone)]
+struct ActiveBroadcast {
+    session_id: String,
+    peer_chat_id: String,
+    remote_peer_id: PeerId,
+    phase: ActiveBroadcastPhase,
+    ring_deadline: Option<std::time::Instant>,
+    ring_expires_at: Option<i64>,
+    started_at: Option<i64>,
+    is_host: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -266,6 +287,8 @@ pub struct NetworkManager {
     persistence_worker_handles: Vec<tauri::async_runtime::JoinHandle<()>>,
     // Current DM call runtime state (single-call invariant across voice+video).
     active_call: Option<ActiveCall>,
+    // Current DM broadcast runtime state (single broadcast session).
+    active_broadcast: Option<ActiveBroadcast>,
     // Backend audio engine for current active call.
     voice_audio_engine: Option<crate::live::voice::voice::VoiceAudioEngine>,
     // Captured local PCM16 frames from audio engine.
@@ -454,6 +477,7 @@ impl NetworkManager {
             persistence_inflight_tasks,
             persistence_worker_handles,
             active_call: None,
+            active_broadcast: None,
             voice_audio_engine: None,
             voice_capture_rx: None,
             voice_next_seq: 0,
@@ -915,6 +939,22 @@ impl NetworkManager {
             *shared = next.clone();
         }
         let _ = self.app_handle.emit("voice-call-state-updated", next);
+    }
+
+    pub(super) async fn set_broadcast_state(
+        &mut self,
+        mut next: crate::app_state::BroadcastState,
+        reason: Option<String>,
+    ) {
+        if reason.is_some() {
+            next.reason = reason;
+        }
+        let state = self.app_handle.state::<crate::NetworkState>();
+        {
+            let mut shared = state.broadcast_state.lock().await;
+            *shared = next.clone();
+        }
+        let _ = self.app_handle.emit("broadcast-state-updated", next);
     }
 
     pub(super) fn note_peer_transport_connected(&mut self, peer_id: PeerId, remote_addr: &Multiaddr) {

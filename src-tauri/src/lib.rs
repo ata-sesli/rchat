@@ -16,9 +16,11 @@ use crate::commands::auth::{
     toggle_online_status, unlock_vault, update_connectivity_settings,
 };
 use crate::commands::call::{
-    accept_video_call, accept_voice_call, end_video_call, end_voice_call, get_connected_chat_ids,
-    get_voice_call_state, reject_video_call, reject_voice_call, send_video_call_chunk,
-    set_video_call_camera_enabled, set_video_call_muted, set_voice_call_muted, start_video_call,
+    accept_screen_broadcast, accept_video_call, accept_voice_call, end_screen_broadcast,
+    end_video_call, end_voice_call, get_broadcast_state, get_connected_chat_ids,
+    get_voice_call_state, reject_screen_broadcast, reject_video_call, reject_voice_call,
+    send_screen_broadcast_chunk, send_video_call_chunk, set_video_call_camera_enabled,
+    set_video_call_muted, set_voice_call_muted, start_screen_broadcast, start_video_call,
     start_voice_call,
 };
 use crate::commands::chat::{
@@ -198,6 +200,12 @@ pub fn run() {
             set_video_call_camera_enabled,
             send_video_call_chunk,
             get_voice_call_state,
+            start_screen_broadcast,
+            accept_screen_broadcast,
+            reject_screen_broadcast,
+            end_screen_broadcast,
+            send_screen_broadcast_chunk,
+            get_broadcast_state,
             get_connected_chat_ids,
         ])
         .run(tauri::generate_context!())

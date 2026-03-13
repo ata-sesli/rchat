@@ -109,4 +109,25 @@ pub enum NetworkCommand {
         chunk_type: String,
         payload: Vec<u8>,
     },
+    StartScreenBroadcast {
+        peer_id: String,
+    },
+    AcceptScreenBroadcast {
+        session_id: String,
+    },
+    RejectScreenBroadcast {
+        session_id: String,
+    },
+    EndScreenBroadcast {
+        session_id: String,
+    },
+    SendScreenBroadcastChunk {
+        session_id: String,
+        seq: u32,
+        timestamp: i64,
+        mime: String,
+        codec: String,
+        chunk_type: String,
+        payload: Vec<u8>,
+    },
 }

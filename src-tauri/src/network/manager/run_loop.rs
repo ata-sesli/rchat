@@ -69,6 +69,8 @@ impl NetworkManager {
             tokio::time::interval(std::time::Duration::from_secs(60));
         // Voice-call tick: ring timeout + outgoing frame pump.
         let mut voice_call_tick = tokio::time::interval(std::time::Duration::from_millis(20));
+        // Broadcast tick: ring timeout lifecycle.
+        let mut broadcast_tick = tokio::time::interval(std::time::Duration::from_millis(100));
         // Ensure mDNS runtime reflects current connectivity settings.
         let mut mdns_reconcile_interval =
             tokio::time::interval(std::time::Duration::from_secs(2));
@@ -112,6 +114,9 @@ impl NetworkManager {
                 }
                 _ = voice_call_tick.tick() => {
                     self.tick_voice_call().await;
+                }
+                _ = broadcast_tick.tick() => {
+                    self.tick_broadcast().await;
                 }
                 _ = mdns_reconcile_interval.tick() => {
                     self.reconcile_mdns_runtime();

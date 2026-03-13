@@ -23,6 +23,9 @@ impl NetworkManager {
                 RChatBehaviourEvent::VideoCall(event) => {
                     self.handle_video_frame_event(event).await;
                 }
+                RChatBehaviourEvent::Broadcast(event) => {
+                    self.handle_broadcast_frame_event(event).await;
+                }
                 RChatBehaviourEvent::Identify(_) => {}
                 RChatBehaviourEvent::Ping(_) => {}
                 RChatBehaviourEvent::Kademlia(_) => {}

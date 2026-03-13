@@ -61,6 +61,16 @@ pub enum VoiceCallPhase {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum BroadcastPhase {
+    Idle,
+    OutgoingRinging,
+    IncomingRinging,
+    Active,
+    Ending,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum CallKind {
     Voice,
     Video,
@@ -95,6 +105,31 @@ impl Default for VoiceCallState {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BroadcastState {
+    pub phase: BroadcastPhase,
+    pub session_id: Option<String>,
+    pub peer_id: Option<String>,
+    pub started_at: Option<i64>,
+    pub ring_expires_at: Option<i64>,
+    pub is_host: bool,
+    pub reason: Option<String>,
+}
+
+impl Default for BroadcastState {
+    fn default() -> Self {
+        Self {
+            phase: BroadcastPhase::Idle,
+            session_id: None,
+            peer_id: None,
+            started_at: None,
+            ring_expires_at: None,
+            is_host: false,
+            reason: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct ChatConnectionRuntime {
     pub connected: bool,
@@ -116,6 +151,7 @@ pub struct NetworkState {
     pub connected_chat_ids: Mutex<HashSet<String>>, // Currently connected chats/peers
     pub chat_connections: Mutex<HashMap<String, ChatConnectionRuntime>>, // Runtime connection metadata by chat id
     pub voice_call_state: Mutex<VoiceCallState>, // Runtime voice-call state for UI polling
+    pub broadcast_state: Mutex<BroadcastState>, // Runtime DM broadcast state for UI polling
     pub connectivity: Mutex<crate::storage::config::ConnectivitySettings>, // Runtime connectivity controls
 }
 
