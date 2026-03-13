@@ -206,6 +206,14 @@ pub struct NetworkManager {
     mdns_dial_failures: HashMap<PeerId, u32>,
     // Recent dial origins keyed by multiaddr string for error attribution.
     recent_dials: HashMap<String, RecentDial>,
+    // Trusted peers eligible for automatic reconnect on discovery.
+    trusted_peer_ids: HashSet<PeerId>,
+    // Per-peer in-flight auto-connect attempt start timestamps.
+    auto_connect_inflight: HashMap<PeerId, std::time::Instant>,
+    // Per-peer next-allowed auto-connect attempt instant (cooldown + backoff).
+    auto_connect_backoff_until: HashMap<PeerId, std::time::Instant>,
+    // Per-peer consecutive auto-connect failures.
+    auto_connect_failures: HashMap<PeerId, u32>,
     // Track our outgoing connection requests (peers we pressed Connect on)
     pending_requests: HashSet<PeerId>,
     // Track incoming connection requests from others
@@ -373,6 +381,8 @@ impl NetworkManager {
     const MDNS_DIAL_INFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
     const MDNS_DIAL_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
     const RECENT_DIAL_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+    const AUTO_CONNECT_INFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+    const AUTO_CONNECT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
     pub fn new(
         swarm: Swarm<RChatBehaviour>,
@@ -414,6 +424,10 @@ impl NetworkManager {
             mdns_backoff_until: HashMap::new(),
             mdns_dial_failures: HashMap::new(),
             recent_dials: HashMap::new(),
+            trusted_peer_ids: HashSet::new(),
+            auto_connect_inflight: HashMap::new(),
+            auto_connect_backoff_until: HashMap::new(),
+            auto_connect_failures: HashMap::new(),
             pending_requests: HashSet::new(),
             incoming_requests: HashSet::new(),
             pending_github_mappings: HashMap::new(),
@@ -453,6 +467,17 @@ impl NetworkManager {
         self.mdns_backoff_until.retain(|_, until| *until > now);
         self.recent_dials
             .retain(|_, recent| now.duration_since(recent.at) <= Self::RECENT_DIAL_TTL);
+        self.auto_connect_inflight.retain(|peer_id, started| {
+            if now.duration_since(*started) <= Self::AUTO_CONNECT_INFLIGHT_TIMEOUT {
+                return true;
+            }
+            println!(
+                "[AutoConnect] Cleared stale in-flight attempt for {} (timed out)",
+                peer_id
+            );
+            false
+        });
+        self.auto_connect_backoff_until.retain(|_, until| *until > now);
     }
 
     pub(super) fn record_outgoing_dial(&mut self, addr: &Multiaddr, source: OutgoingDialSource) {
@@ -553,6 +578,7 @@ impl NetworkManager {
         self.mdns_dial_inflight.remove(&peer_id);
         self.mdns_backoff_until.remove(&peer_id);
         self.mdns_dial_failures.remove(&peer_id);
+        self.note_auto_connect_success(peer_id);
     }
 
     pub(super) fn note_mdns_dial_failure(&mut self, peer_id: PeerId) {
@@ -573,6 +599,7 @@ impl NetworkManager {
             *attempts,
             backoff.as_secs_f32()
         );
+        self.note_auto_connect_failure(peer_id);
     }
 
     pub(super) fn cache_peer_mapping(&mut self, github_username: &str, peer_id: &str) {
@@ -580,6 +607,7 @@ impl NetworkManager {
             .insert(github_username.to_string(), peer_id.to_string());
         self.github_by_peer_id
             .insert(peer_id.to_string(), github_username.to_string());
+        self.remember_trusted_peer_id_str(peer_id);
     }
 
     pub(super) async fn refresh_peer_mapping_cache(&mut self) {
@@ -597,6 +625,121 @@ impl NetworkManager {
 
         self.peer_id_by_github = next_peer_id_by_github;
         self.github_by_peer_id = next_github_by_peer_id;
+    }
+
+    pub(super) async fn refresh_trusted_peer_registry(&mut self) {
+        let mut trusted = HashSet::new();
+
+        let state = self.app_handle.state::<crate::AppState>();
+        if let Ok(conn) = state.db_conn.lock() {
+            if let Ok(peers) = crate::storage::db::get_all_peers(&conn) {
+                for peer in peers {
+                    if peer.id == "Me" {
+                        continue;
+                    }
+                    if let Ok(peer_id) = peer.id.parse::<PeerId>() {
+                        trusted.insert(peer_id);
+                    }
+                }
+            }
+        }
+
+        let mgr = state.config_manager.lock().await;
+        if let Ok(config) = mgr.load().await {
+            for peer_id_str in config.user.github_peer_mapping.values() {
+                if let Ok(peer_id) = peer_id_str.parse::<PeerId>() {
+                    trusted.insert(peer_id);
+                }
+            }
+        }
+
+        self.trusted_peer_ids = trusted;
+        println!(
+            "[AutoConnect] Trusted peer registry loaded: {} peer(s)",
+            self.trusted_peer_ids.len()
+        );
+    }
+
+    pub(super) fn remember_trusted_peer_id(&mut self, peer_id: PeerId) {
+        self.trusted_peer_ids.insert(peer_id);
+    }
+
+    pub(super) fn remember_trusted_peer_id_str(&mut self, peer_id: &str) {
+        if let Ok(parsed) = peer_id.parse::<PeerId>() {
+            self.remember_trusted_peer_id(parsed);
+        }
+    }
+
+    fn note_auto_connect_started(&mut self, peer_id: PeerId) {
+        let now = std::time::Instant::now();
+        self.auto_connect_inflight.insert(peer_id, now);
+        self.auto_connect_backoff_until
+            .insert(peer_id, now + Self::MDNS_DIAL_DEBOUNCE);
+    }
+
+    fn note_auto_connect_success(&mut self, peer_id: PeerId) {
+        self.auto_connect_inflight.remove(&peer_id);
+        self.auto_connect_backoff_until.remove(&peer_id);
+        self.auto_connect_failures.remove(&peer_id);
+    }
+
+    fn note_auto_connect_failure(&mut self, peer_id: PeerId) {
+        let now = std::time::Instant::now();
+        if self.auto_connect_inflight.remove(&peer_id).is_none() {
+            return;
+        }
+        let attempts = self.auto_connect_failures.entry(peer_id).or_insert(0);
+        *attempts = attempts.saturating_add(1);
+        let pow = std::cmp::min(*attempts, 6);
+        let secs = 1u64 << pow;
+        let backoff = std::cmp::min(
+            std::time::Duration::from_secs(secs),
+            Self::AUTO_CONNECT_MAX_BACKOFF,
+        );
+        self.auto_connect_backoff_until.insert(peer_id, now + backoff);
+        println!(
+            "[AutoConnect] Attempt failed for {} (attempt {}), retry in {:.1}s",
+            peer_id,
+            *attempts,
+            backoff.as_secs_f32()
+        );
+    }
+
+    pub(super) async fn maybe_auto_connect_trusted_peer(&mut self, peer_id: PeerId) {
+        let now = std::time::Instant::now();
+        self.prune_stale_mdns_dials(now);
+
+        if !self.trusted_peer_ids.contains(&peer_id) {
+            println!("[AutoConnect] Skipped unknown peer {}", peer_id);
+            return;
+        }
+        if self.swarm.is_connected(&peer_id) {
+            self.note_auto_connect_success(peer_id);
+            println!("[AutoConnect] Skipped {} (already connected)", peer_id);
+            return;
+        }
+        if self.pending_requests.contains(&peer_id) || self.incoming_requests.contains(&peer_id) {
+            println!("[AutoConnect] Skipped {} (request already in-flight)", peer_id);
+            return;
+        }
+        if self.auto_connect_inflight.contains_key(&peer_id) {
+            println!("[AutoConnect] Skipped {} (auto-connect attempt in-flight)", peer_id);
+            return;
+        }
+        if let Some(until) = self.auto_connect_backoff_until.get(&peer_id) {
+            if *until > now {
+                println!(
+                    "[AutoConnect] Skipped {} (cooldown {:.1}s)",
+                    peer_id,
+                    until.duration_since(now).as_secs_f32()
+                );
+                return;
+            }
+        }
+
+        println!("[AutoConnect] Auto-requesting trusted peer {}", peer_id);
+        self.note_auto_connect_started(peer_id);
+        self.handle_connection_request(&peer_id.to_string()).await;
     }
 
     pub(super) async fn resolve_peer_id(
@@ -677,16 +820,37 @@ impl NetworkManager {
         Some(chat_id)
     }
 
+    pub(super) fn emit_connected_chat_ids_updated(&self) {
+        let app_handle = self.app_handle.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = app_handle.state::<crate::NetworkState>();
+            let mut connected_ids: Vec<String> = {
+                let connected = state.connected_chat_ids.lock().await;
+                connected.iter().cloned().collect()
+            };
+            connected_ids.sort_unstable();
+            let _ = app_handle.emit("connected-chat-ids-updated", connected_ids);
+        });
+    }
+
     pub(super) async fn mark_connected_chat_id(&mut self, chat_id: String) {
         let state = self.app_handle.state::<crate::NetworkState>();
         let mut connected = state.connected_chat_ids.lock().await;
-        connected.insert(chat_id);
+        let changed = connected.insert(chat_id);
+        drop(connected);
+        if changed {
+            self.emit_connected_chat_ids_updated();
+        }
     }
 
     pub(super) async fn unmark_connected_chat_id(&mut self, chat_id: &str) {
         let state = self.app_handle.state::<crate::NetworkState>();
         let mut connected = state.connected_chat_ids.lock().await;
-        connected.remove(chat_id);
+        let changed = connected.remove(chat_id);
+        drop(connected);
+        if changed {
+            self.emit_connected_chat_ids_updated();
+        }
     }
 
     pub(super) async fn note_chat_connection_established(

@@ -90,6 +90,7 @@
     | "accept-invite-user"
     | "accept-invite-code" = "select-network";
   let localPeers: { peer_id: string; addresses: string[] }[] = [];
+  let connectedChatIds = new Set<string>();
 
   // Context Menu
   let showContextMenu = false;
@@ -267,6 +268,12 @@
       await listen("local-peer-expired", (event: any) => {
         localPeers = localPeers.filter((p) => p.peer_id !== event.payload);
       });
+      await listen("connected-chat-ids-updated", (event: any) => {
+        const ids = Array.isArray(event.payload) ? event.payload : [];
+        connectedChatIds = new Set(
+          ids.map((id: string) => (id === "self" ? "Me" : id)),
+        );
+      });
       // Update chat order and unread counts when new message arrives
       await listen("message-received", (event: any) => {
         const rawChatId = event.payload?.chat_id;
@@ -440,6 +447,10 @@
       const unreadRaw = await api.getUnreadCounts("Me");
       unreadCounts = Object.fromEntries(
         Object.entries(unreadRaw).map(([k, v]) => [k === "self" ? "Me" : k, v]),
+      );
+      const connectedIds = await api.getConnectedChatIds();
+      connectedChatIds = new Set(
+        connectedIds.map((id) => (id === "self" ? "Me" : id)),
       );
     } catch (e) {
       console.error("Refresh failed:", e);
@@ -717,7 +728,7 @@
       {isDragging}
       {draggingPeer}
       {connectivitySettings}
-      {localPeers}
+      {connectedChatIds}
       {unreadCounts}
       onselectConnectivityMode={handleSetConnectivityMode}
       ontoggleSidebar={() => (isSidebarOpen = !isSidebarOpen)}

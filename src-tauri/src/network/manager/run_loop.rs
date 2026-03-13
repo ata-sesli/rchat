@@ -4,6 +4,7 @@ impl NetworkManager {
     pub async fn run(mut self: Self) {
         println!("🛜 Network Manager: Running!");
         self.refresh_peer_mapping_cache().await;
+        self.refresh_trusted_peer_registry().await;
 
         let control_topic = crate::network::gossip::control_topic();
         if let Err(e) = self
@@ -125,7 +126,7 @@ impl NetworkManager {
                     let _ = self.swarm.dial(addr);
                 }
                 Some(peer) = self.mdns_rx.recv() => {
-                    self.handle_mdns_peer(peer);
+                    self.handle_mdns_peer(peer).await;
                 }
                 Some(transfer_result) = self.transfer_result_rx.recv() => {
                     self.handle_transfer_result(transfer_result).await;

@@ -32,7 +32,7 @@
       nat_keepalive_enabled: true,
       punch_assist_enabled: true,
     } as ConnectivitySettings,
-    localPeers = [] as { peer_id: string; addresses: string[] }[],
+    connectedChatIds = new Set<string>() as Set<string>,
     unreadCounts = {} as Record<string, number>,
     // Callbacks
     onselectConnectivityMode = (_mode: ConnectivityMode) => {},
@@ -213,7 +213,7 @@
   function isPeerOnline(peerId: string) {
     if (peerId === "Me") return true;
     if (isGroupChat(peerId)) return true;
-    return localPeers.some((p) => p.peer_id === peerId);
+    return connectedChatIds.has(peerId);
   }
 
   function closeMenusOnWindowClick() {

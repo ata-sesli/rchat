@@ -197,6 +197,45 @@ fn outgoing_status_for_chat(chat_kind: ChatKind) -> Result<&'static str, String>
     }
 }
 
+fn ensure_persisted_outgoing_chat(
+    conn: &rusqlite::Connection,
+    chat_kind: ChatKind,
+    canonical_chat_id: &str,
+) -> Result<(), String> {
+    match chat_kind {
+        ChatKind::Direct => {
+            if !storage::db::is_peer(conn, canonical_chat_id) {
+                storage::db::add_peer(conn, canonical_chat_id, None, None, "local")
+                    .map_err(|e| e.to_string())?;
+            }
+
+            if !storage::db::chat_exists(conn, canonical_chat_id) {
+                storage::db::create_chat(conn, canonical_chat_id, canonical_chat_id, false)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        ChatKind::Group => {
+            if !storage::db::chat_exists(conn, canonical_chat_id) {
+                storage::db::upsert_chat(
+                    conn,
+                    canonical_chat_id,
+                    &chat_kind::default_group_name(canonical_chat_id),
+                    true,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            storage::db::add_chat_member(conn, canonical_chat_id, "Me", "member")
+                .map_err(|e| e.to_string())?;
+        }
+        ChatKind::SelfChat
+        | ChatKind::TemporaryDirect
+        | ChatKind::TemporaryGroup
+        | ChatKind::Archived => {}
+    }
+
+    Ok(())
+}
+
 async fn store_outgoing_temp_message(
     net_state: &State<'_, NetworkState>,
     chat_id: &str,
@@ -337,19 +376,7 @@ pub async fn send_image_message(
         store_outgoing_temp_message(&net_state, &chat_id, message).await;
     } else {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
-        if matches!(chat_kind, ChatKind::Group)
-            && !storage::db::chat_exists(&conn, &canonical_peer_id)
-        {
-            storage::db::upsert_chat(
-                &conn,
-                &canonical_peer_id,
-                &chat_kind::default_group_name(&canonical_peer_id),
-                true,
-            )
-            .map_err(|e| e.to_string())?;
-            storage::db::add_chat_member(&conn, &canonical_peer_id, "Me", "member")
-                .map_err(|e| e.to_string())?;
-        }
+        ensure_persisted_outgoing_chat(&conn, chat_kind, &canonical_peer_id)?;
         if let Err(e) = storage::db::insert_message(&conn, &message) {
             eprintln!("[Backend] Failed to save image message: {}", e);
             return Err(e.to_string());
@@ -553,19 +580,7 @@ pub async fn send_document_message(
         store_outgoing_temp_message(&net_state, &chat_id, message).await;
     } else {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
-        if matches!(chat_kind, ChatKind::Group)
-            && !storage::db::chat_exists(&conn, &canonical_peer_id)
-        {
-            storage::db::upsert_chat(
-                &conn,
-                &canonical_peer_id,
-                &chat_kind::default_group_name(&canonical_peer_id),
-                true,
-            )
-            .map_err(|e| e.to_string())?;
-            storage::db::add_chat_member(&conn, &canonical_peer_id, "Me", "member")
-                .map_err(|e| e.to_string())?;
-        }
+        ensure_persisted_outgoing_chat(&conn, chat_kind, &canonical_peer_id)?;
 
         if let Err(e) = storage::db::insert_message(&conn, &message) {
             eprintln!("[Backend] Failed to save document message: {}", e);
@@ -707,19 +722,7 @@ pub async fn send_video_message(
         store_outgoing_temp_message(&net_state, &chat_id, message).await;
     } else {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
-        if matches!(chat_kind, ChatKind::Group)
-            && !storage::db::chat_exists(&conn, &canonical_peer_id)
-        {
-            storage::db::upsert_chat(
-                &conn,
-                &canonical_peer_id,
-                &chat_kind::default_group_name(&canonical_peer_id),
-                true,
-            )
-            .map_err(|e| e.to_string())?;
-            storage::db::add_chat_member(&conn, &canonical_peer_id, "Me", "member")
-                .map_err(|e| e.to_string())?;
-        }
+        ensure_persisted_outgoing_chat(&conn, chat_kind, &canonical_peer_id)?;
 
         if let Err(e) = storage::db::insert_message(&conn, &message) {
             eprintln!("[Backend] Failed to save video message: {}", e);
@@ -864,19 +867,7 @@ pub async fn send_audio_message(
         store_outgoing_temp_message(&net_state, &chat_id, message).await;
     } else {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
-        if matches!(chat_kind, ChatKind::Group)
-            && !storage::db::chat_exists(&conn, &canonical_peer_id)
-        {
-            storage::db::upsert_chat(
-                &conn,
-                &canonical_peer_id,
-                &chat_kind::default_group_name(&canonical_peer_id),
-                true,
-            )
-            .map_err(|e| e.to_string())?;
-            storage::db::add_chat_member(&conn, &canonical_peer_id, "Me", "member")
-                .map_err(|e| e.to_string())?;
-        }
+        ensure_persisted_outgoing_chat(&conn, chat_kind, &canonical_peer_id)?;
 
         if let Err(e) = storage::db::insert_message(&conn, &message) {
             eprintln!("[Backend] Failed to save audio message: {}", e);
@@ -1198,19 +1189,7 @@ pub async fn send_sticker_message(
         };
 
         if !is_temporary {
-            if matches!(chat_kind, ChatKind::Group)
-                && !storage::db::chat_exists(&conn, &canonical_peer_id)
-            {
-                storage::db::upsert_chat(
-                    &conn,
-                    &canonical_peer_id,
-                    &chat_kind::default_group_name(&canonical_peer_id),
-                    true,
-                )
-                .map_err(|e| e.to_string())?;
-                storage::db::add_chat_member(&conn, &canonical_peer_id, "Me", "member")
-                    .map_err(|e| e.to_string())?;
-            }
+            ensure_persisted_outgoing_chat(&conn, chat_kind, &canonical_peer_id)?;
         }
 
         (file_name, chat_id)

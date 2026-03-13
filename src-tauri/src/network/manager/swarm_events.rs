@@ -158,7 +158,7 @@ impl NetworkManager {
         }
     }
 
-    pub(super) fn handle_mdns_peer(&mut self, peer: crate::network::mdns::MdnsPeer) {
+    pub(super) async fn handle_mdns_peer(&mut self, peer: crate::network::mdns::MdnsPeer) {
         if !self.is_mdns_enabled() {
             return;
         }
@@ -194,6 +194,7 @@ impl NetworkManager {
                             .unwrap_or_default(),
                     };
                     let _ = self.app_handle.emit("local-peer-discovered", peer_info);
+                    self.maybe_auto_connect_trusted_peer(peer_id).await;
                     return;
                 }
 
@@ -209,6 +210,7 @@ impl NetworkManager {
                             .unwrap_or_default(),
                     };
                     let _ = self.app_handle.emit("local-peer-discovered", peer_info);
+                    self.maybe_auto_connect_trusted_peer(peer_id).await;
                     return;
                 }
 
@@ -265,6 +267,7 @@ impl NetworkManager {
                         .unwrap_or_default(),
                 };
                 let _ = self.app_handle.emit("local-peer-discovered", peer_info);
+                self.maybe_auto_connect_trusted_peer(peer_id).await;
             }
             Err(e) => {
                 eprintln!("[NetworkManager] Invalid Peer ID from mDNS: {}", e);

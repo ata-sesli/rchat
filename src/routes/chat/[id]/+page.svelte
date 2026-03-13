@@ -34,8 +34,7 @@
   let unlisten: () => void;
   let unlistenStatus: () => void;
   let unlistenVoiceCall: () => void;
-  let unlistenPeerDiscovered: () => void;
-  let unlistenPeerExpired: () => void;
+  let unlistenConnectedChatIds: () => void;
   let voiceCallState: VoiceCallState = { phase: "idle", muted: false };
   let connectedChatIds = new Set<string>();
   let activeConversationIds = new Set<string>();
@@ -136,17 +135,11 @@
     unlistenVoiceCall = await listen<VoiceCallState>("voice-call-state-updated", (event) => {
       voiceCallState = event.payload;
     });
-    unlistenPeerDiscovered = await listen("local-peer-discovered", (event: any) => {
-      const chatId = event.payload?.peer_id;
-      if (!chatId) return;
-      connectedChatIds = new Set([...connectedChatIds, chatId]);
-    });
-    unlistenPeerExpired = await listen("local-peer-expired", (event: any) => {
-      const chatId = String(event.payload ?? "");
-      if (!chatId) return;
-      const next = new Set(connectedChatIds);
-      next.delete(chatId);
-      connectedChatIds = next;
+    unlistenConnectedChatIds = await listen("connected-chat-ids-updated", (event: any) => {
+      const ids = Array.isArray(event.payload) ? event.payload : [];
+      connectedChatIds = new Set(
+        ids.map((id: string) => (id === "self" ? "Me" : id)),
+      );
     });
 
     // Listen for message status updates (e.g., delivered -> read)
@@ -174,8 +167,7 @@
     if (unlisten) unlisten();
     if (unlistenStatus) unlistenStatus();
     if (unlistenVoiceCall) unlistenVoiceCall();
-    if (unlistenPeerDiscovered) unlistenPeerDiscovered();
-    if (unlistenPeerExpired) unlistenPeerExpired();
+    if (unlistenConnectedChatIds) unlistenConnectedChatIds();
   });
 
   async function handleSendMessage(text: string) {

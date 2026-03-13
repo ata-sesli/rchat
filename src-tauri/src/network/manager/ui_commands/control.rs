@@ -49,7 +49,7 @@ impl NetworkManager {
     }
 
     /// Handle a connection request from UI (user pressed Connect on a peer)
-    pub(super) async fn handle_connection_request(&mut self, peer_id_str: &str) {
+    pub(crate) async fn handle_connection_request(&mut self, peer_id_str: &str) {
         println!("[Handshake] User requested connection to: {}", peer_id_str);
 
         let peer_id = if let Some(p) = self.resolve_peer_id(peer_id_str, "Handshake").await {
@@ -119,6 +119,7 @@ impl NetworkManager {
     fn complete_handshake(&mut self, peer_id: PeerId) {
         self.pending_requests.remove(&peer_id);
         self.incoming_requests.remove(&peer_id);
+        self.remember_trusted_peer_id(peer_id);
 
         use tauri::Manager;
         let state = self.app_handle.state::<crate::AppState>();
