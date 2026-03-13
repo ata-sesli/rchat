@@ -25,6 +25,10 @@ use crate::commands::chat::{
     join_group_chat, leave_group_chat, mark_messages_read, save_temporary_chat_to_archive,
     send_message, send_message_to_self,
 };
+use crate::commands::chat_details::{
+    drop_chat_connection, force_chat_reconnect, get_chat_details_overview, get_chat_stats,
+    list_chat_files,
+};
 use crate::commands::envelopes::{
     create_envelope, delete_envelope, get_envelope_assignments, get_envelopes,
     move_chat_to_envelope, update_envelope,
@@ -145,6 +149,11 @@ pub fn run() {
             set_fast_discovery,
             get_chat_latest_times,
             get_chat_list,
+            get_chat_details_overview,
+            get_chat_stats,
+            list_chat_files,
+            drop_chat_connection,
+            force_chat_reconnect,
             send_image_message,
             get_image_data,
             get_image_from_path,

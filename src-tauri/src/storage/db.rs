@@ -58,6 +58,43 @@ pub struct ChatListItem {
     pub is_group: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ChatConnectionStats {
+    pub first_connected_at: Option<i64>,
+    pub last_connected_at: Option<i64>,
+    pub reconnect_count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ChatContentBreakdown {
+    pub text: i64,
+    pub sticker: i64,
+    pub image: i64,
+    pub video: i64,
+    pub audio: i64,
+    pub document: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ChatMessageStats {
+    pub sent_total: i64,
+    pub received_total: i64,
+    pub sent: ChatContentBreakdown,
+    pub received: ChatContentBreakdown,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChatFileRow {
+    pub message_id: String,
+    pub timestamp: i64,
+    pub content_type: String,
+    pub file_hash: String,
+    pub file_name: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub mime_type: Option<String>,
+    pub sender: String,
+}
+
 // --- 2. Database Initialization ---
 pub fn connect_to_db() -> anyhow::Result<Connection> {
     if let Some(project_dirs) = ProjectDirs::from("io.github", "ata-sesli", "RChat") {
@@ -195,6 +232,17 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
         [],
     )?;
 
+    // 5c. Per-chat durable connection stats
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS chat_connection_stats (
+             chat_id TEXT NOT NULL PRIMARY KEY,
+             first_connected_at INTEGER,
+             last_connected_at INTEGER,
+             reconnect_count INTEGER NOT NULL DEFAULT 0
+         )",
+        [],
+    )?;
+
     // 6. Messages
     conn.execute(
         "CREATE TABLE IF NOT EXISTS messages (
@@ -286,6 +334,12 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
     // Speed up sticker list ordering
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_stickers_created_at ON stickers(created_at DESC)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chat_connection_stats_last_connected
+         ON chat_connection_stats(last_connected_at DESC)",
         [],
     )?;
 
@@ -555,6 +609,76 @@ pub fn get_chat_list(conn: &Connection) -> anyhow::Result<Vec<ChatListItem>> {
     Ok(items)
 }
 
+pub fn get_chat_name(conn: &Connection, chat_id: &str) -> anyhow::Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM chats WHERE id = ?1 LIMIT 1")?;
+    let mut rows = stmt.query([chat_id])?;
+    if let Some(row) = rows.next()? {
+        return Ok(Some(row.get(0)?));
+    }
+    Ok(None)
+}
+
+pub fn get_peer_alias(conn: &Connection, peer_id: &str) -> anyhow::Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT alias FROM peers WHERE id = ?1 LIMIT 1")?;
+    let mut rows = stmt.query([peer_id])?;
+    if let Some(row) = rows.next()? {
+        return Ok(Some(row.get(0)?));
+    }
+    Ok(None)
+}
+
+pub fn record_chat_connection_established(
+    conn: &Connection,
+    chat_id: &str,
+    connected_at: i64,
+) -> anyhow::Result<()> {
+    let existing = get_chat_connection_stats(conn, chat_id)?;
+    match existing.first_connected_at {
+        None => {
+            conn.execute(
+                "INSERT INTO chat_connection_stats (chat_id, first_connected_at, last_connected_at, reconnect_count)
+                 VALUES (?1, ?2, ?3, 0)
+                 ON CONFLICT(chat_id) DO UPDATE SET
+                    first_connected_at = COALESCE(chat_connection_stats.first_connected_at, excluded.first_connected_at),
+                    last_connected_at = excluded.last_connected_at,
+                    reconnect_count = chat_connection_stats.reconnect_count",
+                (chat_id, connected_at, connected_at),
+            )?;
+        }
+        Some(_) => {
+            conn.execute(
+                "UPDATE chat_connection_stats
+                 SET last_connected_at = ?2, reconnect_count = reconnect_count + 1
+                 WHERE chat_id = ?1",
+                (chat_id, connected_at),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn get_chat_connection_stats(
+    conn: &Connection,
+    chat_id: &str,
+) -> anyhow::Result<ChatConnectionStats> {
+    let mut stmt = conn.prepare(
+        "SELECT first_connected_at, last_connected_at, reconnect_count
+         FROM chat_connection_stats
+         WHERE chat_id = ?1",
+    )?;
+    let mut rows = stmt.query([chat_id])?;
+    if let Some(row) = rows.next()? {
+        return Ok(ChatConnectionStats {
+            first_connected_at: row.get(0)?,
+            last_connected_at: row.get(1)?,
+            reconnect_count: row.get::<_, i64>(2)?,
+        });
+    }
+
+    Ok(ChatConnectionStats::default())
+}
+
 /// Delete a peer and their related chat/messages
 pub fn delete_peer(conn: &Connection, peer_id: &str) -> anyhow::Result<()> {
     conn.execute("DELETE FROM chat_peers WHERE peer_id = ?1", [peer_id])?;
@@ -754,6 +878,112 @@ pub fn get_chat_latest_times(
         result.insert(chat_id, latest_time);
     }
 
+    Ok(result)
+}
+
+pub fn get_chat_message_stats(conn: &Connection, chat_id: &str) -> anyhow::Result<ChatMessageStats> {
+    let mut stmt = conn.prepare(
+        "SELECT
+            SUM(CASE WHEN peer_id = 'Me' THEN 1 ELSE 0 END) AS sent_total,
+            SUM(CASE WHEN peer_id != 'Me' THEN 1 ELSE 0 END) AS received_total,
+            SUM(CASE WHEN peer_id = 'Me' AND content_type = 'text' THEN 1 ELSE 0 END) AS sent_text,
+            SUM(CASE WHEN peer_id = 'Me' AND content_type = 'sticker' THEN 1 ELSE 0 END) AS sent_sticker,
+            SUM(CASE WHEN peer_id = 'Me' AND (content_type = 'image' OR content_type = 'photo') THEN 1 ELSE 0 END) AS sent_image,
+            SUM(CASE WHEN peer_id = 'Me' AND content_type = 'video' THEN 1 ELSE 0 END) AS sent_video,
+            SUM(CASE WHEN peer_id = 'Me' AND content_type = 'audio' THEN 1 ELSE 0 END) AS sent_audio,
+            SUM(CASE WHEN peer_id = 'Me' AND content_type = 'document' THEN 1 ELSE 0 END) AS sent_document,
+            SUM(CASE WHEN peer_id != 'Me' AND content_type = 'text' THEN 1 ELSE 0 END) AS recv_text,
+            SUM(CASE WHEN peer_id != 'Me' AND content_type = 'sticker' THEN 1 ELSE 0 END) AS recv_sticker,
+            SUM(CASE WHEN peer_id != 'Me' AND (content_type = 'image' OR content_type = 'photo') THEN 1 ELSE 0 END) AS recv_image,
+            SUM(CASE WHEN peer_id != 'Me' AND content_type = 'video' THEN 1 ELSE 0 END) AS recv_video,
+            SUM(CASE WHEN peer_id != 'Me' AND content_type = 'audio' THEN 1 ELSE 0 END) AS recv_audio,
+            SUM(CASE WHEN peer_id != 'Me' AND content_type = 'document' THEN 1 ELSE 0 END) AS recv_document
+         FROM messages
+         WHERE chat_id = ?1",
+    )?;
+
+    let stats = stmt.query_row([chat_id], |row| {
+        let sent_total = row.get::<_, Option<i64>>(0)?.unwrap_or(0);
+        let received_total = row.get::<_, Option<i64>>(1)?.unwrap_or(0);
+        Ok(ChatMessageStats {
+            sent_total,
+            received_total,
+            sent: ChatContentBreakdown {
+                text: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                sticker: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                image: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                video: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                audio: row.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                document: row.get::<_, Option<i64>>(7)?.unwrap_or(0),
+            },
+            received: ChatContentBreakdown {
+                text: row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                sticker: row.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                image: row.get::<_, Option<i64>>(10)?.unwrap_or(0),
+                video: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                audio: row.get::<_, Option<i64>>(12)?.unwrap_or(0),
+                document: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+            },
+        })
+    })?;
+
+    Ok(stats)
+}
+
+pub fn list_chat_files(
+    conn: &Connection,
+    chat_id: &str,
+    filter: &str,
+    limit: i64,
+    offset: i64,
+) -> anyhow::Result<Vec<ChatFileRow>> {
+    let safe_limit = limit.clamp(1, 200);
+    let safe_offset = offset.max(0);
+    let filter_lower = filter.to_lowercase();
+
+    let mut stmt = conn.prepare(
+        "SELECT
+            m.id,
+            m.timestamp,
+            m.content_type,
+            m.file_hash,
+            COALESCE(f.file_name, m.text_content) AS file_name,
+            f.size_bytes,
+            f.mime_type,
+            m.peer_id
+         FROM messages m
+         LEFT JOIN files f ON f.file_hash = m.file_hash
+         WHERE m.chat_id = ?1
+           AND m.file_hash IS NOT NULL
+           AND (
+               ?2 = 'all'
+               OR (?2 = 'image' AND (m.content_type = 'image' OR m.content_type = 'photo'))
+               OR m.content_type = ?2
+           )
+         ORDER BY m.timestamp DESC
+         LIMIT ?3 OFFSET ?4",
+    )?;
+
+    let rows = stmt.query_map(
+        rusqlite::params![chat_id, filter_lower, safe_limit, safe_offset],
+        |row| {
+            Ok(ChatFileRow {
+                message_id: row.get(0)?,
+                timestamp: row.get(1)?,
+                content_type: row.get(2)?,
+                file_hash: row.get(3)?,
+                file_name: row.get(4)?,
+                size_bytes: row.get(5)?,
+                mime_type: row.get(6)?,
+                sender: row.get(7)?,
+            })
+        },
+    )?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
     Ok(result)
 }
 
@@ -967,5 +1197,23 @@ mod tests {
             .expect("check messages");
         assert!(!chat_exists);
         assert!(!msg_exists);
+    }
+
+    #[test]
+    fn connection_stats_increment_only_after_first_connect() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        create_tables(&conn).expect("schema");
+
+        record_chat_connection_established(&conn, "peer-a", 10).expect("first connect");
+        let first = get_chat_connection_stats(&conn, "peer-a").expect("read first");
+        assert_eq!(first.first_connected_at, Some(10));
+        assert_eq!(first.last_connected_at, Some(10));
+        assert_eq!(first.reconnect_count, 0);
+
+        record_chat_connection_established(&conn, "peer-a", 20).expect("reconnect");
+        let second = get_chat_connection_stats(&conn, "peer-a").expect("read second");
+        assert_eq!(second.first_connected_at, Some(10));
+        assert_eq!(second.last_connected_at, Some(20));
+        assert_eq!(second.reconnect_count, 1);
     }
 }

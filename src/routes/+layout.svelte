@@ -23,6 +23,7 @@
   import EnvelopeModal from "../components/sidebar/EnvelopeModal.svelte";
   import NewPersonModal from "../components/sidebar/NewPersonModal.svelte";
   import GroupChatModal from "../components/chat/GroupChatModal.svelte";
+  import ChatDetailsModal from "../components/chat/ChatDetailsModal.svelte";
   import Sidebar from "../components/sidebar/Sidebar.svelte";
   import ThemeProvider from "../components/ThemeProvider.svelte";
 
@@ -77,6 +78,8 @@
   let showCreateMenu = false;
   let showNewPersonModal = false;
   let showNewGroupModal = false;
+  let showChatDetailsModal = false;
+  let chatDetailsChatId: string | null = null;
   let newPersonStep:
     | "select-network"
     | "local-scan"
@@ -503,6 +506,12 @@
           await refreshData();
           goto(`/chat/${result.chat_id}`);
         }
+        if (action === "more") {
+          if (getChatKind(id) === "dm") {
+            chatDetailsChatId = id;
+            showChatDetailsModal = true;
+          }
+        }
         if (action === "remove") {
           // Remove from envelope = move to root
           await api.moveChatToEnvelope(id === "Me" ? "self" : id, null);
@@ -817,6 +826,15 @@
         {pinnedPeers}
         {currentEnvelope}
         onaction={handleContextAction}
+      />
+
+      <ChatDetailsModal
+        show={showChatDetailsModal}
+        chatId={chatDetailsChatId}
+        onclose={() => {
+          showChatDetailsModal = false;
+          chatDetailsChatId = null;
+        }}
       />
 
       {#if voiceCallState.phase === "incoming_ringing" && voiceCallState.call_id}

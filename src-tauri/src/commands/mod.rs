@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod call;
 pub mod chat;
+pub mod chat_details;
 pub mod envelopes;
 pub mod invite;
 pub mod media;

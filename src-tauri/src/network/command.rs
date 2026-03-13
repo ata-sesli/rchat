@@ -19,6 +19,9 @@ pub enum NetworkCommand {
     RequestConnection {
         peer_id: String,
     },
+    DropConnection {
+        peer_id: String,
+    },
     RegisterShadow {
         invitee: String,
         password: String,

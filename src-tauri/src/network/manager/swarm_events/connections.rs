@@ -1,6 +1,22 @@
 use super::*;
 
 impl NetworkManager {
+    fn record_chat_reconnection(&self, chat_id: &str, connected_at: i64) {
+        use tauri::Manager;
+        let state = self.app_handle.state::<crate::AppState>();
+        let Ok(conn) = state.db_conn.lock() else {
+            return;
+        };
+        if let Err(e) =
+            crate::storage::db::record_chat_connection_established(&conn, chat_id, connected_at)
+        {
+            eprintln!(
+                "[Connection] Failed to update reconnect counters for {}: {}",
+                chat_id, e
+            );
+        }
+    }
+
     pub(super) async fn handle_connection_established(
         &mut self,
         peer_id: PeerId,
@@ -35,10 +51,27 @@ impl NetworkManager {
         }
 
         let remote_addr_str = remote_addr.to_string();
+        let connected_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         let peer_id_str = peer_id.to_string();
         self.mark_connected_chat_id(peer_id_str.clone()).await;
+        let transitioned = self
+            .note_chat_connection_established(&peer_id_str, &remote_addr_str, connected_at)
+            .await;
+        if transitioned {
+            self.record_chat_reconnection(&peer_id_str, connected_at);
+        }
         if let Some(username) = self.github_by_peer_id.get(&peer_id_str).cloned() {
-            self.mark_connected_chat_id(format!("gh:{}", username)).await;
+            let chat_id = format!("gh:{}", username);
+            self.mark_connected_chat_id(chat_id.clone()).await;
+            let transitioned = self
+                .note_chat_connection_established(&chat_id, &remote_addr_str, connected_at)
+                .await;
+            if transitioned {
+                self.record_chat_reconnection(&chat_id, connected_at);
+            }
         }
 
         if let Some(chat_id) = self.temp_chat_by_peer_id.get(&peer_id_str).cloned() {
@@ -101,6 +134,13 @@ impl NetworkManager {
             self.cache_peer_mapping(&inviter_github_user, &peer_id_str);
             self.mark_connected_chat_id(format!("gh:{}", inviter_github_user))
                 .await;
+            let chat_id = format!("gh:{}", inviter_github_user);
+            let transitioned = self
+                .note_chat_connection_established(&chat_id, &remote_addr_str, connected_at)
+                .await;
+            if transitioned {
+                self.record_chat_reconnection(&chat_id, connected_at);
+            }
 
             let app_handle = self.app_handle.clone();
             let gh_user = inviter_github_user.clone();
@@ -201,8 +241,10 @@ impl NetworkManager {
 
                 let peer_id_str = peer_id.to_string();
                 self.unmark_connected_chat_id(&peer_id_str).await;
+                self.note_chat_connection_closed(&peer_id_str).await;
                 if let Some(chat_id) = self.remove_temporary_by_peer_id(&peer_id_str) {
                     self.unmark_connected_chat_id(&chat_id).await;
+                    self.note_chat_connection_closed(&chat_id).await;
                     let _ = self.app_handle.emit(
                         "temporary-chat-ended",
                         serde_json::json!({
@@ -214,8 +256,9 @@ impl NetworkManager {
                 }
 
                 if let Some(username) = self.github_by_peer_id.get(&peer_id_str).cloned() {
-                    self.unmark_connected_chat_id(&format!("gh:{}", username))
-                        .await;
+                    let chat_id = format!("gh:{}", username);
+                    self.unmark_connected_chat_id(&chat_id).await;
+                    self.note_chat_connection_closed(&chat_id).await;
                     let _ = self
                         .app_handle
                         .emit("local-peer-expired", format!("gh:{}", username));
@@ -224,8 +267,9 @@ impl NetworkManager {
 
                 self.refresh_peer_mapping_cache().await;
                 if let Some(username) = self.github_by_peer_id.get(&peer_id_str).cloned() {
-                    self.unmark_connected_chat_id(&format!("gh:{}", username))
-                        .await;
+                    let chat_id = format!("gh:{}", username);
+                    self.unmark_connected_chat_id(&chat_id).await;
+                    self.note_chat_connection_closed(&chat_id).await;
                     let _ = self
                         .app_handle
                         .emit("local-peer-expired", format!("gh:{}", username));

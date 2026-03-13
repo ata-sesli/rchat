@@ -34,6 +34,11 @@ export const COMMANDS = {
   togglePinPeer: "toggle_pin_peer",
   getChatLatestTimes: "get_chat_latest_times",
   getChatList: "get_chat_list",
+  getChatDetailsOverview: "get_chat_details_overview",
+  getChatStats: "get_chat_stats",
+  listChatFiles: "list_chat_files",
+  dropChatConnection: "drop_chat_connection",
+  forceChatReconnect: "force_chat_reconnect",
   saveTemporaryChatToArchive: "save_temporary_chat_to_archive",
   createGroupChat: "create_group_chat",
   joinGroupChat: "join_group_chat",
@@ -185,6 +190,60 @@ export type ChatListItem = {
   id: string;
   name: string;
   is_group: boolean;
+};
+
+export type ChatConnectionView = {
+  connected: boolean;
+  remote_addr?: string | null;
+  connected_since?: number | null;
+  last_connected_at?: number | null;
+  first_connected_at?: number | null;
+  reconnect_count: number;
+};
+
+export type ChatDetailsOverview = {
+  chat_id: string;
+  peer_id: string;
+  peer_name: string;
+  peer_alias?: string | null;
+  avatar_url?: string | null;
+  connection: ChatConnectionView;
+};
+
+export type ChatContentBreakdown = {
+  text: number;
+  sticker: number;
+  image: number;
+  video: number;
+  audio: number;
+  document: number;
+};
+
+export type ChatStats = {
+  sent_total: number;
+  received_total: number;
+  sent: ChatContentBreakdown;
+  received: ChatContentBreakdown;
+  reconnect_count: number;
+};
+
+export type ChatFileFilter =
+  | "all"
+  | "sticker"
+  | "image"
+  | "video"
+  | "document"
+  | "audio";
+
+export type ChatFileRow = {
+  message_id: string;
+  timestamp: number;
+  content_type: string;
+  file_hash: string;
+  file_name?: string | null;
+  size_bytes?: number | null;
+  mime_type?: string | null;
+  sender: string;
 };
 
 export type GroupChatResult = {
@@ -353,6 +412,31 @@ type CommandSpec = {
     result: Record<string, number>;
   };
   [COMMANDS.getChatList]: { args?: undefined; result: ChatListItem[] };
+  [COMMANDS.getChatDetailsOverview]: {
+    args: { chat_id: string };
+    result: ChatDetailsOverview;
+  };
+  [COMMANDS.getChatStats]: {
+    args: { chat_id: string };
+    result: ChatStats;
+  };
+  [COMMANDS.listChatFiles]: {
+    args: {
+      chat_id: string;
+      filter?: ChatFileFilter;
+      limit?: number;
+      offset?: number;
+    };
+    result: ChatFileRow[];
+  };
+  [COMMANDS.dropChatConnection]: {
+    args: { chat_id: string };
+    result: void;
+  };
+  [COMMANDS.forceChatReconnect]: {
+    args: { chat_id: string };
+    result: void;
+  };
   [COMMANDS.saveTemporaryChatToArchive]: {
     args: { chat_id: string };
     result: ArchivedChatResult;
@@ -634,6 +718,26 @@ export const api = {
     invokeCommand(COMMANDS.togglePinPeer, { username }),
   getChatLatestTimes: () => invokeCommand(COMMANDS.getChatLatestTimes),
   getChatList: () => invokeCommand(COMMANDS.getChatList),
+  getChatDetailsOverview: (chatId: string) =>
+    invokeCommand(COMMANDS.getChatDetailsOverview, { chat_id: chatId }),
+  getChatStats: (chatId: string) =>
+    invokeCommand(COMMANDS.getChatStats, { chat_id: chatId }),
+  listChatFiles: (
+    chatId: string,
+    filter: ChatFileFilter = "all",
+    limit = 50,
+    offset = 0
+  ) =>
+    invokeCommand(COMMANDS.listChatFiles, {
+      chat_id: chatId,
+      filter,
+      limit,
+      offset,
+    }),
+  dropChatConnection: (chatId: string) =>
+    invokeCommand(COMMANDS.dropChatConnection, { chat_id: chatId }),
+  forceChatReconnect: (chatId: string) =>
+    invokeCommand(COMMANDS.forceChatReconnect, { chat_id: chatId }),
   saveTemporaryChatToArchive: (chatId: string) =>
     invokeCommand(COMMANDS.saveTemporaryChatToArchive, { chat_id: chatId }),
   createGroupChat: (name?: string | null) =>

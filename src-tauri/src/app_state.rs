@@ -95,6 +95,14 @@ impl Default for VoiceCallState {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct ChatConnectionRuntime {
+    pub connected: bool,
+    pub remote_addr: Option<String>,
+    pub connected_since: Option<i64>,
+    pub last_connected_at: Option<i64>,
+}
+
 // This struct holds the Sender channel.
 // We wrap it in Mutex so multiple UI threads can use it safely.
 pub struct NetworkState {
@@ -106,6 +114,7 @@ pub struct NetworkState {
     pub stun_external_port: Mutex<Option<u16>>, // NAT-mapped UDP port for QUIC invites
     pub temporary_state: Mutex<TemporaryRuntimeState>, // In-memory temporary chat sessions/invites
     pub connected_chat_ids: Mutex<HashSet<String>>, // Currently connected chats/peers
+    pub chat_connections: Mutex<HashMap<String, ChatConnectionRuntime>>, // Runtime connection metadata by chat id
     pub voice_call_state: Mutex<VoiceCallState>, // Runtime voice-call state for UI polling
     pub connectivity: Mutex<crate::storage::config::ConnectivitySettings>, // Runtime connectivity controls
 }

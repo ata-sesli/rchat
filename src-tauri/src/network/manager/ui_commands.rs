@@ -16,6 +16,9 @@ impl NetworkManager {
             NetworkCommand::RequestConnection { peer_id } => {
                 self.handle_connection_request(&peer_id).await;
             }
+            NetworkCommand::DropConnection { peer_id } => {
+                self.handle_drop_connection(&peer_id).await;
+            }
             NetworkCommand::RegisterShadow {
                 invitee,
                 password,

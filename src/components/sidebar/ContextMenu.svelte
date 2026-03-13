@@ -39,12 +39,14 @@
           Remove from Envelope
         </button>
       {/if}
-      <button
-        onclick={() => handleAction("info")}
-        class="w-full text-left px-4 py-2 text-sm text-theme-base-300 hover:bg-theme-base-700 hover:text-white transition-colors"
-      >
-        Info
-      </button>
+      {#if targetKind === "dm"}
+        <button
+          onclick={() => handleAction("more")}
+          class="w-full text-left px-4 py-2 text-sm text-theme-base-300 hover:bg-theme-base-700 hover:text-white transition-colors"
+        >
+          More...
+        </button>
+      {/if}
       {#if targetKind === "tempdm" || targetKind === "tempgroup"}
         <button
           onclick={() => handleAction("save-archive")}

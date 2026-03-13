@@ -78,6 +78,20 @@ impl NetworkManager {
         }
     }
 
+    pub(super) async fn handle_drop_connection(&mut self, peer_id_str: &str) {
+        let Some(peer_id) = self.resolve_peer_id(peer_id_str, "Disconnect").await else {
+            return;
+        };
+
+        match self.swarm.disconnect_peer_id(peer_id) {
+            Ok(()) => println!("[Connection] 🔌 Disconnect requested for {}", peer_id),
+            Err(e) => eprintln!(
+                "[Connection] ❌ Failed to disconnect {}: {:?}",
+                peer_id, e
+            ),
+        }
+    }
+
     /// Handle incoming connection request from another peer
     pub(crate) fn handle_incoming_connection_request(&mut self, from_peer_id: PeerId) {
         println!(

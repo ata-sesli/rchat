@@ -154,6 +154,7 @@ pub async fn init(app_handle: AppHandle) -> Result<()> {
         stun_external_port: tokio::sync::Mutex::new(stun_external_port),
         temporary_state: tokio::sync::Mutex::new(crate::app_state::TemporaryRuntimeState::default()),
         connected_chat_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+        chat_connections: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         voice_call_state: tokio::sync::Mutex::new(crate::app_state::VoiceCallState::default()),
         connectivity: tokio::sync::Mutex::new(connectivity_settings),
     };

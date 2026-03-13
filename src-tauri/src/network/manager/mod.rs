@@ -473,6 +473,33 @@ impl NetworkManager {
         connected.remove(chat_id);
     }
 
+    pub(super) async fn note_chat_connection_established(
+        &mut self,
+        chat_id: &str,
+        remote_addr: &str,
+        connected_at: i64,
+    ) -> bool {
+        let state = self.app_handle.state::<crate::NetworkState>();
+        let mut runtime = state.chat_connections.lock().await;
+        let entry = runtime.entry(chat_id.to_string()).or_default();
+        let was_connected = entry.connected;
+        entry.connected = true;
+        entry.remote_addr = Some(remote_addr.to_string());
+        entry.last_connected_at = Some(connected_at);
+        if !was_connected {
+            entry.connected_since = Some(connected_at);
+        }
+        !was_connected
+    }
+
+    pub(super) async fn note_chat_connection_closed(&mut self, chat_id: &str) {
+        let state = self.app_handle.state::<crate::NetworkState>();
+        let mut runtime = state.chat_connections.lock().await;
+        let entry = runtime.entry(chat_id.to_string()).or_default();
+        entry.connected = false;
+        entry.connected_since = None;
+    }
+
     pub(super) async fn set_voice_call_state(
         &mut self,
         mut next: crate::app_state::VoiceCallState,
