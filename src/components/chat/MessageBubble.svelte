@@ -32,6 +32,10 @@
   let audioDataUrl: string | null = null;
   let loadingAudio = false;
   let downloadingAudio = false;
+  let imageRetryTimeout: ReturnType<typeof setTimeout> | null = null;
+  let audioRetryTimeout: ReturnType<typeof setTimeout> | null = null;
+  let imageRetryCount = 0;
+  let audioRetryCount = 0;
   let loadError = false;
   let unlistenTransfer: (() => void) | null = null;
   let showViewer = false;
@@ -49,6 +53,31 @@
     loadAudio(msg.file_hash);
   }
 
+  const MAX_MEDIA_RETRY_ATTEMPTS = 30;
+  const MEDIA_RETRY_MS = 1500;
+
+  function scheduleImageRetry(fileHash: string) {
+    if (imageDataUrl || loadingImage || imageRetryTimeout || imageRetryCount >= MAX_MEDIA_RETRY_ATTEMPTS) {
+      return;
+    }
+    imageRetryTimeout = setTimeout(() => {
+      imageRetryTimeout = null;
+      imageRetryCount += 1;
+      loadImage(fileHash);
+    }, MEDIA_RETRY_MS);
+  }
+
+  function scheduleAudioRetry(fileHash: string) {
+    if (audioDataUrl || loadingAudio || audioRetryTimeout || audioRetryCount >= MAX_MEDIA_RETRY_ATTEMPTS) {
+      return;
+    }
+    audioRetryTimeout = setTimeout(() => {
+      audioRetryTimeout = null;
+      audioRetryCount += 1;
+      loadAudio(fileHash);
+    }, MEDIA_RETRY_MS);
+  }
+
   onMount(async () => {
     // Listen for file transfer completion to reload image
     if ((isImage || isSticker || isAudio) && msg.file_hash) {
@@ -59,11 +88,13 @@
             console.log("[MessageBubble] Transfer complete for", msg.file_hash);
             if (isImage || isSticker) {
               downloadingImage = false;
+              imageRetryCount = 0;
               imageDataUrl = null; // Reset to trigger reload
               loadImage(msg.file_hash!);
             }
             if (isAudio) {
               downloadingAudio = false;
+              audioRetryCount = 0;
               audioDataUrl = null;
               loadAudio(msg.file_hash!);
             }
@@ -79,6 +110,8 @@
 
   onDestroy(() => {
     if (unlistenTransfer) unlistenTransfer();
+    if (imageRetryTimeout) clearTimeout(imageRetryTimeout);
+    if (audioRetryTimeout) clearTimeout(audioRetryTimeout);
   });
 
   async function loadImage(fileHash: string) {
@@ -88,19 +121,22 @@
     try {
       const dataUrl = await api.getImageData(fileHash);
       // Check if we got valid data (not empty)
-      if (dataUrl && dataUrl.startsWith("data:image")) {
+      if (dataUrl && dataUrl.startsWith("data:")) {
         imageDataUrl = dataUrl;
         downloadingImage = false;
+        imageRetryCount = 0;
       } else {
         // File exists but no data - still downloading
         downloadingImage = true;
         imageDataUrl = null;
+        scheduleImageRetry(fileHash);
       }
     } catch (e) {
       console.error("Failed to load image:", e);
       // Could be still downloading
       downloadingImage = true;
       loadError = true;
+      scheduleImageRetry(fileHash);
     } finally {
       loadingImage = false;
     }
@@ -111,16 +147,19 @@
     loadingAudio = true;
     try {
       const dataUrl = await api.getAudioData(fileHash);
-      if (dataUrl && dataUrl.startsWith("data:audio")) {
+      if (dataUrl && dataUrl.startsWith("data:")) {
         audioDataUrl = dataUrl;
         downloadingAudio = false;
+        audioRetryCount = 0;
       } else {
         downloadingAudio = true;
         audioDataUrl = null;
+        scheduleAudioRetry(fileHash);
       }
     } catch (e) {
       console.error("Failed to load audio:", e);
       downloadingAudio = true;
+      scheduleAudioRetry(fileHash);
     } finally {
       loadingAudio = false;
     }

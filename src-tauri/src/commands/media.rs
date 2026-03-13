@@ -154,6 +154,40 @@ fn detect_audio_mime(file_path: &str) -> Option<&'static str> {
     }
 }
 
+fn detect_image_mime_from_bytes(data: &[u8]) -> Option<&'static str> {
+    match image::guess_format(data).ok()? {
+        image::ImageFormat::Png => Some("image/png"),
+        image::ImageFormat::Jpeg => Some("image/jpeg"),
+        image::ImageFormat::Gif => Some("image/gif"),
+        image::ImageFormat::WebP => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn detect_audio_mime_from_bytes(data: &[u8]) -> Option<&'static str> {
+    if data.len() >= 12 {
+        if &data[0..4] == b"RIFF" && &data[8..12] == b"WAVE" {
+            return Some("audio/wav");
+        }
+        if &data[4..8] == b"ftyp" {
+            return Some("audio/mp4");
+        }
+    }
+    if data.len() >= 4 && &data[0..4] == b"OggS" {
+        return Some("audio/ogg");
+    }
+    if data.len() >= 4 && data[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+        return Some("audio/webm");
+    }
+    if data.len() >= 3 && &data[0..3] == b"ID3" {
+        return Some("audio/mpeg");
+    }
+    if data.len() >= 2 && data[0] == 0xFF && (data[1] & 0xE0) == 0xE0 {
+        return Some("audio/mpeg");
+    }
+    None
+}
+
 fn outgoing_status_for_chat(chat_kind: ChatKind) -> Result<&'static str, String> {
     match chat_kind {
         ChatKind::SelfChat => Ok("read"),
@@ -376,17 +410,30 @@ pub async fn get_image_data(
     let data = storage::object::load(&conn, &file_hash, None)
         .map_err(|e| format!("Failed to load image: {}", e))?;
 
-    let mime_type: String = conn
+    let stored_mime_type: String = conn
         .query_row(
             "SELECT COALESCE(mime_type, 'image/png') FROM files WHERE file_hash = ?1",
             [&file_hash],
             |row| row.get(0),
         )
         .unwrap_or_else(|_| "image/png".to_string());
+    let resolved_mime_type = if stored_mime_type.starts_with("image/") {
+        stored_mime_type.clone()
+    } else {
+        detect_image_mime_from_bytes(&data)
+            .unwrap_or("image/png")
+            .to_string()
+    };
+    if resolved_mime_type != stored_mime_type {
+        let _ = conn.execute(
+            "UPDATE files SET mime_type = ?2 WHERE file_hash = ?1",
+            rusqlite::params![&file_hash, &resolved_mime_type],
+        );
+    }
 
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let b64 = STANDARD.encode(&data);
-    let data_url = format!("data:{};base64,{}", mime_type, b64);
+    let data_url = format!("data:{};base64,{}", resolved_mime_type, b64);
 
     Ok(data_url)
 }
@@ -894,17 +941,30 @@ pub async fn get_audio_data(
     let data = storage::object::load(&conn, &file_hash, None)
         .map_err(|e| format!("Failed to load audio: {}", e))?;
 
-    let mime_type: String = conn
+    let stored_mime_type: String = conn
         .query_row(
             "SELECT COALESCE(mime_type, 'audio/mpeg') FROM files WHERE file_hash = ?1",
             [&file_hash],
             |row| row.get(0),
         )
         .unwrap_or_else(|_| "audio/mpeg".to_string());
+    let resolved_mime_type = if stored_mime_type.starts_with("audio/") {
+        stored_mime_type.clone()
+    } else {
+        detect_audio_mime_from_bytes(&data)
+            .unwrap_or("audio/webm")
+            .to_string()
+    };
+    if resolved_mime_type != stored_mime_type {
+        let _ = conn.execute(
+            "UPDATE files SET mime_type = ?2 WHERE file_hash = ?1",
+            rusqlite::params![&file_hash, &resolved_mime_type],
+        );
+    }
 
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let b64 = STANDARD.encode(&data);
-    let data_url = format!("data:{};base64,{}", mime_type, b64);
+    let data_url = format!("data:{};base64,{}", resolved_mime_type, b64);
 
     Ok(data_url)
 }
