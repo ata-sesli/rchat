@@ -78,8 +78,12 @@ impl NetworkManager {
                     self.publish_listeners().await;
                 }
                 _ = heartbeat_interval.tick() => {
-                    let peer_count = self.local_peers.len();
-                    println!("[Network Debug] Heartbeat: Swarm active. Peer count: {}. Listening...", peer_count);
+                    let connected_count = self.swarm.connected_peers().count();
+                    let discovered_count = self.local_peers.len();
+                    println!(
+                        "[Network Debug] Heartbeat: Swarm active. Connected: {}, discovered: {}. Listening...",
+                        connected_count, discovered_count
+                    );
                 }
                 _ = nat_keepalive_interval.tick() => {
                     // Dial a dummy address to send outbound UDP and keep NAT mapping alive

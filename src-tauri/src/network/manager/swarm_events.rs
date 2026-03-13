@@ -72,11 +72,17 @@ impl NetworkManager {
                 }
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                if let Some(peer) = peer_id {
-                    self.note_mdns_dial_failure(peer);
-                } else if self.mdns_dial_inflight.len() == 1 {
-                    if let Some(peer) = self.mdns_dial_inflight.keys().next().cloned() {
+                let error_debug = format!("{:?}", error);
+                let is_nat_keepalive_error =
+                    error_debug.contains("/ip4/1.1.1.1/udp/9/quic-v1");
+
+                if !is_nat_keepalive_error {
+                    if let Some(peer) = peer_id {
                         self.note_mdns_dial_failure(peer);
+                    } else if self.mdns_dial_inflight.len() == 1 {
+                        if let Some(peer) = self.mdns_dial_inflight.keys().next().cloned() {
+                            self.note_mdns_dial_failure(peer);
+                        }
                     }
                 }
                 eprintln!(
