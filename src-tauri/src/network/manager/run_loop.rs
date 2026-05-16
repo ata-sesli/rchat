@@ -72,8 +72,7 @@ impl NetworkManager {
         // Broadcast tick: ring timeout lifecycle.
         let mut broadcast_tick = tokio::time::interval(std::time::Duration::from_millis(100));
         // Ensure mDNS runtime reflects current connectivity settings.
-        let mut mdns_reconcile_interval =
-            tokio::time::interval(std::time::Duration::from_secs(2));
+        let mut mdns_reconcile_interval = tokio::time::interval(std::time::Duration::from_secs(2));
 
         loop {
             tokio::select! {
@@ -114,6 +113,9 @@ impl NetworkManager {
                 }
                 _ = voice_call_tick.tick() => {
                     self.tick_voice_call().await;
+                }
+                Some(event) = self.voice_stream_event_rx.recv() => {
+                    self.handle_voice_stream_event(event).await;
                 }
                 _ = broadcast_tick.tick() => {
                     self.tick_broadcast().await;

@@ -20,13 +20,14 @@ impl NetworkManager {
     pub(super) async fn handle_connection_established(
         &mut self,
         peer_id: PeerId,
+        connection_id: libp2p::swarm::ConnectionId,
         endpoint: libp2p::core::ConnectedPoint,
     ) {
         println!("[Swarm] Connected to {}", peer_id);
         self.note_mdns_dial_success(peer_id);
 
         let remote_addr = endpoint.get_remote_address().clone();
-        self.note_peer_transport_connected(peer_id, &remote_addr);
+        self.note_peer_transport_connected(peer_id, connection_id, &remote_addr);
         self.local_peers
             .entry(peer_id)
             .or_insert_with(Vec::new)
@@ -260,12 +261,14 @@ impl NetworkManager {
     pub(super) async fn handle_connection_closed(
         &mut self,
         peer_id: PeerId,
+        connection_id: libp2p::swarm::ConnectionId,
         num_established: u32,
         endpoint: libp2p::core::ConnectedPoint,
     ) {
         println!("[Swarm] Disconnected from {}", peer_id);
         let remote_addr = endpoint.get_remote_address().clone();
-        let quic_path_lost = self.note_peer_transport_disconnected(peer_id, &remote_addr);
+        let quic_path_lost =
+            self.note_peer_transport_disconnected(peer_id, connection_id, &remote_addr);
         if quic_path_lost {
             let end_quic_media_call = self
                 .active_call

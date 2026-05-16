@@ -17,9 +17,7 @@ impl NetworkManager {
                 RChatBehaviourEvent::DirectMessage(event) => {
                     self.handle_direct_message_event(event).await;
                 }
-                RChatBehaviourEvent::VoiceCall(event) => {
-                    self.handle_voice_frame_event(event).await;
-                }
+                RChatBehaviourEvent::VoiceCall(()) => {}
                 RChatBehaviourEvent::VideoCall(event) => {
                     self.handle_video_frame_event(event).await;
                 }
@@ -43,17 +41,22 @@ impl NetworkManager {
                 }
             },
             SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                connection_id,
+                endpoint,
+                ..
             } => {
-                self.handle_connection_established(peer_id, endpoint).await;
+                self.handle_connection_established(peer_id, connection_id, endpoint)
+                    .await;
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
+                connection_id,
                 num_established,
                 endpoint,
                 ..
             } => {
-                self.handle_connection_closed(peer_id, num_established, endpoint)
+                self.handle_connection_closed(peer_id, connection_id, num_established, endpoint)
                     .await;
             }
             SwarmEvent::NewListenAddr { address, .. } => {

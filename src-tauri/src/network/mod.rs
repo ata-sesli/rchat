@@ -9,6 +9,7 @@ pub mod invite;
 mod manager;
 pub mod mdns;
 pub mod stun;
+pub(crate) mod voice_stream;
 use anyhow::Result;
 use libp2p::{identity, PeerId, SwarmBuilder};
 use tauri::{AppHandle, Manager};

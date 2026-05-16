@@ -2,7 +2,10 @@ use crate::network::behaviour::{RChatBehaviour, RChatBehaviourEvent};
 use crate::network::command::NetworkCommand;
 use crate::network::gossip::GroupMessageEnvelope;
 use futures::StreamExt;
-use libp2p::{swarm::SwarmEvent, Multiaddr, PeerId, Swarm};
+use libp2p::{
+    swarm::{ConnectionId, SwarmEvent},
+    Multiaddr, PeerId, Swarm,
+};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
@@ -80,6 +83,7 @@ struct VoiceNetworkStats {
     outbound_frames: u64,
     inbound_frames: u64,
     inbound_seq_gaps: u64,
+    inbound_out_of_order_frames: u64,
     outbound_failures: u64,
     inbound_failures: u64,
     rejected_responses: u64,
@@ -91,6 +95,25 @@ impl VoiceNetworkStats {
     }
 }
 
+enum VoiceStreamEvent {
+    InboundFrame {
+        peer: PeerId,
+        call_id: String,
+        seq: u32,
+        payload: Vec<u8>,
+    },
+    InboundFailure {
+        peer: PeerId,
+        call_id: Option<String>,
+        error: String,
+    },
+    OutboundFailure {
+        peer: PeerId,
+        call_id: String,
+        error: String,
+    },
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct PeerTransportState {
     quic_connections: usize,
@@ -100,6 +123,8 @@ struct PeerTransportState {
 #[derive(Debug, Default, Clone)]
 struct PeerTransportRegistry {
     by_peer: HashMap<PeerId, PeerTransportState>,
+    quic_connections_by_peer: HashMap<PeerId, HashSet<ConnectionId>>,
+    tcp_connections_by_peer: HashMap<PeerId, HashSet<ConnectionId>>,
 }
 
 impl PeerTransportRegistry {
@@ -112,16 +137,34 @@ impl PeerTransportRegistry {
         addr.to_string().contains("/tcp/")
     }
 
-    fn record_connected(&mut self, peer_id: PeerId, remote_addr: &Multiaddr) {
+    fn record_connected(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        remote_addr: &Multiaddr,
+    ) {
         let state = self.by_peer.entry(peer_id).or_default();
         if Self::is_quic_addr(remote_addr) {
             state.quic_connections = state.quic_connections.saturating_add(1);
+            self.quic_connections_by_peer
+                .entry(peer_id)
+                .or_default()
+                .insert(connection_id);
         } else if Self::is_tcp_addr(remote_addr) {
             state.tcp_connections = state.tcp_connections.saturating_add(1);
+            self.tcp_connections_by_peer
+                .entry(peer_id)
+                .or_default()
+                .insert(connection_id);
         }
     }
 
-    fn record_disconnected(&mut self, peer_id: PeerId, remote_addr: &Multiaddr) -> bool {
+    fn record_disconnected(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        remote_addr: &Multiaddr,
+    ) -> bool {
         let Some(state) = self.by_peer.get_mut(&peer_id) else {
             return false;
         };
@@ -131,6 +174,18 @@ impl PeerTransportRegistry {
             state.quic_connections = state.quic_connections.saturating_sub(1);
         } else if Self::is_tcp_addr(remote_addr) {
             state.tcp_connections = state.tcp_connections.saturating_sub(1);
+        }
+        if let Some(quic_ids) = self.quic_connections_by_peer.get_mut(&peer_id) {
+            quic_ids.remove(&connection_id);
+            if quic_ids.is_empty() {
+                self.quic_connections_by_peer.remove(&peer_id);
+            }
+        }
+        if let Some(tcp_ids) = self.tcp_connections_by_peer.get_mut(&peer_id) {
+            tcp_ids.remove(&connection_id);
+            if tcp_ids.is_empty() {
+                self.tcp_connections_by_peer.remove(&peer_id);
+            }
         }
 
         let has_quic = state.quic_connections > 0;
@@ -159,6 +214,13 @@ impl PeerTransportRegistry {
             .get(peer_id)
             .map(|state| state.tcp_connections)
             .unwrap_or(0)
+    }
+
+    fn quic_connection_ids(&self, peer_id: &PeerId) -> Vec<ConnectionId> {
+        self.quic_connections_by_peer
+            .get(peer_id)
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -341,6 +403,15 @@ pub struct NetworkManager {
     voice_audio_engine: Option<crate::live::voice::voice::VoiceAudioEngine>,
     // Captured local PCM16 frames from audio engine.
     voice_capture_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>>,
+    // Voice stream task events returned to the network manager loop.
+    voice_stream_event_rx: tokio::sync::mpsc::Receiver<VoiceStreamEvent>,
+    // Voice stream task event sender cloned into accept/writer tasks.
+    voice_stream_event_tx: tokio::sync::mpsc::Sender<VoiceStreamEvent>,
+    // Current active outbound voice stream writer queue.
+    voice_stream_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::live::voice::protocol::VoiceFrameRequest>>,
+    // Current active outbound voice stream writer task.
+    voice_stream_writer_handle: Option<tauri::async_runtime::JoinHandle<()>>,
     // Sequence number for outgoing voice frames.
     voice_next_seq: u32,
     // Sequence-aware jitter buffer for inbound voice frames.
@@ -462,7 +533,7 @@ impl NetworkManager {
     const AUTO_CONNECT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
     pub fn new(
-        swarm: Swarm<RChatBehaviour>,
+        mut swarm: Swarm<RChatBehaviour>,
         crx: Receiver<NetworkCommand>,
         disc_rx: Receiver<Multiaddr>,
         mdns_rx: Receiver<crate::network::mdns::MdnsPeer>,
@@ -486,6 +557,13 @@ impl NetworkManager {
             persistence_inflight_tasks,
             persistence_worker_handles,
         ) = persistence::start_persistence_workers(app_handle.clone());
+
+        let (voice_stream_event_tx, voice_stream_event_rx) = tokio::sync::mpsc::channel(512);
+        if let Some(incoming) = swarm.behaviour_mut().voice_call.take_incoming() {
+            voice_call::start_voice_stream_accept_loop(incoming, voice_stream_event_tx.clone());
+        } else {
+            eprintln!("[Voice] Voice stream incoming receiver was already taken");
+        }
 
         Self {
             swarm,
@@ -534,6 +612,10 @@ impl NetworkManager {
             active_broadcast: None,
             voice_audio_engine: None,
             voice_capture_rx: None,
+            voice_stream_event_rx,
+            voice_stream_event_tx,
+            voice_stream_tx: None,
+            voice_stream_writer_handle: None,
             voice_next_seq: 0,
             voice_jitter_buffer: crate::live::voice::jitter::VoiceJitterBuffer::new(),
             voice_expected_inbound_seq: None,
@@ -1020,19 +1102,21 @@ impl NetworkManager {
     pub(super) fn note_peer_transport_connected(
         &mut self,
         peer_id: PeerId,
+        connection_id: ConnectionId,
         remote_addr: &Multiaddr,
     ) {
         self.peer_transport_registry
-            .record_connected(peer_id, remote_addr);
+            .record_connected(peer_id, connection_id, remote_addr);
     }
 
     pub(super) fn note_peer_transport_disconnected(
         &mut self,
         peer_id: PeerId,
+        connection_id: ConnectionId,
         remote_addr: &Multiaddr,
     ) -> bool {
         self.peer_transport_registry
-            .record_disconnected(peer_id, remote_addr)
+            .record_disconnected(peer_id, connection_id, remote_addr)
     }
 
     pub(super) fn peer_has_quic_path(&self, peer_id: &PeerId) -> bool {
@@ -1044,6 +1128,13 @@ impl NetworkManager {
             self.peer_transport_registry.quic_connection_count(peer_id),
             self.peer_transport_registry.tcp_connection_count(peer_id),
         )
+    }
+
+    pub(super) fn voice_quic_connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
+        self.peer_transport_registry
+            .quic_connection_ids(peer_id)
+            .into_iter()
+            .next()
     }
 
     pub(super) fn dial_known_voice_quic_addresses(&mut self, peer_id: &PeerId) -> usize {
@@ -1089,7 +1180,7 @@ impl NetworkManager {
     pub(super) fn log_voice_network_summary(&mut self, label: &str, peer_id: &PeerId) {
         let (quic_count, tcp_count) = self.peer_transport_counts(peer_id);
         eprintln!(
-            "[Voice][Network][{}] peer={}, quic_connections={}, tcp_connections={}, outbound_frames={}, inbound_frames={}, inbound_seq_gaps={}, outbound_failures={}, inbound_failures={}, rejected_responses={}",
+            "[Voice][Network][{}] peer={}, quic_connections={}, tcp_connections={}, outbound_frames={}, inbound_frames={}, inbound_seq_gaps={}, inbound_out_of_order_frames={}, outbound_failures={}, inbound_failures={}, rejected_responses={}",
             label,
             peer_id,
             quic_count,
@@ -1097,6 +1188,7 @@ impl NetworkManager {
             self.voice_network_stats.outbound_frames,
             self.voice_network_stats.inbound_frames,
             self.voice_network_stats.inbound_seq_gaps,
+            self.voice_network_stats.inbound_out_of_order_frames,
             self.voice_network_stats.outbound_failures,
             self.voice_network_stats.inbound_failures,
             self.voice_network_stats.rejected_responses,

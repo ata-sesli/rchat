@@ -1,6 +1,7 @@
 use super::{
     build_incoming_dm_db_message, build_incoming_group_db_message, classify_outgoing_error_source,
     quic_addresses_for_peer, OutgoingDialSource, PeerTransportRegistry, RecentDial,
+    VoiceStreamEvent,
 };
 use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
 use crate::network::gossip::{GroupContentType, GroupMessageEnvelope};
@@ -146,27 +147,62 @@ fn peer_transport_registry_tracks_quic_and_tcp() {
     let peer = keypair.public().to_peer_id();
     let quic: Multiaddr = "/ip4/10.0.0.5/udp/4242/quic-v1".parse().unwrap();
     let tcp: Multiaddr = "/ip4/10.0.0.5/tcp/4242".parse().unwrap();
+    let tcp_id = libp2p::swarm::ConnectionId::new_unchecked(1);
+    let quic_id = libp2p::swarm::ConnectionId::new_unchecked(2);
 
     let mut registry = PeerTransportRegistry::default();
     assert!(!registry.has_quic(&peer));
     assert_eq!(registry.quic_connection_count(&peer), 0);
     assert_eq!(registry.tcp_connection_count(&peer), 0);
 
-    registry.record_connected(peer, &tcp);
+    registry.record_connected(peer, tcp_id, &tcp);
     assert!(!registry.has_quic(&peer));
     assert_eq!(registry.quic_connection_count(&peer), 0);
     assert_eq!(registry.tcp_connection_count(&peer), 1);
 
-    registry.record_connected(peer, &quic);
+    registry.record_connected(peer, quic_id, &quic);
     assert!(registry.has_quic(&peer));
     assert_eq!(registry.quic_connection_count(&peer), 1);
     assert_eq!(registry.tcp_connection_count(&peer), 1);
 
-    let quic_lost = registry.record_disconnected(peer, &quic);
+    let quic_lost = registry.record_disconnected(peer, quic_id, &quic);
     assert!(quic_lost);
     assert!(!registry.has_quic(&peer));
     assert_eq!(registry.quic_connection_count(&peer), 0);
     assert_eq!(registry.tcp_connection_count(&peer), 1);
+}
+
+#[test]
+fn peer_transport_registry_lists_quic_connection_ids_without_dropping_tcp() {
+    let keypair = libp2p::identity::Keypair::generate_ed25519();
+    let peer = keypair.public().to_peer_id();
+    let tcp: Multiaddr = "/ip4/10.0.0.5/tcp/4242".parse().unwrap();
+    let quic: Multiaddr = "/ip4/10.0.0.5/udp/4242/quic-v1".parse().unwrap();
+    let tcp_id = libp2p::swarm::ConnectionId::new_unchecked(11);
+    let quic_id = libp2p::swarm::ConnectionId::new_unchecked(12);
+
+    let mut registry = PeerTransportRegistry::default();
+    registry.record_connected(peer, tcp_id, &tcp);
+    registry.record_connected(peer, quic_id, &quic);
+
+    assert_eq!(registry.quic_connection_ids(&peer), vec![quic_id]);
+    assert_eq!(registry.tcp_connection_count(&peer), 1);
+}
+
+#[test]
+fn voice_stream_failure_events_carry_call_id() {
+    let keypair = libp2p::identity::Keypair::generate_ed25519();
+    let peer = keypair.public().to_peer_id();
+    let event = VoiceStreamEvent::OutboundFailure {
+        peer,
+        call_id: "call-123".to_string(),
+        error: "closed".to_string(),
+    };
+
+    match event {
+        VoiceStreamEvent::OutboundFailure { call_id, .. } => assert_eq!(call_id, "call-123"),
+        _ => panic!("expected outbound failure"),
+    }
 }
 
 #[test]
@@ -175,17 +211,19 @@ fn peer_transport_registry_handles_multiple_quic_connections() {
     let peer = keypair.public().to_peer_id();
     let quic_a: Multiaddr = "/ip4/10.0.0.5/udp/4242/quic-v1".parse().unwrap();
     let quic_b: Multiaddr = "/ip4/10.0.0.6/udp/5252/quic-v1".parse().unwrap();
+    let quic_a_id = libp2p::swarm::ConnectionId::new_unchecked(21);
+    let quic_b_id = libp2p::swarm::ConnectionId::new_unchecked(22);
 
     let mut registry = PeerTransportRegistry::default();
-    registry.record_connected(peer, &quic_a);
-    registry.record_connected(peer, &quic_b);
+    registry.record_connected(peer, quic_a_id, &quic_a);
+    registry.record_connected(peer, quic_b_id, &quic_b);
     assert!(registry.has_quic(&peer));
 
-    let lost_after_first_close = registry.record_disconnected(peer, &quic_a);
+    let lost_after_first_close = registry.record_disconnected(peer, quic_a_id, &quic_a);
     assert!(!lost_after_first_close);
     assert!(registry.has_quic(&peer));
 
-    let lost_after_second_close = registry.record_disconnected(peer, &quic_b);
+    let lost_after_second_close = registry.record_disconnected(peer, quic_b_id, &quic_b);
     assert!(lost_after_second_close);
     assert!(!registry.has_quic(&peer));
 }
