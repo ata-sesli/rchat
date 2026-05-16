@@ -123,8 +123,8 @@ struct PeerTransportState {
 #[derive(Debug, Default, Clone)]
 struct PeerTransportRegistry {
     by_peer: HashMap<PeerId, PeerTransportState>,
-    quic_connections_by_peer: HashMap<PeerId, HashSet<ConnectionId>>,
-    tcp_connections_by_peer: HashMap<PeerId, HashSet<ConnectionId>>,
+    quic_connections_by_peer: HashMap<PeerId, Vec<ConnectionId>>,
+    tcp_connections_by_peer: HashMap<PeerId, Vec<ConnectionId>>,
 }
 
 impl PeerTransportRegistry {
@@ -146,16 +146,14 @@ impl PeerTransportRegistry {
         let state = self.by_peer.entry(peer_id).or_default();
         if Self::is_quic_addr(remote_addr) {
             state.quic_connections = state.quic_connections.saturating_add(1);
-            self.quic_connections_by_peer
-                .entry(peer_id)
-                .or_default()
-                .insert(connection_id);
+            let ids = self.quic_connections_by_peer.entry(peer_id).or_default();
+            ids.retain(|id| *id != connection_id);
+            ids.push(connection_id);
         } else if Self::is_tcp_addr(remote_addr) {
             state.tcp_connections = state.tcp_connections.saturating_add(1);
-            self.tcp_connections_by_peer
-                .entry(peer_id)
-                .or_default()
-                .insert(connection_id);
+            let ids = self.tcp_connections_by_peer.entry(peer_id).or_default();
+            ids.retain(|id| *id != connection_id);
+            ids.push(connection_id);
         }
     }
 
@@ -176,13 +174,13 @@ impl PeerTransportRegistry {
             state.tcp_connections = state.tcp_connections.saturating_sub(1);
         }
         if let Some(quic_ids) = self.quic_connections_by_peer.get_mut(&peer_id) {
-            quic_ids.remove(&connection_id);
+            quic_ids.retain(|id| *id != connection_id);
             if quic_ids.is_empty() {
                 self.quic_connections_by_peer.remove(&peer_id);
             }
         }
         if let Some(tcp_ids) = self.tcp_connections_by_peer.get_mut(&peer_id) {
-            tcp_ids.remove(&connection_id);
+            tcp_ids.retain(|id| *id != connection_id);
             if tcp_ids.is_empty() {
                 self.tcp_connections_by_peer.remove(&peer_id);
             }
@@ -216,11 +214,10 @@ impl PeerTransportRegistry {
             .unwrap_or(0)
     }
 
-    fn quic_connection_ids(&self, peer_id: &PeerId) -> Vec<ConnectionId> {
+    fn newest_quic_connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
         self.quic_connections_by_peer
             .get(peer_id)
-            .map(|ids| ids.iter().copied().collect())
-            .unwrap_or_default()
+            .and_then(|ids| ids.last().copied())
     }
 }
 
@@ -410,6 +407,8 @@ pub struct NetworkManager {
     // Current active outbound voice stream writer queue.
     voice_stream_tx:
         Option<tokio::sync::mpsc::UnboundedSender<crate::live::voice::protocol::VoiceFrameRequest>>,
+    // Call id currently owned by the outbound voice stream writer.
+    voice_stream_call_id: Option<String>,
     // Current active outbound voice stream writer task.
     voice_stream_writer_handle: Option<tauri::async_runtime::JoinHandle<()>>,
     // Sequence number for outgoing voice frames.
@@ -615,6 +614,7 @@ impl NetworkManager {
             voice_stream_event_rx,
             voice_stream_event_tx,
             voice_stream_tx: None,
+            voice_stream_call_id: None,
             voice_stream_writer_handle: None,
             voice_next_seq: 0,
             voice_jitter_buffer: crate::live::voice::jitter::VoiceJitterBuffer::new(),
@@ -1132,9 +1132,7 @@ impl NetworkManager {
 
     pub(super) fn voice_quic_connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
         self.peer_transport_registry
-            .quic_connection_ids(peer_id)
-            .into_iter()
-            .next()
+            .newest_quic_connection_id(peer_id)
     }
 
     pub(super) fn dial_known_voice_quic_addresses(&mut self, peer_id: &PeerId) -> usize {

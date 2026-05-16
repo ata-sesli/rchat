@@ -78,6 +78,7 @@ impl NetworkManager {
         self.voice_audio_engine = None;
         self.voice_capture_rx = None;
         self.voice_stream_tx = None;
+        self.voice_stream_call_id = None;
         if let Some(handle) = self.voice_stream_writer_handle.take() {
             handle.abort();
         }
@@ -97,6 +98,12 @@ impl NetworkManager {
     }
 
     pub(super) fn start_voice_stream_writer(&mut self, peer: PeerId, call_id: String) -> bool {
+        if self.voice_stream_tx.is_some()
+            && self.voice_stream_call_id.as_deref() == Some(call_id.as_str())
+        {
+            return true;
+        }
+
         let Some(connection_id) = self.voice_quic_connection_id(&peer) else {
             eprintln!(
                 "[Voice][QUIC] No QUIC connection id available for voice stream: peer={}",
@@ -106,9 +113,15 @@ impl NetworkManager {
         };
 
         self.voice_stream_tx = None;
+        self.voice_stream_call_id = None;
         if let Some(handle) = self.voice_stream_writer_handle.take() {
             handle.abort();
         }
+
+        eprintln!(
+            "[Voice][Stream] selected outbound QUIC connection peer={} call_id={} connection_id={:?}",
+            peer, call_id, connection_id
+        );
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<VoiceFrameRequest>();
         let stream_rx = match self
@@ -127,53 +140,69 @@ impl NetworkManager {
             }
         };
         let event_tx = self.voice_stream_event_tx.clone();
+        let writer_call_id = call_id.clone();
         let handle = tauri::async_runtime::spawn(async move {
-            let mut stream =
-                match tokio::time::timeout(std::time::Duration::from_secs(5), stream_rx).await {
-                    Ok(Ok(Ok(stream))) => stream,
-                    Ok(Ok(Err(e))) => {
-                        let _ = event_tx
-                            .send(VoiceStreamEvent::OutboundFailure {
-                                peer,
-                                call_id: call_id.clone(),
-                                error: e.to_string(),
-                            })
-                            .await;
-                        return;
-                    }
-                    Ok(Err(_)) => {
-                        let _ = event_tx
-                            .send(VoiceStreamEvent::OutboundFailure {
-                                peer,
-                                call_id: call_id.clone(),
-                                error: "stream open canceled".to_string(),
-                            })
-                            .await;
-                        return;
-                    }
-                    Err(e) => {
-                        let _ = event_tx
-                            .send(VoiceStreamEvent::OutboundFailure {
-                                peer,
-                                call_id: call_id.clone(),
-                                error: format!("stream open timed out: {}", e),
-                            })
-                            .await;
-                        return;
-                    }
-                };
+            let mut stream = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream_rx,
+            )
+            .await
+            {
+                Ok(Ok(Ok(stream))) => {
+                    eprintln!(
+                        "[Voice][Stream] outbound stream opened peer={} call_id={} connection_id={:?}",
+                        peer, writer_call_id, connection_id
+                    );
+                    stream
+                }
+                Ok(Ok(Err(e))) => {
+                    let _ = event_tx
+                        .send(VoiceStreamEvent::OutboundFailure {
+                            peer,
+                            call_id: writer_call_id.clone(),
+                            error: e.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+                Ok(Err(_)) => {
+                    let _ = event_tx
+                        .send(VoiceStreamEvent::OutboundFailure {
+                            peer,
+                            call_id: writer_call_id.clone(),
+                            error: "stream open canceled".to_string(),
+                        })
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(VoiceStreamEvent::OutboundFailure {
+                            peer,
+                            call_id: writer_call_id.clone(),
+                            error: format!("stream open timed out: {}", e),
+                        })
+                        .await;
+                    return;
+                }
+            };
 
-            if let Err(e) = write_voice_stream_header(&mut stream, &call_id).await {
+            if let Err(e) = write_voice_stream_header(&mut stream, &writer_call_id).await {
                 let _ = event_tx
                     .send(VoiceStreamEvent::OutboundFailure {
                         peer,
-                        call_id: call_id.clone(),
+                        call_id: writer_call_id.clone(),
                         error: e.to_string(),
                     })
                     .await;
                 return;
             }
+            eprintln!(
+                "[Voice][Stream] outbound header written peer={} call_id={} connection_id={:?}",
+                peer, writer_call_id, connection_id
+            );
 
+            let mut first_frame_written = false;
             while let Some(frame) = rx.recv().await {
                 if let Err(e) = write_voice_stream_frame(
                     &mut stream,
@@ -192,12 +221,24 @@ impl NetworkManager {
                         .await;
                     return;
                 }
+                if !first_frame_written {
+                    eprintln!(
+                        "[Voice][Stream] outbound first frame written peer={} call_id={} seq={} bytes={} connection_id={:?}",
+                        peer,
+                        frame.call_id,
+                        frame.seq,
+                        frame.payload.len(),
+                        connection_id
+                    );
+                    first_frame_written = true;
+                }
             }
 
             let _ = stream.close().await;
         });
 
         self.voice_stream_tx = Some(tx);
+        self.voice_stream_call_id = Some(call_id);
         self.voice_stream_writer_handle = Some(handle);
         true
     }
@@ -350,15 +391,13 @@ impl NetworkManager {
                 .await;
             return;
         }
-        let _ = self
-            .start_voice_stream_writer(call_snapshot.remote_peer_id, call_snapshot.call_id.clone());
-
         let mut updated = call_snapshot.clone();
         updated.phase = ActiveCallPhase::Active;
         updated.ring_deadline = None;
         updated.ring_expires_at = None;
         updated.started_at = Some(Self::now_unix_ts());
         self.active_call = Some(updated.clone());
+        let _ = self.start_voice_stream_writer(updated.remote_peer_id, updated.call_id.clone());
         self.push_active_call_state(&updated, VoiceCallPhase::Active, None)
             .await;
     }
@@ -524,13 +563,13 @@ impl NetworkManager {
                         .await;
                     return Ok(());
                 }
-                let _ = self.start_voice_stream_writer(peer, call_snapshot.call_id.clone());
                 let mut updated = call_snapshot;
                 updated.phase = ActiveCallPhase::Active;
                 updated.ring_deadline = None;
                 updated.ring_expires_at = None;
                 updated.started_at = Some(Self::now_unix_ts());
                 self.active_call = Some(updated.clone());
+                let _ = self.start_voice_stream_writer(peer, updated.call_id.clone());
                 self.push_active_call_state(&updated, VoiceCallPhase::Active, None)
                     .await;
             }
@@ -634,6 +673,11 @@ impl NetworkManager {
                     self.voice_network_stats.outbound_frames += 1;
                     if voice_stream_tx.send(req).is_err() {
                         self.voice_network_stats.outbound_failures += 1;
+                        if self.voice_stream_call_id.as_deref() == Some(call_id.as_str()) {
+                            self.voice_stream_tx = None;
+                            self.voice_stream_call_id = None;
+                            self.voice_stream_writer_handle = None;
+                        }
                         break;
                     }
                 }
@@ -714,6 +758,11 @@ impl NetworkManager {
             } => {
                 eprintln!("[Voice] Outbound stream failure to {}: {}", peer, error);
                 self.voice_network_stats.outbound_failures += 1;
+                if self.voice_stream_call_id.as_deref() == Some(call_id.as_str()) {
+                    self.voice_stream_tx = None;
+                    self.voice_stream_call_id = None;
+                    self.voice_stream_writer_handle = None;
+                }
                 if self
                     .active_call
                     .as_ref()
@@ -741,6 +790,7 @@ pub(super) fn start_voice_stream_accept_loop(
         while let Some((peer, mut stream)) = incoming.next().await {
             let event_tx = event_tx.clone();
             tauri::async_runtime::spawn(async move {
+                eprintln!("[Voice][Stream] inbound stream accepted peer={}", peer);
                 let call_id = match read_voice_stream_header(&mut stream).await {
                     Ok(call_id) => call_id,
                     Err(e) => {
@@ -754,10 +804,25 @@ pub(super) fn start_voice_stream_accept_loop(
                         return;
                     }
                 };
+                eprintln!(
+                    "[Voice][Stream] inbound header read peer={} call_id={}",
+                    peer, call_id
+                );
 
+                let mut first_frame_read = false;
                 loop {
                     match read_voice_stream_frame(&mut stream).await {
                         Ok(frame) => {
+                            if !first_frame_read {
+                                eprintln!(
+                                    "[Voice][Stream] inbound first frame read peer={} call_id={} seq={} bytes={}",
+                                    peer,
+                                    call_id,
+                                    frame.seq,
+                                    frame.payload.len()
+                                );
+                                first_frame_read = true;
+                            }
                             if event_tx
                                 .send(VoiceStreamEvent::InboundFrame {
                                     peer,

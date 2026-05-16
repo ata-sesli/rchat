@@ -173,7 +173,7 @@ fn peer_transport_registry_tracks_quic_and_tcp() {
 }
 
 #[test]
-fn peer_transport_registry_lists_quic_connection_ids_without_dropping_tcp() {
+fn peer_transport_registry_selects_quic_connection_without_dropping_tcp() {
     let keypair = libp2p::identity::Keypair::generate_ed25519();
     let peer = keypair.public().to_peer_id();
     let tcp: Multiaddr = "/ip4/10.0.0.5/tcp/4242".parse().unwrap();
@@ -185,7 +185,7 @@ fn peer_transport_registry_lists_quic_connection_ids_without_dropping_tcp() {
     registry.record_connected(peer, tcp_id, &tcp);
     registry.record_connected(peer, quic_id, &quic);
 
-    assert_eq!(registry.quic_connection_ids(&peer), vec![quic_id]);
+    assert_eq!(registry.newest_quic_connection_id(&peer), Some(quic_id));
     assert_eq!(registry.tcp_connection_count(&peer), 1);
 }
 
@@ -226,6 +226,25 @@ fn peer_transport_registry_handles_multiple_quic_connections() {
     let lost_after_second_close = registry.record_disconnected(peer, quic_b_id, &quic_b);
     assert!(lost_after_second_close);
     assert!(!registry.has_quic(&peer));
+}
+
+#[test]
+fn peer_transport_registry_selects_newest_quic_connection_id() {
+    let keypair = libp2p::identity::Keypair::generate_ed25519();
+    let peer = keypair.public().to_peer_id();
+    let quic_a: Multiaddr = "/ip4/10.0.0.5/udp/4242/quic-v1".parse().unwrap();
+    let quic_b: Multiaddr = "/ip4/10.0.0.6/udp/5252/quic-v1".parse().unwrap();
+    let quic_a_id = libp2p::swarm::ConnectionId::new_unchecked(31);
+    let quic_b_id = libp2p::swarm::ConnectionId::new_unchecked(32);
+
+    let mut registry = PeerTransportRegistry::default();
+    registry.record_connected(peer, quic_a_id, &quic_a);
+    registry.record_connected(peer, quic_b_id, &quic_b);
+
+    assert_eq!(registry.newest_quic_connection_id(&peer), Some(quic_b_id));
+
+    registry.record_disconnected(peer, quic_b_id, &quic_b);
+    assert_eq!(registry.newest_quic_connection_id(&peer), Some(quic_a_id));
 }
 
 #[test]
