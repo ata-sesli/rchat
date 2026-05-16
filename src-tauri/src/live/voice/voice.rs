@@ -20,6 +20,11 @@ const MAX_PLAYBACK_QUEUE_SAMPLES: usize = FRAME_SAMPLES * 16; // 320ms
 const CONCEALMENT_SAMPLES: usize = FRAME_SAMPLES;
 const CONCEALMENT_HOLD_SAMPLES: usize = FRAME_SAMPLES / 4;
 const CAPTURE_RATE_MEASURE_INTERVAL: Duration = Duration::from_secs(2);
+const PLAYBACK_RATE_MEASURE_INTERVAL: Duration = Duration::from_secs(1);
+const PLAYBACK_RATE_EMA_ALPHA: f64 = 0.15;
+const MIN_PLAUSIBLE_OUTPUT_RATE_HZ: f64 = 8_000.0;
+const MAX_PLAUSIBLE_OUTPUT_RATE_HZ: f64 = 192_000.0;
+const OUTPUT_CLOCK_UNSTABLE_THRESHOLD: f64 = 0.10;
 
 #[derive(Debug, Default)]
 struct VoiceAudioStats {
@@ -33,6 +38,10 @@ struct VoiceAudioStats {
     resampler_errors: u64,
     playback_callbacks: u64,
     output_device_frames: u64,
+    playback_declared_rate_hz: f64,
+    playback_measured_rate_hz: f64,
+    playback_effective_rate_hz: f64,
+    output_clock_unstable: bool,
     playback_frames_received: u64,
     playback_samples_consumed: u64,
     playback_samples_dropped: u64,
@@ -55,7 +64,7 @@ impl VoiceAudioStats {
         let output_device_hz = self.output_device_frames as f64 / elapsed;
         let playback_fps = (self.playback_samples_consumed as f64 / FRAME_SAMPLES as f64) / elapsed;
         eprintln!(
-            "[Voice][Audio][{}] capture_callbacks={}, capture_device_hz={:.1}, measured_capture_hz={:.1}, capture_resample_ratio={:.6}, capture_panics={}, generated_frames={}, generated_fps={:.1}, resampler_errors={}, playback_callbacks={}, output_device_hz={:.1}, playback_frames_received={}, playback_fps={:.1}, playback_underruns={}, playback_concealed_samples={}, playback_samples_dropped={}, playback_queue_trim_events={}, current_playback_queue_ms={:.1}, max_playback_queue_ms={:.1}",
+            "[Voice][Audio][{}] capture_callbacks={}, capture_device_hz={:.1}, measured_capture_hz={:.1}, capture_resample_ratio={:.6}, capture_panics={}, generated_frames={}, generated_fps={:.1}, resampler_errors={}, playback_callbacks={}, output_device_hz={:.1}, playback_declared_hz={:.1}, playback_measured_hz={:.1}, playback_effective_hz={:.1}, output_clock_unstable={}, playback_frames_received={}, playback_fps={:.1}, playback_underruns={}, playback_concealed_samples={}, playback_samples_dropped={}, playback_queue_trim_events={}, current_playback_queue_ms={:.1}, max_playback_queue_ms={:.1}",
             label,
             self.capture_callbacks,
             capture_device_hz,
@@ -67,6 +76,10 @@ impl VoiceAudioStats {
             self.resampler_errors,
             self.playback_callbacks,
             output_device_hz,
+            self.playback_declared_rate_hz,
+            self.playback_measured_rate_hz,
+            self.playback_effective_rate_hz,
+            self.output_clock_unstable,
             self.playback_frames_received,
             playback_fps,
             self.playback_underruns,
@@ -76,6 +89,17 @@ impl VoiceAudioStats {
             samples_to_ms(self.current_playback_queue_samples),
             samples_to_ms(self.max_playback_queue_samples),
         );
+        if self.output_clock_unstable && self.playback_queue_trim_events > 0 {
+            eprintln!(
+                "[Voice][Audio][PLAYBACK_CLOCK_MISMATCH][OUTPUT_CALLBACK_STARVATION] playback_declared_hz={:.1}, playback_measured_hz={:.1}, playback_effective_hz={:.1}, playback_queue_ms={:.1}, playback_samples_dropped={}, playback_queue_trim_events={}",
+                self.playback_declared_rate_hz,
+                self.playback_measured_rate_hz,
+                self.playback_effective_rate_hz,
+                samples_to_ms(self.current_playback_queue_samples),
+                self.playback_samples_dropped,
+                self.playback_queue_trim_events,
+            );
+        }
     }
 }
 
@@ -328,7 +352,7 @@ fn build_output_stream(
     let channels = config.channels as usize;
     let out_rate = config.sample_rate.0;
     let mut queue = VecDeque::<i16>::new();
-    let mut playback_state = PlaybackState::new();
+    let mut playback_state = PlaybackState::new(out_rate);
     let err_fn = |err| eprintln!("[Voice] Output stream error: {}", err);
 
     match sample_format {
@@ -342,7 +366,6 @@ fn build_output_stream(
                         write_output_frames_f32(
                             data,
                             channels,
-                            out_rate,
                             &mut queue,
                             &mut playback_state,
                             &mut mono,
@@ -364,7 +387,6 @@ fn build_output_stream(
                         write_output_frames_i16(
                             data,
                             channels,
-                            out_rate,
                             &mut queue,
                             &mut playback_state,
                             &mut mono,
@@ -386,7 +408,6 @@ fn build_output_stream(
                         write_output_frames_u16(
                             data,
                             channels,
-                            out_rate,
                             &mut queue,
                             &mut playback_state,
                             &mut mono,
@@ -693,8 +714,7 @@ fn trim_playback_queue_to_cap(queue: &mut VecDeque<i16>) -> usize {
         return 0;
     }
 
-    let target_len = PLAYBACK_TARGET_QUEUE_SAMPLES.min(queue.len());
-    let drop_count = queue.len().saturating_sub(target_len);
+    let drop_count = FRAME_SAMPLES.min(queue.len());
     for _ in 0..drop_count {
         let _ = queue.pop_front();
     }
@@ -705,15 +725,83 @@ struct PlaybackState {
     src_cursor: f32,
     last_sample: i16,
     consecutive_underrun_samples: usize,
+    declared_output_rate_hz: f64,
+    measured_output_rate_hz: Option<f64>,
+    effective_output_rate_hz: f64,
+    output_clock_unstable: bool,
+    output_rate_window_started: Instant,
+    output_rate_window_frames: u64,
 }
 
 impl PlaybackState {
-    fn new() -> Self {
+    fn new(declared_output_rate_hz: u32) -> Self {
+        let declared_output_rate_hz = declared_output_rate_hz as f64;
         Self {
             src_cursor: 0.0,
             last_sample: 0,
             consecutive_underrun_samples: 0,
+            declared_output_rate_hz,
+            measured_output_rate_hz: None,
+            effective_output_rate_hz: declared_output_rate_hz,
+            output_clock_unstable: false,
+            output_rate_window_started: Instant::now(),
+            output_rate_window_frames: 0,
         }
+    }
+
+    fn note_output_callback_samples(&mut self, sample_count: usize, channels: usize) {
+        if channels == 0 {
+            return;
+        }
+        self.note_output_callback(sample_count / channels);
+    }
+
+    fn note_output_callback(&mut self, frame_count: usize) {
+        self.output_rate_window_frames = self
+            .output_rate_window_frames
+            .saturating_add(frame_count as u64);
+
+        let elapsed = self.output_rate_window_started.elapsed();
+        if elapsed < PLAYBACK_RATE_MEASURE_INTERVAL {
+            return;
+        }
+
+        let measured = self.output_rate_window_frames as f64 / elapsed.as_secs_f64().max(0.001);
+        self.output_rate_window_started = Instant::now();
+        self.output_rate_window_frames = 0;
+
+        if !(MIN_PLAUSIBLE_OUTPUT_RATE_HZ..=MAX_PLAUSIBLE_OUTPUT_RATE_HZ).contains(&measured) {
+            return;
+        }
+
+        self.measured_output_rate_hz = Some(measured);
+        self.output_clock_unstable = ((measured - self.declared_output_rate_hz).abs()
+            / self.declared_output_rate_hz)
+            > OUTPUT_CLOCK_UNSTABLE_THRESHOLD;
+        self.effective_output_rate_hz = if self.measured_output_rate_hz == Some(measured)
+            && (self.effective_output_rate_hz - self.declared_output_rate_hz).abs() < f64::EPSILON
+        {
+            measured
+        } else {
+            (self.effective_output_rate_hz * (1.0 - PLAYBACK_RATE_EMA_ALPHA))
+                + (measured * PLAYBACK_RATE_EMA_ALPHA)
+        };
+    }
+
+    fn declared_output_rate_hz(&self) -> f64 {
+        self.declared_output_rate_hz
+    }
+
+    fn measured_output_rate_hz(&self) -> Option<f64> {
+        self.measured_output_rate_hz
+    }
+
+    fn effective_output_rate_hz(&self) -> f64 {
+        self.effective_output_rate_hz
+    }
+
+    fn output_clock_unstable(&self) -> bool {
+        self.output_clock_unstable
     }
 
     fn conceal_sample(&mut self) -> i16 {
@@ -742,8 +830,8 @@ impl PlaybackState {
     }
 }
 
-fn playback_step(out_rate: u32, queued_samples: usize) -> f32 {
-    let base = TARGET_RATE as f32 / out_rate as f32;
+fn playback_step(effective_output_rate_hz: f64, queued_samples: usize) -> f32 {
+    let base = TARGET_RATE as f32 / effective_output_rate_hz.max(1.0) as f32;
     let correction = if queued_samples > PLAYBACK_TARGET_QUEUE_SAMPLES {
         1.015
     } else if queued_samples < PLAYBACK_LOW_QUEUE_SAMPLES {
@@ -761,14 +849,13 @@ struct PlaybackRenderStats {
 
 fn render_playback_mono_samples(
     frame_count: usize,
-    out_rate: u32,
     queue: &mut VecDeque<i16>,
     state: &mut PlaybackState,
     out: &mut Vec<i16>,
 ) -> PlaybackRenderStats {
     out.clear();
     out.reserve(frame_count);
-    let step = playback_step(out_rate, queue.len());
+    let step = playback_step(state.effective_output_rate_hz(), queue.len());
     let mut underruns = 0u64;
     for _ in 0..frame_count {
         let src_idx = state.src_cursor.floor() as usize;
@@ -801,7 +888,6 @@ fn render_playback_mono_samples(
 fn write_output_frames_i16(
     data: &mut [i16],
     channels: usize,
-    out_rate: u32,
     queue: &mut VecDeque<i16>,
     playback_state: &mut PlaybackState,
     mono: &mut Vec<i16>,
@@ -811,8 +897,8 @@ fn write_output_frames_i16(
         return;
     }
     let frame_count = data.len() / channels;
-    let render_stats =
-        render_playback_mono_samples(frame_count, out_rate, queue, playback_state, mono);
+    playback_state.note_output_callback_samples(data.len(), channels);
+    let render_stats = render_playback_mono_samples(frame_count, queue, playback_state, mono);
     for frame_idx in 0..frame_count {
         let sample = mono[frame_idx];
         for ch in 0..channels {
@@ -822,6 +908,10 @@ fn write_output_frames_i16(
     with_audio_stats(stats, |s| {
         s.playback_callbacks += 1;
         s.output_device_frames = s.output_device_frames.saturating_add(frame_count as u64);
+        s.playback_declared_rate_hz = playback_state.declared_output_rate_hz();
+        s.playback_measured_rate_hz = playback_state.measured_output_rate_hz().unwrap_or(0.0);
+        s.playback_effective_rate_hz = playback_state.effective_output_rate_hz();
+        s.output_clock_unstable = playback_state.output_clock_unstable();
         s.playback_samples_consumed = s
             .playback_samples_consumed
             .saturating_add(render_stats.consumed_samples as u64);
@@ -837,7 +927,6 @@ fn write_output_frames_i16(
 fn write_output_frames_f32(
     data: &mut [f32],
     channels: usize,
-    out_rate: u32,
     queue: &mut VecDeque<i16>,
     playback_state: &mut PlaybackState,
     mono: &mut Vec<i16>,
@@ -847,8 +936,8 @@ fn write_output_frames_f32(
         return;
     }
     let frame_count = data.len() / channels;
-    let render_stats =
-        render_playback_mono_samples(frame_count, out_rate, queue, playback_state, mono);
+    playback_state.note_output_callback_samples(data.len(), channels);
+    let render_stats = render_playback_mono_samples(frame_count, queue, playback_state, mono);
     for frame_idx in 0..frame_count {
         let f = i16_to_f32(mono[frame_idx]);
         for ch in 0..channels {
@@ -858,6 +947,10 @@ fn write_output_frames_f32(
     with_audio_stats(stats, |s| {
         s.playback_callbacks += 1;
         s.output_device_frames = s.output_device_frames.saturating_add(frame_count as u64);
+        s.playback_declared_rate_hz = playback_state.declared_output_rate_hz();
+        s.playback_measured_rate_hz = playback_state.measured_output_rate_hz().unwrap_or(0.0);
+        s.playback_effective_rate_hz = playback_state.effective_output_rate_hz();
+        s.output_clock_unstable = playback_state.output_clock_unstable();
         s.playback_samples_consumed = s
             .playback_samples_consumed
             .saturating_add(render_stats.consumed_samples as u64);
@@ -873,7 +966,6 @@ fn write_output_frames_f32(
 fn write_output_frames_u16(
     data: &mut [u16],
     channels: usize,
-    out_rate: u32,
     queue: &mut VecDeque<i16>,
     playback_state: &mut PlaybackState,
     mono: &mut Vec<i16>,
@@ -883,8 +975,8 @@ fn write_output_frames_u16(
         return;
     }
     let frame_count = data.len() / channels;
-    let render_stats =
-        render_playback_mono_samples(frame_count, out_rate, queue, playback_state, mono);
+    playback_state.note_output_callback_samples(data.len(), channels);
+    let render_stats = render_playback_mono_samples(frame_count, queue, playback_state, mono);
     for frame_idx in 0..frame_count {
         let u = i16_to_u16(mono[frame_idx]);
         for ch in 0..channels {
@@ -894,6 +986,10 @@ fn write_output_frames_u16(
     with_audio_stats(stats, |s| {
         s.playback_callbacks += 1;
         s.output_device_frames = s.output_device_frames.saturating_add(frame_count as u64);
+        s.playback_declared_rate_hz = playback_state.declared_output_rate_hz();
+        s.playback_measured_rate_hz = playback_state.measured_output_rate_hz().unwrap_or(0.0);
+        s.playback_effective_rate_hz = playback_state.effective_output_rate_hz();
+        s.output_clock_unstable = playback_state.output_clock_unstable();
         s.playback_samples_consumed = s
             .playback_samples_consumed
             .saturating_add(render_stats.consumed_samples as u64);
@@ -979,24 +1075,23 @@ mod tests {
     }
 
     #[test]
-    fn playback_queue_trims_to_latency_cap() {
+    fn playback_queue_drops_one_frame_at_a_time() {
         let mut queue: VecDeque<i16> = (0..(FRAME_SAMPLES * 40)).map(|idx| idx as i16).collect();
 
         let dropped = trim_playback_queue_to_cap(&mut queue);
 
-        assert!(dropped > 0);
-        assert!(queue.len() <= MAX_PLAYBACK_QUEUE_SAMPLES);
+        assert_eq!(dropped, FRAME_SAMPLES);
+        assert_eq!(queue.len(), FRAME_SAMPLES * 39);
     }
 
     #[test]
     fn playback_output_conceals_short_underruns_with_last_sample() {
         let mut queue = VecDeque::new();
-        let mut state = PlaybackState::new();
+        let mut state = PlaybackState::new(44_100);
         state.last_sample = 1234;
         let mut out = Vec::new();
 
-        let render_stats =
-            render_playback_mono_samples(8, 44_100, &mut queue, &mut state, &mut out);
+        let render_stats = render_playback_mono_samples(8, &mut queue, &mut state, &mut out);
 
         assert_eq!(render_stats.underruns, 8);
         assert_eq!(out, vec![1234; 8]);
@@ -1005,15 +1100,73 @@ mod tests {
     #[test]
     fn playback_render_reports_only_samples_removed_from_queue() {
         let mut queue: VecDeque<i16> = vec![1, 2].into();
-        let mut state = PlaybackState::new();
+        let mut state = PlaybackState::new(16_000);
         let mut out = Vec::new();
 
-        let render_stats =
-            render_playback_mono_samples(32, 16_000, &mut queue, &mut state, &mut out);
+        let render_stats = render_playback_mono_samples(32, &mut queue, &mut state, &mut out);
 
         assert_eq!(render_stats.consumed_samples, 2);
         assert!(queue.is_empty());
         assert!(render_stats.underruns > 0);
+    }
+
+    #[test]
+    fn playback_uses_measured_output_rate_when_plausible() {
+        let mut state = PlaybackState::new(44_100);
+        state.output_rate_window_started = Instant::now() - PLAYBACK_RATE_MEASURE_INTERVAL;
+
+        state.note_output_callback(22_000);
+
+        let measured = state.measured_output_rate_hz().expect("measured output");
+        assert!((measured - 22_000.0).abs() < 100.0);
+        assert!(state.effective_output_rate_hz() < 30_000.0);
+        assert!(
+            playback_step(
+                state.effective_output_rate_hz(),
+                PLAYBACK_TARGET_QUEUE_SAMPLES
+            ) > 0.7
+        );
+    }
+
+    #[test]
+    fn playback_falls_back_to_declared_rate_when_measured_rate_is_implausible() {
+        let mut state = PlaybackState::new(44_100);
+        state.output_rate_window_started = Instant::now() - PLAYBACK_RATE_MEASURE_INTERVAL;
+
+        state.note_output_callback(1_000);
+
+        assert!(state.measured_output_rate_hz().is_none());
+        assert_eq!(state.effective_output_rate_hz(), 44_100.0);
+    }
+
+    #[test]
+    fn output_clock_unstable_detects_large_declared_measured_divergence() {
+        let mut state = PlaybackState::new(44_100);
+        state.output_rate_window_started = Instant::now() - PLAYBACK_RATE_MEASURE_INTERVAL;
+
+        state.note_output_callback(22_000);
+
+        assert!(state.output_clock_unstable());
+
+        let mut stable = PlaybackState::new(44_100);
+        stable.output_rate_window_started = Instant::now() - PLAYBACK_RATE_MEASURE_INTERVAL;
+        stable.note_output_callback(42_000);
+
+        assert!(!stable.output_clock_unstable());
+    }
+
+    #[test]
+    fn measured_output_rate_counts_frames_not_channels() {
+        let mut state = PlaybackState::new(44_100);
+
+        for _ in 0..99 {
+            state.note_output_callback_samples(882, 2);
+        }
+        state.output_rate_window_started = Instant::now() - PLAYBACK_RATE_MEASURE_INTERVAL;
+        state.note_output_callback_samples(882, 2);
+
+        let measured = state.measured_output_rate_hz().expect("measured output");
+        assert!((measured - 44_100.0).abs() < 100.0);
     }
 
     #[test]
