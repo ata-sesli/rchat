@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-REQUIRED_PACKAGES="webkit2gtk4.1 gtk3 libayatana-appindicator-gtk3 librsvg2 alsa-lib openssl-libs avahi-compat-libdns_sd"
+REQUIRED_PACKAGES="webkit2gtk4.1 gtk3 libayatana-appindicator-gtk3 librsvg2 alsa-lib openssl-libs opus avahi-compat-libdns_sd"
 
 missing=""
 for pkg in $REQUIRED_PACKAGES; do

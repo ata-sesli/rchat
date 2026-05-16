@@ -87,6 +87,10 @@ struct VoiceNetworkStats {
     outbound_failures: u64,
     inbound_failures: u64,
     rejected_responses: u64,
+    opus_encode_errors: u64,
+    opus_decode_errors: u64,
+    opus_out_bytes: u64,
+    opus_in_bytes: u64,
 }
 
 impl VoiceNetworkStats {
@@ -415,6 +419,10 @@ pub struct NetworkManager {
     voice_next_seq: u32,
     // Sequence-aware jitter buffer for inbound voice frames.
     voice_jitter_buffer: crate::live::voice::jitter::VoiceJitterBuffer,
+    // Opus encoder for outbound 16kHz mono voice frames.
+    voice_opus_encoder: Option<crate::live::voice::codec::VoiceOpusEncoder>,
+    // Opus decoder for inbound 16kHz mono voice frames.
+    voice_opus_decoder: Option<crate::live::voice::codec::VoiceOpusDecoder>,
     // Expected next inbound voice sequence for diagnostics.
     voice_expected_inbound_seq: Option<u32>,
     // Aggregated voice transport diagnostics.
@@ -618,6 +626,8 @@ impl NetworkManager {
             voice_stream_writer_handle: None,
             voice_next_seq: 0,
             voice_jitter_buffer: crate::live::voice::jitter::VoiceJitterBuffer::new(),
+            voice_opus_encoder: None,
+            voice_opus_decoder: None,
             voice_expected_inbound_seq: None,
             voice_network_stats: VoiceNetworkStats::default(),
             voice_last_summary_at: None,
@@ -1177,8 +1187,20 @@ impl NetworkManager {
 
     pub(super) fn log_voice_network_summary(&mut self, label: &str, peer_id: &PeerId) {
         let (quic_count, tcp_count) = self.peer_transport_counts(peer_id);
+        let avg_opus_out_bytes = if self.voice_network_stats.outbound_frames == 0 {
+            0.0
+        } else {
+            self.voice_network_stats.opus_out_bytes as f64
+                / self.voice_network_stats.outbound_frames as f64
+        };
+        let avg_opus_in_bytes = if self.voice_network_stats.inbound_frames == 0 {
+            0.0
+        } else {
+            self.voice_network_stats.opus_in_bytes as f64
+                / self.voice_network_stats.inbound_frames as f64
+        };
         eprintln!(
-            "[Voice][Network][{}] peer={}, quic_connections={}, tcp_connections={}, outbound_frames={}, inbound_frames={}, inbound_seq_gaps={}, inbound_out_of_order_frames={}, outbound_failures={}, inbound_failures={}, rejected_responses={}",
+            "[Voice][Network][{}] peer={}, quic_connections={}, tcp_connections={}, outbound_frames={}, inbound_frames={}, inbound_seq_gaps={}, inbound_out_of_order_frames={}, outbound_failures={}, inbound_failures={}, rejected_responses={}, opus_encode_errors={}, opus_decode_errors={}, opus_out_bytes={}, opus_in_bytes={}, avg_opus_out_bytes={:.1}, avg_opus_in_bytes={:.1}",
             label,
             peer_id,
             quic_count,
@@ -1190,6 +1212,12 @@ impl NetworkManager {
             self.voice_network_stats.outbound_failures,
             self.voice_network_stats.inbound_failures,
             self.voice_network_stats.rejected_responses,
+            self.voice_network_stats.opus_encode_errors,
+            self.voice_network_stats.opus_decode_errors,
+            self.voice_network_stats.opus_out_bytes,
+            self.voice_network_stats.opus_in_bytes,
+            avg_opus_out_bytes,
+            avg_opus_in_bytes,
         );
     }
 

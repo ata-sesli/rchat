@@ -25,21 +25,6 @@ impl NetworkManager {
             .unwrap_or_else(|| request.id.clone())
     }
 
-    fn encode_pcm16_le(samples: &[i16]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(samples.len() * 2);
-        for s in samples {
-            out.extend_from_slice(&s.to_le_bytes());
-        }
-        out
-    }
-
-    fn decode_pcm16_le(payload: &[u8]) -> Vec<i16> {
-        payload
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]))
-            .collect()
-    }
-
     pub(super) async fn push_idle_call_state(&mut self, reason: Option<String>) {
         self.set_voice_call_state(VoiceCallState::default(), reason)
             .await;
@@ -84,13 +69,21 @@ impl NetworkManager {
         }
         self.voice_next_seq = 0;
         self.voice_jitter_buffer.reset();
+        self.voice_opus_encoder = None;
+        self.voice_opus_decoder = None;
         self.reset_voice_network_diagnostics();
     }
 
     pub(super) fn start_voice_audio(&mut self) -> Result<(), String> {
+        let encoder = crate::live::voice::codec::VoiceOpusEncoder::new()
+            .map_err(|e| format!("failed to start Opus encoder: {}", e))?;
+        let decoder = crate::live::voice::codec::VoiceOpusDecoder::new()
+            .map_err(|e| format!("failed to start Opus decoder: {}", e))?;
         let (engine, capture_rx) = crate::live::voice::voice::VoiceAudioEngine::start()?;
         self.voice_audio_engine = Some(engine);
         self.voice_capture_rx = Some(capture_rx);
+        self.voice_opus_encoder = Some(encoder);
+        self.voice_opus_decoder = Some(decoder);
         self.voice_next_seq = 0;
         self.voice_jitter_buffer.reset();
         self.reset_voice_network_diagnostics();
@@ -650,39 +643,55 @@ impl NetworkManager {
             let _ = self.start_voice_stream_writer(peer, call_id.clone());
         }
 
-        let Some(capture_rx) = self.voice_capture_rx.as_mut() else {
-            return;
-        };
         let Some(voice_stream_tx) = self.voice_stream_tx.as_ref().cloned() else {
             return;
         };
 
         loop {
-            match capture_rx.try_recv() {
-                Ok(frame) => {
-                    if muted {
+            let frame = match self.voice_capture_rx.as_mut() {
+                Some(capture_rx) => match capture_rx.try_recv() {
+                    Ok(frame) => frame,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                },
+                None => return,
+            };
+
+            if muted {
+                continue;
+            }
+
+            let payload = match self.voice_opus_encoder.as_mut() {
+                Some(encoder) => match encoder.encode_frame(&frame) {
+                    Ok(packet) => packet,
+                    Err(_) => {
+                        self.voice_network_stats.opus_encode_errors += 1;
                         continue;
                     }
-                    let req = VoiceFrameRequest {
-                        call_id: call_id.clone(),
-                        seq: self.voice_next_seq,
-                        timestamp: Self::now_unix_ts(),
-                        payload: Self::encode_pcm16_le(&frame),
-                    };
-                    self.voice_next_seq = self.voice_next_seq.wrapping_add(1);
-                    self.voice_network_stats.outbound_frames += 1;
-                    if voice_stream_tx.send(req).is_err() {
-                        self.voice_network_stats.outbound_failures += 1;
-                        if self.voice_stream_call_id.as_deref() == Some(call_id.as_str()) {
-                            self.voice_stream_tx = None;
-                            self.voice_stream_call_id = None;
-                            self.voice_stream_writer_handle = None;
-                        }
-                        break;
-                    }
+                },
+                None => {
+                    self.voice_network_stats.opus_encode_errors += 1;
+                    break;
                 }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            };
+
+            let req = VoiceFrameRequest {
+                call_id: call_id.clone(),
+                seq: self.voice_next_seq,
+                timestamp: Self::now_unix_ts(),
+                payload,
+            };
+            self.voice_next_seq = self.voice_next_seq.wrapping_add(1);
+            self.voice_network_stats.outbound_frames += 1;
+            self.voice_network_stats.opus_out_bytes += req.payload.len() as u64;
+            if voice_stream_tx.send(req).is_err() {
+                self.voice_network_stats.outbound_failures += 1;
+                if self.voice_stream_call_id.as_deref() == Some(call_id.as_str()) {
+                    self.voice_stream_tx = None;
+                    self.voice_stream_call_id = None;
+                    self.voice_stream_writer_handle = None;
+                }
+                break;
             }
         }
     }
@@ -711,6 +720,7 @@ impl NetworkManager {
                         && call.remote_peer_id == peer
                     {
                         self.voice_network_stats.inbound_frames += 1;
+                        self.voice_network_stats.opus_in_bytes += payload.len() as u64;
                         if let Some(expected) = self.voice_expected_inbound_seq {
                             if seq != expected {
                                 self.voice_network_stats.inbound_seq_gaps += 1;
@@ -720,7 +730,19 @@ impl NetworkManager {
                             }
                         }
                         self.voice_expected_inbound_seq = Some(seq.wrapping_add(1));
-                        let pcm = Self::decode_pcm16_le(&payload);
+                        let pcm = match self.voice_opus_decoder.as_mut() {
+                            Some(decoder) => match decoder.decode_packet(&payload) {
+                                Ok(pcm) => pcm,
+                                Err(_) => {
+                                    self.voice_network_stats.opus_decode_errors += 1;
+                                    return;
+                                }
+                            },
+                            None => {
+                                self.voice_network_stats.opus_decode_errors += 1;
+                                return;
+                            }
+                        };
                         let ordered_frames = self.voice_jitter_buffer.push(seq, pcm);
                         if let Some(engine) = self.voice_audio_engine.as_ref() {
                             for frame in ordered_frames {

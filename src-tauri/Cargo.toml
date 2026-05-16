@@ -67,6 +67,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 zeroize = { version = "1.8.2", features = ["derive"] }
 tauri-plugin-deep-link = "2"
 cpal = "0.15.3"
+opus = "0.3.1"
 rubato = { version = "2.0.0", default-features = false }
 [dev-dependencies]
 tempfile = "3.23.0"

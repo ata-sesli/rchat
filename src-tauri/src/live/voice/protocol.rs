@@ -132,7 +132,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stream_frame_round_trips_pcm_payload() {
+    fn stream_frame_round_trips_opaque_media_payload() {
         let payload = vec![1, 0, 255, 127, 0, 128];
         let encoded = encode_voice_stream_frame(42, 1234, &payload);
         let decoded = decode_voice_stream_frame(&encoded).expect("frame decodes");

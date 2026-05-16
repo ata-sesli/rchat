@@ -53,6 +53,7 @@
           "librsvg2-2",
           "libasound2",
           "libssl3",
+          "libopus0",
           "libavahi-client3",
           "libavahi-compat-libdnssd1"
         ]
@@ -69,6 +70,7 @@
           "librsvg2",
           "alsa-lib",
           "openssl-libs",
+          "opus",
           "avahi-compat-libdns_sd"
         ]
       }

@@ -5,6 +5,7 @@ use rubato::{
     SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 use std::collections::VecDeque;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -27,6 +28,7 @@ struct VoiceAudioStats {
     capture_input_frames: u64,
     measured_capture_rate_hz: f64,
     capture_resample_ratio: f64,
+    capture_panics: u64,
     generated_frames: u64,
     resampler_errors: u64,
     playback_callbacks: u64,
@@ -53,12 +55,13 @@ impl VoiceAudioStats {
         let output_device_hz = self.output_device_frames as f64 / elapsed;
         let playback_fps = (self.playback_samples_consumed as f64 / FRAME_SAMPLES as f64) / elapsed;
         eprintln!(
-            "[Voice][Audio][{}] capture_callbacks={}, capture_device_hz={:.1}, measured_capture_hz={:.1}, capture_resample_ratio={:.6}, generated_frames={}, generated_fps={:.1}, resampler_errors={}, playback_callbacks={}, output_device_hz={:.1}, playback_frames_received={}, playback_fps={:.1}, playback_underruns={}, playback_concealed_samples={}, playback_samples_dropped={}, playback_queue_trim_events={}, current_playback_queue_ms={:.1}, max_playback_queue_ms={:.1}",
+            "[Voice][Audio][{}] capture_callbacks={}, capture_device_hz={:.1}, measured_capture_hz={:.1}, capture_resample_ratio={:.6}, capture_panics={}, generated_frames={}, generated_fps={:.1}, resampler_errors={}, playback_callbacks={}, output_device_hz={:.1}, playback_frames_received={}, playback_fps={:.1}, playback_underruns={}, playback_concealed_samples={}, playback_samples_dropped={}, playback_queue_trim_events={}, current_playback_queue_ms={:.1}, max_playback_queue_ms={:.1}",
             label,
             self.capture_callbacks,
             capture_device_hz,
             self.measured_capture_rate_hz,
             self.capture_resample_ratio,
+            self.capture_panics,
             self.generated_frames,
             generated_fps,
             self.resampler_errors,
@@ -262,7 +265,7 @@ fn build_input_stream(
                 move |data: &[f32], _| {
                     with_audio_stats(&stats, |s| s.capture_callbacks += 1);
                     let mono = input_to_mono_i16_f32(data, channels);
-                    send_captured_frames(&capture_tx, &mut assembler, &mono, &stats);
+                    handle_capture_callback(&capture_tx, &mut assembler, &mono, &stats);
                 },
                 err_fn,
                 None,
@@ -274,7 +277,7 @@ fn build_input_stream(
                 move |data: &[i16], _| {
                     with_audio_stats(&stats, |s| s.capture_callbacks += 1);
                     let mono = input_to_mono_i16_i16(data, channels);
-                    send_captured_frames(&capture_tx, &mut assembler, &mono, &stats);
+                    handle_capture_callback(&capture_tx, &mut assembler, &mono, &stats);
                 },
                 err_fn,
                 None,
@@ -286,13 +289,32 @@ fn build_input_stream(
                 move |data: &[u16], _| {
                     with_audio_stats(&stats, |s| s.capture_callbacks += 1);
                     let mono = input_to_mono_i16_u16(data, channels);
-                    send_captured_frames(&capture_tx, &mut assembler, &mono, &stats);
+                    handle_capture_callback(&capture_tx, &mut assembler, &mono, &stats);
                 },
                 err_fn,
                 None,
             )
             .map_err(|e| format!("Failed to build u16 input stream: {}", e)),
         _ => Err("Unsupported input sample format".to_string()),
+    }
+}
+
+fn handle_capture_callback(
+    capture_tx: &tokio::sync::mpsc::UnboundedSender<Vec<i16>>,
+    assembler: &mut VoiceFrameAssembler,
+    mono: &[i16],
+    stats: &Arc<Mutex<VoiceAudioStats>>,
+) {
+    if catch_unwind(AssertUnwindSafe(|| {
+        send_captured_frames(capture_tx, assembler, mono, stats);
+    }))
+    .is_err()
+    {
+        with_audio_stats(stats, |s| {
+            s.capture_panics = s.capture_panics.saturating_add(1);
+            s.resampler_errors = s.resampler_errors.saturating_add(1);
+        });
+        eprintln!("[Voice] Capture processing panicked; skipping callback frame");
     }
 }
 
@@ -471,7 +493,6 @@ impl VoiceFrameAssembler {
         let measured = self.rate_window_input_samples as f64 / elapsed.as_secs_f64().max(0.001);
         if (8_000.0..=192_000.0).contains(&measured) {
             self.measured_input_rate_hz = Some(measured);
-            self.resampler.adapt_to_measured_input_rate(measured);
         }
         self.rate_window_started = Instant::now();
         self.rate_window_input_samples = 0;
@@ -491,7 +512,6 @@ enum VoiceResamplerMode {
 struct VoiceResampler {
     mode: VoiceResamplerMode,
     errors: u64,
-    nominal_input_rate: u32,
     current_ratio: Option<f64>,
 }
 
@@ -501,7 +521,6 @@ impl VoiceResampler {
             return Ok(Self {
                 mode: VoiceResamplerMode::Bypass,
                 errors: 0,
-                nominal_input_rate: input_rate,
                 current_ratio: None,
             });
         }
@@ -534,7 +553,6 @@ impl VoiceResampler {
                 output_buffer: vec![vec![0.0; output_capacity]],
             },
             errors: 0,
-            nominal_input_rate: input_rate,
             current_ratio: Some(initial_ratio),
         })
     }
@@ -550,29 +568,6 @@ impl VoiceResampler {
 
     fn current_ratio(&self) -> Option<f64> {
         self.current_ratio
-    }
-
-    fn adapt_to_measured_input_rate(&mut self, measured_input_rate_hz: f64) {
-        if self.nominal_input_rate == TARGET_RATE || measured_input_rate_hz <= 0.0 {
-            return;
-        }
-
-        if let VoiceResamplerMode::Rubato { resampler, .. } = &mut self.mode {
-            let target_ratio = TARGET_RATE as f64 / measured_input_rate_hz;
-            let current_ratio = resampler.resample_ratio();
-            if ((target_ratio / current_ratio) - 1.0).abs() < 0.002 {
-                return;
-            }
-            if let Err(e) = resampler.set_resample_ratio(target_ratio, true) {
-                self.errors = self.errors.saturating_add(1);
-                eprintln!(
-                    "[Voice] Failed to adjust capture resampler ratio to {:.6}: {}",
-                    target_ratio, e
-                );
-            } else {
-                self.current_ratio = Some(target_ratio);
-            }
-        }
     }
 
     fn push_mono_i16(&mut self, samples: &[i16]) -> Vec<i16> {
@@ -1022,13 +1017,16 @@ mod tests {
     }
 
     #[test]
-    fn voice_resampler_adapts_ratio_to_slower_measured_input_rate() {
-        let mut resampler = VoiceResampler::new(44_100).expect("resampler");
-        let before = resampler.current_ratio().expect("rubato ratio");
+    fn measured_input_rate_does_not_mutate_capture_resampler_ratio() {
+        let mut assembler = VoiceFrameAssembler::new(44_100).expect("assembler");
+        assembler.rate_window_started = Instant::now() - CAPTURE_RATE_MEASURE_INTERVAL;
+        assembler.rate_window_input_samples = 26_000;
+        let before = assembler.resampler_ratio().expect("rubato ratio");
 
-        resampler.adapt_to_measured_input_rate(36_000.0);
+        assembler.update_measured_input_rate(0);
 
-        let after = resampler.current_ratio().expect("rubato ratio");
-        assert!(after > before);
+        let measured = assembler.measured_input_rate_hz().expect("measured rate");
+        assert!((measured - 13_000.0).abs() < 50.0);
+        assert_eq!(assembler.resampler_ratio(), Some(before));
     }
 }
