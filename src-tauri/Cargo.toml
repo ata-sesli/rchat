@@ -23,6 +23,9 @@ tauri-build = { version = "2", features = [] }
 debug = 0           # Turn off debug info for all dependencies
 opt-level = 3       # Maximize optimization for dependencies (makes app run faster too)
 
+[profile.dev]
+debug = 1
+
 [dependencies]
 
 rvault-core = { git = "https://github.com/ata-sesli/rvault", rev = "7dda2de45ac31eccb17dad7d1a4f1ebdd893e99c" }
@@ -64,6 +67,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 zeroize = { version = "1.8.2", features = ["derive"] }
 tauri-plugin-deep-link = "2"
 cpal = "0.15.3"
+rubato = { version = "2.0.0", default-features = false }
 [dev-dependencies]
 tempfile = "3.23.0"
 

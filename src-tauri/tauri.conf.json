@@ -42,6 +42,10 @@
     },
     "linux": {
       "deb": {
+        "preInstallScript": "scripts/deb-preinstall.sh",
+        "postInstallScript": "scripts/deb-postinstall.sh",
+        "preRemoveScript": "scripts/deb-preremove.sh",
+        "postRemoveScript": "scripts/deb-postremove.sh",
         "depends": [
           "libwebkit2gtk-4.1-0",
           "libgtk-3-0",
@@ -54,6 +58,10 @@
         ]
       },
       "rpm": {
+        "preInstallScript": "scripts/rpm-preinstall.sh",
+        "postInstallScript": "scripts/rpm-postinstall.sh",
+        "preRemoveScript": "scripts/rpm-preremove.sh",
+        "postRemoveScript": "scripts/rpm-postremove.sh",
         "depends": [
           "webkit2gtk4.1",
           "gtk3",

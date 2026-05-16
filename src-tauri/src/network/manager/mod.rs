@@ -11,14 +11,14 @@ use std::sync::Arc;
 use tauri::async_runtime::Receiver;
 use tauri::{AppHandle, Emitter, Manager};
 
+#[path = "../../live/broadcast/manager.rs"]
+mod broadcast;
 mod persistence;
 mod punching;
 mod run_loop;
 mod swarm_events;
 mod transfer;
 mod ui_commands;
-#[path = "../../live/broadcast/manager.rs"]
-mod broadcast;
 #[path = "../../live/video/manager.rs"]
 mod video_call;
 #[path = "../../live/voice/manager.rs"]
@@ -73,6 +73,22 @@ struct ActiveBroadcast {
     ring_expires_at: Option<i64>,
     started_at: Option<i64>,
     is_host: bool,
+}
+
+#[derive(Debug, Default)]
+struct VoiceNetworkStats {
+    outbound_frames: u64,
+    inbound_frames: u64,
+    inbound_seq_gaps: u64,
+    outbound_failures: u64,
+    inbound_failures: u64,
+    rejected_responses: u64,
+}
+
+impl VoiceNetworkStats {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -130,6 +146,33 @@ impl PeerTransportRegistry {
             .map(|state| state.quic_connections > 0)
             .unwrap_or(false)
     }
+
+    fn quic_connection_count(&self, peer_id: &PeerId) -> usize {
+        self.by_peer
+            .get(peer_id)
+            .map(|state| state.quic_connections)
+            .unwrap_or(0)
+    }
+
+    fn tcp_connection_count(&self, peer_id: &PeerId) -> usize {
+        self.by_peer
+            .get(peer_id)
+            .map(|state| state.tcp_connections)
+            .unwrap_or(0)
+    }
+}
+
+pub(super) fn quic_addresses_for_peer(
+    local_peers: &HashMap<PeerId, Vec<Multiaddr>>,
+    peer_id: &PeerId,
+) -> Vec<Multiaddr> {
+    local_peers
+        .get(peer_id)
+        .into_iter()
+        .flat_map(|addrs| addrs.iter())
+        .filter(|addr| PeerTransportRegistry::is_quic_addr(addr))
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +181,7 @@ pub(super) enum OutgoingDialSource {
     Mdns,
     Gist,
     Punch,
+    VoiceQuic,
     Unknown,
 }
 
@@ -148,6 +192,7 @@ impl OutgoingDialSource {
             Self::Mdns => "mdns",
             Self::Gist => "gist",
             Self::Punch => "punch",
+            Self::VoiceQuic => "voice_quic",
             Self::Unknown => "unknown",
         }
     }
@@ -170,7 +215,10 @@ fn extract_candidate_multiaddr_from_error_debug(error_debug: &str) -> Option<Str
     if candidate.is_empty() {
         return None;
     }
-    candidate.parse::<Multiaddr>().ok().map(|_| candidate.to_string())
+    candidate
+        .parse::<Multiaddr>()
+        .ok()
+        .map(|_| candidate.to_string())
 }
 
 fn classify_outgoing_error_source(
@@ -297,6 +345,12 @@ pub struct NetworkManager {
     voice_next_seq: u32,
     // Sequence-aware jitter buffer for inbound voice frames.
     voice_jitter_buffer: crate::live::voice::jitter::VoiceJitterBuffer,
+    // Expected next inbound voice sequence for diagnostics.
+    voice_expected_inbound_seq: Option<u32>,
+    // Aggregated voice transport diagnostics.
+    voice_network_stats: VoiceNetworkStats,
+    // Last time voice transport diagnostics were printed.
+    voice_last_summary_at: Option<std::time::Instant>,
 }
 
 fn build_incoming_dm_db_message(
@@ -482,6 +536,9 @@ impl NetworkManager {
             voice_capture_rx: None,
             voice_next_seq: 0,
             voice_jitter_buffer: crate::live::voice::jitter::VoiceJitterBuffer::new(),
+            voice_expected_inbound_seq: None,
+            voice_network_stats: VoiceNetworkStats::default(),
+            voice_last_summary_at: None,
         }
     }
 
@@ -501,18 +558,14 @@ impl NetworkManager {
             );
             false
         });
-        self.auto_connect_backoff_until.retain(|_, until| *until > now);
+        self.auto_connect_backoff_until
+            .retain(|_, until| *until > now);
     }
 
     pub(super) fn record_outgoing_dial(&mut self, addr: &Multiaddr, source: OutgoingDialSource) {
         let now = std::time::Instant::now();
-        self.recent_dials.insert(
-            addr.to_string(),
-            RecentDial {
-                source,
-                at: now,
-            },
-        );
+        self.recent_dials
+            .insert(addr.to_string(), RecentDial { source, at: now });
         self.prune_stale_mdns_dials(now);
     }
 
@@ -720,7 +773,8 @@ impl NetworkManager {
             std::time::Duration::from_secs(secs),
             Self::AUTO_CONNECT_MAX_BACKOFF,
         );
-        self.auto_connect_backoff_until.insert(peer_id, now + backoff);
+        self.auto_connect_backoff_until
+            .insert(peer_id, now + backoff);
         println!(
             "[AutoConnect] Attempt failed for {} (attempt {}), retry in {:.1}s",
             peer_id,
@@ -743,11 +797,17 @@ impl NetworkManager {
             return;
         }
         if self.pending_requests.contains(&peer_id) || self.incoming_requests.contains(&peer_id) {
-            println!("[AutoConnect] Skipped {} (request already in-flight)", peer_id);
+            println!(
+                "[AutoConnect] Skipped {} (request already in-flight)",
+                peer_id
+            );
             return;
         }
         if self.auto_connect_inflight.contains_key(&peer_id) {
-            println!("[AutoConnect] Skipped {} (auto-connect attempt in-flight)", peer_id);
+            println!(
+                "[AutoConnect] Skipped {} (auto-connect attempt in-flight)",
+                peer_id
+            );
             return;
         }
         if let Some(until) = self.auto_connect_backoff_until.get(&peer_id) {
@@ -957,7 +1017,11 @@ impl NetworkManager {
         let _ = self.app_handle.emit("broadcast-state-updated", next);
     }
 
-    pub(super) fn note_peer_transport_connected(&mut self, peer_id: PeerId, remote_addr: &Multiaddr) {
+    pub(super) fn note_peer_transport_connected(
+        &mut self,
+        peer_id: PeerId,
+        remote_addr: &Multiaddr,
+    ) {
         self.peer_transport_registry
             .record_connected(peer_id, remote_addr);
     }
@@ -975,7 +1039,73 @@ impl NetworkManager {
         self.peer_transport_registry.has_quic(peer_id)
     }
 
-    pub(super) fn current_connectivity_settings(&self) -> crate::storage::config::ConnectivitySettings {
+    pub(super) fn peer_transport_counts(&self, peer_id: &PeerId) -> (usize, usize) {
+        (
+            self.peer_transport_registry.quic_connection_count(peer_id),
+            self.peer_transport_registry.tcp_connection_count(peer_id),
+        )
+    }
+
+    pub(super) fn dial_known_voice_quic_addresses(&mut self, peer_id: &PeerId) -> usize {
+        let addrs = quic_addresses_for_peer(&self.local_peers, peer_id);
+        for addr in &addrs {
+            self.record_outgoing_dial(addr, OutgoingDialSource::VoiceQuic);
+            if let Err(e) = self.swarm.dial(addr.clone()) {
+                eprintln!(
+                    "[Voice][QUIC] Dial failed for {} at {}: {}",
+                    peer_id, addr, e
+                );
+            } else {
+                eprintln!("[Voice][QUIC] Dialing {} at {}", peer_id, addr);
+            }
+        }
+        addrs.len()
+    }
+
+    pub(super) fn ensure_voice_quic_path(&mut self, peer_id: &PeerId) -> bool {
+        let (quic_count, tcp_count) = self.peer_transport_counts(peer_id);
+        if quic_count > 0 {
+            eprintln!(
+                "[Voice][QUIC] peer={} quic_connections={}, tcp_connections={}",
+                peer_id, quic_count, tcp_count
+            );
+            return true;
+        }
+
+        let dial_count = self.dial_known_voice_quic_addresses(peer_id);
+        eprintln!(
+            "[Voice][QUIC] peer={} missing QUIC path, tcp_connections={}, quic_candidates_dialed={}",
+            peer_id, tcp_count, dial_count
+        );
+        false
+    }
+
+    pub(super) fn reset_voice_network_diagnostics(&mut self) {
+        self.voice_network_stats.reset();
+        self.voice_expected_inbound_seq = None;
+        self.voice_last_summary_at = Some(std::time::Instant::now());
+    }
+
+    pub(super) fn log_voice_network_summary(&mut self, label: &str, peer_id: &PeerId) {
+        let (quic_count, tcp_count) = self.peer_transport_counts(peer_id);
+        eprintln!(
+            "[Voice][Network][{}] peer={}, quic_connections={}, tcp_connections={}, outbound_frames={}, inbound_frames={}, inbound_seq_gaps={}, outbound_failures={}, inbound_failures={}, rejected_responses={}",
+            label,
+            peer_id,
+            quic_count,
+            tcp_count,
+            self.voice_network_stats.outbound_frames,
+            self.voice_network_stats.inbound_frames,
+            self.voice_network_stats.inbound_seq_gaps,
+            self.voice_network_stats.outbound_failures,
+            self.voice_network_stats.inbound_failures,
+            self.voice_network_stats.rejected_responses,
+        );
+    }
+
+    pub(super) fn current_connectivity_settings(
+        &self,
+    ) -> crate::storage::config::ConnectivitySettings {
         let state = self.app_handle.state::<crate::NetworkState>();
         let settings = match state.connectivity.try_lock() {
             Ok(settings) => settings.clone(),

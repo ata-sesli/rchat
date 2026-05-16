@@ -66,10 +66,17 @@ impl NetworkManager {
     }
 
     pub(super) fn stop_voice_audio(&mut self) {
+        if let Some(call) = self.active_call.as_ref() {
+            if call.kind == CallKind::Voice {
+                let peer = call.remote_peer_id;
+                self.log_voice_network_summary("final", &peer);
+            }
+        }
         self.voice_audio_engine = None;
         self.voice_capture_rx = None;
         self.voice_next_seq = 0;
         self.voice_jitter_buffer.reset();
+        self.reset_voice_network_diagnostics();
     }
 
     pub(super) fn start_voice_audio(&mut self) -> Result<(), String> {
@@ -78,16 +85,22 @@ impl NetworkManager {
         self.voice_capture_rx = Some(capture_rx);
         self.voice_next_seq = 0;
         self.voice_jitter_buffer.reset();
+        self.reset_voice_network_diagnostics();
         Ok(())
     }
 
     pub(super) async fn transition_to_idle(&mut self, reason: Option<String>) {
-        self.active_call = None;
         self.stop_voice_audio();
+        self.active_call = None;
         self.push_idle_call_state(reason).await;
     }
 
-    pub(super) fn send_call_signal(&mut self, peer: PeerId, kind: DirectMessageKind, call_id: &str) {
+    pub(super) fn send_call_signal(
+        &mut self,
+        peer: PeerId,
+        kind: DirectMessageKind,
+        call_id: &str,
+    ) {
         let now = Self::now_unix_ts();
         let req = DirectMessageRequest {
             id: format!("call-signal-{}-{}", kind.as_str(), now),
@@ -109,8 +122,7 @@ impl NetworkManager {
 
     pub(super) async fn handle_start_voice_call(&mut self, peer_chat_id: String) {
         if let Some(session) = self.active_broadcast.as_ref() {
-            if session.phase != ActiveBroadcastPhase::Active
-                || session.peer_chat_id != peer_chat_id
+            if session.phase != ActiveBroadcastPhase::Active || session.peer_chat_id != peer_chat_id
             {
                 self.push_idle_call_state(Some("broadcast_conflict".to_string()))
                     .await;
@@ -142,6 +154,11 @@ impl NetworkManager {
                 .await;
             return;
         }
+        if !self.ensure_voice_quic_path(&peer_id) {
+            self.push_idle_call_state(Some("quic_required".to_string()))
+                .await;
+            return;
+        }
 
         let now = Self::now_unix_ts();
         let call_id = format!("call-{}-{}", now, rand::random::<u32>());
@@ -151,7 +168,9 @@ impl NetworkManager {
             peer_chat_id,
             remote_peer_id: peer_id,
             phase: ActiveCallPhase::OutgoingRinging,
-            ring_deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(CALL_RING_TIMEOUT_SECS)),
+            ring_deadline: Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(CALL_RING_TIMEOUT_SECS),
+            ),
             ring_expires_at: Some(now + CALL_RING_TIMEOUT_SECS as i64),
             started_at: None,
             muted: false,
@@ -188,6 +207,17 @@ impl NetworkManager {
             || call_snapshot.phase != ActiveCallPhase::IncomingRinging
             || call_snapshot.kind != CallKind::Voice
         {
+            return;
+        }
+
+        if !self.ensure_voice_quic_path(&call_snapshot.remote_peer_id) {
+            self.send_call_signal(
+                call_snapshot.remote_peer_id,
+                DirectMessageKind::CallEnd,
+                &call_snapshot.call_id,
+            );
+            self.transition_to_idle(Some("quic_required".to_string()))
+                .await;
             return;
         }
 
@@ -228,7 +258,11 @@ impl NetworkManager {
         {
             return;
         }
-        self.send_call_signal(call.remote_peer_id, DirectMessageKind::CallReject, &call.call_id);
+        self.send_call_signal(
+            call.remote_peer_id,
+            DirectMessageKind::CallReject,
+            &call.call_id,
+        );
         self.transition_to_idle(Some("rejected".to_string())).await;
     }
 
@@ -241,7 +275,11 @@ impl NetworkManager {
         }
         self.push_active_call_state(&call, VoiceCallPhase::Ending, None)
             .await;
-        self.send_call_signal(call.remote_peer_id, DirectMessageKind::CallEnd, &call.call_id);
+        self.send_call_signal(
+            call.remote_peer_id,
+            DirectMessageKind::CallEnd,
+            &call.call_id,
+        );
         self.transition_to_idle(Some("ended".to_string())).await;
     }
 
@@ -286,6 +324,12 @@ impl NetworkManager {
                     self.send_call_signal(peer, DirectMessageKind::CallReject, &request.id);
                     return Ok(());
                 }
+                if request.msg_type == DirectMessageKind::CallOffer
+                    && !self.ensure_voice_quic_path(&peer)
+                {
+                    self.send_call_signal(peer, DirectMessageKind::CallReject, &request.id);
+                    return Ok(());
+                }
                 if request.msg_type == DirectMessageKind::CallOfferVideo
                     && self.active_broadcast.is_some()
                 {
@@ -319,7 +363,10 @@ impl NetworkManager {
                     peer_chat_id: incoming_chat_id,
                     remote_peer_id: peer,
                     phase: ActiveCallPhase::IncomingRinging,
-                    ring_deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(CALL_RING_TIMEOUT_SECS)),
+                    ring_deadline: Some(
+                        std::time::Instant::now()
+                            + std::time::Duration::from_secs(CALL_RING_TIMEOUT_SECS),
+                    ),
                     ring_expires_at: Some(now + CALL_RING_TIMEOUT_SECS as i64),
                     started_at: None,
                     muted: false,
@@ -346,6 +393,12 @@ impl NetworkManager {
                     return Ok(());
                 }
                 if expected_kind == CallKind::Video && !self.peer_has_quic_path(&peer) {
+                    self.transition_to_idle(Some("quic_required".to_string()))
+                        .await;
+                    return Ok(());
+                }
+                if expected_kind == CallKind::Voice && !self.ensure_voice_quic_path(&peer) {
+                    self.send_call_signal(peer, DirectMessageKind::CallEnd, &call_snapshot.call_id);
                     self.transition_to_idle(Some("quic_required".to_string()))
                         .await;
                     return Ok(());
@@ -385,7 +438,8 @@ impl NetworkManager {
                 let call_id = Self::call_id_from_signal(request);
                 if let Some(call) = self.active_call.as_ref() {
                     if call.call_id == call_id {
-                        self.transition_to_idle(Some("ended_remote".to_string())).await;
+                        self.transition_to_idle(Some("ended_remote".to_string()))
+                            .await;
                     }
                 }
             }
@@ -402,18 +456,39 @@ impl NetworkManager {
                     let call_id = call.call_id.clone();
                     let peer = call.remote_peer_id;
                     self.send_call_signal(peer, DirectMessageKind::CallEnd, &call_id);
-                    self.transition_to_idle(Some("ring_timeout".to_string())).await;
+                    self.transition_to_idle(Some("ring_timeout".to_string()))
+                        .await;
                     return;
                 }
             }
         }
 
-        let (call_id, peer, muted, phase) = match self.active_call.as_ref() {
-            Some(c) => (c.call_id.clone(), c.remote_peer_id, c.muted, c.phase),
+        let (call_id, peer, muted, phase, kind) = match self.active_call.as_ref() {
+            Some(c) => (
+                c.call_id.clone(),
+                c.remote_peer_id,
+                c.muted,
+                c.phase,
+                c.kind.clone(),
+            ),
             None => return,
         };
         if phase != ActiveCallPhase::Active {
             return;
+        }
+        if kind == CallKind::Voice && !self.peer_has_quic_path(&peer) {
+            self.transition_to_idle(Some("quic_path_lost".to_string()))
+                .await;
+            return;
+        }
+
+        if self
+            .voice_last_summary_at
+            .map(|last| last.elapsed() >= std::time::Duration::from_secs(5))
+            .unwrap_or(true)
+        {
+            self.log_voice_network_summary("summary", &peer);
+            self.voice_last_summary_at = Some(std::time::Instant::now());
         }
 
         let Some(capture_rx) = self.voice_capture_rx.as_mut() else {
@@ -433,6 +508,7 @@ impl NetworkManager {
                         payload: Self::encode_pcm16_le(&frame),
                     };
                     self.voice_next_seq = self.voice_next_seq.wrapping_add(1);
+                    self.voice_network_stats.outbound_frames += 1;
                     self.swarm
                         .behaviour_mut()
                         .voice_call
@@ -447,7 +523,8 @@ impl NetworkManager {
     pub(super) async fn handle_peer_disconnect_for_voice_call(&mut self, peer_id: &PeerId) {
         if let Some(call) = self.active_call.as_ref() {
             if &call.remote_peer_id == peer_id {
-                self.transition_to_idle(Some("disconnected".to_string())).await;
+                self.transition_to_idle(Some("disconnected".to_string()))
+                    .await;
             }
         }
     }
@@ -469,6 +546,17 @@ impl NetworkManager {
                             && call.call_id == request.call_id
                             && call.remote_peer_id == peer
                         {
+                            self.voice_network_stats.inbound_frames += 1;
+                            if let Some(expected) = self.voice_expected_inbound_seq {
+                                if request.seq != expected {
+                                    self.voice_network_stats.inbound_seq_gaps += 1;
+                                    eprintln!(
+                                        "[Voice][Network] inbound seq gap from {}: expected={}, got={}",
+                                        peer, expected, request.seq
+                                    );
+                                }
+                            }
+                            self.voice_expected_inbound_seq = Some(request.seq.wrapping_add(1));
                             let pcm = Self::decode_pcm16_le(&request.payload);
                             let ordered_frames = self.voice_jitter_buffer.push(request.seq, pcm);
                             if let Some(engine) = self.voice_audio_engine.as_ref() {
@@ -487,10 +575,13 @@ impl NetworkManager {
                 }
                 Message::Response { response, .. } => {
                     if !response.ok {
+                        self.voice_network_stats.rejected_responses += 1;
                         let should_end = self
                             .active_call
                             .as_ref()
-                            .map(|call| call.phase == ActiveCallPhase::Active && call.remote_peer_id == peer)
+                            .map(|call| {
+                                call.phase == ActiveCallPhase::Active && call.remote_peer_id == peer
+                            })
                             .unwrap_or(false);
                         if should_end {
                             self.transition_to_idle(Some("stream_rejected".to_string()))
@@ -501,10 +592,13 @@ impl NetworkManager {
             },
             Event::OutboundFailure { peer, error, .. } => {
                 eprintln!("[Voice] Outbound frame failure to {}: {:?}", peer, error);
+                self.voice_network_stats.outbound_failures += 1;
                 let should_end = self
                     .active_call
                     .as_ref()
-                    .map(|call| call.phase == ActiveCallPhase::Active && call.remote_peer_id == peer)
+                    .map(|call| {
+                        call.phase == ActiveCallPhase::Active && call.remote_peer_id == peer
+                    })
                     .unwrap_or(false);
                 if should_end {
                     self.transition_to_idle(Some("stream_failure".to_string()))
@@ -513,10 +607,13 @@ impl NetworkManager {
             }
             Event::InboundFailure { peer, error, .. } => {
                 eprintln!("[Voice] Inbound frame failure from {}: {:?}", peer, error);
+                self.voice_network_stats.inbound_failures += 1;
                 let should_end = self
                     .active_call
                     .as_ref()
-                    .map(|call| call.phase == ActiveCallPhase::Active && call.remote_peer_id == peer)
+                    .map(|call| {
+                        call.phase == ActiveCallPhase::Active && call.remote_peer_id == peer
+                    })
                     .unwrap_or(false);
                 if should_end {
                     self.transition_to_idle(Some("stream_failure".to_string()))

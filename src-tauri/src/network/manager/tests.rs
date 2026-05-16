@@ -1,6 +1,6 @@
 use super::{
     build_incoming_dm_db_message, build_incoming_group_db_message, classify_outgoing_error_source,
-    OutgoingDialSource, PeerTransportRegistry, RecentDial,
+    quic_addresses_for_peer, OutgoingDialSource, PeerTransportRegistry, RecentDial,
 };
 use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
 use crate::network::gossip::{GroupContentType, GroupMessageEnvelope};
@@ -149,16 +149,24 @@ fn peer_transport_registry_tracks_quic_and_tcp() {
 
     let mut registry = PeerTransportRegistry::default();
     assert!(!registry.has_quic(&peer));
+    assert_eq!(registry.quic_connection_count(&peer), 0);
+    assert_eq!(registry.tcp_connection_count(&peer), 0);
 
     registry.record_connected(peer, &tcp);
     assert!(!registry.has_quic(&peer));
+    assert_eq!(registry.quic_connection_count(&peer), 0);
+    assert_eq!(registry.tcp_connection_count(&peer), 1);
 
     registry.record_connected(peer, &quic);
     assert!(registry.has_quic(&peer));
+    assert_eq!(registry.quic_connection_count(&peer), 1);
+    assert_eq!(registry.tcp_connection_count(&peer), 1);
 
     let quic_lost = registry.record_disconnected(peer, &quic);
     assert!(quic_lost);
     assert!(!registry.has_quic(&peer));
+    assert_eq!(registry.quic_connection_count(&peer), 0);
+    assert_eq!(registry.tcp_connection_count(&peer), 1);
 }
 
 #[test]
@@ -196,6 +204,45 @@ fn outgoing_error_classifier_marks_nat_keepalive() {
         now,
     );
     assert_eq!(source, OutgoingDialSource::NatKeepalive);
+}
+
+#[test]
+fn outgoing_error_classifier_uses_recent_voice_quic_dial_context() {
+    let now = std::time::Instant::now();
+    let mut recent = HashMap::<String, RecentDial>::new();
+    recent.insert(
+        "/ip4/192.168.1.20/udp/9001/quic-v1".to_string(),
+        RecentDial {
+            source: OutgoingDialSource::VoiceQuic,
+            at: now,
+        },
+    );
+
+    let source = classify_outgoing_error_source(
+        "Transport([(/ip4/192.168.1.20/udp/9001/quic-v1, Other(...))])",
+        Some("/ip4/192.168.1.20/udp/9001/quic-v1"),
+        &recent,
+        false,
+        false,
+        false,
+        now,
+    );
+    assert_eq!(source, OutgoingDialSource::VoiceQuic);
+}
+
+#[test]
+fn quic_addresses_for_peer_filters_known_addresses_to_quic_only() {
+    let keypair = libp2p::identity::Keypair::generate_ed25519();
+    let peer = keypair.public().to_peer_id();
+    let quic_a: Multiaddr = "/ip4/10.0.0.5/udp/4242/quic-v1".parse().unwrap();
+    let tcp: Multiaddr = "/ip4/10.0.0.5/tcp/4242".parse().unwrap();
+    let quic_b: Multiaddr = "/ip6/::1/udp/5252/quic-v1".parse().unwrap();
+    let mut local_peers = HashMap::new();
+    local_peers.insert(peer, vec![quic_a.clone(), tcp, quic_b.clone()]);
+
+    let addrs = quic_addresses_for_peer(&local_peers, &peer);
+
+    assert_eq!(addrs, vec![quic_a, quic_b]);
 }
 
 #[test]

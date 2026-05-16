@@ -77,20 +77,19 @@ impl NetworkManager {
             use tauri::Manager;
             let state = self.app_handle.state::<crate::AppState>();
             let local_chat_id = if let Ok(conn) = state.db_conn.lock() {
-                let local_chat_id = crate::storage::db::find_existing_local_chat_id_for_peer(
-                    &conn,
-                    &peer_id_str,
-                )
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| {
-                    let local_name = crate::storage::db::get_peer_alias(&conn, &peer_id_str)
+                let local_chat_id =
+                    crate::storage::db::find_existing_local_chat_id_for_peer(&conn, &peer_id_str)
                         .ok()
                         .flatten()
-                        .filter(|name| !name.trim().is_empty() && name != &peer_id_str)
-                        .unwrap_or_else(|| "peer".to_string());
-                    crate::chat_identity::build_local_chat_id(&local_name, &peer_id_str)
-                });
+                        .unwrap_or_else(|| {
+                            let local_name =
+                                crate::storage::db::get_peer_alias(&conn, &peer_id_str)
+                                    .ok()
+                                    .flatten()
+                                    .filter(|name| !name.trim().is_empty() && name != &peer_id_str)
+                                    .unwrap_or_else(|| "peer".to_string());
+                            crate::chat_identity::build_local_chat_id(&local_name, &peer_id_str)
+                        });
 
                 let local_name = crate::chat_identity::extract_name_from_chat_id(&local_chat_id)
                     .unwrap_or_else(|| "peer".to_string());
@@ -268,14 +267,17 @@ impl NetworkManager {
         let remote_addr = endpoint.get_remote_address().clone();
         let quic_path_lost = self.note_peer_transport_disconnected(peer_id, &remote_addr);
         if quic_path_lost {
-            let end_video_call = self
+            let end_quic_media_call = self
                 .active_call
                 .as_ref()
                 .map(|call| {
-                    call.kind == crate::app_state::CallKind::Video && call.remote_peer_id == peer_id
+                    matches!(
+                        call.kind,
+                        crate::app_state::CallKind::Video | crate::app_state::CallKind::Voice
+                    ) && call.remote_peer_id == peer_id
                 })
                 .unwrap_or(false);
-            if end_video_call {
+            if end_quic_media_call {
                 self.transition_to_idle(Some("quic_path_lost".to_string()))
                     .await;
             }
@@ -324,9 +326,12 @@ impl NetworkManager {
                     let local_chat_id = if let Ok(conn) =
                         self.app_handle.state::<crate::AppState>().db_conn.lock()
                     {
-                        crate::storage::db::find_existing_local_chat_id_for_peer(&conn, &peer_id_str)
-                            .ok()
-                            .flatten()
+                        crate::storage::db::find_existing_local_chat_id_for_peer(
+                            &conn,
+                            &peer_id_str,
+                        )
+                        .ok()
+                        .flatten()
                     } else {
                         None
                     };
