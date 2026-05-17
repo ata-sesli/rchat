@@ -1,3 +1,4 @@
+use super::codec::{VOICE_FRAME_SAMPLES, VOICE_SAMPLE_RATE};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig,
@@ -14,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const TARGET_RATE: u32 = 16_000;
-const FRAME_SAMPLES: usize = 320; // 20ms @ 16kHz mono
+const TARGET_RATE: u32 = VOICE_SAMPLE_RATE;
+const FRAME_SAMPLES: usize = VOICE_FRAME_SAMPLES; // 20ms @ 48kHz mono
 const VOICE_DIAGNOSTICS_INTERVAL: Duration = Duration::from_secs(5);
 const PLAYBACK_TARGET_QUEUE_SAMPLES: usize = FRAME_SAMPLES * 8; // 160ms
 const PLAYBACK_LOW_QUEUE_SAMPLES: usize = FRAME_SAMPLES * 4; // 80ms
@@ -28,7 +29,7 @@ const MIN_PLAUSIBLE_OUTPUT_RATE_HZ: f64 = 8_000.0;
 const MAX_PLAUSIBLE_OUTPUT_RATE_HZ: f64 = 192_000.0;
 const OUTPUT_CLOCK_UNSTABLE_THRESHOLD: f64 = 0.10;
 const VOICE_OUTPUT_RATE_ENV: &str = "RCHAT_VOICE_OUTPUT_RATE";
-const PREFERRED_OUTPUT_RATES: &[u32] = &[TARGET_RATE, 22_050, 24_000, 48_000, 44_100];
+const PREFERRED_OUTPUT_RATES: &[u32] = &[48_000, 44_100, 24_000, 22_050, 16_000];
 
 #[derive(Debug, Default)]
 struct VoiceAudioStats {
@@ -329,7 +330,10 @@ fn choose_voice_output_config(
     let supported_ranges = match output_device.supported_output_configs() {
         Ok(ranges) => ranges.collect::<Vec<_>>(),
         Err(e) => {
-            eprintln!("[Voice][Audio] Failed to read supported output configs: {}", e);
+            eprintln!(
+                "[Voice][Audio] Failed to read supported output configs: {}",
+                e
+            );
             return OutputConfigSelection {
                 config: default,
                 reason: OutputConfigSelectionReason::SupportedConfigUnavailable,
@@ -1183,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_resampler_bypasses_when_input_is_already_16khz() {
+    fn voice_resampler_bypasses_when_input_is_already_48khz() {
         let mut resampler = VoiceResampler::new(TARGET_RATE).expect("resampler");
         let input = ramp(FRAME_SAMPLES * 3);
         let output = resampler.push_mono_i16(&input);
@@ -1193,7 +1197,9 @@ mod tests {
     }
 
     #[test]
-    fn voice_frame_assembler_emits_20ms_frames_at_16khz() {
+    fn voice_frame_assembler_emits_20ms_frames_at_48khz() {
+        assert_eq!(TARGET_RATE, 48_000);
+        assert_eq!(FRAME_SAMPLES, 960);
         let mut assembler = VoiceFrameAssembler::new(TARGET_RATE).expect("assembler");
         let frames = assembler.push_samples(&ramp(FRAME_SAMPLES * 2 + 17));
 
@@ -1206,7 +1212,7 @@ mod tests {
         let mut assembler = VoiceFrameAssembler::new(48_000).expect("assembler");
         let frames = assembler.push_samples(&ramp(960 * 6));
 
-        assert_eq!(frames.len(), 5);
+        assert_eq!(frames.len(), 6);
         assert!(frames.iter().all(|frame| frame.len() == FRAME_SAMPLES));
     }
 
@@ -1274,7 +1280,7 @@ mod tests {
             playback_step(
                 state.effective_output_rate_hz(),
                 PLAYBACK_TARGET_QUEUE_SAMPLES
-            ) < 0.4
+            ) > 1.0
         );
     }
 
@@ -1320,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_output_config_prefers_16khz_when_supported() {
+    fn voice_output_config_prefers_48khz_when_supported() {
         let default = SupportedStreamConfig::new(
             2,
             SampleRate(44_100),
@@ -1337,8 +1343,11 @@ mod tests {
 
         let selection = select_voice_output_config(default, ranges, None);
 
-        assert_eq!(selection.reason, OutputConfigSelectionReason::PreferredVoiceRate);
-        assert_eq!(selection.config.sample_rate().0, TARGET_RATE);
+        assert_eq!(
+            selection.reason,
+            OutputConfigSelectionReason::PreferredVoiceRate
+        );
+        assert_eq!(selection.config.sample_rate().0, 48_000);
     }
 
     #[test]
@@ -1381,7 +1390,10 @@ mod tests {
 
         let selection = select_voice_output_config(default, ranges, Some(16_000));
 
-        assert_eq!(selection.reason, OutputConfigSelectionReason::DefaultOutputConfig);
+        assert_eq!(
+            selection.reason,
+            OutputConfigSelectionReason::DefaultOutputConfig
+        );
         assert_eq!(selection.config.sample_rate().0, 44_100);
     }
 

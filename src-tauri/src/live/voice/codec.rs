@@ -1,6 +1,6 @@
-pub const VOICE_SAMPLE_RATE: u32 = 16_000;
-pub const VOICE_FRAME_SAMPLES: usize = 320;
-pub const VOICE_OPUS_BITRATE: i32 = 24_000;
+pub const VOICE_SAMPLE_RATE: u32 = 48_000;
+pub const VOICE_FRAME_SAMPLES: usize = 960;
+pub const VOICE_OPUS_BITRATE: i32 = 32_000;
 const VOICE_OPUS_MAX_PACKET_BYTES: usize = 1_275;
 
 pub struct VoiceOpusEncoder {
@@ -85,6 +85,12 @@ mod tests {
             *sample = (phase.sin() * 12_000.0) as i16;
         }
         frame
+    }
+
+    #[test]
+    fn opus_media_clock_is_48khz_with_20ms_frames() {
+        assert_eq!(VOICE_SAMPLE_RATE, 48_000);
+        assert_eq!(VOICE_FRAME_SAMPLES, 960);
     }
 
     #[test]

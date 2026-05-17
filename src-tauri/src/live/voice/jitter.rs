@@ -60,7 +60,9 @@ impl VoiceJitterBuffer {
 
         if self.prebuffering {
             let mut contiguous = 0usize;
-            while self.pending.contains_key(&expected.wrapping_add(contiguous as u32))
+            while self
+                .pending
+                .contains_key(&expected.wrapping_add(contiguous as u32))
                 && contiguous < START_PREBUFFER_FRAMES
             {
                 contiguous += 1;
@@ -101,10 +103,12 @@ impl VoiceJitterBuffer {
 
 #[cfg(test)]
 mod tests {
+    use crate::live::voice::codec::VOICE_FRAME_SAMPLES;
+
     use super::VoiceJitterBuffer;
 
     fn frame(sample: i16) -> Vec<i16> {
-        vec![sample; 320]
+        vec![sample; VOICE_FRAME_SAMPLES]
     }
 
     #[test]
