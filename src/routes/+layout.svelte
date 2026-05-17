@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { listen } from "@tauri-apps/api/event";
   import {
     getCurrent,
     isRegistered,
@@ -10,14 +9,38 @@
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
   import {
-    api,
-    type BroadcastState,
     type ConnectivityMode,
-    type ConnectivitySettings,
-    type VoiceCallState,
   } from "$lib/tauri/api";
   import { defaultGroupName, getChatKind } from "$lib/chatKind";
-  import { connectedChatIds, initPresence } from "$lib/stores/presence";
+  import {
+    appSession,
+    applyConnectivitySettings,
+    chatState,
+    clearClosedChatMarker,
+    connectedChatIds,
+    createEnvelope,
+    createGroup,
+    deleteChat,
+    deleteEnvelope,
+    ensureAppReady,
+    initAppSession,
+    joinGroup,
+    liveActions,
+    liveState,
+    markChatRead,
+    moveChatToEnvelope,
+    openTemporaryGroup,
+    redeemTemporaryInvite,
+    refreshChats,
+    refreshUserProfile,
+    saveTemporaryChatToArchive,
+    selectEnvelope,
+    setConnectivityMode,
+    setSearchQuery,
+    sortedPeers,
+    togglePinPeer,
+    updateEnvelope,
+  } from "$lib/stores";
   import "../app.css"; // Ensure global styles are loaded
 
   // Components
@@ -29,38 +52,9 @@
   import Sidebar from "../components/sidebar/Sidebar.svelte";
   import ThemeProvider from "../components/ThemeProvider.svelte";
 
-  // Types
-  type Envelope = { id: string; name: string; icon?: string | null };
-
-  // State
-  let peers: string[] = [];
-  let peerAliases: Record<string, string | null> = {};
-  let chatNames: Record<string, string> = {};
-  let groupChats: Record<string, boolean> = {};
-  let pinnedPeers: string[] = [];
-  let userProfile = {
-    alias: "Me" as string | null,
-    avatar_path: null as string | null,
-  };
-  let searchQuery = "";
-  let connectivitySettings: ConnectivitySettings = {
-    mode: "reachable",
-    mdns_enabled: true,
-    github_sync_enabled: true,
-    nat_keepalive_enabled: true,
-    punch_assist_enabled: true,
-  };
-
-  // Active peer is derived from route params
   $: activePeer = $page.params.id || "";
-
-  // Envelopes
-  let envelopes: Envelope[] = [];
-  let chatAssignments: Record<string, string> = {};
-  let currentEnvelope: string | null = null;
   let dragOverEnvelopeId: string | null = null;
 
-  // Envelope modal
   let showEnvelopeModal = false;
   let editingEnvelopeId: string | null = null;
   let newEnvelopeName = "";
@@ -73,7 +67,6 @@
     '<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.38z" clip-rule="evenodd" /></svg>',
   ];
 
-  // UI State
   let isSidebarOpen = true;
   let showEnvelopeSettings = false;
   let envelopeSettingsTargetId: string | null = null;
@@ -91,177 +84,63 @@
     | "create-invite-code"
     | "accept-invite-user"
     | "accept-invite-code" = "select-network";
-  let localPeers: { peer_id: string; addresses: string[] }[] = [];
 
-  // Context Menu
   let showContextMenu = false;
   let contextMenuPos = { x: 0, y: 0 };
   let contextMenuTarget: { type: "peer" | "envelope"; id: string } | null =
     null;
 
-  // Drag State
   let isDragging = false;
   let draggingPeer: string | null = null;
   let dragStartY = 0;
 
-  // Sorted peers (reactive) - sorted by latest message time
-  let latestMessageTimes: Record<string, number> = {};
-
-  // Unread message counts per chat
-  let unreadCounts: Record<string, number> = {};
   const seenDeepLinks = new Set<string>();
-  let unlistenOpenUrl: (() => void) | null = null;
-  let unlistenPresence: (() => void) | null = null;
-  let unlistenVoiceCallState: (() => void) | null = null;
-  let unlistenBroadcastState: (() => void) | null = null;
-  let voiceCallState: VoiceCallState = { phase: "idle", muted: false };
-  let broadcastState: BroadcastState = { phase: "idle", is_host: false };
-  let videoCallSupported = true;
-  let videoCallUnsupportedReason: string | null = null;
-  let screenBroadcastSupported = true;
-  let screenBroadcastUnsupportedReason: string | null = null;
-  const autoRejectedUnsupportedVideoCalls = new Set<string>();
-  const autoRejectedUnsupportedBroadcasts = new Set<string>();
-
-  function detectVideoCallSupport(): { supported: boolean; reason: string | null } {
-    if (typeof window === "undefined") {
-      return { supported: false, reason: "Unavailable in this environment." };
-    }
-    if (!navigator?.mediaDevices?.getUserMedia) {
-      return { supported: false, reason: "Camera capture is unavailable on this device." };
-    }
-    const w = window as any;
-    if (!w.VideoEncoder || !w.VideoDecoder || !w.EncodedVideoChunk || !w.MediaStreamTrackProcessor) {
-      return { supported: false, reason: "WebCodecs video support is unavailable on this client." };
-    }
-    return { supported: true, reason: null };
+  let layoutCleanups: Array<() => void> = [];
+  $: isLoginRoute = $page.url.pathname === "/login";
+  $: voiceCallState = $liveState.voiceCallState;
+  $: broadcastState = $liveState.broadcastState;
+  $: videoCallSupported = $liveState.videoCallSupported;
+  $: videoCallUnsupportedReason = $liveState.videoCallUnsupportedReason;
+  $: screenBroadcastSupported = $liveState.screenBroadcastSupported;
+  $: screenBroadcastUnsupportedReason =
+    $liveState.screenBroadcastUnsupportedReason;
+  $: if (
+    !isLoginRoute &&
+    $appSession.authChecked &&
+    $appSession.authPhase === "locked"
+  ) {
+    void goto("/login");
+  }
+  $: if ($chatState.closedChatId && $chatState.closedChatId === activePeer) {
+    clearClosedChatMarker();
+    void goto("/");
   }
 
-  function detectScreenBroadcastSupport(): {
-    supported: boolean;
-    reason: string | null;
-  } {
-    const base = detectVideoCallSupport();
-    if (!base.supported) return base;
-    if (!navigator?.mediaDevices?.getDisplayMedia) {
-      return { supported: false, reason: "Screen capture is unavailable on this client." };
-    }
-    return { supported: true, reason: null };
-  }
-
-  $: {
-    const incomingUnsupportedVideoCallId =
-      voiceCallState.phase === "incoming_ringing" &&
-      voiceCallState.call_kind === "video" &&
-      voiceCallState.call_id &&
-      !videoCallSupported
-        ? voiceCallState.call_id
-        : null;
-    if (
-      incomingUnsupportedVideoCallId &&
-      !autoRejectedUnsupportedVideoCalls.has(incomingUnsupportedVideoCallId)
-    ) {
-      autoRejectedUnsupportedVideoCalls.add(incomingUnsupportedVideoCallId);
-      void api.rejectVideoCall(incomingUnsupportedVideoCallId).catch((e) => {
-        console.error("Failed to auto-reject unsupported incoming video call:", e);
-      });
-    }
-    if (voiceCallState.phase === "idle" && autoRejectedUnsupportedVideoCalls.size > 32) {
-      autoRejectedUnsupportedVideoCalls.clear();
-    }
-  }
-
-  $: {
-    const incomingUnsupportedBroadcastId =
-      broadcastState.phase === "incoming_ringing" &&
-      broadcastState.session_id &&
-      !screenBroadcastSupported
-        ? broadcastState.session_id
-        : null;
-    if (
-      incomingUnsupportedBroadcastId &&
-      !autoRejectedUnsupportedBroadcasts.has(incomingUnsupportedBroadcastId)
-    ) {
-      autoRejectedUnsupportedBroadcasts.add(incomingUnsupportedBroadcastId);
-      void api.rejectScreenBroadcast(incomingUnsupportedBroadcastId).catch((e) => {
-        console.error(
-          "Failed to auto-reject unsupported incoming screen share:",
-          e,
-        );
-      });
-    }
-    if (broadcastState.phase === "idle" && autoRejectedUnsupportedBroadcasts.size > 32) {
-      autoRejectedUnsupportedBroadcasts.clear();
-    }
-  }
-
-  $: sortedPeers = computeSortedPeers(
-    peers,
-    pinnedPeers,
-    latestMessageTimes,
-    searchQuery,
-    currentEnvelope,
-    chatAssignments,
-  );
-
-  function computeSortedPeers(
-    peers: string[],
-    pinnedPeers: string[],
-    latestMessageTimes: Record<string, number>,
-    searchQuery: string,
-    currentEnvelope: string | null,
-    chatAssignments: Record<string, string>,
-  ): string[] {
-    let allPeers = [...peers];
-
-    // Filter by envelope
-    if (currentEnvelope) {
-      allPeers = allPeers.filter((p) => chatAssignments[p] === currentEnvelope);
-    } else {
-      allPeers = allPeers.filter((p) => !chatAssignments[p]);
-    }
-
-    // Fuzzy search
-    if (searchQuery.trim()) {
-      const query = searchQuery.toLowerCase().trim();
-      allPeers = allPeers.filter((p) => {
-        const name = p.toLowerCase();
-        let qi = 0;
-        for (let i = 0; i < name.length && qi < query.length; i++) {
-          if (name[i] === query[qi]) qi++;
-        }
-        return qi === query.length;
-      });
-    }
-
-    // Sort: pinned first
-    const pinned = allPeers.filter((p) => pinnedPeers.includes(p));
-    const others = allPeers.filter((p) => !pinnedPeers.includes(p));
-
-    // Sort pinned by latest message time (most recent first)
-    pinned.sort((a, b) => {
-      const aTime = latestMessageTimes[a] || 0;
-      const bTime = latestMessageTimes[b] || 0;
-      return bTime - aTime; // Most recent first
+  function addLayoutCleanup(cleanup: () => void) {
+    let called = false;
+    layoutCleanups.push(() => {
+      if (called) return;
+      called = true;
+      cleanup();
     });
+  }
 
-    // Sort others by latest message time (most recent first)
-    others.sort((a, b) => {
-      if (a === "Me") return -1;
-      if (b === "Me") return 1;
-      const aTime = latestMessageTimes[a] || 0;
-      const bTime = latestMessageTimes[b] || 0;
-      return bTime - aTime; // Most recent first
-    });
+  function addWindowCleanup(type: string, listener: EventListener) {
+    window.addEventListener(type, listener);
+    addLayoutCleanup(() => window.removeEventListener(type, listener));
+  }
 
-    return [...pinned, ...others];
+  function cleanupLayout() {
+    while (layoutCleanups.length > 0) {
+      layoutCleanups.pop()?.();
+    }
   }
 
   // Lifecycle
   async function redeemTemporaryLinkAndNavigate(link: string): Promise<boolean> {
+    if (!(await ensureAppReady())) return false;
     try {
-      const result = await api.redeemTemporaryInvite(link);
-      await refreshData();
+      const result = await redeemTemporaryInvite(link);
       goto(`/chat/${result.chat_id}`);
       return true;
     } catch (e) {
@@ -285,151 +164,66 @@
     }
   }
 
-  onMount(async () => {
-    const support = detectVideoCallSupport();
-    videoCallSupported = support.supported;
-    videoCallUnsupportedReason = support.reason;
-    const broadcastSupport = detectScreenBroadcastSupport();
-    screenBroadcastSupported = broadcastSupport.supported;
-    screenBroadcastUnsupportedReason = broadcastSupport.reason;
+  async function setupDeepLinks() {
     try {
-      await listen("auth-status", async () => {
-        const authed = await refreshData();
-        if (authed && !unlistenPresence) {
-          unlistenPresence = await initPresence();
-        }
-      });
-      window.addEventListener("open-chat", async (event: Event) => {
+      if (!(await isRegistered("rchat"))) {
+        await register("rchat");
+      }
+    } catch {
+      // Not all platforms support dynamic registration.
+    }
+
+    await handleDeepLinks(await getCurrent());
+    const unlistenOpenUrl = await onOpenUrl((urls) => {
+      void handleDeepLinks(urls);
+    });
+    addLayoutCleanup(unlistenOpenUrl);
+  }
+
+  onMount(async () => {
+    try {
+      addLayoutCleanup(await initAppSession());
+
+      addWindowCleanup("open-chat", async (event: Event) => {
         const peerId = (event as CustomEvent<{ peerId?: string }>).detail?.peerId;
         if (!peerId) return;
-        await refreshData();
+        if (!(await ensureAppReady())) return;
         goto(`/chat/${peerId}`);
       });
-      window.addEventListener("open-temp-invite", async (event: Event) => {
+
+      addWindowCleanup("open-temp-invite", async (event: Event) => {
         const link = (event as CustomEvent<{ link?: string }>).detail?.link;
         if (!link) return;
         await redeemTemporaryLinkAndNavigate(link);
       });
-      await listen("local-peer-discovered", (event: any) => {
-        const peer = event.payload;
-        if (!localPeers.find((p) => p.peer_id === peer.peer_id)) {
-          localPeers = [...localPeers, peer];
-        }
-      });
-      await listen("local-peer-expired", (event: any) => {
-        localPeers = localPeers.filter((p) => p.peer_id !== event.payload);
-      });
-      const authed = await refreshData();
-      if (authed && !unlistenPresence) {
-        unlistenPresence = await initPresence();
-      }
-      // Update chat order and unread counts when new message arrives
-      await listen("message-received", (event: any) => {
-        const rawChatId = event.payload?.chat_id;
-        if (rawChatId) {
-          const chatId = rawChatId === "self" ? "Me" : rawChatId;
-          const now = Math.floor(Date.now() / 1000);
-          latestMessageTimes = { ...latestMessageTimes, [chatId]: now };
 
-          // Increment unread count if user is NOT viewing this chat
-          if (chatId !== activePeer) {
-            unreadCounts = {
-              ...unreadCounts,
-              [chatId]: (unreadCounts[chatId] || 0) + 1,
-            };
-          }
-        }
-      });
-
-      // Listen for new GitHub chats (handshake received)
-      await listen("new-github-chat", (event: any) => {
-        const chatId = event.payload?.chat_id;
-        console.log("[Layout] Received new-github-chat event:", event.payload);
-        if (chatId && !peers.includes(chatId)) {
-          peers = [...peers, chatId];
-          console.log("[Layout] Added new peer to list:", chatId);
-        }
-      });
-      await listen("temporary-chat-connected", async () => {
-        await refreshData();
-      });
-      await listen("temporary-chat-ended", async (event: any) => {
-        const chatId = event.payload?.chat_id;
-        if (chatId && activePeer === chatId) {
-          goto("/");
-        }
-        await refreshData();
-      });
-
-      // Listen for profile updates from settings
-      window.addEventListener("profile-updated", () => {
+      addWindowCleanup("profile-updated", () => {
         console.log("[Layout] Profile updated, refreshing...");
-        refreshData();
+        void refreshUserProfile();
       });
-      window.addEventListener("connectivity-updated", (event: Event) => {
-        const next = (event as CustomEvent<ConnectivitySettings>).detail;
+
+      addWindowCleanup("connectivity-updated", (event: Event) => {
+        const next = (event as CustomEvent<typeof $appSession.connectivitySettings>).detail;
         if (!next) return;
-        connectivitySettings = next;
+        applyConnectivitySettings(next);
       });
 
       // Force repaint on resize to fix WebKit rendering bug
-      window.addEventListener("resize", () => {
+      addWindowCleanup("resize", () => {
         document.body.style.display = "none";
         void document.body.offsetHeight; // Force reflow
         document.body.style.display = "";
       });
 
-      try {
-        voiceCallState = await api.getVoiceCallState();
-        broadcastState = await api.getBroadcastState();
-      } catch (e) {
-        console.warn("Voice call state unavailable yet:", e);
-      }
-      unlistenVoiceCallState = await listen<VoiceCallState>(
-        "voice-call-state-updated",
-        (event) => {
-          voiceCallState = event.payload;
-        },
-      );
-      unlistenBroadcastState = await listen<BroadcastState>(
-        "broadcast-state-updated",
-        (event) => {
-          broadcastState = event.payload;
-        },
-      );
-      try {
-        if (!(await isRegistered("rchat"))) {
-          await register("rchat");
-        }
-      } catch {
-        // Not all platforms support dynamic registration.
-      }
-      await handleDeepLinks(await getCurrent());
-      unlistenOpenUrl = await onOpenUrl((urls) => {
-        void handleDeepLinks(urls);
-      });
+      await setupDeepLinks();
+      await ensureAppReady();
     } catch (e) {
       console.error("Setup failed:", e);
     }
   });
 
   onDestroy(() => {
-    if (unlistenOpenUrl) {
-      unlistenOpenUrl();
-      unlistenOpenUrl = null;
-    }
-    if (unlistenPresence) {
-      unlistenPresence();
-      unlistenPresence = null;
-    }
-    if (unlistenVoiceCallState) {
-      unlistenVoiceCallState();
-      unlistenVoiceCallState = null;
-    }
-    if (unlistenBroadcastState) {
-      unlistenBroadcastState();
-      unlistenBroadcastState = null;
-    }
+    cleanupLayout();
   });
 
   async function acceptIncomingCall() {
@@ -437,12 +231,12 @@
     try {
       if (voiceCallState.call_kind === "video") {
         if (!videoCallSupported) {
-          await api.rejectVideoCall(voiceCallState.call_id);
+          await liveActions.rejectVideoCall(voiceCallState.call_id);
           return;
         }
-        await api.acceptVideoCall(voiceCallState.call_id);
+        await liveActions.acceptVideoCall(voiceCallState.call_id);
       } else {
-        await api.acceptVoiceCall(voiceCallState.call_id);
+        await liveActions.acceptVoiceCall(voiceCallState.call_id);
       }
       if (voiceCallState.peer_id) {
         goto(`/chat/${voiceCallState.peer_id}`);
@@ -456,9 +250,9 @@
     if (!voiceCallState.call_id) return;
     try {
       if (voiceCallState.call_kind === "video") {
-        await api.rejectVideoCall(voiceCallState.call_id);
+        await liveActions.rejectVideoCall(voiceCallState.call_id);
       } else {
-        await api.rejectVoiceCall(voiceCallState.call_id);
+        await liveActions.rejectVoiceCall(voiceCallState.call_id);
       }
     } catch (e) {
       console.error("Failed to reject call:", e);
@@ -468,7 +262,7 @@
   async function acceptIncomingBroadcast() {
     if (!broadcastState.session_id) return;
     try {
-      await api.acceptScreenBroadcast(broadcastState.session_id);
+      await liveActions.acceptScreenBroadcast(broadcastState.session_id);
       if (broadcastState.peer_id) {
         goto(`/chat/${broadcastState.peer_id}`);
       }
@@ -480,71 +274,15 @@
   async function rejectIncomingBroadcast() {
     if (!broadcastState.session_id) return;
     try {
-      await api.rejectScreenBroadcast(broadcastState.session_id);
+      await liveActions.rejectScreenBroadcast(broadcastState.session_id);
     } catch (e) {
       console.error("Failed to reject screen share:", e);
     }
   }
 
-  async function refreshData(): Promise<boolean> {
-    try {
-      const auth = await api.checkAuthStatus();
-      if (!auth.is_setup || !auth.is_unlocked) {
-        await goto("/login");
-        return false;
-      }
-
-      // Ensure network is started (handles session restore case)
-      console.log("[Layout] Ensuring network is started...");
-      await api.startNetwork();
-
-      connectivitySettings = auth.connectivity;
-
-      const chatList = await api.getChatList();
-      const nextPeers: string[] = [];
-      const nextChatNames: Record<string, string> = {};
-      const nextGroupChats: Record<string, boolean> = {};
-      for (const chat of chatList) {
-        const uiId = chat.id === "self" ? "Me" : chat.id;
-        nextPeers.push(uiId);
-        nextChatNames[uiId] = chat.name;
-        nextGroupChats[uiId] = chat.is_group;
-      }
-      peers = nextPeers;
-      chatNames = nextChatNames;
-      groupChats = nextGroupChats;
-
-      peerAliases = await api.getPeerAliases();
-
-      pinnedPeers = await api.getPinnedPeers();
-      userProfile = await api.getUserProfile();
-      envelopes = await api.getEnvelopes();
-      chatAssignments = Object.fromEntries(
-        (await api.getEnvelopeAssignments()).map((item) => [
-          item.chat_id === "self" ? "Me" : item.chat_id,
-          item.envelope_id,
-        ]),
-      );
-      // Load latest message times for sorting
-      const latestTimesRaw = await api.getChatLatestTimes();
-      latestMessageTimes = Object.fromEntries(
-        Object.entries(latestTimesRaw).map(([k, v]) => [k === "self" ? "Me" : k, v]),
-      );
-      // Load unread message counts for badges
-      const unreadRaw = await api.getUnreadCounts("Me");
-      unreadCounts = Object.fromEntries(
-        Object.entries(unreadRaw).map(([k, v]) => [k === "self" ? "Me" : k, v]),
-      );
-      return true;
-    } catch (e) {
-      console.error("Refresh failed:", e);
-      return false;
-    }
-  }
-
   async function handleSetConnectivityMode(mode: ConnectivityMode) {
     try {
-      connectivitySettings = await api.setConnectivityMode(mode);
+      await setConnectivityMode(mode);
     } catch (e) {
       console.error("Connectivity mode update failed:", e);
     }
@@ -579,27 +317,16 @@
     try {
       if (type === "peer") {
         if (action === "pin") {
-          const isPinned = await api.togglePinPeer(id);
-          pinnedPeers = isPinned
-            ? [...new Set([...pinnedPeers, id])]
-            : pinnedPeers.filter((p) => p !== id);
+          await togglePinPeer(id);
         }
         if (action === "delete-peer") {
-          if (getChatKind(id) === "group") {
-            await api.leaveGroupChat(id);
-          } else if (getChatKind(id) === "tempgroup" || getChatKind(id) === "tempdm") {
-            await api.cancelTemporaryInvite().catch(() => {});
-          } else {
-            await api.deletePeer(id);
-          }
-          peers = peers.filter((p) => p !== id);
+          await deleteChat(id);
           if (activePeer === id) {
             goto("/");
           }
         }
         if (action === "save-archive") {
-          const result = await api.saveTemporaryChatToArchive(id);
-          await refreshData();
+          const result = await saveTemporaryChatToArchive(id);
           goto(`/chat/${result.chat_id}`);
         }
         if (action === "more") {
@@ -609,20 +336,14 @@
           }
         }
         if (action === "remove") {
-          // Remove from envelope = move to root
-          await api.moveChatToEnvelope(id === "Me" ? "self" : id, null);
-          const updated = { ...chatAssignments };
-          delete updated[id];
-          chatAssignments = updated;
+          await moveChatToEnvelope(id, null);
         }
       } else if (type === "envelope") {
         if (action === "delete") {
-          await api.deleteEnvelope(id);
-          envelopes = envelopes.filter((e) => e.id !== id);
-          if (currentEnvelope === id) currentEnvelope = null;
+          await deleteEnvelope(id);
         }
         if (action === "edit") {
-          const env = envelopes.find((e) => e.id === id);
+          const env = $chatState.envelopes.find((e) => e.id === id);
           if (env) {
             newEnvelopeName = env.name;
             newEnvelopeIcon = env.icon || AVAILABLE_ICONS[0];
@@ -639,10 +360,10 @@
 
   // Envelope actions
   function enterEnvelope(id: string) {
-    currentEnvelope = id;
+    selectEnvelope(id);
   }
   function exitEnvelope() {
-    currentEnvelope = null;
+    selectEnvelope(null);
   }
 
   async function submitEnvelopeCreation(data?: { name: string; icon: string }) {
@@ -654,15 +375,9 @@
 
     try {
       if (editingEnvelopeId) {
-        await api.updateEnvelope(editingEnvelopeId, name, icon);
-        envelopes = envelopes.map((e) =>
-          e.id === editingEnvelopeId ? { ...e, name: name, icon: icon } : e,
-        );
+        await updateEnvelope(editingEnvelopeId, name, icon);
       } else {
-        const id = `env_${Date.now()}`;
-        const newEnv = { id, name: name, icon: icon };
-        await api.createEnvelope(id, name, icon);
-        envelopes = [...envelopes, newEnv];
+        await createEnvelope(name, icon);
       }
     } catch (e) {
       console.error("Envelope operation failed:", e);
@@ -703,12 +418,7 @@
   async function handleDragEnd(e: PointerEvent) {
     if (draggingPeer && dragOverEnvelopeId) {
       try {
-        const chatId = draggingPeer === "Me" ? "self" : draggingPeer;
-        await api.moveChatToEnvelope(chatId, dragOverEnvelopeId);
-        chatAssignments = {
-          ...chatAssignments,
-          [draggingPeer]: dragOverEnvelopeId,
-        };
+        await moveChatToEnvelope(draggingPeer, dragOverEnvelopeId);
       } catch (err) {
         console.error("Move failed:", err);
       }
@@ -735,9 +445,8 @@
 
   async function handleCreateGroup(name: string) {
     try {
-      const result = await api.createGroupChat(name || null);
+      const result = await createGroup(name || "");
       showNewGroupModal = false;
-      await refreshData();
       goto(`/chat/${result.chat_id}`);
     } catch (e) {
       console.error("Create group failed:", e);
@@ -747,9 +456,8 @@
   async function handleJoinGroup(chatId: string, name: string) {
     try {
       const fallback = name || defaultGroupName(chatId);
-      const result = await api.joinGroupChat(chatId, fallback);
+      const result = await joinGroup(chatId, fallback);
       showNewGroupModal = false;
-      await refreshData();
       goto(`/chat/${result.chat_id}`);
     } catch (e) {
       console.error("Join group failed:", e);
@@ -759,7 +467,7 @@
   async function handleTempGroupJoin(chatId: string, _name: string) {
     try {
       showNewGroupModal = false;
-      await refreshData();
+      await openTemporaryGroup(chatId);
       goto(`/chat/${chatId}`);
     } catch (e) {
       console.error("Open temporary group failed:", e);
@@ -775,13 +483,8 @@
     const target = peer === "Me" ? "Me" : peer;
 
     // Clear unread count for this chat
-    if (unreadCounts[peer]) {
-      const { [peer]: _, ...rest } = unreadCounts;
-      unreadCounts = rest;
-
-      // Mark messages as read in backend
-      const chatId = peer === "Me" ? "self" : peer;
-      api.markMessagesRead(chatId).catch((e) => {
+    if ($chatState.unreadCounts[peer]) {
+      markChatRead(peer).catch((e) => {
         console.error("Failed to mark messages as read:", e);
       });
     }
@@ -792,29 +495,41 @@
 
 <svelte:window onclick={handleGlobalClick} />
 
-<ThemeProvider>
+{#if isLoginRoute}
+  <slot />
+{:else if !$appSession.authChecked || !$appSession.appReady}
+  <div
+    class="flex h-screen items-center justify-center bg-theme-base-950 text-theme-base-300"
+  >
+    <div
+      class="h-8 w-8 rounded-full border-2 border-theme-base-700 border-t-theme-primary-500 animate-spin"
+      aria-label="Loading"
+    ></div>
+  </div>
+{:else}
+  <ThemeProvider>
   <main
     class="flex h-screen bg-theme-base-950 text-theme-base-200 font-sans overflow-hidden selection:bg-teal-500/30"
   >
     <Sidebar
       {isSidebarOpen}
-      {currentEnvelope}
-      bind:searchQuery
+      currentEnvelope={$chatState.currentEnvelope}
+      searchQuery={$chatState.searchQuery}
       {showCreateMenu}
-      {envelopes}
-      {sortedPeers}
-      {peerAliases}
-      {chatNames}
-      {groupChats}
-      {pinnedPeers}
+      envelopes={$chatState.envelopes}
+      sortedPeers={$sortedPeers}
+      peerAliases={$chatState.peerAliases}
+      chatNames={$chatState.chatNames}
+      groupChats={$chatState.groupChats}
+      pinnedPeers={$chatState.pinnedPeers}
       {activePeer}
-      {userProfile}
+      userProfile={$appSession.userProfile}
       {dragOverEnvelopeId}
       {isDragging}
       {draggingPeer}
-      {connectivitySettings}
+      connectivitySettings={$appSession.connectivitySettings}
       connectedChatIds={$connectedChatIds}
-      {unreadCounts}
+      unreadCounts={$chatState.unreadCounts}
       onselectConnectivityMode={handleSetConnectivityMode}
       ontoggleSidebar={() => (isSidebarOpen = !isSidebarOpen)}
       onopenSettings={() => goto("/settings")}
@@ -823,9 +538,9 @@
       onopenNewGroup={() => (showNewGroupModal = true)}
       onopenEnvelopeModal={openEnvelopeModal}
       ontoggleCreateMenu={() => (showCreateMenu = !showCreateMenu)}
-      onenterEnvelope={(id: string) => (currentEnvelope = id)}
-      onexitEnvelope={() => (currentEnvelope = null)}
-      onsearchChange={(query: string) => (searchQuery = query)}
+      onenterEnvelope={selectEnvelope}
+      onexitEnvelope={() => selectEnvelope(null)}
+      onsearchChange={setSearchQuery}
       oncontextMenu={(data: {
         event: MouseEvent;
         type: "peer" | "envelope";
@@ -895,7 +610,7 @@
       <NewPersonModal
         show={showNewPersonModal}
         bind:step={newPersonStep}
-        {localPeers}
+        localPeers={$chatState.localPeers}
         onclose={() => {
           showNewPersonModal = false;
           newPersonStep = "select-network";
@@ -903,7 +618,7 @@
         onconnect={async (peerId: string) => {
           console.log("Peer connected:", peerId);
           // Refresh data to show the new peer (already in known_devices from backend)
-          await refreshData();
+          await refreshChats();
         }}
       />
 
@@ -919,8 +634,8 @@
         show={showContextMenu}
         position={contextMenuPos}
         target={contextMenuTarget}
-        {pinnedPeers}
-        {currentEnvelope}
+        pinnedPeers={$chatState.pinnedPeers}
+        currentEnvelope={$chatState.currentEnvelope}
         onaction={handleContextAction}
       />
 
@@ -1005,7 +720,8 @@
       {/if}
     </section>
   </main>
-</ThemeProvider>
+  </ThemeProvider>
+{/if}
 
 <svelte:body class:is-dragging={isDragging} />
 

@@ -58,3 +58,12 @@ export async function initPresence(): Promise<UnlistenFn> {
 
   return initPromise;
 }
+
+export function resetPresence() {
+  if (activeUnlisten) {
+    activeUnlisten();
+  }
+  connectedChatIds.set(new Set());
+  activeUnlisten = null;
+  initPromise = null;
+}

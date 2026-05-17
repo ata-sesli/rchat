@@ -8,6 +8,10 @@
 
   async function loadTheme(context: string) {
     try {
+      const auth = await api.checkAuthStatus();
+      if (!auth.is_setup || !auth.is_unlocked) {
+        return;
+      }
       const theme = await api.getTheme();
       applyTheme(theme);
     } catch (e) {
