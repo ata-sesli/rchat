@@ -1,5 +1,8 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, Stream, StreamConfig};
+use cpal::{
+    SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig,
+    SupportedStreamConfigRange,
+};
 use rubato::{
     audioadapter_buffers::direct::SequentialSliceOfVecs, Async, FixedAsync, Resampler,
     SincInterpolationParameters, SincInterpolationType, WindowFunction,
@@ -21,10 +24,11 @@ const CONCEALMENT_SAMPLES: usize = FRAME_SAMPLES;
 const CONCEALMENT_HOLD_SAMPLES: usize = FRAME_SAMPLES / 4;
 const CAPTURE_RATE_MEASURE_INTERVAL: Duration = Duration::from_secs(2);
 const PLAYBACK_RATE_MEASURE_INTERVAL: Duration = Duration::from_secs(1);
-const PLAYBACK_RATE_EMA_ALPHA: f64 = 0.15;
 const MIN_PLAUSIBLE_OUTPUT_RATE_HZ: f64 = 8_000.0;
 const MAX_PLAUSIBLE_OUTPUT_RATE_HZ: f64 = 192_000.0;
 const OUTPUT_CLOCK_UNSTABLE_THRESHOLD: f64 = 0.10;
+const VOICE_OUTPUT_RATE_ENV: &str = "RCHAT_VOICE_OUTPUT_RATE";
+const PREFERRED_OUTPUT_RATES: &[u32] = &[TARGET_RATE, 22_050, 24_000, 48_000, 44_100];
 
 #[derive(Debug, Default)]
 struct VoiceAudioStats {
@@ -180,10 +184,15 @@ fn run_audio_thread(
         eprintln!("[Voice] Failed to read input config");
         return;
     };
-    let Ok(output_supported) = output_device.default_output_config() else {
+    let Ok(output_supported_default) = output_device.default_output_config() else {
         eprintln!("[Voice] Failed to read output config");
         return;
     };
+    let output_default_rate = output_supported_default.sample_rate().0;
+    let output_default_channels = output_supported_default.channels();
+    let output_default_format = output_supported_default.sample_format();
+    let output_selection = choose_voice_output_config(&output_device, output_supported_default);
+    let output_supported = output_selection.config;
 
     let input_config = StreamConfig {
         channels: input_supported.channels(),
@@ -209,6 +218,21 @@ fn run_audio_thread(
         input_config.channels,
         input_supported.sample_format(),
         output_name,
+        output_config.sample_rate.0,
+        output_config.channels,
+        output_supported.sample_format(),
+    );
+    eprintln!(
+        "[Voice][Audio] output_config_selection={} requested_output_rate={} supported_output_configs={} default_output_rate={} default_output_channels={} default_output_format={:?}; selected_output_rate={} selected_output_channels={} selected_output_format={:?}",
+        output_selection.reason.as_str(),
+        output_selection
+            .requested_rate
+            .map(|rate| rate.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        output_selection.supported_config_count,
+        output_default_rate,
+        output_default_channels,
+        output_default_format,
         output_config.sample_rate.0,
         output_config.channels,
         output_supported.sample_format(),
@@ -268,6 +292,138 @@ fn run_audio_thread(
     if let Ok(guard) = stats.lock() {
         guard.log_summary("final");
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputConfigSelectionReason {
+    EnvOverride,
+    PreferredVoiceRate,
+    DefaultOutputConfig,
+    SupportedConfigUnavailable,
+}
+
+impl OutputConfigSelectionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::EnvOverride => "env_override",
+            Self::PreferredVoiceRate => "preferred_voice_rate",
+            Self::DefaultOutputConfig => "default_output_config",
+            Self::SupportedConfigUnavailable => "supported_config_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OutputConfigSelection {
+    config: SupportedStreamConfig,
+    reason: OutputConfigSelectionReason,
+    requested_rate: Option<u32>,
+    supported_config_count: usize,
+}
+
+fn choose_voice_output_config(
+    output_device: &cpal::Device,
+    default: SupportedStreamConfig,
+) -> OutputConfigSelection {
+    let requested_rate = requested_output_rate_override();
+    let supported_ranges = match output_device.supported_output_configs() {
+        Ok(ranges) => ranges.collect::<Vec<_>>(),
+        Err(e) => {
+            eprintln!("[Voice][Audio] Failed to read supported output configs: {}", e);
+            return OutputConfigSelection {
+                config: default,
+                reason: OutputConfigSelectionReason::SupportedConfigUnavailable,
+                requested_rate,
+                supported_config_count: 0,
+            };
+        }
+    };
+
+    select_voice_output_config(default, supported_ranges, requested_rate)
+}
+
+fn requested_output_rate_override() -> Option<u32> {
+    let Ok(value) = std::env::var(VOICE_OUTPUT_RATE_ENV) else {
+        return None;
+    };
+    match value.trim().parse::<u32>() {
+        Ok(rate) if rate > 0 => Some(rate),
+        _ => {
+            eprintln!(
+                "[Voice][Audio] Ignoring invalid {}='{}'",
+                VOICE_OUTPUT_RATE_ENV, value
+            );
+            None
+        }
+    }
+}
+
+fn select_voice_output_config(
+    default: SupportedStreamConfig,
+    supported_ranges: Vec<SupportedStreamConfigRange>,
+    requested_rate: Option<u32>,
+) -> OutputConfigSelection {
+    let supported_config_count = supported_ranges.len();
+    if let Some(rate) = requested_rate {
+        if let Some(config) = find_output_config_for_rate(&supported_ranges, &default, rate) {
+            return OutputConfigSelection {
+                config,
+                reason: OutputConfigSelectionReason::EnvOverride,
+                requested_rate,
+                supported_config_count,
+            };
+        }
+        eprintln!(
+            "[Voice][Audio] Requested {}={} is not supported; falling back to voice preferences",
+            VOICE_OUTPUT_RATE_ENV, rate
+        );
+    }
+
+    for rate in PREFERRED_OUTPUT_RATES {
+        if let Some(config) = find_output_config_for_rate(&supported_ranges, &default, *rate) {
+            return OutputConfigSelection {
+                config,
+                reason: OutputConfigSelectionReason::PreferredVoiceRate,
+                requested_rate,
+                supported_config_count,
+            };
+        }
+    }
+
+    OutputConfigSelection {
+        config: default,
+        reason: OutputConfigSelectionReason::DefaultOutputConfig,
+        requested_rate,
+        supported_config_count,
+    }
+}
+
+fn find_output_config_for_rate(
+    ranges: &[SupportedStreamConfigRange],
+    default: &SupportedStreamConfig,
+    rate: u32,
+) -> Option<SupportedStreamConfig> {
+    let sample_rate = SampleRate(rate);
+    let default_channels = default.channels();
+    let default_format = default.sample_format();
+
+    for require_channels in [true, false] {
+        for require_format in [true, false] {
+            if let Some(config) = ranges.iter().find_map(|range| {
+                if require_channels && range.channels() != default_channels {
+                    return None;
+                }
+                if require_format && range.sample_format() != default_format {
+                    return None;
+                }
+                range.try_with_sample_rate(sample_rate)
+            }) {
+                return Some(config);
+            }
+        }
+    }
+
+    None
 }
 
 fn build_input_stream(
@@ -778,14 +934,7 @@ impl PlaybackState {
         self.output_clock_unstable = ((measured - self.declared_output_rate_hz).abs()
             / self.declared_output_rate_hz)
             > OUTPUT_CLOCK_UNSTABLE_THRESHOLD;
-        self.effective_output_rate_hz = if self.measured_output_rate_hz == Some(measured)
-            && (self.effective_output_rate_hz - self.declared_output_rate_hz).abs() < f64::EPSILON
-        {
-            measured
-        } else {
-            (self.effective_output_rate_hz * (1.0 - PLAYBACK_RATE_EMA_ALPHA))
-                + (measured * PLAYBACK_RATE_EMA_ALPHA)
-        };
+        self.effective_output_rate_hz = self.declared_output_rate_hz;
     }
 
     fn declared_output_rate_hz(&self) -> f64 {
@@ -1111,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn playback_uses_measured_output_rate_when_plausible() {
+    fn playback_tracks_measured_output_rate_without_changing_render_rate() {
         let mut state = PlaybackState::new(44_100);
         state.output_rate_window_started = Instant::now() - PLAYBACK_RATE_MEASURE_INTERVAL;
 
@@ -1119,12 +1268,13 @@ mod tests {
 
         let measured = state.measured_output_rate_hz().expect("measured output");
         assert!((measured - 22_000.0).abs() < 100.0);
-        assert!(state.effective_output_rate_hz() < 30_000.0);
+        assert_eq!(state.effective_output_rate_hz(), 44_100.0);
+        assert!(state.output_clock_unstable());
         assert!(
             playback_step(
                 state.effective_output_rate_hz(),
                 PLAYBACK_TARGET_QUEUE_SAMPLES
-            ) > 0.7
+            ) < 0.4
         );
     }
 
@@ -1167,6 +1317,72 @@ mod tests {
 
         let measured = state.measured_output_rate_hz().expect("measured output");
         assert!((measured - 44_100.0).abs() < 100.0);
+    }
+
+    #[test]
+    fn voice_output_config_prefers_16khz_when_supported() {
+        let default = SupportedStreamConfig::new(
+            2,
+            SampleRate(44_100),
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        );
+        let ranges = vec![SupportedStreamConfigRange::new(
+            2,
+            SampleRate(8_000),
+            SampleRate(48_000),
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        )];
+
+        let selection = select_voice_output_config(default, ranges, None);
+
+        assert_eq!(selection.reason, OutputConfigSelectionReason::PreferredVoiceRate);
+        assert_eq!(selection.config.sample_rate().0, TARGET_RATE);
+    }
+
+    #[test]
+    fn voice_output_config_uses_override_when_supported() {
+        let default = SupportedStreamConfig::new(
+            2,
+            SampleRate(44_100),
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        );
+        let ranges = vec![SupportedStreamConfigRange::new(
+            2,
+            SampleRate(8_000),
+            SampleRate(48_000),
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        )];
+
+        let selection = select_voice_output_config(default, ranges, Some(22_050));
+
+        assert_eq!(selection.reason, OutputConfigSelectionReason::EnvOverride);
+        assert_eq!(selection.config.sample_rate().0, 22_050);
+    }
+
+    #[test]
+    fn voice_output_config_falls_back_to_default_when_rates_are_unsupported() {
+        let default = SupportedStreamConfig::new(
+            2,
+            SampleRate(44_100),
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        );
+        let ranges = vec![SupportedStreamConfigRange::new(
+            2,
+            SampleRate(96_000),
+            SampleRate(96_000),
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        )];
+
+        let selection = select_voice_output_config(default, ranges, Some(16_000));
+
+        assert_eq!(selection.reason, OutputConfigSelectionReason::DefaultOutputConfig);
+        assert_eq!(selection.config.sample_rate().0, 44_100);
     }
 
     #[test]
