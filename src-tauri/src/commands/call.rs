@@ -1,12 +1,27 @@
 use tauri::State;
 
+use crate::chat_identity;
 use crate::chat_kind::{self, ChatKind};
 use crate::network::command::NetworkCommand;
 use crate::NetworkState;
+use std::collections::HashSet;
 
-async fn ensure_dm_connected(
+fn direct_presence_key(chat_id: &str) -> String {
+    let normalized = if chat_id == "self" { "Me" } else { chat_id };
+    chat_identity::extract_peer_id_from_chat_id(normalized)
+        .unwrap_or_else(|| normalized.to_string())
+}
+
+fn connected_ids_contain_direct_peer(peer_id: &str, connected: &HashSet<String>) -> bool {
+    let target = direct_presence_key(peer_id);
+    connected
+        .iter()
+        .any(|connected_id| direct_presence_key(connected_id) == target)
+}
+
+fn validate_dm_call_target(
     peer_id: &str,
-    state: &State<'_, NetworkState>,
+    connected: &HashSet<String>,
     media_label: &str,
 ) -> Result<(), String> {
     if !matches!(chat_kind::parse_chat_kind(peer_id), ChatKind::Direct) {
@@ -16,14 +31,23 @@ async fn ensure_dm_connected(
         ));
     }
 
-    let connected = {
-        let connected = state.connected_chat_ids.lock().await;
-        connected.contains(peer_id)
-    };
-    if !connected {
+    if !connected_ids_contain_direct_peer(peer_id, connected) {
         return Err("Peer is not currently connected".to_string());
     }
+
     Ok(())
+}
+
+async fn ensure_dm_connected(
+    peer_id: &str,
+    state: &State<'_, NetworkState>,
+    media_label: &str,
+) -> Result<(), String> {
+    let connected = {
+        let connected = state.connected_chat_ids.lock().await;
+        connected.clone()
+    };
+    validate_dm_call_target(peer_id, &connected, media_label)
 }
 
 #[tauri::command]
@@ -285,4 +309,67 @@ pub async fn get_broadcast_state(
 pub async fn get_connected_chat_ids(state: State<'_, NetworkState>) -> Result<Vec<String>, String> {
     let connected = state.connected_chat_ids.lock().await;
     Ok(connected.iter().cloned().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const PEER_ID: &str = "12D3KooWLk1GoEB3MbHbRLHTxXrvNGSxC2UALaCuKAgKuYXkXazU";
+    const OTHER_PEER_ID: &str = "12D3KooWQap2BiV8iNRjj23tn2uq3ekjaEFmzjici2RHvht63RGQ";
+
+    fn connected(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn call_validation_accepts_exact_connected_chat_id() {
+        let chat_id = format!("lh:ata-{}", PEER_ID);
+
+        assert!(validate_dm_call_target(&chat_id, &connected(&[&chat_id]), "Voice").is_ok());
+    }
+
+    #[test]
+    fn call_validation_accepts_raw_peer_connection_for_scoped_chat_id() {
+        let chat_id = format!("lh:ata-{}", PEER_ID);
+
+        assert!(validate_dm_call_target(&chat_id, &connected(&[PEER_ID]), "Voice").is_ok());
+    }
+
+    #[test]
+    fn call_validation_accepts_scoped_connection_for_raw_peer_id() {
+        let connected_chat_id = format!("gh:ata-{}", PEER_ID);
+
+        assert!(
+            validate_dm_call_target(PEER_ID, &connected(&[&connected_chat_id]), "Voice").is_ok()
+        );
+    }
+
+    #[test]
+    fn call_validation_rejects_unrelated_connected_peer() {
+        let chat_id = format!("lh:ata-{}", PEER_ID);
+
+        assert_eq!(
+            validate_dm_call_target(&chat_id, &connected(&[OTHER_PEER_ID]), "Voice"),
+            Err("Peer is not currently connected".to_string())
+        );
+    }
+
+    #[test]
+    fn call_validation_rejects_non_regular_dm_chat_ids() {
+        let connected_ids = connected(&[]);
+        let non_dm_ids = [
+            "group:00000000-0000-4000-8000-000000000000",
+            "tempdm:00000000-0000-4000-8000-000000000000",
+            "archived:lh:ata-old",
+        ];
+
+        for chat_id in non_dm_ids {
+            assert_eq!(
+                validate_dm_call_target(chat_id, &connected_ids, "Voice"),
+                Err("Voice calls are only available for regular DM chats".to_string())
+            );
+        }
+    }
 }

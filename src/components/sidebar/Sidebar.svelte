@@ -4,8 +4,8 @@
   import type { ConnectivityMode, ConnectivitySettings } from "$lib/tauri/api";
   import EnvelopeItem from "./EnvelopeItem.svelte";
   import { getChatKind } from "$lib/chatKind";
+  import { isChatConnected } from "$lib/stores/presence";
   import {
-    directPeerKey,
     displayNameFromChatId,
     githubUsernameFromChatId,
   } from "$lib/chatIdentity";
@@ -218,12 +218,7 @@
   function isPeerOnline(peerId: string) {
     if (peerId === "Me") return true;
     if (isGroupChat(peerId)) return true;
-    const targetKey = directPeerKey(peerId) || peerId;
-    for (const connectedId of connectedChatIds) {
-        const connectedKey = directPeerKey(connectedId) || connectedId;
-        if (connectedKey === targetKey) return true;
-    }
-    return false;
+    return isChatConnected(peerId, connectedChatIds);
   }
 
   function closeMenusOnWindowClick() {

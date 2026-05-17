@@ -11,6 +11,10 @@
   } from "$lib/tauri/api";
   import { getChatKind } from "$lib/chatKind";
   import { extractPeerIdFromChatId } from "$lib/chatIdentity";
+  import {
+    connectedChatIds,
+    isChatConnected,
+  } from "$lib/stores/presence";
 
   // Types
   type Message = {
@@ -41,10 +45,8 @@
   let unlistenStatus: () => void;
   let unlistenVoiceCall: () => void;
   let unlistenBroadcast: () => void;
-  let unlistenConnectedChatIds: () => void;
   let voiceCallState: VoiceCallState = { phase: "idle", muted: false };
   let broadcastState: BroadcastState = { phase: "idle", is_host: false };
-  let connectedChatIds = new Set<string>();
   let activeConversationIds = new Set<string>();
 
   function peerKey(chatId: string): string {
@@ -52,17 +54,9 @@
     return extractPeerIdFromChatId(normalized) || normalized;
   }
 
-  function isChatConnected(chatId: string, connectedIds: Set<string>): boolean {
-    const target = peerKey(chatId);
-    for (const connectedId of connectedIds) {
-      if (peerKey(connectedId) === target) return true;
-    }
-    return false;
-  }
-
   // Cache for status updates that arrive before we've swapped tempId → msgId
   let pendingStatusCache: Record<string, string> = {};
-  $: activeChatConnected = isChatConnected(activePeer, connectedChatIds);
+  $: activeChatConnected = isChatConnected(activePeer, $connectedChatIds);
   $: canStartScreenBroadcast =
     activeChatKind === "dm" &&
     activeChatConnected &&
@@ -159,7 +153,6 @@
     try {
       voiceCallState = await api.getVoiceCallState();
       broadcastState = await api.getBroadcastState();
-      connectedChatIds = new Set(await api.getConnectedChatIds());
     } catch (e) {
       console.warn("Voice call state unavailable:", e);
     }
@@ -169,12 +162,6 @@
     });
     unlistenBroadcast = await listen<BroadcastState>("broadcast-state-updated", (event) => {
       broadcastState = event.payload;
-    });
-    unlistenConnectedChatIds = await listen("connected-chat-ids-updated", (event: any) => {
-      const ids = Array.isArray(event.payload) ? event.payload : [];
-      connectedChatIds = new Set(
-        ids.map((id: string) => (id === "self" ? "Me" : id)),
-      );
     });
 
     // Listen for message status updates (e.g., delivered -> read)
@@ -203,7 +190,6 @@
     if (unlistenStatus) unlistenStatus();
     if (unlistenVoiceCall) unlistenVoiceCall();
     if (unlistenBroadcast) unlistenBroadcast();
-    if (unlistenConnectedChatIds) unlistenConnectedChatIds();
   });
 
   async function handleSendMessage(text: string) {

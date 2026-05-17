@@ -17,6 +17,7 @@
     type VoiceCallState,
   } from "$lib/tauri/api";
   import { defaultGroupName, getChatKind } from "$lib/chatKind";
+  import { connectedChatIds, initPresence } from "$lib/stores/presence";
   import "../app.css"; // Ensure global styles are loaded
 
   // Components
@@ -91,7 +92,6 @@
     | "accept-invite-user"
     | "accept-invite-code" = "select-network";
   let localPeers: { peer_id: string; addresses: string[] }[] = [];
-  let connectedChatIds = new Set<string>();
 
   // Context Menu
   let showContextMenu = false;
@@ -111,6 +111,7 @@
   let unreadCounts: Record<string, number> = {};
   const seenDeepLinks = new Set<string>();
   let unlistenOpenUrl: (() => void) | null = null;
+  let unlistenPresence: (() => void) | null = null;
   let unlistenVoiceCallState: (() => void) | null = null;
   let unlistenBroadcastState: (() => void) | null = null;
   let voiceCallState: VoiceCallState = { phase: "idle", muted: false };
@@ -292,7 +293,12 @@
     screenBroadcastSupported = broadcastSupport.supported;
     screenBroadcastUnsupportedReason = broadcastSupport.reason;
     try {
-      await listen("auth-status", () => refreshData());
+      await listen("auth-status", async () => {
+        const authed = await refreshData();
+        if (authed && !unlistenPresence) {
+          unlistenPresence = await initPresence();
+        }
+      });
       window.addEventListener("open-chat", async (event: Event) => {
         const peerId = (event as CustomEvent<{ peerId?: string }>).detail?.peerId;
         if (!peerId) return;
@@ -313,12 +319,10 @@
       await listen("local-peer-expired", (event: any) => {
         localPeers = localPeers.filter((p) => p.peer_id !== event.payload);
       });
-      await listen("connected-chat-ids-updated", (event: any) => {
-        const ids = Array.isArray(event.payload) ? event.payload : [];
-        connectedChatIds = new Set(
-          ids.map((id: string) => (id === "self" ? "Me" : id)),
-        );
-      });
+      const authed = await refreshData();
+      if (authed && !unlistenPresence) {
+        unlistenPresence = await initPresence();
+      }
       // Update chat order and unread counts when new message arrives
       await listen("message-received", (event: any) => {
         const rawChatId = event.payload?.chat_id;
@@ -375,7 +379,6 @@
         document.body.style.display = "";
       });
 
-      await refreshData();
       try {
         voiceCallState = await api.getVoiceCallState();
         broadcastState = await api.getBroadcastState();
@@ -414,6 +417,10 @@
     if (unlistenOpenUrl) {
       unlistenOpenUrl();
       unlistenOpenUrl = null;
+    }
+    if (unlistenPresence) {
+      unlistenPresence();
+      unlistenPresence = null;
     }
     if (unlistenVoiceCallState) {
       unlistenVoiceCallState();
@@ -479,10 +486,13 @@
     }
   }
 
-  async function refreshData() {
+  async function refreshData(): Promise<boolean> {
     try {
       const auth = await api.checkAuthStatus();
-      if (!auth.is_setup || !auth.is_unlocked) return goto("/login");
+      if (!auth.is_setup || !auth.is_unlocked) {
+        await goto("/login");
+        return false;
+      }
 
       // Ensure network is started (handles session restore case)
       console.log("[Layout] Ensuring network is started...");
@@ -525,12 +535,10 @@
       unreadCounts = Object.fromEntries(
         Object.entries(unreadRaw).map(([k, v]) => [k === "self" ? "Me" : k, v]),
       );
-      const connectedIds = await api.getConnectedChatIds();
-      connectedChatIds = new Set(
-        connectedIds.map((id) => (id === "self" ? "Me" : id)),
-      );
+      return true;
     } catch (e) {
       console.error("Refresh failed:", e);
+      return false;
     }
   }
 
@@ -805,7 +813,7 @@
       {isDragging}
       {draggingPeer}
       {connectivitySettings}
-      {connectedChatIds}
+      connectedChatIds={$connectedChatIds}
       {unreadCounts}
       onselectConnectivityMode={handleSetConnectivityMode}
       ontoggleSidebar={() => (isSidebarOpen = !isSidebarOpen)}
