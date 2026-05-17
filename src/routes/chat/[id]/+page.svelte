@@ -52,9 +52,9 @@
     return extractPeerIdFromChatId(normalized) || normalized;
   }
 
-  function isChatConnected(chatId: string): boolean {
+  function isChatConnected(chatId: string, connectedIds: Set<string>): boolean {
     const target = peerKey(chatId);
-    for (const connectedId of connectedChatIds) {
+    for (const connectedId of connectedIds) {
       if (peerKey(connectedId) === target) return true;
     }
     return false;
@@ -62,9 +62,10 @@
 
   // Cache for status updates that arrive before we've swapped tempId → msgId
   let pendingStatusCache: Record<string, string> = {};
+  $: activeChatConnected = isChatConnected(activePeer, connectedChatIds);
   $: canStartScreenBroadcast =
     activeChatKind === "dm" &&
-    isChatConnected(activePeer) &&
+    activeChatConnected &&
     broadcastState.phase === "idle" &&
     (voiceCallState.phase === "idle" ||
       (voiceCallState.phase === "active" &&
@@ -276,8 +277,8 @@
     {userProfile}
     voiceCallState={voiceCallState}
     broadcastState={broadcastState}
-    canStartVoiceCall={activeChatKind === "dm" && isChatConnected(activePeer) && voiceCallState.phase === "idle"}
-    canStartVideoCall={activeChatKind === "dm" && isChatConnected(activePeer) && voiceCallState.phase === "idle" && broadcastState.phase === "idle"}
+    canStartVoiceCall={activeChatKind === "dm" && activeChatConnected && voiceCallState.phase === "idle"}
+    canStartVideoCall={activeChatKind === "dm" && activeChatConnected && voiceCallState.phase === "idle" && broadcastState.phase === "idle"}
     {canStartScreenBroadcast}
     onStartVoiceCall={async () => {
       try {
