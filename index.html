@@ -15,12 +15,12 @@
 			rel="stylesheet"
 		/>
 		
-		<link rel="modulepreload" href="/rchat/internal/immutable/entry/start.DWpXTVml.js">
-		<link rel="modulepreload" href="/rchat/internal/immutable/chunks/DObylFDH.js">
-		<link rel="modulepreload" href="/rchat/internal/immutable/chunks/BgYbjkz7.js">
-		<link rel="modulepreload" href="/rchat/internal/immutable/entry/app.C9hto7eh.js">
-		<link rel="modulepreload" href="/rchat/internal/immutable/chunks/DRckodY0.js">
-		<link rel="modulepreload" href="/rchat/internal/immutable/chunks/BJGS6ND8.js">
+		<link rel="modulepreload" href="./internal/immutable/entry/start.DWpXTVml.js">
+		<link rel="modulepreload" href="./internal/immutable/chunks/DObylFDH.js">
+		<link rel="modulepreload" href="./internal/immutable/chunks/BgYbjkz7.js">
+		<link rel="modulepreload" href="./internal/immutable/entry/app.C9hto7eh.js">
+		<link rel="modulepreload" href="./internal/immutable/chunks/DRckodY0.js">
+		<link rel="modulepreload" href="./internal/immutable/chunks/BJGS6ND8.js">
 	</head>
 	<body
 		data-sveltekit-preload-data="hover"
@@ -30,15 +30,15 @@
 			<script>
 				{
 					__sveltekit_1nd6ynq = {
-						base: "/rchat",
+						base: new URL(".", location).pathname.slice(0, -1),
 						assets: "/rchat"
 					};
 
 					const element = document.currentScript.parentElement;
 
 					Promise.all([
-						import("/rchat/internal/immutable/entry/start.DWpXTVml.js"),
-						import("/rchat/internal/immutable/entry/app.C9hto7eh.js")
+						import("./internal/immutable/entry/start.DWpXTVml.js"),
+						import("./internal/immutable/entry/app.C9hto7eh.js")
 					]).then(([kit, app]) => {
 						kit.start(app, element);
 					});
