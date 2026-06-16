@@ -52,20 +52,73 @@ For a visual showcase, visit [ata-sesli.github.io/rchat](https://ata-sesli.githu
 
 ## High-Level Architecture
 
-```text
-Svelte UI
-  |
-  | Tauri commands + Tauri events
-  v
-Rust application state
-  |
-  |-- encrypted config: rchat.config + rchat.keystore
-  |-- SQLite DB: chats, messages, files, stickers, envelopes
-  |-- libp2p swarm: transports, protocols, connections
-  |-- mDNS service: local discovery
-  |-- GitHub Gist sync: remote discovery
-  |-- live media engines: voice, video, broadcast
+```mermaid
+flowchart TB
+  user["User"]
+  ui["Svelte UI<br/>routes + components"]
+  stores["Frontend stores<br/>appSession · chat · presence · live"]
+  api["Typed Tauri API<br/>commands + events"]
+
+  subgraph backend["Rust/Tauri backend"]
+    commands["Command handlers<br/>auth · chat · media · calls · settings"]
+    appstate["Shared app state<br/>vault · database · network runtime"]
+    storage["Storage layer"]
+    network["Network manager<br/>libp2p swarm"]
+    live["Live media engines<br/>voice implemented<br/>video/screen WIP"]
+  end
+
+  subgraph disk["Local disk"]
+    vault["Encrypted config<br/>rchat.config + rchat.keystore"]
+    sqlite["SQLite database<br/>rchat.sqlite"]
+    files["File/media storage<br/>chunks · stickers · attachments"]
+  end
+
+  subgraph discovery["Discovery"]
+    mdns["mDNS LAN discovery<br/>_rchat._udp TXT records"]
+    gist["GitHub Gist discovery<br/>rchat-peer-info / peers.txt"]
+    hks["HKS encrypted discovery blob<br/>signed + friend-scoped"]
+  end
+
+  subgraph p2p["Peer-to-peer transport"]
+    transports["libp2p transports<br/>QUIC · TCP · relay · DCUtR"]
+    dm["Direct messages<br/>request-response"]
+    group["Group messages<br/>Gossipsub"]
+    voice["Voice calls<br/>QUIC stream · Opus 48 kHz"]
+    wipmedia["Video/screen protocols<br/>work in progress"]
+    remote["Remote RChat peers"]
+  end
+
+  user --> ui
+  ui --> stores
+  stores <--> api
+  api <--> commands
+  commands <--> appstate
+  appstate <--> storage
+  appstate <--> network
+  appstate <--> live
+
+  storage <--> vault
+  storage <--> sqlite
+  storage <--> files
+
+  network <--> mdns
+  network <--> gist
+  gist <--> hks
+  network <--> transports
+  transports <--> dm
+  transports <--> group
+  transports <--> voice
+  transports <--> wipmedia
+  live <--> voice
+  live <--> wipmedia
+
+  dm -.-> remote
+  group -.-> remote
+  voice -.-> remote
+  wipmedia -.-> remote
 ```
+
+Arrows show the ownership and data flow inside one local RChat instance. Remote peers run the same stack. Discovery only provides addresses and encrypted invite/discovery metadata; message history stays local.
 
 The frontend never talks directly to the database or network stack. It calls typed Tauri commands from `src/lib/tauri/api.ts` and listens to backend events such as message updates, presence changes, call state changes, and temporary-chat events.
 
