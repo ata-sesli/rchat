@@ -237,6 +237,7 @@ impl NetworkManager {
     }
 
     pub(super) async fn transition_to_idle(&mut self, reason: Option<String>) {
+        self.stop_video_media();
         self.stop_voice_audio();
         self.active_call = None;
         self.push_idle_call_state(reason).await;
@@ -465,6 +466,38 @@ impl NetworkManager {
                     self.send_call_signal(peer, DirectMessageKind::CallReject, &request.id);
                     return Ok(());
                 }
+                if request.msg_type == DirectMessageKind::CallOfferVideo {
+                    let upgrade_call_id = Self::call_id_from_signal(request);
+                    if let Some(existing) = self.active_call.as_ref().cloned() {
+                        let same_active_voice = existing.phase == ActiveCallPhase::Active
+                            && existing.kind == CallKind::Voice
+                            && existing.remote_peer_id == peer
+                            && existing.call_id == upgrade_call_id;
+                        if same_active_voice {
+                            if !self.peer_has_quic_path(&peer) {
+                                self.send_call_signal(
+                                    peer,
+                                    DirectMessageKind::CallReject,
+                                    &upgrade_call_id,
+                                );
+                                return Ok(());
+                            }
+                            self.send_call_signal(
+                                peer,
+                                DirectMessageKind::CallAcceptVideo,
+                                &upgrade_call_id,
+                            );
+                            let mut updated = existing;
+                            updated.kind = CallKind::Video;
+                            updated.camera_enabled = false;
+                            self.active_call = Some(updated.clone());
+                            self.start_video_media(peer, updated.call_id.clone(), false);
+                            self.push_active_call_state(&updated, VoiceCallPhase::Active, None)
+                                .await;
+                            return Ok(());
+                        }
+                    }
+                }
                 if request.msg_type == DirectMessageKind::CallOfferVideo
                     && !self.peer_has_quic_path(&peer)
                 {
@@ -517,7 +550,7 @@ impl NetworkManager {
                     ring_expires_at: Some(now + CALL_RING_TIMEOUT_SECS as i64),
                     started_at: None,
                     muted: false,
-                    camera_enabled: request.msg_type == DirectMessageKind::CallOfferVideo,
+                    camera_enabled: false,
                 };
                 self.push_active_call_state(&call, VoiceCallPhase::IncomingRinging, None)
                     .await;
@@ -533,6 +566,19 @@ impl NetworkManager {
                 } else {
                     CallKind::Voice
                 };
+                if call_snapshot.call_id == call_id
+                    && call_snapshot.phase == ActiveCallPhase::Active
+                    && call_snapshot.kind == expected_kind
+                {
+                    if expected_kind == CallKind::Video {
+                        self.start_video_media(
+                            peer,
+                            call_snapshot.call_id.clone(),
+                            call_snapshot.camera_enabled,
+                        );
+                    }
+                    return Ok(());
+                }
                 if call_snapshot.call_id != call_id
                     || call_snapshot.phase != ActiveCallPhase::OutgoingRinging
                     || call_snapshot.kind != expected_kind
@@ -563,6 +609,9 @@ impl NetworkManager {
                 updated.started_at = Some(Self::now_unix_ts());
                 self.active_call = Some(updated.clone());
                 let _ = self.start_voice_stream_writer(peer, updated.call_id.clone());
+                if updated.kind == CallKind::Video {
+                    self.start_video_media(peer, updated.call_id.clone(), updated.camera_enabled);
+                }
                 self.push_active_call_state(&updated, VoiceCallPhase::Active, None)
                     .await;
             }
@@ -715,7 +764,7 @@ impl NetworkManager {
             } => {
                 if let Some(call) = self.active_call.as_ref() {
                     if call.phase == ActiveCallPhase::Active
-                        && call.kind == CallKind::Voice
+                        && matches!(call.kind, CallKind::Voice | CallKind::Video)
                         && call.call_id == call_id
                         && call.remote_peer_id == peer
                     {

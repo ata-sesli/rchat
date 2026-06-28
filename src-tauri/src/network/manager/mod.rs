@@ -118,6 +118,86 @@ enum VoiceStreamEvent {
     },
 }
 
+#[derive(Debug, Default)]
+struct VideoNetworkStats {
+    submitted_frames: u64,
+    raw_frames_dropped: u64,
+    encoded_frames: u64,
+    keyframes: u64,
+    delta_frames: u64,
+    outbound_bytes: u64,
+    inbound_frames: u64,
+    inbound_bytes: u64,
+    inbound_seq_gaps: u64,
+    inbound_out_of_order_frames: u64,
+    outbound_failures: u64,
+    inbound_failures: u64,
+    encode_errors: u64,
+    encoded_queue_drops: u64,
+    local_rendered_frames: u64,
+    local_dropped_frames: u64,
+    local_decode_errors: u64,
+    receiver_received_frames: u64,
+    receiver_rendered_frames: u64,
+    receiver_dropped_frames: u64,
+    receiver_decode_errors: u64,
+    quality_changes: u64,
+}
+
+impl VideoNetworkStats {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Debug, Default)]
+struct VideoWindowCounters {
+    submitted_frames: u64,
+    raw_frames_dropped: u64,
+    encoded_frames: u64,
+    encoded_queue_drops: u64,
+    inbound_frames: u64,
+    receiver_received_frames: u64,
+    receiver_rendered_frames: u64,
+    receiver_dropped_frames: u64,
+    receiver_decode_errors: u64,
+    encode_micros: Vec<u64>,
+}
+
+impl VideoWindowCounters {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn encode_p95_ms(&self) -> f64 {
+        if self.encode_micros.is_empty() {
+            return 0.0;
+        }
+        let mut values = self.encode_micros.clone();
+        values.sort_unstable();
+        let index = ((values.len() - 1) as f64 * 0.95).round() as usize;
+        values[index] as f64 / 1000.0
+    }
+}
+
+enum VideoStreamEvent {
+    InboundRecord {
+        peer: PeerId,
+        call_id: String,
+        record: crate::live::video::protocol::VideoStreamRecord,
+    },
+    InboundFailure {
+        peer: PeerId,
+        call_id: Option<String>,
+        error: String,
+    },
+    OutboundFailure {
+        peer: PeerId,
+        call_id: String,
+        error: String,
+    },
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct PeerTransportState {
     quic_connections: usize,
@@ -429,6 +509,33 @@ pub struct NetworkManager {
     voice_network_stats: VoiceNetworkStats,
     // Last time voice transport diagnostics were printed.
     voice_last_summary_at: Option<std::time::Instant>,
+    // Video stream task events returned to the network manager loop.
+    video_stream_event_rx: tokio::sync::mpsc::Receiver<VideoStreamEvent>,
+    // Video stream task event sender cloned into accept/writer tasks.
+    video_stream_event_tx: tokio::sync::mpsc::Sender<VideoStreamEvent>,
+    // Current active outbound video stream writer queue.
+    video_stream_tx:
+        Option<tokio::sync::mpsc::Sender<crate::live::video::protocol::VideoStreamRecord>>,
+    // Call id currently owned by the outbound video stream writer.
+    video_stream_call_id: Option<String>,
+    // Current active outbound video stream writer task.
+    video_stream_writer_handle: Option<tauri::async_runtime::JoinHandle<()>>,
+    // Sequence number for outgoing VP8 frames.
+    video_next_seq: u32,
+    // Expected next inbound video sequence for diagnostics.
+    video_expected_inbound_seq: Option<u32>,
+    // VP8 encoder for outbound camera frames.
+    video_vp8_encoder: Option<crate::live::video::codec::Vp8VideoEncoder>,
+    // Local video quality/adaptation controller.
+    video_quality_controller: crate::live::video::codec::VideoQualityController,
+    // Aggregated video transport diagnostics.
+    video_network_stats: VideoNetworkStats,
+    // Per-adaptation-window counters.
+    video_window_counters: VideoWindowCounters,
+    // Start time for the current adaptation window.
+    video_window_started_at: Option<std::time::Instant>,
+    // Last time video transport diagnostics were printed.
+    video_last_summary_at: Option<std::time::Instant>,
 }
 
 fn build_incoming_dm_db_message(
@@ -571,6 +678,12 @@ impl NetworkManager {
         } else {
             eprintln!("[Voice] Voice stream incoming receiver was already taken");
         }
+        let (video_stream_event_tx, video_stream_event_rx) = tokio::sync::mpsc::channel(512);
+        if let Some(incoming) = swarm.behaviour_mut().video_call.take_incoming() {
+            video_call::start_video_stream_accept_loop(incoming, video_stream_event_tx.clone());
+        } else {
+            eprintln!("[Video] Video stream incoming receiver was already taken");
+        }
 
         Self {
             swarm,
@@ -631,6 +744,21 @@ impl NetworkManager {
             voice_expected_inbound_seq: None,
             voice_network_stats: VoiceNetworkStats::default(),
             voice_last_summary_at: None,
+            video_stream_event_rx,
+            video_stream_event_tx,
+            video_stream_tx: None,
+            video_stream_call_id: None,
+            video_stream_writer_handle: None,
+            video_next_seq: 0,
+            video_expected_inbound_seq: None,
+            video_vp8_encoder: None,
+            video_quality_controller: crate::live::video::codec::VideoQualityController::new(
+                crate::live::video::codec::VideoQualityMode::Auto,
+            ),
+            video_network_stats: VideoNetworkStats::default(),
+            video_window_counters: VideoWindowCounters::default(),
+            video_window_started_at: None,
+            video_last_summary_at: None,
         }
     }
 

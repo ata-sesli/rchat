@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.atasesli.rchat",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "bun run build",
     "frontendDist": "../build"
   },
   "app": {
@@ -54,6 +54,7 @@
           "libasound2",
           "libssl3",
           "libopus0",
+          "libvpx9 | libvpx8 | libvpx7",
           "libavahi-client3",
           "libavahi-compat-libdnssd1"
         ]
@@ -71,6 +72,7 @@
           "alsa-lib",
           "openssl-libs",
           "opus",
+          "libvpx",
           "avahi-compat-libdns_sd"
         ]
       }

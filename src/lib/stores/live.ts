@@ -56,15 +56,10 @@ function detectVideoCallSupport(): { supported: boolean; reason: string | null }
     };
   }
   const w = window as any;
-  if (
-    !w.VideoEncoder ||
-    !w.VideoDecoder ||
-    !w.EncodedVideoChunk ||
-    !w.MediaStreamTrackProcessor
-  ) {
+  if (!w.VideoDecoder || !w.EncodedVideoChunk || !w.MediaStreamTrackProcessor) {
     return {
       supported: false,
-      reason: "WebCodecs video support is unavailable on this client.",
+      reason: "WebCodecs video decode support is unavailable on this client.",
     };
   }
   return { supported: true, reason: null };
@@ -220,6 +215,10 @@ export function callAvailabilityFor(
     voice.phase === "active" &&
     voice.call_kind === "voice" &&
     voice.peer_id === chatId;
+  const activeVoiceSamePeer =
+    voice.phase === "active" &&
+    voice.call_kind === "voice" &&
+    voice.peer_id === chatId;
 
   return {
     canStartVoiceCall:
@@ -227,7 +226,7 @@ export function callAvailabilityFor(
     canStartVideoCall:
       kind === "dm" &&
       isConnected &&
-      voice.phase === "idle" &&
+      (voice.phase === "idle" || activeVoiceSamePeer) &&
       broadcast.phase === "idle" &&
       live.videoCallSupported,
     canStartScreenBroadcast:

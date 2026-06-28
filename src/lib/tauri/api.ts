@@ -92,6 +92,9 @@ export const COMMANDS = {
   setVideoCallMuted: "set_video_call_muted",
   setVideoCallCameraEnabled: "set_video_call_camera_enabled",
   sendVideoCallChunk: "send_video_call_chunk",
+  submitVideoCallI420Frame: "submit_video_call_i420_frame",
+  setVideoCallQuality: "set_video_call_quality",
+  reportVideoCallRenderStats: "report_video_call_render_stats",
   getVoiceCallState: "get_voice_call_state",
   startScreenBroadcast: "start_screen_broadcast",
   acceptScreenBroadcast: "accept_screen_broadcast",
@@ -302,6 +305,14 @@ export type VoiceCallPhase =
 
 export type CallKind = "voice" | "video";
 export type VideoChunkType = "key" | "delta";
+export type VideoQualityMode = "auto" | "360p30" | "480p30" | "720p30";
+export type VideoProfile = "360p30" | "480p30" | "720p30";
+export type VideoRenderStats = {
+  received_frames: number;
+  rendered_frames: number;
+  dropped_frames: number;
+  decode_errors: number;
+};
 export type BroadcastPhase =
   | "idle"
   | "outgoing_ringing"
@@ -612,6 +623,25 @@ type CommandSpec = {
       chunk_type: VideoChunkType;
       payload: Uint8Array;
     };
+    result: void;
+  };
+  [COMMANDS.submitVideoCallI420Frame]: {
+    args: {
+      call_id: string;
+      timestamp_us: number;
+      width: number;
+      height: number;
+      profile: VideoProfile;
+      data: Uint8Array;
+    };
+    result: void;
+  };
+  [COMMANDS.setVideoCallQuality]: {
+    args: { call_id: string; mode: VideoQualityMode };
+    result: void;
+  };
+  [COMMANDS.reportVideoCallRenderStats]: {
+    args: { call_id: string; stats: VideoRenderStats };
     result: void;
   };
   [COMMANDS.getVoiceCallState]: { args?: undefined; result: VoiceCallState };
@@ -933,6 +963,29 @@ export const api = {
       codec,
       chunk_type: chunkType,
       payload,
+    }),
+  submitVideoCallI420Frame: (
+    callId: string,
+    timestampUs: number,
+    width: number,
+    height: number,
+    profile: VideoProfile,
+    data: Uint8Array,
+  ) =>
+    invokeCommand(COMMANDS.submitVideoCallI420Frame, {
+      call_id: callId,
+      timestamp_us: timestampUs,
+      width,
+      height,
+      profile,
+      data,
+    }),
+  setVideoCallQuality: (callId: string, mode: VideoQualityMode) =>
+    invokeCommand(COMMANDS.setVideoCallQuality, { call_id: callId, mode }),
+  reportVideoCallRenderStats: (callId: string, stats: VideoRenderStats) =>
+    invokeCommand(COMMANDS.reportVideoCallRenderStats, {
+      call_id: callId,
+      stats,
     }),
   getVoiceCallState: () => invokeCommand(COMMANDS.getVoiceCallState),
   startScreenBroadcast: (peerId: string) =>

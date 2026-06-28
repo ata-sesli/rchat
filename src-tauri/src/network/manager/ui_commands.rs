@@ -118,7 +118,44 @@ impl NetworkManager {
                 self.handle_send_video_call_chunk(
                     call_id, seq, timestamp, mime, codec, chunk_type, payload,
                 )
-                    .await;
+                .await;
+            }
+            NetworkCommand::SubmitVideoCallI420Frame {
+                call_id,
+                timestamp_us,
+                width,
+                height,
+                profile,
+                data,
+            } => {
+                self.handle_submit_video_call_i420_frame(
+                    call_id,
+                    timestamp_us,
+                    width,
+                    height,
+                    profile,
+                    data,
+                )
+                .await;
+            }
+            NetworkCommand::SetVideoCallQuality { call_id, mode } => {
+                self.handle_set_video_call_quality(call_id, mode).await;
+            }
+            NetworkCommand::ReportVideoCallRenderStats {
+                call_id,
+                received_frames,
+                rendered_frames,
+                dropped_frames,
+                decode_errors,
+            } => {
+                self.handle_report_video_call_render_stats(
+                    call_id,
+                    received_frames,
+                    rendered_frames,
+                    dropped_frames,
+                    decode_errors,
+                )
+                .await;
             }
             NetworkCommand::StartScreenBroadcast { peer_id } => {
                 self.handle_start_screen_broadcast(peer_id).await;
@@ -142,13 +179,7 @@ impl NetworkManager {
                 payload,
             } => {
                 self.handle_send_screen_broadcast_chunk(
-                    session_id,
-                    seq,
-                    timestamp,
-                    mime,
-                    codec,
-                    chunk_type,
-                    payload,
+                    session_id, seq, timestamp, mime, codec, chunk_type, payload,
                 )
                 .await;
             }

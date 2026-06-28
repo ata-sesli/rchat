@@ -69,6 +69,8 @@ impl NetworkManager {
             tokio::time::interval(std::time::Duration::from_secs(60));
         // Voice-call tick: ring timeout + outgoing frame pump.
         let mut voice_call_tick = tokio::time::interval(std::time::Duration::from_millis(20));
+        // Video-call tick: stream lifecycle + diagnostics/adaptation.
+        let mut video_call_tick = tokio::time::interval(std::time::Duration::from_millis(100));
         // Broadcast tick: ring timeout lifecycle.
         let mut broadcast_tick = tokio::time::interval(std::time::Duration::from_millis(100));
         // Ensure mDNS runtime reflects current connectivity settings.
@@ -116,6 +118,12 @@ impl NetworkManager {
                 }
                 Some(event) = self.voice_stream_event_rx.recv() => {
                     self.handle_voice_stream_event(event).await;
+                }
+                _ = video_call_tick.tick() => {
+                    self.tick_video_call().await;
+                }
+                Some(event) = self.video_stream_event_rx.recv() => {
+                    self.handle_video_stream_event(event).await;
                 }
                 _ = broadcast_tick.tick() => {
                     self.tick_broadcast().await;

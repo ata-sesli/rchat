@@ -109,6 +109,25 @@ pub enum NetworkCommand {
         chunk_type: String,
         payload: Vec<u8>,
     },
+    SubmitVideoCallI420Frame {
+        call_id: String,
+        timestamp_us: i64,
+        width: u32,
+        height: u32,
+        profile: String,
+        data: Vec<u8>,
+    },
+    SetVideoCallQuality {
+        call_id: String,
+        mode: String,
+    },
+    ReportVideoCallRenderStats {
+        call_id: String,
+        received_frames: u64,
+        rendered_frames: u64,
+        dropped_frames: u64,
+        decode_errors: u64,
+    },
     StartScreenBroadcast {
         peer_id: String,
     },

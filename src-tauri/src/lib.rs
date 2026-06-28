@@ -12,16 +12,17 @@ pub use app_state::{AppState, NetworkState};
 
 use crate::commands::auth::{
     check_auth_status, get_connectivity_settings, init_vault, poll_github_auth, reset_vault,
-    save_api_token, set_connectivity_mode, start_github_auth, start_network,
-    toggle_online_status, unlock_vault, update_connectivity_settings,
+    save_api_token, set_connectivity_mode, start_github_auth, start_network, toggle_online_status,
+    unlock_vault, update_connectivity_settings,
 };
 use crate::commands::call::{
     accept_screen_broadcast, accept_video_call, accept_voice_call, end_screen_broadcast,
     end_video_call, end_voice_call, get_broadcast_state, get_connected_chat_ids,
     get_voice_call_state, reject_screen_broadcast, reject_video_call, reject_voice_call,
-    send_screen_broadcast_chunk, send_video_call_chunk, set_video_call_camera_enabled,
-    set_video_call_muted, set_voice_call_muted, start_screen_broadcast, start_video_call,
-    start_voice_call,
+    report_video_call_render_stats, send_screen_broadcast_chunk, send_video_call_chunk,
+    set_video_call_camera_enabled, set_video_call_muted, set_video_call_quality,
+    set_voice_call_muted, start_screen_broadcast, start_video_call, start_voice_call,
+    submit_video_call_i420_frame,
 };
 use crate::commands::chat::{
     create_group_chat, get_chat_history, get_chat_latest_times, get_chat_list, get_unread_counts,
@@ -199,6 +200,9 @@ pub fn run() {
             set_video_call_muted,
             set_video_call_camera_enabled,
             send_video_call_chunk,
+            submit_video_call_i420_frame,
+            set_video_call_quality,
+            report_video_call_render_stats,
             get_voice_call_state,
             start_screen_broadcast,
             accept_screen_broadcast,

@@ -18,9 +18,7 @@ impl NetworkManager {
                     self.handle_direct_message_event(event).await;
                 }
                 RChatBehaviourEvent::VoiceCall(()) => {}
-                RChatBehaviourEvent::VideoCall(event) => {
-                    self.handle_video_frame_event(event).await;
-                }
+                RChatBehaviourEvent::VideoCall(()) => {}
                 RChatBehaviourEvent::Broadcast(event) => {
                     self.handle_broadcast_frame_event(event).await;
                 }

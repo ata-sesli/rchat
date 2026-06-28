@@ -20,7 +20,8 @@ For a visual showcase, visit [ata-sesli.github.io/rchat](https://ata-sesli.githu
 - **Temporary chats** through short-lived invite links.
 - **File and media messages** for images, documents, videos, audio, and stickers.
 - **Voice calls** over a dedicated QUIC media stream using Opus at 48 kHz mono.
-- **Video calls** and **screen broadcast** over separate live media protocols. These are work in progress and are not ready for normal use yet.
+- **1:1 video calls** over a dedicated QUIC media stream using VP8.
+- **Screen broadcast** protocol scaffolding. This remains work in progress.
 - **Local peer discovery** with mDNS.
 - **Remote peer discovery** with encrypted GitHub Gist publication.
 - **Encrypted local configuration** protected by the vault password.
@@ -49,6 +50,7 @@ For a visual showcase, visit [ata-sesli.github.io/rchat](https://ata-sesli.githu
 - **octocrab** talks to GitHub Gists for remote discovery.
 - **rubato** handles sample-rate conversion for voice capture/playback.
 - **opus** encodes/decodes voice media.
+- **vpx-rs/libvpx** encodes VP8 video media.
 
 ## High-Level Architecture
 
@@ -64,7 +66,7 @@ flowchart TB
     appstate["Shared app state<br/>vault · database · network runtime"]
     storage["Storage layer"]
     network["Network manager<br/>libp2p swarm"]
-    live["Live media engines<br/>voice implemented<br/>video/screen WIP"]
+    live["Live media engines<br/>voice · 1:1 VP8 video · screen WIP"]
   end
 
   subgraph disk["Local disk"]
@@ -84,7 +86,8 @@ flowchart TB
     dm["Direct messages<br/>request-response"]
     group["Group messages<br/>Gossipsub"]
     voice["Voice calls<br/>QUIC stream · Opus 48 kHz"]
-    wipmedia["Video/screen protocols<br/>work in progress"]
+    video["Video calls<br/>QUIC stream · VP8"]
+    wipmedia["Screen broadcast protocol<br/>work in progress"]
     remote["Remote RChat peers"]
   end
 
@@ -108,13 +111,16 @@ flowchart TB
   transports <--> dm
   transports <--> group
   transports <--> voice
+  transports <--> video
   transports <--> wipmedia
   live <--> voice
+  live <--> video
   live <--> wipmedia
 
   dm -.-> remote
   group -.-> remote
   voice -.-> remote
+  video -.-> remote
   wipmedia -.-> remote
 ```
 
@@ -275,8 +281,8 @@ RChat builds a libp2p swarm with:
 - **Ping** for connection health
 - **Kademlia** with an in-memory store
 - **Gossipsub** for group messages
-- **request-response** protocols for direct messages, video frames, and broadcast frames
-- a custom **voice stream** behaviour for long-lived voice media streams
+- **request-response** protocols for direct messages and broadcast frames
+- custom stream behaviours for long-lived voice and video media streams
 
 The app listens on IPv4 and IPv6 TCP and QUIC addresses. Voice calls require a QUIC path because low-latency media is sensitive to transport behavior.
 
@@ -337,16 +343,21 @@ The receiver decodes Opus packets back to PCM and feeds a playback queue. The vo
 
 ## Video Calls and Screen Broadcasts
 
-Video calls and screen broadcasts are work in progress. The codebase has protocol and UI scaffolding for them, but they are not ready for normal use yet.
+1:1 video calls are being implemented on the same live-call model as voice:
 
-The intended structure is:
+- the WebView owns camera capture, local preview, and remote frame rendering,
+- Rust owns VP8 encoding through `vpx-rs`/`libvpx`,
+- video media uses a long-lived libp2p QUIC stream:
 
-- video call frames use a video protocol over libp2p request-response,
-- screen broadcast frames use a broadcast protocol over libp2p request-response,
-- frontend capture/encoding uses browser media APIs and WebCodecs when available,
-- incoming state is surfaced through `voice-call-state-updated` and `broadcast-state-updated` style events.
+```text
+/rchat/call/video/1.0.0
+```
 
-The UI detects whether the local client supports camera capture, screen capture, and required WebCodecs APIs. Unsupported incoming video or broadcast sessions are rejected automatically.
+The video stream carries ordered records for VP8 frames, receiver reports, camera state, and quality changes. Auto quality starts at `720p30` and can shift between `720p30`, `480p30`, and `360p30` based on encode/render pressure. Video calls reuse the existing Opus voice path for audio, and a one-sided camera session is valid.
+
+Screen broadcasts are still work in progress. They remain separate from the 1:1 video-call path.
+
+The UI detects whether the local client supports camera capture, screen capture, and the required browser media APIs. Unsupported incoming video or broadcast sessions are rejected automatically.
 
 ## Frontend State Structure
 
@@ -385,19 +396,19 @@ Routes consume stores. They should not each independently subscribe to backend e
 Install JavaScript dependencies:
 
 ```bash
-pnpm install
+bun install
 ```
 
 Run the frontend/Tauri development flow:
 
 ```bash
-pnpm tauri dev
+bun run tauri dev
 ```
 
 Run frontend checks:
 
 ```bash
-pnpm check
+bun run check
 ```
 
 Run Rust tests:
@@ -414,11 +425,12 @@ cargo test --manifest-path src-tauri/Cargo.toml call_validation
 
 ## Native Dependencies
 
-RChat uses native desktop and audio/networking libraries through Rust crates and Tauri. On Linux, make sure the system has the runtime/build dependencies needed by Tauri, PipeWire/ALSA, and Opus. The package scripts and dependency docs in this repository track the exact packaging requirements.
+RChat uses native desktop, audio, video, and networking libraries through Rust crates and Tauri. On Linux, make sure the system has the runtime/build dependencies needed by Tauri, PipeWire/ALSA, Opus, and libvpx. The package scripts and dependency docs in this repository track the exact packaging requirements.
 
 Notable native pieces:
 
 - `opus` links to native libopus through Rust bindings.
+- `vpx-rs` links to native libvpx for VP8 video encoding.
 - `cpal` talks to platform audio backends.
 - `zeroconf` uses platform mDNS/Bonjour/Avahi-style functionality.
 - Tauri requires the usual platform WebView dependencies.

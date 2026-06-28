@@ -5,7 +5,6 @@ use libp2p::{
 
 use super::direct_message::{DirectMessageRequest, DirectMessageResponse};
 use crate::live::broadcast::protocol::{BroadcastFrameRequest, BroadcastFrameResponse};
-use crate::live::video::protocol::{VideoFrameRequest, VideoFrameResponse};
 
 #[derive(NetworkBehaviour)]
 pub struct RChatBehaviour {
@@ -28,7 +27,7 @@ pub struct RChatBehaviour {
     // Dedicated voice-call media transport
     pub voice_call: crate::network::voice_stream::Behaviour,
     // Dedicated video-call media transport
-    pub video_call: request_response::cbor::Behaviour<VideoFrameRequest, VideoFrameResponse>,
+    pub video_call: crate::network::voice_stream::Behaviour,
     // Dedicated DM screen-broadcast media transport
     pub broadcast: request_response::cbor::Behaviour<BroadcastFrameRequest, BroadcastFrameResponse>,
 
@@ -79,14 +78,10 @@ impl RChatBehaviour {
             crate::live::voice::protocol::VOICE_PROTOCOL,
         ));
 
-        // 6c. Request-Response (Video Frames)
-        let video_call = request_response::cbor::Behaviour::new(
-            [(
-                libp2p::StreamProtocol::new(crate::live::video::video::VIDEO_PROTOCOL),
-                request_response::ProtocolSupport::Full,
-            )],
-            request_response::Config::default(),
-        );
+        // 6c. Stream protocol (Video Frames)
+        let video_call = crate::network::voice_stream::Behaviour::new(libp2p::StreamProtocol::new(
+            crate::live::video::video::VIDEO_PROTOCOL,
+        ));
 
         // 6d. Request-Response (Broadcast Frames)
         let broadcast = request_response::cbor::Behaviour::new(

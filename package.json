@@ -3,12 +3,13 @@
   "version": "0.1.0",
   "description": "",
   "type": "module",
+  "packageManager": "bun@1.3.14",
   "scripts": {
     "dev": "vite dev",
     "build": "vite build",
     "preview": "vite preview",
     "check:commands": "node ./scripts/check-command-parity.mjs",
-    "check": "pnpm check:commands && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "check": "bun run check:commands && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri"
   },

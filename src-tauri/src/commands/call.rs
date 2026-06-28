@@ -6,6 +6,14 @@ use crate::network::command::NetworkCommand;
 use crate::NetworkState;
 use std::collections::HashSet;
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct VideoRenderStatsInput {
+    pub received_frames: u64,
+    pub rendered_frames: u64,
+    pub dropped_frames: u64,
+    pub decode_errors: u64,
+}
+
 fn direct_presence_key(chat_id: &str) -> String {
     let normalized = if chat_id == "self" { "Me" } else { chat_id };
     chat_identity::extract_peer_id_from_chat_id(normalized)
@@ -89,10 +97,7 @@ pub async fn reject_voice_call(
 }
 
 #[tauri::command]
-pub async fn end_voice_call(
-    call_id: String,
-    state: State<'_, NetworkState>,
-) -> Result<(), String> {
+pub async fn end_voice_call(call_id: String, state: State<'_, NetworkState>) -> Result<(), String> {
     let sender = state.sender.lock().await;
     sender
         .send(NetworkCommand::EndVoiceCall { call_id })
@@ -152,10 +157,7 @@ pub async fn reject_video_call(
 }
 
 #[tauri::command]
-pub async fn end_video_call(
-    call_id: String,
-    state: State<'_, NetworkState>,
-) -> Result<(), String> {
+pub async fn end_video_call(call_id: String, state: State<'_, NetworkState>) -> Result<(), String> {
     let sender = state.sender.lock().await;
     sender
         .send(NetworkCommand::EndVideoCall { call_id })
@@ -213,6 +215,63 @@ pub async fn send_video_call_chunk(
         })
         .await
         .map_err(|e| format!("Failed to send video chunk: {}", e))
+}
+
+#[tauri::command]
+pub async fn submit_video_call_i420_frame(
+    call_id: String,
+    timestamp_us: i64,
+    width: u32,
+    height: u32,
+    profile: String,
+    data: Vec<u8>,
+    state: State<'_, NetworkState>,
+) -> Result<(), String> {
+    let sender = state.sender.lock().await;
+    match sender.try_send(NetworkCommand::SubmitVideoCallI420Frame {
+        call_id,
+        timestamp_us,
+        width,
+        height,
+        profile,
+        data,
+    }) {
+        Ok(()) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
+        Err(e) => Err(format!("Failed to submit video frame: {}", e)),
+    }
+}
+
+#[tauri::command]
+pub async fn set_video_call_quality(
+    call_id: String,
+    mode: String,
+    state: State<'_, NetworkState>,
+) -> Result<(), String> {
+    let sender = state.sender.lock().await;
+    sender
+        .send(NetworkCommand::SetVideoCallQuality { call_id, mode })
+        .await
+        .map_err(|e| format!("Failed to update video quality: {}", e))
+}
+
+#[tauri::command]
+pub async fn report_video_call_render_stats(
+    call_id: String,
+    stats: VideoRenderStatsInput,
+    state: State<'_, NetworkState>,
+) -> Result<(), String> {
+    let sender = state.sender.lock().await;
+    sender
+        .send(NetworkCommand::ReportVideoCallRenderStats {
+            call_id,
+            received_frames: stats.received_frames,
+            rendered_frames: stats.rendered_frames,
+            dropped_frames: stats.dropped_frames,
+            decode_errors: stats.decode_errors,
+        })
+        .await
+        .map_err(|e| format!("Failed to report video render stats: {}", e))
 }
 
 #[tauri::command]
