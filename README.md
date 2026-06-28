@@ -393,6 +393,29 @@ Routes consume stores. They should not each independently subscribe to backend e
 
 ## Development
 
+### Fedora/RHEL Source Build
+
+Install native build dependencies first:
+
+```bash
+scripts/dist/install-fedora-build-deps.sh
+```
+
+Then install the JavaScript dependencies and run RChat:
+
+```bash
+bun install
+bun run tauri dev
+```
+
+For a release-style local build:
+
+```bash
+bun run tauri build
+```
+
+The Fedora helper installs native libraries and compilers only. If `cargo`, `rustc`, or `bun` are missing, install Rust with `rustup` and Bun from the official Bun installer before building.
+
 Install JavaScript dependencies:
 
 ```bash
