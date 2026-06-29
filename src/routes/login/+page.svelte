@@ -3,6 +3,7 @@
   import { goto } from "$app/navigation";
   import GitHubButton from "../../components/GitHubButton.svelte";
   import { api } from "$lib/tauri/api";
+  import { refreshAppSession } from "$lib/stores";
 
   // State
   type ViewState = "loading" | "setup" | "unlock" | "login";
@@ -50,6 +51,15 @@
     }
   }
 
+  async function refreshUnlockedSession(): Promise<boolean> {
+    const ready = await refreshAppSession();
+    if (!ready) {
+      error = "Vault unlocked, but RChat failed to finish startup. Check the backend logs.";
+      return false;
+    }
+    return true;
+  }
+
   async function handleSetup() {
     if (password !== confirmPassword) {
       error = "Passwords do not match";
@@ -64,12 +74,7 @@
     error = "";
     try {
       await api.initVault(password);
-
-      // Start P2P network AFTER vault is created (so we can save keypair)
-      console.log("[Login] Starting network...");
-      await api.startNetwork();
-      console.log("[Login] Network started");
-
+      if (!(await refreshUnlockedSession())) return;
       await checkStatus(); // Should move to 'login'
     } catch (e: any) {
       error = e.toString();
@@ -83,12 +88,7 @@
     error = "";
     try {
       await api.unlockVault(password);
-
-      // Start P2P network AFTER vault is unlocked (so we can load persisted keypair)
-      console.log("[Login] Starting network...");
-      await api.startNetwork();
-      console.log("[Login] Network started");
-
+      if (!(await refreshUnlockedSession())) return;
       await checkStatus(); // Should move to 'login'
     } catch (e: any) {
       error = "Invalid password";

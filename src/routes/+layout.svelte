@@ -96,6 +96,7 @@
 
   const seenDeepLinks = new Set<string>();
   let layoutCleanups: Array<() => void> = [];
+  let protectedStartupInFlight = false;
   $: isLoginRoute = $page.url.pathname === "/login";
   $: voiceCallState = $liveState.voiceCallState;
   $: broadcastState = $liveState.broadcastState;
@@ -110,6 +111,18 @@
     $appSession.authPhase === "locked"
   ) {
     void goto("/login");
+  }
+  $: if (
+    !isLoginRoute &&
+    $appSession.authChecked &&
+    $appSession.authPhase === "unlocked" &&
+    !$appSession.appReady &&
+    !protectedStartupInFlight
+  ) {
+    protectedStartupInFlight = true;
+    void ensureAppReady().finally(() => {
+      protectedStartupInFlight = false;
+    });
   }
   $: if ($chatState.closedChatId && $chatState.closedChatId === activePeer) {
     clearClosedChatMarker();
@@ -216,7 +229,9 @@
       });
 
       await setupDeepLinks();
-      await ensureAppReady();
+      if ($page.url.pathname !== "/login") {
+        await ensureAppReady();
+      }
     } catch (e) {
       console.error("Setup failed:", e);
     }

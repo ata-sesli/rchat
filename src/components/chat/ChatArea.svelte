@@ -23,6 +23,7 @@
     type VoiceCallState,
   } from "$lib/tauri/api";
   import { getChatKind } from "$lib/chatKind";
+  import { presencePeerKey } from "$lib/stores/presence";
 
   // Types
   type Message = {
@@ -164,11 +165,20 @@
   let chatContainer: HTMLElement;
   let textarea: HTMLTextAreaElement;
 
+  function matchesChatPeer(
+    left: string | null | undefined,
+    right: string | null | undefined,
+  ): boolean {
+    return Boolean(left && right && presencePeerKey(left) === presencePeerKey(right));
+  }
+
   $: isRegularDmChat = chatKind === "dm";
   $: callMatchesActivePeer =
-    voiceCallState.phase !== "idle" && voiceCallState.peer_id === activePeer;
+    voiceCallState.phase !== "idle" &&
+    matchesChatPeer(voiceCallState.peer_id, activePeer);
   $: callBusyOnOtherChat =
-    voiceCallState.phase !== "idle" && voiceCallState.peer_id !== activePeer;
+    voiceCallState.phase !== "idle" &&
+    !matchesChatPeer(voiceCallState.peer_id, activePeer);
   $: canShowCallButton = isRegularDmChat;
   $: canPressVoiceCallButton = canStartVoiceCall && voiceCallState.phase === "idle";
   $: activeCallId = voiceCallState.call_id ?? null;
@@ -205,9 +215,11 @@
     voiceCallState.phase === "active" &&
     activeCallKind === "video";
   $: broadcastMatchesActivePeer =
-    broadcastState.phase !== "idle" && broadcastState.peer_id === activePeer;
+    broadcastState.phase !== "idle" &&
+    matchesChatPeer(broadcastState.peer_id, activePeer);
   $: broadcastBusyOnOtherChat =
-    broadcastState.phase !== "idle" && broadcastState.peer_id !== activePeer;
+    broadcastState.phase !== "idle" &&
+    !matchesChatPeer(broadcastState.peer_id, activePeer);
   $: activeBroadcastSessionId = broadcastState.session_id ?? null;
   $: isBroadcastActiveInThisChat =
     broadcastMatchesActivePeer && broadcastState.phase === "active";
@@ -235,11 +247,8 @@
     if (!navigator?.mediaDevices?.getUserMedia) {
       return { supported: false, reason: "Camera capture is unavailable on this device." };
     }
-    if (!w.VideoDecoder || !w.EncodedVideoChunk) {
-      return { supported: false, reason: "WebCodecs video decode is not supported by this client." };
-    }
     if (!w.MediaStreamTrackProcessor) {
-      return { supported: false, reason: "Track processing API is unavailable on this client." };
+      return { supported: false, reason: "Camera frame processing is unavailable on this client." };
     }
     return { supported: true, reason: null };
   }
@@ -752,7 +761,7 @@
       if (voiceCallState.phase !== "active" || !callMatchesActivePeer) return;
       if (!activeCallCameraEnabled) return;
       if (!videoCallSupported) {
-        remoteVideoStateError = videoCallUnsupportedReason || "WebCodecs unsupported.";
+        remoteVideoStateError = videoCallUnsupportedReason || "Video capture unsupported.";
         await onEndVideoCall(sessionId);
         return;
       }

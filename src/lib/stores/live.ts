@@ -2,7 +2,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { get } from "svelte/store";
 import { writable } from "svelte/store";
 import { getChatKind } from "$lib/chatKind";
-import { isChatConnected } from "$lib/stores/presence";
+import { isChatConnected, presencePeerKey } from "$lib/stores/presence";
 import {
   api,
   type BroadcastState,
@@ -56,10 +56,10 @@ function detectVideoCallSupport(): { supported: boolean; reason: string | null }
     };
   }
   const w = window as any;
-  if (!w.VideoDecoder || !w.EncodedVideoChunk || !w.MediaStreamTrackProcessor) {
+  if (!w.MediaStreamTrackProcessor) {
     return {
       supported: false,
-      reason: "WebCodecs video decode support is unavailable on this client.",
+      reason: "Camera frame processing is unavailable on this client.",
     };
   }
   return { supported: true, reason: null };
@@ -211,14 +211,16 @@ export function callAvailabilityFor(
   const isConnected = isChatConnected(chatId, connectedChatIds);
   const voice = live.voiceCallState;
   const broadcast = live.broadcastState;
-  const activeVoiceBroadcastCombo =
-    voice.phase === "active" &&
-    voice.call_kind === "voice" &&
-    voice.peer_id === chatId;
+  const sameVoicePeer =
+    !!voice.peer_id && presencePeerKey(voice.peer_id) === presencePeerKey(chatId);
   const activeVoiceSamePeer =
     voice.phase === "active" &&
     voice.call_kind === "voice" &&
-    voice.peer_id === chatId;
+    sameVoicePeer;
+  const activeVoiceBroadcastCombo =
+    voice.phase === "active" &&
+    voice.call_kind === "voice" &&
+    sameVoicePeer;
 
   return {
     canStartVoiceCall:
