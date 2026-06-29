@@ -97,7 +97,8 @@ impl NetworkManager {
 
     pub(super) async fn handle_start_screen_broadcast(&mut self, peer_chat_id: String) {
         if self.active_broadcast.is_some() {
-            self.push_idle_broadcast_state(Some("busy".to_string())).await;
+            self.push_idle_broadcast_state(Some("busy".to_string()))
+                .await;
             return;
         }
 
@@ -115,7 +116,10 @@ impl NetworkManager {
             return;
         }
 
-        let Some(peer_id) = self.resolve_peer_id(&peer_chat_id, "SCREEN_BROADCAST").await else {
+        let Some(peer_id) = self
+            .resolve_peer_id(&peer_chat_id, "SCREEN_BROADCAST")
+            .await
+        else {
             self.push_idle_broadcast_state(Some("peer_unresolved".to_string()))
                 .await;
             return;
@@ -135,7 +139,8 @@ impl NetworkManager {
             remote_peer_id: peer_id,
             phase: ActiveBroadcastPhase::OutgoingRinging,
             ring_deadline: Some(
-                std::time::Instant::now() + std::time::Duration::from_secs(BROADCAST_RING_TIMEOUT_SECS),
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs(BROADCAST_RING_TIMEOUT_SECS),
             ),
             ring_expires_at: Some(now + BROADCAST_RING_TIMEOUT_SECS as i64),
             started_at: None,
@@ -256,21 +261,18 @@ impl NetworkManager {
             return;
         }
 
-        self.swarm
-            .behaviour_mut()
-            .broadcast
-            .send_request(
-                &session_snapshot.remote_peer_id,
-                BroadcastFrameRequest {
-                    session_id,
-                    seq,
-                    timestamp,
-                    mime,
-                    codec,
-                    chunk_type: Self::parse_broadcast_chunk_type(&chunk_type),
-                    payload,
-                },
-            );
+        self.swarm.behaviour_mut().broadcast.send_request(
+            &session_snapshot.remote_peer_id,
+            BroadcastFrameRequest {
+                session_id,
+                seq,
+                timestamp,
+                mime,
+                codec,
+                chunk_type: Self::parse_broadcast_chunk_type(&chunk_type),
+                payload,
+            },
+        );
     }
 
     pub(super) async fn handle_broadcast_signal(
@@ -288,7 +290,11 @@ impl NetworkManager {
                     crate::chat_kind::parse_chat_kind(&incoming_chat_id),
                     crate::chat_kind::ChatKind::Direct
                 ) {
-                    self.send_broadcast_signal(peer, DirectMessageKind::BroadcastReject, &request.id);
+                    self.send_broadcast_signal(
+                        peer,
+                        DirectMessageKind::BroadcastReject,
+                        &request.id,
+                    );
                     return Ok(());
                 }
 
@@ -454,7 +460,10 @@ impl NetworkManager {
                 }
             },
             Event::OutboundFailure { peer, error, .. } => {
-                eprintln!("[Broadcast] Outbound frame failure to {}: {:?}", peer, error);
+                eprintln!(
+                    "[Broadcast] Outbound frame failure to {}: {:?}",
+                    peer, error
+                );
                 let should_end = self
                     .active_broadcast
                     .as_ref()
@@ -469,7 +478,10 @@ impl NetworkManager {
                 }
             }
             Event::InboundFailure { peer, error, .. } => {
-                eprintln!("[Broadcast] Inbound frame failure from {}: {:?}", peer, error);
+                eprintln!(
+                    "[Broadcast] Inbound frame failure from {}: {:?}",
+                    peer, error
+                );
                 let should_end = self
                     .active_broadcast
                     .as_ref()

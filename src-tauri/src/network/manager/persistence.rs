@@ -208,7 +208,7 @@ fn persist_incoming_direct_message(
                 None,
                 "direct",
             )
-                .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?;
         }
 
         let chat_exists = crate::storage::db::chat_exists(conn, chat_id);

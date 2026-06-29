@@ -33,6 +33,7 @@ use crate::commands::chat_details::{
     drop_chat_connection, force_chat_reconnect, get_chat_details_overview, get_chat_stats,
     list_chat_files,
 };
+use crate::commands::debug::frontend_log;
 use crate::commands::envelopes::{
     create_envelope, delete_envelope, get_envelope_assignments, get_envelopes,
     move_chat_to_envelope, update_envelope,
@@ -115,6 +116,7 @@ pub fn run() {
             set_connectivity_mode,
             update_connectivity_settings,
             toggle_online_status,
+            frontend_log,
             init_vault,
             unlock_vault,
             start_network,

@@ -261,7 +261,11 @@
           .map(([key, value]) => `${key}=${String(value)}`)
           .join(" ")
       : "";
-    console.log(`[Video][Capture] ${message}${details}`);
+    const line = `[Video][Capture] ${message}${details}`;
+    console.log(line);
+    void api.frontendLog(line).catch(() => {
+      // Backend logging is best-effort diagnostics only.
+    });
   }
 
   function detectScreenBroadcastSupport(): {

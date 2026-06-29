@@ -2,6 +2,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { get } from "svelte/store";
 import { writable } from "svelte/store";
 import { getChatKind } from "$lib/chatKind";
+import { ensureVideoCallCameraAccess } from "$lib/media/callPermissions";
 import { isChatConnected, presencePeerKey } from "$lib/stores/presence";
 import {
   api,
@@ -44,6 +45,13 @@ let initPromise: Promise<UnlistenFn> | null = null;
 let activeUnlisten: UnlistenFn | null = null;
 const autoRejectedUnsupportedVideoCalls = new Set<string>();
 const autoRejectedUnsupportedBroadcasts = new Set<string>();
+
+function logLive(message: string, data?: Record<string, unknown>) {
+  const details = data ? ` ${JSON.stringify(data)}` : "";
+  const line = `[Live] ${message}${details}`;
+  console.log(line);
+  void api.frontendLog(line).catch(() => {});
+}
 
 function detectVideoCallSupport(): { supported: boolean; reason: string | null } {
   if (typeof window === "undefined") {
@@ -247,14 +255,41 @@ export const liveActions = {
   endVoiceCall: (callId: string) => api.endVoiceCall(callId),
   setVoiceCallMuted: (callId: string, muted: boolean) =>
     api.setVoiceCallMuted(callId, muted),
-  startVideoCall: (peerId: string) => api.startVideoCall(peerId),
+  startVideoCall: async (peerId: string) => {
+    logLive("video camera preflight requested", { peer_id: peerId });
+    try {
+      await ensureVideoCallCameraAccess();
+    } catch (e) {
+      logLive("video camera preflight failed", {
+        peer_id: peerId,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      throw e;
+    }
+    logLive("video camera preflight ok", { peer_id: peerId });
+    return api.startVideoCall(peerId);
+  },
   acceptVideoCall: (callId: string) => api.acceptVideoCall(callId),
   rejectVideoCall: (callId: string) => api.rejectVideoCall(callId),
   endVideoCall: (callId: string) => api.endVideoCall(callId),
   setVideoCallMuted: (callId: string, muted: boolean) =>
     api.setVideoCallMuted(callId, muted),
-  setVideoCallCameraEnabled: (callId: string, enabled: boolean) =>
-    api.setVideoCallCameraEnabled(callId, enabled),
+  setVideoCallCameraEnabled: async (callId: string, enabled: boolean) => {
+    if (enabled) {
+      logLive("video camera preflight requested", { call_id: callId });
+      try {
+        await ensureVideoCallCameraAccess();
+      } catch (e) {
+        logLive("video camera preflight failed", {
+          call_id: callId,
+          error: e instanceof Error ? e.message : String(e),
+        });
+        throw e;
+      }
+      logLive("video camera preflight ok", { call_id: callId });
+    }
+    return api.setVideoCallCameraEnabled(callId, enabled);
+  },
   startScreenBroadcast: (peerId: string) => api.startScreenBroadcast(peerId),
   acceptScreenBroadcast: (sessionId: string) =>
     api.acceptScreenBroadcast(sessionId),

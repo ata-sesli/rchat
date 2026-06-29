@@ -5,6 +5,18 @@ description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
 
+[workspace]
+members = [
+    ".",
+    "crates/rchat-audio-processing",
+    "crates/rchat-libvpx",
+    "crates/sonora-aec3",
+]
+resolver = "2"
+
+[patch.crates-io]
+sonora-aec3 = { path = "crates/sonora-aec3" }
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
@@ -68,6 +80,7 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 tauri-plugin-deep-link = "2"
 cpal = "0.15.3"
 opus = "0.3.1"
+rchat-audio-processing = { path = "crates/rchat-audio-processing" }
 rchat-libvpx = { path = "crates/rchat-libvpx" }
 rubato = { version = "2.0.0", default-features = false }
 [dev-dependencies]

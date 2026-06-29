@@ -7,6 +7,7 @@ export const COMMANDS = {
   setConnectivityMode: "set_connectivity_mode",
   updateConnectivitySettings: "update_connectivity_settings",
   toggleOnlineStatus: "toggle_online_status",
+  frontendLog: "frontend_log",
   initVault: "init_vault",
   unlockVault: "unlock_vault",
   startNetwork: "start_network",
@@ -392,6 +393,7 @@ type CommandSpec = {
     result: ConnectivitySettings;
   };
   [COMMANDS.toggleOnlineStatus]: { args: { online: boolean }; result: void };
+  [COMMANDS.frontendLog]: { args: { message: string }; result: void };
   [COMMANDS.initVault]: { args: { password: string }; result: void };
   [COMMANDS.unlockVault]: { args: { password: string }; result: void };
   [COMMANDS.startNetwork]: { args?: undefined; result: void };
@@ -734,6 +736,8 @@ export const api = {
     invokeCommand(COMMANDS.updateConnectivitySettings, { patch }),
   toggleOnlineStatus: (online: boolean) =>
     invokeCommand(COMMANDS.toggleOnlineStatus, { online }),
+  frontendLog: (message: string) =>
+    invokeCommand(COMMANDS.frontendLog, { message }),
   initVault: (password: string) => invokeCommand(COMMANDS.initVault, { password }),
   unlockVault: (password: string) =>
     invokeCommand(COMMANDS.unlockVault, { password }),

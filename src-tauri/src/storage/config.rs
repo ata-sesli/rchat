@@ -452,7 +452,10 @@ mod tests {
             ConnectivitySettings::invisible().derive_mode(),
             ConnectivityMode::Invisible
         );
-        assert_eq!(ConnectivitySettings::lan().derive_mode(), ConnectivityMode::Lan);
+        assert_eq!(
+            ConnectivitySettings::lan().derive_mode(),
+            ConnectivityMode::Lan
+        );
         assert_eq!(
             ConnectivitySettings::reachable().derive_mode(),
             ConnectivityMode::Reachable

@@ -41,7 +41,10 @@ fn ensure_dm_chat(chat_id: &str) -> Result<(), String> {
     }
 }
 
-async fn resolve_dm_peer_id(chat_id: &str, _app_state: &State<'_, AppState>) -> Result<String, String> {
+async fn resolve_dm_peer_id(
+    chat_id: &str,
+    _app_state: &State<'_, AppState>,
+) -> Result<String, String> {
     ensure_dm_chat(chat_id)?;
     crate::chat_identity::resolve_peer_id_for_direct_chat_id(chat_id)
         .ok_or_else(|| format!("No active peer mapping found for {}", chat_id))
@@ -73,16 +76,16 @@ pub async fn get_chat_details_overview(
 
         let peer_name = crate::storage::db::get_chat_name(&conn, &chat_id)
             .map_err(|e| e.to_string())?
-            .or_else(|| {
-                crate::chat_identity::extract_name_from_chat_id(&chat_id)
-            })
+            .or_else(|| crate::chat_identity::extract_name_from_chat_id(&chat_id))
             .unwrap_or_else(|| chat_id.clone());
 
         let peer_alias = crate::storage::db::get_peer_alias(&conn, &chat_id)
             .map_err(|e| e.to_string())?
             .or_else(|| {
                 if peer_id != chat_id {
-                    crate::storage::db::get_peer_alias(&conn, &peer_id).ok().flatten()
+                    crate::storage::db::get_peer_alias(&conn, &peer_id)
+                        .ok()
+                        .flatten()
                 } else {
                     None
                 }
@@ -141,10 +144,10 @@ pub async fn get_chat_stats(
 
     let (message_stats, connection_stats) = {
         let conn = app_state.db_conn.lock().map_err(|e| e.to_string())?;
-        let message_stats =
-            crate::storage::db::get_chat_message_stats(&conn, &chat_id).map_err(|e| e.to_string())?;
-        let connection_stats =
-            crate::storage::db::get_chat_connection_stats(&conn, &chat_id).map_err(|e| e.to_string())?;
+        let message_stats = crate::storage::db::get_chat_message_stats(&conn, &chat_id)
+            .map_err(|e| e.to_string())?;
+        let connection_stats = crate::storage::db::get_chat_connection_stats(&conn, &chat_id)
+            .map_err(|e| e.to_string())?;
         (message_stats, connection_stats)
     };
 

@@ -423,7 +423,9 @@ fn merge_chat_connection_stats(
         (None, Some(b)) => Some(b),
         (None, None) => None,
     };
-    let reconnect_count = from_stats.reconnect_count.saturating_add(to_stats.reconnect_count);
+    let reconnect_count = from_stats
+        .reconnect_count
+        .saturating_add(to_stats.reconnect_count);
 
     tx.execute(
         "INSERT INTO chat_connection_stats (chat_id, first_connected_at, last_connected_at, reconnect_count)
@@ -525,7 +527,10 @@ fn migrate_chat_id_references(
                 (new_chat_id, envelope_id),
             )?;
         }
-        tx.execute("DELETE FROM chat_envelopes WHERE chat_id = ?1", [old_chat_id])?;
+        tx.execute(
+            "DELETE FROM chat_envelopes WHERE chat_id = ?1",
+            [old_chat_id],
+        )?;
     }
 
     merge_chat_connection_stats(tx, old_chat_id, new_chat_id)?;
@@ -849,7 +854,8 @@ pub fn get_chat_list(conn: &Connection) -> anyhow::Result<Vec<ChatListItem>> {
     for row in peer_rows {
         let (peer_id, alias) = row?;
         let has_scoped_direct_chat = seen_ids.iter().any(|id| {
-            (id.starts_with("gh:") || id.starts_with("lh:")) && id.ends_with(&format!("-{}", peer_id))
+            (id.starts_with("gh:") || id.starts_with("lh:"))
+                && id.ends_with(&format!("-{}", peer_id))
         });
         if !seen_ids.contains(&peer_id) && !has_scoped_direct_chat {
             items.push(ChatListItem {
@@ -1145,7 +1151,10 @@ pub fn get_chat_latest_times(
     Ok(result)
 }
 
-pub fn get_chat_message_stats(conn: &Connection, chat_id: &str) -> anyhow::Result<ChatMessageStats> {
+pub fn get_chat_message_stats(
+    conn: &Connection,
+    chat_id: &str,
+) -> anyhow::Result<ChatMessageStats> {
     let mut stmt = conn.prepare(
         "SELECT
             SUM(CASE WHEN peer_id = 'Me' THEN 1 ELSE 0 END) AS sent_total,
@@ -1491,8 +1500,14 @@ mod tests {
         let canonical_chat_id =
             crate::chat_identity::build_github_chat_id("professional-tester", peer_id);
 
-        add_peer(&conn, legacy_chat_id, Some("professional-tester"), None, "github")
-            .expect("legacy peer");
+        add_peer(
+            &conn,
+            legacy_chat_id,
+            Some("professional-tester"),
+            None,
+            "github",
+        )
+        .expect("legacy peer");
         create_chat(&conn, legacy_chat_id, "professional-tester", false).expect("legacy chat");
 
         let msg = Message {

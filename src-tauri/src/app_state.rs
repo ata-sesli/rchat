@@ -151,7 +151,7 @@ pub struct NetworkState {
     pub connected_chat_ids: Mutex<HashSet<String>>, // Currently connected chats/peers
     pub chat_connections: Mutex<HashMap<String, ChatConnectionRuntime>>, // Runtime connection metadata by chat id
     pub voice_call_state: Mutex<VoiceCallState>, // Runtime voice-call state for UI polling
-    pub broadcast_state: Mutex<BroadcastState>, // Runtime DM broadcast state for UI polling
+    pub broadcast_state: Mutex<BroadcastState>,  // Runtime DM broadcast state for UI polling
     pub connectivity: Mutex<crate::storage::config::ConnectivitySettings>, // Runtime connectivity controls
 }
 

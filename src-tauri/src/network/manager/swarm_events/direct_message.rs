@@ -337,7 +337,8 @@ impl NetworkManager {
                 invitee_github, invitee_peer_id
             );
 
-            let chat_id = crate::chat_identity::build_github_chat_id(&invitee_github, &invitee_peer_id);
+            let chat_id =
+                crate::chat_identity::build_github_chat_id(&invitee_github, &invitee_peer_id);
             self.cache_peer_mapping(&invitee_github, &invitee_peer_id);
             self.mark_connected_chat_id(chat_id.clone()).await;
 

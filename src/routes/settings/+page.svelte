@@ -5,6 +5,7 @@
   import SettingsStickers from "../../components/settings/SettingsStickers.svelte";
   import SettingsTheme from "../../components/settings/SettingsTheme.svelte";
   import SettingsConnectivity from "../../components/settings/SettingsConnectivity.svelte";
+  import SettingsMediaTest from "../../components/settings/SettingsMediaTest.svelte";
   import SettingsAbout from "../../components/settings/SettingsAbout.svelte";
 
   type View =
@@ -12,6 +13,7 @@
     | "profile"
     | "add-peers"
     | "connectivity"
+    | "media-test"
     | "stickers"
     | "set-theme"
     | "about";
@@ -47,6 +49,8 @@
     <SettingsPeers onback={goBack} />
   {:else if currentView === "connectivity"}
     <SettingsConnectivity onback={goBack} />
+  {:else if currentView === "media-test"}
+    <SettingsMediaTest onback={goBack} />
   {:else if currentView === "stickers"}
     <SettingsStickers onback={goBack} />
   {:else if currentView === "set-theme"}

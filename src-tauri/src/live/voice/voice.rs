@@ -10,6 +10,7 @@ use rubato::{
 };
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -28,6 +29,10 @@ const PLAYBACK_RATE_MEASURE_INTERVAL: Duration = Duration::from_secs(1);
 const MIN_PLAUSIBLE_OUTPUT_RATE_HZ: f64 = 8_000.0;
 const MAX_PLAUSIBLE_OUTPUT_RATE_HZ: f64 = 192_000.0;
 const OUTPUT_CLOCK_UNSTABLE_THRESHOLD: f64 = 0.10;
+const ECHO_SUPPRESSION_HOLD: Duration = Duration::from_millis(220);
+const ECHO_PLAYBACK_PEAK_THRESHOLD: i16 = 384;
+const ECHO_NO_PLAYBACK_ACTIVITY: u64 = u64::MAX;
+const AEC_FALLBACK_ERROR_THRESHOLD: u64 = 3;
 const VOICE_OUTPUT_RATE_ENV: &str = "RCHAT_VOICE_OUTPUT_RATE";
 const PREFERRED_OUTPUT_RATES: &[u32] = &[48_000, 44_100, 24_000, 22_050, 16_000];
 
@@ -39,6 +44,12 @@ struct VoiceAudioStats {
     measured_capture_rate_hz: f64,
     capture_resample_ratio: f64,
     capture_panics: u64,
+    capture_echo_suppressed_samples: u64,
+    aec_enabled: bool,
+    aec_render_frames: u64,
+    aec_capture_frames: u64,
+    aec_errors: u64,
+    aec_fallback_active: bool,
     generated_frames: u64,
     resampler_errors: u64,
     playback_callbacks: u64,
@@ -69,13 +80,19 @@ impl VoiceAudioStats {
         let output_device_hz = self.output_device_frames as f64 / elapsed;
         let playback_fps = (self.playback_samples_consumed as f64 / FRAME_SAMPLES as f64) / elapsed;
         eprintln!(
-            "[Voice][Audio][{}] capture_callbacks={}, capture_device_hz={:.1}, measured_capture_hz={:.1}, capture_resample_ratio={:.6}, capture_panics={}, generated_frames={}, generated_fps={:.1}, resampler_errors={}, playback_callbacks={}, output_device_hz={:.1}, playback_declared_hz={:.1}, playback_measured_hz={:.1}, playback_effective_hz={:.1}, output_clock_unstable={}, playback_frames_received={}, playback_fps={:.1}, playback_underruns={}, playback_concealed_samples={}, playback_samples_dropped={}, playback_queue_trim_events={}, current_playback_queue_ms={:.1}, max_playback_queue_ms={:.1}",
+            "[Voice][Audio][{}] capture_callbacks={}, capture_device_hz={:.1}, measured_capture_hz={:.1}, capture_resample_ratio={:.6}, capture_panics={}, capture_echo_suppressed_ms={:.1}, aec_enabled={}, aec_render_frames={}, aec_capture_frames={}, aec_errors={}, aec_fallback_active={}, generated_frames={}, generated_fps={:.1}, resampler_errors={}, playback_callbacks={}, output_device_hz={:.1}, playback_declared_hz={:.1}, playback_measured_hz={:.1}, playback_effective_hz={:.1}, output_clock_unstable={}, playback_frames_received={}, playback_fps={:.1}, playback_underruns={}, playback_concealed_samples={}, playback_samples_dropped={}, playback_queue_trim_events={}, current_playback_queue_ms={:.1}, max_playback_queue_ms={:.1}",
             label,
             self.capture_callbacks,
             capture_device_hz,
             self.measured_capture_rate_hz,
             self.capture_resample_ratio,
             self.capture_panics,
+            samples_to_ms(self.capture_echo_suppressed_samples as usize),
+            self.aec_enabled,
+            self.aec_render_frames,
+            self.aec_capture_frames,
+            self.aec_errors,
+            self.aec_fallback_active,
             self.generated_frames,
             generated_fps,
             self.resampler_errors,
@@ -116,6 +133,119 @@ fn with_audio_stats(
         update(&mut guard);
     }
 }
+
+struct EchoGuard {
+    started_at: Instant,
+    last_playback_active_ms: AtomicU64,
+}
+
+impl EchoGuard {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            last_playback_active_ms: AtomicU64::new(ECHO_NO_PLAYBACK_ACTIVITY),
+        }
+    }
+
+    fn mark_playback_activity(&self, samples: &[i16], now: Instant) {
+        let has_audible_output = samples
+            .iter()
+            .any(|sample| (*sample as i32).abs() >= ECHO_PLAYBACK_PEAK_THRESHOLD as i32);
+        if has_audible_output {
+            self.last_playback_active_ms
+                .store(self.elapsed_ms(now), Ordering::Relaxed);
+        }
+    }
+
+    fn should_suppress_capture(&self, now: Instant) -> bool {
+        let last = self.last_playback_active_ms.load(Ordering::Relaxed);
+        if last == ECHO_NO_PLAYBACK_ACTIVITY {
+            return false;
+        }
+
+        self.elapsed_ms(now).saturating_sub(last) <= ECHO_SUPPRESSION_HOLD.as_millis() as u64
+    }
+
+    fn apply_to_capture(&self, samples: &mut [i16], now: Instant) -> bool {
+        if !self.should_suppress_capture(now) {
+            return false;
+        }
+
+        samples.fill(0);
+        true
+    }
+
+    fn elapsed_ms(&self, now: Instant) -> u64 {
+        now.checked_duration_since(self.started_at)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct VoiceAecStats {
+    render_frames: u64,
+    capture_frames: u64,
+    errors: u64,
+    fallback_active: bool,
+}
+
+struct VoiceAecProcessor {
+    canceller: rchat_audio_processing::RchatEchoCanceller,
+    stats: VoiceAecStats,
+}
+
+impl VoiceAecProcessor {
+    fn new(canceller: rchat_audio_processing::RchatEchoCanceller) -> Self {
+        Self {
+            canceller,
+            stats: VoiceAecStats::default(),
+        }
+    }
+
+    fn process_render_frame(&mut self, frame: &[i16]) -> Result<(), String> {
+        match self.canceller.process_render_20ms_i16(frame) {
+            Ok(()) => {
+                self.stats.render_frames = self.stats.render_frames.saturating_add(1);
+                Ok(())
+            }
+            Err(e) => {
+                self.note_error();
+                Err(e.to_string())
+            }
+        }
+    }
+
+    fn process_capture_frame(&mut self, frame: &[i16]) -> Result<Vec<i16>, String> {
+        match self.canceller.process_capture_20ms_i16(frame) {
+            Ok(processed) => {
+                self.stats.capture_frames = self.stats.capture_frames.saturating_add(1);
+                Ok(processed)
+            }
+            Err(e) => {
+                self.note_error();
+                Err(e.to_string())
+            }
+        }
+    }
+
+    fn note_error(&mut self) {
+        self.stats.errors = self.stats.errors.saturating_add(1);
+        if self.stats.errors >= AEC_FALLBACK_ERROR_THRESHOLD {
+            self.stats.fallback_active = true;
+        }
+    }
+
+    fn fallback_active(&self) -> bool {
+        self.stats.fallback_active
+    }
+
+    fn stats(&self) -> VoiceAecStats {
+        self.stats
+    }
+}
+
+type SharedVoiceAecProcessor = Arc<Mutex<VoiceAecProcessor>>;
 
 pub struct VoiceAudioEngine {
     playback_tx: mpsc::Sender<Vec<i16>>,
@@ -239,12 +369,38 @@ fn run_audio_thread(
         output_supported.sample_format(),
     );
 
+    let echo_guard = Arc::new(EchoGuard::new());
+    let aec_processor = match rchat_audio_processing::RchatEchoCanceller::new_48khz_mono() {
+        Ok(mut canceller) => {
+            let delay_ms = samples_to_ms(PLAYBACK_TARGET_QUEUE_SAMPLES) as i32;
+            let _ = canceller.set_stream_delay_ms(delay_ms);
+            eprintln!("[Voice][Audio] acoustic_echo_cancellation=enabled");
+            with_audio_stats(&stats, |s| {
+                s.aec_enabled = true;
+                s.aec_fallback_active = false;
+            });
+            Some(Arc::new(Mutex::new(VoiceAecProcessor::new(canceller))))
+        }
+        Err(e) => {
+            eprintln!(
+                "[Voice][Audio] acoustic_echo_cancellation=disabled error={}",
+                e
+            );
+            with_audio_stats(&stats, |s| {
+                s.aec_enabled = false;
+                s.aec_fallback_active = true;
+            });
+            None
+        }
+    };
     let input_stream = match build_input_stream(
         &input_device,
         &input_supported.sample_format(),
         &input_config,
         capture_tx,
         stats.clone(),
+        echo_guard.clone(),
+        aec_processor.clone(),
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -259,6 +415,8 @@ fn run_audio_thread(
         &output_config,
         playback_rx,
         stats.clone(),
+        echo_guard,
+        aec_processor,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -436,6 +594,8 @@ fn build_input_stream(
     config: &StreamConfig,
     capture_tx: tokio::sync::mpsc::UnboundedSender<Vec<i16>>,
     stats: Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: Arc<EchoGuard>,
+    aec_processor: Option<SharedVoiceAecProcessor>,
 ) -> Result<Stream, String> {
     let channels = config.channels as usize;
     let in_rate = config.sample_rate.0;
@@ -443,42 +603,75 @@ fn build_input_stream(
     let err_fn = |err| eprintln!("[Voice] Input stream error: {}", err);
 
     match sample_format {
-        SampleFormat::F32 => input_device
-            .build_input_stream(
-                config,
-                move |data: &[f32], _| {
-                    with_audio_stats(&stats, |s| s.capture_callbacks += 1);
-                    let mono = input_to_mono_i16_f32(data, channels);
-                    handle_capture_callback(&capture_tx, &mut assembler, &mono, &stats);
-                },
-                err_fn,
-                None,
-            )
-            .map_err(|e| format!("Failed to build f32 input stream: {}", e)),
-        SampleFormat::I16 => input_device
-            .build_input_stream(
-                config,
-                move |data: &[i16], _| {
-                    with_audio_stats(&stats, |s| s.capture_callbacks += 1);
-                    let mono = input_to_mono_i16_i16(data, channels);
-                    handle_capture_callback(&capture_tx, &mut assembler, &mono, &stats);
-                },
-                err_fn,
-                None,
-            )
-            .map_err(|e| format!("Failed to build i16 input stream: {}", e)),
-        SampleFormat::U16 => input_device
-            .build_input_stream(
-                config,
-                move |data: &[u16], _| {
-                    with_audio_stats(&stats, |s| s.capture_callbacks += 1);
-                    let mono = input_to_mono_i16_u16(data, channels);
-                    handle_capture_callback(&capture_tx, &mut assembler, &mono, &stats);
-                },
-                err_fn,
-                None,
-            )
-            .map_err(|e| format!("Failed to build u16 input stream: {}", e)),
+        SampleFormat::F32 => {
+            let echo_guard = echo_guard.clone();
+            let aec_processor = aec_processor.clone();
+            input_device
+                .build_input_stream(
+                    config,
+                    move |data: &[f32], _| {
+                        with_audio_stats(&stats, |s| s.capture_callbacks += 1);
+                        let mut mono = input_to_mono_i16_f32(data, channels);
+                        handle_capture_callback(
+                            &capture_tx,
+                            &mut assembler,
+                            &mut mono,
+                            &stats,
+                            &echo_guard,
+                            aec_processor.as_ref(),
+                        );
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("Failed to build f32 input stream: {}", e))
+        }
+        SampleFormat::I16 => {
+            let echo_guard = echo_guard.clone();
+            let aec_processor = aec_processor.clone();
+            input_device
+                .build_input_stream(
+                    config,
+                    move |data: &[i16], _| {
+                        with_audio_stats(&stats, |s| s.capture_callbacks += 1);
+                        let mut mono = input_to_mono_i16_i16(data, channels);
+                        handle_capture_callback(
+                            &capture_tx,
+                            &mut assembler,
+                            &mut mono,
+                            &stats,
+                            &echo_guard,
+                            aec_processor.as_ref(),
+                        );
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("Failed to build i16 input stream: {}", e))
+        }
+        SampleFormat::U16 => {
+            let echo_guard = echo_guard.clone();
+            let aec_processor = aec_processor.clone();
+            input_device
+                .build_input_stream(
+                    config,
+                    move |data: &[u16], _| {
+                        with_audio_stats(&stats, |s| s.capture_callbacks += 1);
+                        let mut mono = input_to_mono_i16_u16(data, channels);
+                        handle_capture_callback(
+                            &capture_tx,
+                            &mut assembler,
+                            &mut mono,
+                            &stats,
+                            &echo_guard,
+                            aec_processor.as_ref(),
+                        );
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("Failed to build u16 input stream: {}", e))
+        }
         _ => Err("Unsupported input sample format".to_string()),
     }
 }
@@ -486,11 +679,27 @@ fn build_input_stream(
 fn handle_capture_callback(
     capture_tx: &tokio::sync::mpsc::UnboundedSender<Vec<i16>>,
     assembler: &mut VoiceFrameAssembler,
-    mono: &[i16],
+    mono: &mut [i16],
     stats: &Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: &EchoGuard,
+    aec_processor: Option<&SharedVoiceAecProcessor>,
 ) {
     if catch_unwind(AssertUnwindSafe(|| {
-        send_captured_frames(capture_tx, assembler, mono, stats);
+        if aec_fallback_active(aec_processor) && echo_guard.apply_to_capture(mono, Instant::now()) {
+            with_audio_stats(stats, |s| {
+                s.capture_echo_suppressed_samples = s
+                    .capture_echo_suppressed_samples
+                    .saturating_add(mono.len() as u64);
+            });
+        }
+        send_captured_frames(
+            capture_tx,
+            assembler,
+            mono,
+            stats,
+            echo_guard,
+            aec_processor,
+        );
     }))
     .is_err()
     {
@@ -508,6 +717,8 @@ fn build_output_stream(
     config: &StreamConfig,
     playback_rx: mpsc::Receiver<Vec<i16>>,
     stats: Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: Arc<EchoGuard>,
+    aec_processor: Option<SharedVoiceAecProcessor>,
 ) -> Result<Stream, String> {
     let channels = config.channels as usize;
     let out_rate = config.sample_rate.0;
@@ -518,11 +729,18 @@ fn build_output_stream(
     match sample_format {
         SampleFormat::F32 => {
             let mut mono = Vec::<i16>::new();
+            let echo_guard = echo_guard.clone();
+            let aec_processor = aec_processor.clone();
             output_device
                 .build_output_stream(
                     config,
                     move |data: &mut [f32], _| {
-                        drain_playback_frames(&playback_rx, &mut queue, &stats);
+                        drain_playback_frames(
+                            &playback_rx,
+                            &mut queue,
+                            &stats,
+                            aec_processor.as_ref(),
+                        );
                         write_output_frames_f32(
                             data,
                             channels,
@@ -530,6 +748,7 @@ fn build_output_stream(
                             &mut playback_state,
                             &mut mono,
                             &stats,
+                            &echo_guard,
                         );
                     },
                     err_fn,
@@ -539,11 +758,18 @@ fn build_output_stream(
         }
         SampleFormat::I16 => {
             let mut mono = Vec::<i16>::new();
+            let echo_guard = echo_guard.clone();
+            let aec_processor = aec_processor.clone();
             output_device
                 .build_output_stream(
                     config,
                     move |data: &mut [i16], _| {
-                        drain_playback_frames(&playback_rx, &mut queue, &stats);
+                        drain_playback_frames(
+                            &playback_rx,
+                            &mut queue,
+                            &stats,
+                            aec_processor.as_ref(),
+                        );
                         write_output_frames_i16(
                             data,
                             channels,
@@ -551,6 +777,7 @@ fn build_output_stream(
                             &mut playback_state,
                             &mut mono,
                             &stats,
+                            &echo_guard,
                         );
                     },
                     err_fn,
@@ -560,11 +787,18 @@ fn build_output_stream(
         }
         SampleFormat::U16 => {
             let mut mono = Vec::<i16>::new();
+            let echo_guard = echo_guard.clone();
+            let aec_processor = aec_processor.clone();
             output_device
                 .build_output_stream(
                     config,
                     move |data: &mut [u16], _| {
-                        drain_playback_frames(&playback_rx, &mut queue, &stats);
+                        drain_playback_frames(
+                            &playback_rx,
+                            &mut queue,
+                            &stats,
+                            aec_processor.as_ref(),
+                        );
                         write_output_frames_u16(
                             data,
                             channels,
@@ -572,6 +806,7 @@ fn build_output_stream(
                             &mut playback_state,
                             &mut mono,
                             &stats,
+                            &echo_guard,
                         );
                     },
                     err_fn,
@@ -588,6 +823,8 @@ fn send_captured_frames(
     assembler: &mut VoiceFrameAssembler,
     samples: &[i16],
     stats: &Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: &EchoGuard,
+    aec_processor: Option<&SharedVoiceAecProcessor>,
 ) {
     let before_errors = assembler.resampler_error_count();
     let frames = assembler.push_samples(samples);
@@ -608,8 +845,89 @@ fn send_captured_frames(
         s.resampler_errors += error_delta;
     });
     for frame in frames {
+        let frame = process_aec_capture_frame(aec_processor, frame, stats, echo_guard);
         let _ = capture_tx.send(frame);
     }
+}
+
+fn process_aec_capture_frame(
+    aec_processor: Option<&SharedVoiceAecProcessor>,
+    mut frame: Vec<i16>,
+    stats: &Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: &EchoGuard,
+) -> Vec<i16> {
+    let Some(aec_processor) = aec_processor else {
+        return frame;
+    };
+    let Ok(mut guard) = aec_processor.try_lock() else {
+        apply_echo_guard_to_capture_frame(&mut frame, stats, echo_guard, Instant::now());
+        return frame;
+    };
+
+    match guard.process_capture_frame(&frame) {
+        Ok(processed) => {
+            sync_aec_stats(stats, guard.stats());
+            processed
+        }
+        Err(_) => {
+            sync_aec_stats(stats, guard.stats());
+            apply_echo_guard_to_capture_frame(&mut frame, stats, echo_guard, Instant::now());
+            frame
+        }
+    }
+}
+
+fn apply_echo_guard_to_capture_frame(
+    frame: &mut [i16],
+    stats: &Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: &EchoGuard,
+    now: Instant,
+) {
+    if frame.iter().all(|sample| *sample == 0) {
+        return;
+    }
+    if echo_guard.apply_to_capture(frame, now) {
+        with_audio_stats(stats, |s| {
+            s.capture_echo_suppressed_samples = s
+                .capture_echo_suppressed_samples
+                .saturating_add(frame.len() as u64);
+        });
+    }
+}
+
+fn process_aec_render_frame(
+    aec_processor: Option<&SharedVoiceAecProcessor>,
+    frame: &[i16],
+    stats: &Arc<Mutex<VoiceAudioStats>>,
+) {
+    let Some(aec_processor) = aec_processor else {
+        return;
+    };
+    let Ok(mut guard) = aec_processor.try_lock() else {
+        return;
+    };
+
+    let _ = guard.process_render_frame(frame);
+    sync_aec_stats(stats, guard.stats());
+}
+
+fn aec_fallback_active(aec_processor: Option<&SharedVoiceAecProcessor>) -> bool {
+    let Some(aec_processor) = aec_processor else {
+        return true;
+    };
+    let Ok(guard) = aec_processor.try_lock() else {
+        return true;
+    };
+    guard.fallback_active()
+}
+
+fn sync_aec_stats(stats: &Arc<Mutex<VoiceAudioStats>>, aec_stats: VoiceAecStats) {
+    with_audio_stats(stats, |s| {
+        s.aec_render_frames = aec_stats.render_frames;
+        s.aec_capture_frames = aec_stats.capture_frames;
+        s.aec_errors = aec_stats.errors;
+        s.aec_fallback_active = aec_stats.fallback_active;
+    });
 }
 
 struct VoiceFrameAssembler {
@@ -845,9 +1163,11 @@ fn drain_playback_frames(
     playback_rx: &mpsc::Receiver<Vec<i16>>,
     queue: &mut VecDeque<i16>,
     stats: &Arc<Mutex<VoiceAudioStats>>,
+    aec_processor: Option<&SharedVoiceAecProcessor>,
 ) {
     let mut received = 0u64;
     while let Ok(frame) = playback_rx.try_recv() {
+        process_aec_render_frame(aec_processor, &frame, stats);
         received += 1;
         queue.extend(frame);
     }
@@ -1045,6 +1365,7 @@ fn write_output_frames_i16(
     playback_state: &mut PlaybackState,
     mono: &mut Vec<i16>,
     stats: &Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: &EchoGuard,
 ) {
     if channels == 0 {
         return;
@@ -1052,6 +1373,9 @@ fn write_output_frames_i16(
     let frame_count = data.len() / channels;
     playback_state.note_output_callback_samples(data.len(), channels);
     let render_stats = render_playback_mono_samples(frame_count, queue, playback_state, mono);
+    if render_stats.consumed_samples > 0 {
+        echo_guard.mark_playback_activity(mono, Instant::now());
+    }
     for frame_idx in 0..frame_count {
         let sample = mono[frame_idx];
         for ch in 0..channels {
@@ -1084,6 +1408,7 @@ fn write_output_frames_f32(
     playback_state: &mut PlaybackState,
     mono: &mut Vec<i16>,
     stats: &Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: &EchoGuard,
 ) {
     if channels == 0 {
         return;
@@ -1091,6 +1416,9 @@ fn write_output_frames_f32(
     let frame_count = data.len() / channels;
     playback_state.note_output_callback_samples(data.len(), channels);
     let render_stats = render_playback_mono_samples(frame_count, queue, playback_state, mono);
+    if render_stats.consumed_samples > 0 {
+        echo_guard.mark_playback_activity(mono, Instant::now());
+    }
     for frame_idx in 0..frame_count {
         let f = i16_to_f32(mono[frame_idx]);
         for ch in 0..channels {
@@ -1123,6 +1451,7 @@ fn write_output_frames_u16(
     playback_state: &mut PlaybackState,
     mono: &mut Vec<i16>,
     stats: &Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: &EchoGuard,
 ) {
     if channels == 0 {
         return;
@@ -1130,6 +1459,9 @@ fn write_output_frames_u16(
     let frame_count = data.len() / channels;
     playback_state.note_output_callback_samples(data.len(), channels);
     let render_stats = render_playback_mono_samples(frame_count, queue, playback_state, mono);
+    if render_stats.consumed_samples > 0 {
+        echo_guard.mark_playback_activity(mono, Instant::now());
+    }
     for frame_idx in 0..frame_count {
         let u = i16_to_u16(mono[frame_idx]);
         for ch in 0..channels {
@@ -1263,6 +1595,106 @@ mod tests {
         assert_eq!(render_stats.consumed_samples, 2);
         assert!(queue.is_empty());
         assert!(render_stats.underruns > 0);
+    }
+
+    #[test]
+    fn echo_guard_suppresses_capture_after_recent_remote_playback() {
+        let guard = EchoGuard::new();
+        guard.mark_playback_activity(&vec![2_000; FRAME_SAMPLES], Instant::now());
+
+        assert!(guard.should_suppress_capture(Instant::now()));
+    }
+
+    #[test]
+    fn echo_guard_ignores_quiet_or_stale_playback() {
+        let guard = EchoGuard::new();
+        let now = Instant::now();
+        guard.mark_playback_activity(&vec![8; FRAME_SAMPLES], now);
+        assert!(!guard.should_suppress_capture(now));
+
+        guard.mark_playback_activity(&vec![2_000; FRAME_SAMPLES], now);
+        assert!(
+            !guard.should_suppress_capture(now + ECHO_SUPPRESSION_HOLD + Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn echo_guard_replaces_capture_with_silence_when_remote_playback_is_active() {
+        let guard = EchoGuard::new();
+        let now = Instant::now();
+        guard.mark_playback_activity(&vec![2_000; FRAME_SAMPLES], now);
+        let mut samples = vec![1_234; FRAME_SAMPLES / 2];
+
+        assert!(guard.apply_to_capture(&mut samples, now));
+        assert!(samples.iter().all(|sample| *sample == 0));
+    }
+
+    #[test]
+    fn voice_aec_processor_counts_processed_frames() {
+        let mut processor = VoiceAecProcessor::new(
+            rchat_audio_processing::RchatEchoCanceller::new_48khz_mono().expect("aec starts"),
+        );
+        let frame = vec![0; FRAME_SAMPLES];
+
+        processor
+            .process_render_frame(&frame)
+            .expect("render frame accepted");
+        let processed = processor
+            .process_capture_frame(&frame)
+            .expect("capture frame accepted");
+        let stats = processor.stats();
+
+        assert_eq!(processed.len(), FRAME_SAMPLES);
+        assert_eq!(stats.render_frames, 1);
+        assert_eq!(stats.capture_frames, 1);
+        assert!(!stats.fallback_active);
+    }
+
+    #[test]
+    fn voice_aec_processor_activates_fallback_after_errors() {
+        let mut processor = VoiceAecProcessor::new(
+            rchat_audio_processing::RchatEchoCanceller::new_48khz_mono().expect("aec starts"),
+        );
+
+        for _ in 0..AEC_FALLBACK_ERROR_THRESHOLD {
+            processor.note_error();
+        }
+
+        assert!(processor.fallback_active());
+        assert_eq!(
+            processor.stats().errors,
+            AEC_FALLBACK_ERROR_THRESHOLD as u64
+        );
+    }
+
+    #[test]
+    fn aec_lock_contention_suppresses_capture_during_playback() {
+        let processor = Arc::new(Mutex::new(VoiceAecProcessor::new(
+            rchat_audio_processing::RchatEchoCanceller::new_48khz_mono().expect("aec starts"),
+        )));
+        let _held = processor.lock().expect("processor lock held");
+        let stats = Arc::new(Mutex::new(VoiceAudioStats::default()));
+        let echo_guard = EchoGuard::new();
+        let now = Instant::now();
+        echo_guard.mark_playback_activity(&vec![2_000; FRAME_SAMPLES], now);
+
+        assert!(aec_fallback_active(Some(&processor)));
+
+        let processed = process_aec_capture_frame(
+            Some(&processor),
+            vec![1_234; FRAME_SAMPLES],
+            &stats,
+            &echo_guard,
+        );
+
+        assert!(processed.iter().all(|sample| *sample == 0));
+        assert_eq!(
+            stats
+                .lock()
+                .expect("stats available")
+                .capture_echo_suppressed_samples,
+            FRAME_SAMPLES as u64
+        );
     }
 
     #[test]

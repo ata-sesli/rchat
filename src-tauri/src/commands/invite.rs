@@ -293,10 +293,13 @@ pub async fn redeem_and_connect(
             let github_username = inviter.clone();
             let existing_peer_id = {
                 let mgr = app_state.config_manager.lock().await;
-                mgr.load()
-                    .await
-                    .ok()
-                    .and_then(|config| config.user.github_peer_mapping.get(&github_username).cloned())
+                mgr.load().await.ok().and_then(|config| {
+                    config
+                        .user
+                        .github_peer_mapping
+                        .get(&github_username)
+                        .cloned()
+                })
             };
             let invite_peer_id = payload.inviter_peer_id.clone().and_then(|candidate| {
                 if candidate.parse::<libp2p::PeerId>().is_ok() {
@@ -309,7 +312,8 @@ pub async fn redeem_and_connect(
                 "Invitation is missing inviter peer id. Ask the inviter to generate a new invite."
                     .to_string()
             })?;
-            let chat_id = crate::chat_identity::build_github_chat_id(&github_username, &resolved_peer_id);
+            let chat_id =
+                crate::chat_identity::build_github_chat_id(&github_username, &resolved_peer_id);
 
             {
                 let mgr = app_state.config_manager.lock().await;

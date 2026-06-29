@@ -226,7 +226,7 @@ fn ensure_persisted_outgoing_chat(
                     &default_direct_chat_name(canonical_chat_id),
                     false,
                 )
-                    .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?;
             }
         }
         ChatKind::Group => {
@@ -270,10 +270,7 @@ async fn store_outgoing_temp_message(
         .push(msg);
 }
 
-async fn canonical_direct_chat_id(
-    app_state: &State<'_, AppState>,
-    peer_id: &str,
-) -> String {
+async fn canonical_direct_chat_id(app_state: &State<'_, AppState>, peer_id: &str) -> String {
     if !matches!(chat_kind::parse_chat_kind(peer_id), ChatKind::Direct) {
         return peer_id.to_string();
     }
@@ -309,10 +306,7 @@ async fn canonical_direct_chat_id(
     crate::chat_identity::build_local_chat_id(&local_name, peer_id)
 }
 
-async fn resolve_direct_target_peer_id(
-    _app_state: &State<'_, AppState>,
-    chat_id: &str,
-) -> String {
+async fn resolve_direct_target_peer_id(_app_state: &State<'_, AppState>, chat_id: &str) -> String {
     crate::chat_identity::resolve_peer_id_for_direct_chat_id(chat_id)
         .unwrap_or_else(|| chat_id.to_string())
 }
@@ -405,7 +399,8 @@ pub async fn send_image_message(
     }
 
     if !matches!(chat_kind, ChatKind::SelfChat) {
-        let direct_target_peer_id = resolve_direct_target_peer_id(&app_state, &canonical_peer_id).await;
+        let direct_target_peer_id =
+            resolve_direct_target_peer_id(&app_state, &canonical_peer_id).await;
         let tx = net_state.sender.lock().await;
         match chat_kind {
             ChatKind::SelfChat => {}
@@ -610,7 +605,8 @@ pub async fn send_document_message(
     }
 
     if !matches!(chat_kind, ChatKind::SelfChat) {
-        let direct_target_peer_id = resolve_direct_target_peer_id(&app_state, &canonical_peer_id).await;
+        let direct_target_peer_id =
+            resolve_direct_target_peer_id(&app_state, &canonical_peer_id).await;
         let tx = net_state.sender.lock().await;
         match chat_kind {
             ChatKind::SelfChat => {}
@@ -752,7 +748,8 @@ pub async fn send_video_message(
     }
 
     if !matches!(chat_kind, ChatKind::SelfChat) {
-        let direct_target_peer_id = resolve_direct_target_peer_id(&app_state, &canonical_peer_id).await;
+        let direct_target_peer_id =
+            resolve_direct_target_peer_id(&app_state, &canonical_peer_id).await;
         let tx = net_state.sender.lock().await;
         match chat_kind {
             ChatKind::SelfChat => {}
@@ -897,7 +894,8 @@ pub async fn send_audio_message(
     }
 
     if !matches!(chat_kind, ChatKind::SelfChat) {
-        let direct_target_peer_id = resolve_direct_target_peer_id(&app_state, &canonical_peer_id).await;
+        let direct_target_peer_id =
+            resolve_direct_target_peer_id(&app_state, &canonical_peer_id).await;
         let tx = net_state.sender.lock().await;
         match chat_kind {
             ChatKind::SelfChat => {}
@@ -1238,7 +1236,8 @@ pub async fn send_sticker_message(
     }
 
     if !matches!(chat_kind, ChatKind::SelfChat) {
-        let direct_target_peer_id = resolve_direct_target_peer_id(&app_state, &canonical_peer_id).await;
+        let direct_target_peer_id =
+            resolve_direct_target_peer_id(&app_state, &canonical_peer_id).await;
         let tx = net_state.sender.lock().await;
         match chat_kind {
             ChatKind::SelfChat => {}

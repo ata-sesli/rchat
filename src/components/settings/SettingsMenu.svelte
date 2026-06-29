@@ -95,6 +95,52 @@
     </svg>
   </button>
 
+  <!-- Media Test Button -->
+  <button
+    onclick={() => onnavigate("media-test")}
+    class="w-full flex items-center justify-between p-4 bg-theme-base-900 border border-theme-base-800 rounded-xl hover:bg-theme-base-800 transition-all group shadow-sm hover:shadow-md"
+  >
+    <div class="flex items-center gap-4">
+      <div
+        class="p-2.5 rounded-lg bg-cyan-500/10 text-cyan-400 group-hover:bg-cyan-500/20 group-hover:text-cyan-300 transition-colors"
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          class="h-6 w-6"
+          fill="none"
+          viewBox="0 0 24 24"
+          stroke="currentColor"
+        >
+          <path
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="2"
+            d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 7h7a3 3 0 013 3v4a3 3 0 01-3 3H5a3 3 0 01-3-3v-4a3 3 0 013-3z"
+          />
+        </svg>
+      </div>
+      <div class="text-left">
+        <span
+          class="block text-lg font-medium text-theme-base-200 group-hover:text-white transition-colors"
+          >Test Voice / Camera</span
+        >
+        <span class="text-sm text-theme-base-500">Check local media devices</span>
+      </div>
+    </div>
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      class="h-5 w-5 text-theme-base-500 group-hover:translate-x-1 transition-transform"
+      viewBox="0 0 20 20"
+      fill="currentColor"
+    >
+      <path
+        fill-rule="evenodd"
+        d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z"
+        clip-rule="evenodd"
+      />
+    </svg>
+  </button>
+
   <!-- Set Theme Button -->
   <button
     onclick={() => onnavigate("set-theme")}

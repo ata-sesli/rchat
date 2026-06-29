@@ -24,10 +24,7 @@ fn normalize_connectivity(settings: ConnectivitySettings) -> ConnectivitySetting
     settings.with_derived_mode()
 }
 
-async fn sync_runtime_connectivity(
-    app_handle: &tauri::AppHandle,
-    settings: &ConnectivitySettings,
-) {
+async fn sync_runtime_connectivity(app_handle: &tauri::AppHandle, settings: &ConnectivitySettings) {
     if let Some(network_state) = app_handle.try_state::<NetworkState>() {
         let mut runtime = network_state.connectivity.lock().await;
         *runtime = settings.clone();

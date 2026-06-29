@@ -85,10 +85,7 @@ impl NetworkManager {
 
         match self.swarm.disconnect_peer_id(peer_id) {
             Ok(()) => println!("[Connection] 🔌 Disconnect requested for {}", peer_id),
-            Err(e) => eprintln!(
-                "[Connection] ❌ Failed to disconnect {}: {:?}",
-                peer_id, e
-            ),
+            Err(e) => eprintln!("[Connection] ❌ Failed to disconnect {}: {:?}", peer_id, e),
         }
     }
 

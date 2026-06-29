@@ -82,9 +82,8 @@ fn parse_scoped_chat_id(
 }
 
 pub fn parse_scoped_direct_chat_id(chat_id: &str) -> Option<ParsedScopedDirectChatId> {
-    parse_scoped_chat_id(chat_id, GITHUB_CHAT_PREFIX, DirectChatScope::Github).or_else(|| {
-        parse_scoped_chat_id(chat_id, LOCAL_CHAT_PREFIX, DirectChatScope::Local)
-    })
+    parse_scoped_chat_id(chat_id, GITHUB_CHAT_PREFIX, DirectChatScope::Github)
+        .or_else(|| parse_scoped_chat_id(chat_id, LOCAL_CHAT_PREFIX, DirectChatScope::Local))
 }
 
 pub fn extract_peer_id_from_chat_id(chat_id: &str) -> Option<String> {
@@ -115,13 +114,15 @@ pub fn github_chat_id_for_peer_id(
     peer_id: &str,
     github_peer_mapping: &HashMap<String, String>,
 ) -> Option<String> {
-    github_peer_mapping.iter().find_map(|(github_username, mapped)| {
-        if mapped == peer_id {
-            Some(build_github_chat_id(github_username, mapped))
-        } else {
-            None
-        }
-    })
+    github_peer_mapping
+        .iter()
+        .find_map(|(github_username, mapped)| {
+            if mapped == peer_id {
+                Some(build_github_chat_id(github_username, mapped))
+            } else {
+                None
+            }
+        })
 }
 
 #[cfg(test)]
@@ -132,7 +133,10 @@ mod tests {
 
     #[test]
     fn normalizes_name_component() {
-        assert_eq!(normalize_name_component(" professional tester "), "professional-tester");
+        assert_eq!(
+            normalize_name_component(" professional tester "),
+            "professional-tester"
+        );
         assert_eq!(normalize_name_component("..."), "peer");
     }
 
@@ -144,7 +148,10 @@ mod tests {
         assert_eq!(parsed.peer_id, PEER_ID);
 
         let lh_id = build_local_chat_id("Ata Sesli", PEER_ID);
-        assert_eq!(extract_peer_id_from_chat_id(&lh_id), Some(PEER_ID.to_string()));
+        assert_eq!(
+            extract_peer_id_from_chat_id(&lh_id),
+            Some(PEER_ID.to_string())
+        );
     }
 
     #[test]
