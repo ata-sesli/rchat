@@ -1,0 +1,7 @@
+[package]
+name = "rchat-audio-processing"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sonora = "0.1.0"
