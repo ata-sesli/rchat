@@ -12,8 +12,37 @@ export type RemoteVideoReceiveQueue = {
   tail: Promise<void>;
 };
 
+export type RemoteVideoDecoderConfig = {
+  codec: string;
+  codedWidth?: number;
+  codedHeight?: number;
+  optimizeForLatency: boolean;
+  hardwareAcceleration?: "no-preference" | "prefer-hardware" | "prefer-software";
+};
+
 export function createRemoteVideoReceiveState(): RemoteVideoReceiveState {
   return { hasKeyframe: false };
+}
+
+export function createRemoteVideoDecoderConfigCandidates(
+  codec: string,
+  width: number,
+  height: number,
+): RemoteVideoDecoderConfig[] {
+  const base = { codec, optimizeForLatency: true };
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return [base];
+  }
+  const coded = {
+    ...base,
+    codedWidth: Math.trunc(width),
+    codedHeight: Math.trunc(height),
+  };
+  return [
+    { ...coded, hardwareAcceleration: "prefer-software" },
+    coded,
+    base,
+  ];
 }
 
 export function createRemoteVideoReceiveQueue(): RemoteVideoReceiveQueue {

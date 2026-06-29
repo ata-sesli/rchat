@@ -26,6 +26,7 @@
   import { presencePeerKey } from "$lib/stores/presence";
   import {
     createRemoteVideoReceiveQueue,
+    createRemoteVideoDecoderConfigCandidates,
     createRemoteVideoReceiveState,
     enqueueRemoteVideoReceiveTask,
     hasRemoteVideoKeyframe,
@@ -133,6 +134,8 @@
   let remoteVideoCanvasCtx: CanvasRenderingContext2D | null = null;
   let remoteVideoDecoder: any | null = null;
   let remoteVideoDecoderCodec: string | null = null;
+  let remoteVideoDecoderWidth: number | null = null;
+  let remoteVideoDecoderHeight: number | null = null;
   let remoteExpectedSeq: number | null = null;
   let remotePendingFrames = new Map<number, IncomingFrame>();
   let remoteReceiveState = createRemoteVideoReceiveState();
@@ -440,6 +443,8 @@
 
   function closeRemoteVideoDecoder() {
     remoteVideoDecoderCodec = null;
+    remoteVideoDecoderWidth = null;
+    remoteVideoDecoderHeight = null;
     if (remoteVideoDecoder) {
       try {
         remoteVideoDecoder.close();
@@ -535,7 +540,7 @@
     }
   }
 
-  async function ensureRemoteVideoDecoder(codec: string): Promise<boolean> {
+  async function ensureRemoteVideoDecoder(frame: IncomingFrame): Promise<boolean> {
     if (isBroadcastViewerInThisChat && !screenBroadcastViewerSupported) {
       remoteVideoStateError =
         screenBroadcastViewerUnsupportedReason || "Screen sharing is unsupported.";
@@ -552,51 +557,91 @@
       return false;
     }
 
-    if (remoteVideoDecoder && remoteVideoDecoderCodec === codec) {
+    if (
+      remoteVideoDecoder &&
+      remoteVideoDecoderCodec === frame.codec &&
+      remoteVideoDecoderWidth === frame.width &&
+      remoteVideoDecoderHeight === frame.height
+    ) {
       return true;
     }
 
     closeRemoteVideoDecoder();
     remoteVideoStateError = null;
-    try {
-      const config = { codec, optimizeForLatency: true };
-      if (decoderCtor.isConfigSupported) {
-        const support = await decoderCtor.isConfigSupported(config);
-        if (!support?.supported) {
-          remoteVideoStateError = `Remote codec is not supported (${codec}).`;
-          return false;
-        }
-      }
+    const candidates = createRemoteVideoDecoderConfigCandidates(
+      frame.codec,
+      frame.width,
+      frame.height,
+    );
+    let unsupported = false;
+    let lastError: unknown = null;
 
-      remoteVideoDecoder = new decoderCtor({
-        output: (frame: any) => renderDecodedFrame(frame),
-        error: (err: unknown) => {
-          console.error("Remote video decoder error:", err);
-          logVideoCapture("remote decoder callback error", {
-            call_id: activeRemoteSessionId() || "none",
-            codec,
-            seq: remoteLastSubmittedFrame?.seq ?? "none",
-            chunk_type: remoteLastSubmittedFrame?.chunk_type ?? "none",
-            bytes: remoteLastSubmittedFrame?.payload.byteLength ?? 0,
-            error: describeError(err),
-          });
-          remoteVideoDecodeErrors += 1;
-          waitForRemoteKeyframeAfterDecoderFailure();
-        },
-      });
-      remoteVideoDecoder.configure(config);
-      remoteVideoDecoderCodec = codec;
-      return true;
-    } catch (e) {
-      console.error("Failed to initialize remote video decoder:", e);
+    for (const config of candidates) {
+      try {
+        if (decoderCtor.isConfigSupported) {
+          const support = await decoderCtor.isConfigSupported(config);
+          if (!support?.supported) {
+            unsupported = true;
+            continue;
+          }
+        }
+
+        const decoder = new decoderCtor({
+          output: (decodedFrame: any) => renderDecodedFrame(decodedFrame),
+          error: (err: unknown) => {
+            console.error("Remote video decoder error:", err);
+            logVideoCapture("remote decoder callback error", {
+              call_id: activeRemoteSessionId() || "none",
+              codec: frame.codec,
+              configured_width: remoteVideoDecoderWidth ?? "none",
+              configured_height: remoteVideoDecoderHeight ?? "none",
+              seq: remoteLastSubmittedFrame?.seq ?? "none",
+              chunk_type: remoteLastSubmittedFrame?.chunk_type ?? "none",
+              bytes: remoteLastSubmittedFrame?.payload.byteLength ?? 0,
+              error: describeError(err),
+            });
+            remoteVideoDecodeErrors += 1;
+            waitForRemoteKeyframeAfterDecoderFailure();
+          },
+        });
+        decoder.configure(config);
+        remoteVideoDecoder = decoder;
+        remoteVideoDecoderCodec = frame.codec;
+        remoteVideoDecoderWidth = frame.width;
+        remoteVideoDecoderHeight = frame.height;
+        logVideoCapture("remote decoder configured", {
+          call_id: activeRemoteSessionId() || "none",
+          codec: frame.codec,
+          width: frame.width,
+          height: frame.height,
+          hardware: (config as any).hardwareAcceleration || "default",
+        });
+        return true;
+      } catch (e) {
+        lastError = e;
+        try {
+          remoteVideoDecoder?.close?.();
+        } catch {
+          // no-op
+        }
+        remoteVideoDecoder = null;
+      }
+    }
+
+    if (unsupported) {
+      remoteVideoStateError = `Remote codec is not supported (${frame.codec}).`;
+    } else {
+      console.error("Failed to initialize remote video decoder:", lastError);
       logVideoCapture("remote decoder init failed", {
         call_id: activeRemoteSessionId() || "none",
-        codec,
-        error: describeError(e),
+        codec: frame.codec,
+        width: frame.width,
+        height: frame.height,
+        error: describeError(lastError),
       });
       remoteVideoStateError = "Remote decoder init failed.";
-      return false;
     }
+    return false;
   }
 
   async function decodeIncomingFrame(frame: IncomingFrame) {
@@ -608,7 +653,7 @@
       return;
     }
 
-    if (!(await ensureRemoteVideoDecoder(frame.codec))) {
+    if (!(await ensureRemoteVideoDecoder(frame))) {
       remoteVideoDecodeErrors += 1;
       markRemoteVideoDecoderFailed(remoteReceiveState);
       return;

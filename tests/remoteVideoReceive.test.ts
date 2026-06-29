@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   createRemoteVideoReceiveQueue,
   createRemoteVideoReceiveState,
+  createRemoteVideoDecoderConfigCandidates,
   enqueueRemoteVideoReceiveTask,
   markRemoteVideoDecoderFailed,
   markRemoteVideoSequenceGap,
@@ -87,5 +88,27 @@ describe("remote video receive state", () => {
     await Promise.all([first, second]);
 
     expect(events).toEqual(["first:start", "first:end", "second:start"]);
+  });
+
+  test("builds frame-aware VP8 decoder config candidates", () => {
+    expect(createRemoteVideoDecoderConfigCandidates("vp8", 1280, 720)).toEqual([
+      {
+        codec: "vp8",
+        codedWidth: 1280,
+        codedHeight: 720,
+        optimizeForLatency: true,
+        hardwareAcceleration: "prefer-software",
+      },
+      {
+        codec: "vp8",
+        codedWidth: 1280,
+        codedHeight: 720,
+        optimizeForLatency: true,
+      },
+      {
+        codec: "vp8",
+        optimizeForLatency: true,
+      },
+    ]);
   });
 });
