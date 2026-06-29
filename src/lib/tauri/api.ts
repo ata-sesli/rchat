@@ -414,8 +414,8 @@ type CommandSpec = {
   };
   [COMMANDS.toggleOnlineStatus]: { args: { online: boolean }; result: void };
   [COMMANDS.frontendLog]: { args: { message: string }; result: void };
-  [COMMANDS.initVault]: { args: { password: string }; result: void };
-  [COMMANDS.unlockVault]: { args: { password: string }; result: void };
+  [COMMANDS.initVault]: { args: { password: string }; result: AuthStatus };
+  [COMMANDS.unlockVault]: { args: { password: string }; result: AuthStatus };
   [COMMANDS.startNetwork]: { args?: undefined; result: void };
   [COMMANDS.startGithubAuth]: { args?: undefined; result: GithubAuthState };
   [COMMANDS.pollGithubAuth]: { args: { device_code: string }; result: string };

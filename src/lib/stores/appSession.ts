@@ -130,7 +130,7 @@ export async function refreshAppSession(): Promise<boolean> {
       return false;
     }
 
-    return ensureAppReady();
+    return ensureAppReady(authStatus);
   } catch (e) {
     if (refreshSeq !== sessionRefreshSeq) {
       return appReadyPromise ?? get(appSession).appReady;
@@ -151,13 +151,13 @@ export async function refreshAppSession(): Promise<boolean> {
   }
 }
 
-export async function ensureAppReady(): Promise<boolean> {
+export async function ensureAppReady(freshAuthStatus?: AuthStatus): Promise<boolean> {
   if (appReadyPromise) return appReadyPromise;
   if (get(appSession).appReady) return true;
 
   appReadyPromise = (async () => {
     try {
-      const authStatus = get(appSession).authStatus ?? (await api.checkAuthStatus());
+      const authStatus = freshAuthStatus ?? (await api.checkAuthStatus());
       const unlocked = authStatus.is_setup && authStatus.is_unlocked;
       appSession.update((state) => ({
         ...state,

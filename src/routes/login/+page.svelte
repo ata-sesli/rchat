@@ -3,19 +3,22 @@
   import { goto } from "$app/navigation";
   import { get } from "svelte/store";
   import GitHubButton from "../../components/GitHubButton.svelte";
-  import { api } from "$lib/tauri/api";
-  import { appSession, refreshAppSession } from "$lib/stores";
+  import { getAuthGateTarget, needsLocalUsername } from "$lib/authGate";
+  import { api, type AuthStatus } from "$lib/tauri/api";
+  import { appSession, ensureAppReady } from "$lib/stores";
 
   // State
-  type ViewState = "loading" | "setup" | "unlock" | "login";
+  type ViewState = "loading" | "setup" | "unlock" | "login" | "username";
   let view: ViewState = "loading";
 
   // Form Data
   let password = "";
   let confirmPassword = "";
   let token = "";
+  let localUsername = "";
   let error = "";
   let isLoading = false;
+  let pendingAuthStatus: AuthStatus | null = null;
 
   // GitHub Device Flow State
   let deviceCode = "";
@@ -34,17 +37,11 @@
       const status = await api.checkAuthStatus();
       console.log("[Login] Status received:", status);
 
-      if (!status.is_setup) {
-        view = "setup";
-      } else if (!status.is_unlocked) {
-        view = "unlock";
+      const target = getAuthGateTarget(status);
+      if (target === "app") {
+        await continueAfterUnlock(status);
       } else {
-        // Vault is unlocked
-        if (status.is_github_connected) {
-          goto("/"); // Already connected, skip login
-        } else {
-          view = "login"; // Needs connection
-        }
+        view = target;
       }
     } catch (e) {
       console.error(e);
@@ -52,8 +49,8 @@
     }
   }
 
-  async function refreshUnlockedSession(): Promise<boolean> {
-    const ready = await refreshAppSession();
+  async function startUnlockedSession(authStatus: AuthStatus): Promise<boolean> {
+    const ready = await ensureAppReady(authStatus);
     if (!ready) {
       const startupError = get(appSession).startupError;
       error = startupError
@@ -62,6 +59,25 @@
       return false;
     }
     return true;
+  }
+
+  async function continueAfterUnlock(authStatus: AuthStatus) {
+    pendingAuthStatus = authStatus;
+
+    if (authStatus.is_github_connected) {
+      if (await startUnlockedSession(authStatus)) goto("/");
+      return;
+    }
+
+    const profile = await api.getUserProfile();
+    localUsername = profile.alias || "";
+
+    if (needsLocalUsername(authStatus, profile)) {
+      view = "login";
+      return;
+    }
+
+    if (await startUnlockedSession(authStatus)) goto("/");
   }
 
   async function handleSetup() {
@@ -77,9 +93,8 @@
     isLoading = true;
     error = "";
     try {
-      await api.initVault(password);
-      if (!(await refreshUnlockedSession())) return;
-      await checkStatus(); // Should move to 'login'
+      const authStatus = await api.initVault(password);
+      await continueAfterUnlock(authStatus);
     } catch (e: any) {
       error = e.toString();
     } finally {
@@ -92,11 +107,10 @@
     isLoading = true;
     error = "";
     try {
-      await api.unlockVault(password);
-      if (!(await refreshUnlockedSession())) return;
-      await checkStatus(); // Should move to 'login'
+      const authStatus = await api.unlockVault(password);
+      await continueAfterUnlock(authStatus);
     } catch (e: any) {
-      error = "Invalid password";
+      error = e?.toString?.() || "Failed to unlock vault";
       console.error(e);
     } finally {
       isLoading = false;
@@ -184,11 +198,45 @@
 
   async function handleSaveToken() {
     if (!token) return;
+    isLoading = true;
+    error = "";
     try {
       await api.saveApiToken(token);
-      goto("/"); // Redirect to home after successful token save
+      const authStatus = pendingAuthStatus
+        ? { ...pendingAuthStatus, is_github_connected: true }
+        : await api.checkAuthStatus();
+      if (await startUnlockedSession(authStatus)) goto("/");
     } catch (e: any) {
       error = "Failed to save token: " + e.toString();
+    } finally {
+      isLoading = false;
+    }
+  }
+
+  function handleSkipGithub() {
+    error = "";
+    view = "username";
+  }
+
+  async function handleSaveLocalUsername() {
+    const username = localUsername.trim();
+    if (!username) {
+      error = "Username is required";
+      return;
+    }
+
+    isLoading = true;
+    error = "";
+    try {
+      await api.updateUserProfile(username, null);
+      window.dispatchEvent(new CustomEvent("profile-updated"));
+
+      const authStatus = pendingAuthStatus ?? (await api.checkAuthStatus());
+      if (await startUnlockedSession(authStatus)) goto("/");
+    } catch (e: any) {
+      error = "Failed to save username: " + e.toString();
+    } finally {
+      isLoading = false;
     }
   }
 </script>
@@ -208,11 +256,11 @@
       </div>
       <h2 class="text-3xl font-bold text-white tracking-tight">
         {#if view === "setup"}Setup Vault{:else if view === "unlock"}Unlock
-          Vault{:else}Welcome Back{/if}
+          Vault{:else if view === "username"}Choose Username{:else}Connect GitHub{/if}
       </h2>
       <p class="mt-2 text-theme-base-400">
         {#if view === "setup"}Create a master password to secure your tokens{:else if view === "unlock"}Enter
-          your master password to continue{:else}Sign in to sync your peers{/if}
+          your master password to continue{:else if view === "username"}Pick a local name before entering RChat{:else}Sync remotely or continue locally{/if}
       </p>
     </div>
 
@@ -335,6 +383,54 @@
             Save Token
           </button>
         </div>
+
+        <div class="relative py-4">
+          <div class="absolute inset-0 flex items-center">
+            <div class="w-full border-t border-theme-base-700"></div>
+          </div>
+          <div class="relative flex justify-center text-sm">
+            <span class="px-2 bg-theme-base-900 text-theme-base-500"
+              >Or continue without GitHub</span
+            >
+          </div>
+        </div>
+
+        <button
+          onclick={handleSkipGithub}
+          disabled={isLoading || isPolling}
+          class="w-full py-3 px-4 bg-theme-base-800 hover:bg-theme-base-700 text-theme-base-200 rounded-xl font-medium transition-all border border-theme-base-700 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          Continue Locally
+        </button>
+      </div>
+
+      <!-- VIEW: USERNAME -->
+    {:else if view === "username"}
+      <div class="space-y-4">
+        <input
+          type="text"
+          bind:value={localUsername}
+          placeholder="Your username"
+          class="w-full px-4 py-3 bg-slate-950/50 border border-theme-base-700 rounded-xl focus:border-theme-primary-500 focus:ring-1 focus:ring-teal-500 outline-none transition-all placeholder:text-theme-base-600 text-white"
+          onkeydown={(e) => e.key === "Enter" && handleSaveLocalUsername()}
+        />
+        <button
+          onclick={handleSaveLocalUsername}
+          disabled={isLoading}
+          class="w-full py-3 bg-theme-primary-600 hover:bg-theme-primary-500 text-white rounded-xl font-semibold shadow-lg shadow-teal-500/20 transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {isLoading ? "Saving..." : "Continue"}
+        </button>
+        <button
+          onclick={() => {
+            error = "";
+            view = "login";
+          }}
+          disabled={isLoading}
+          class="w-full py-3 px-4 bg-transparent hover:bg-theme-base-800 text-theme-base-300 rounded-xl font-medium transition-all border border-theme-base-800 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          Back to GitHub Options
+        </button>
       </div>
     {/if}
 

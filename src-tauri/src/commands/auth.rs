@@ -1,6 +1,6 @@
 use tauri::{Emitter, Manager, State};
 
-use crate::storage::config::{ConnectivityMode, ConnectivitySettings};
+use crate::storage::config::{Config, ConnectivityMode, ConnectivitySettings};
 use crate::{network, oauth, AppState, NetworkState};
 
 #[derive(serde::Serialize)]
@@ -22,6 +22,17 @@ pub struct ConnectivitySettingsPatch {
 
 fn normalize_connectivity(settings: ConnectivitySettings) -> ConnectivitySettings {
     settings.with_derived_mode()
+}
+
+fn unlocked_auth_status(config: &Config) -> AuthStatus {
+    let connectivity = normalize_connectivity(config.user.connectivity.clone());
+    AuthStatus {
+        is_setup: true,
+        is_unlocked: true,
+        is_github_connected: config.system.github_token.is_some(),
+        is_online: connectivity.github_sync_enabled,
+        connectivity,
+    }
 }
 
 async fn sync_runtime_connectivity(app_handle: &tauri::AppHandle, settings: &ConnectivitySettings) {
@@ -199,28 +210,35 @@ pub async fn update_connectivity_settings(
 }
 
 #[tauri::command]
-pub async fn init_vault(password: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn init_vault(
+    password: String,
+    state: State<'_, AppState>,
+) -> Result<AuthStatus, String> {
     let mut mgr = state.config_manager.lock().await;
-    mgr.init(password.trim()).await.map_err(|e| e.to_string())?;
-    Ok(())
+    let config = mgr.init(password.trim()).await.map_err(|e| e.to_string())?;
+    Ok(unlocked_auth_status(&config))
 }
 
 #[tauri::command]
-pub async fn unlock_vault(password: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn unlock_vault(
+    password: String,
+    state: State<'_, AppState>,
+) -> Result<AuthStatus, String> {
     println!(
         "[Backend] unlock_vault called. Password len: {}",
         password.len()
     );
     let mut mgr = state.config_manager.lock().await;
     println!("[Backend] Password trimmed len: {}", password.trim().len());
-    mgr.unlock_with_password(password.trim())
+    let config = mgr
+        .unlock_with_password(password.trim())
         .await
         .map_err(|e| {
             eprintln!("[Backend] Unlock failed: {}", e);
             e.to_string()
         })?;
     println!("[Backend] Vault unlocked successfully.");
-    Ok(())
+    Ok(unlocked_auth_status(&config))
 }
 
 /// Start the P2P network - call this AFTER vault is unlocked
