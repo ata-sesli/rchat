@@ -262,18 +262,19 @@ fn run_pipewire_capture(
                 return;
             }
             let data = &mut datas[0];
-            let Some(bytes) = data.data() else {
-                return;
-            };
             let chunk = data.chunk();
             let offset = chunk.offset() as usize;
             let size = chunk.size() as usize;
+            let stride = chunk.stride();
+            let Some(bytes) = data.data() else {
+                return;
+            };
             if offset >= bytes.len() || size == 0 {
                 return;
             }
             let end = offset.saturating_add(size).min(bytes.len());
             let frame_bytes = &bytes[offset..end];
-            match convert_pipewire_frame(frame_bytes, chunk.stride(), &user_data.format, user_data.profile) {
+            match convert_pipewire_frame(frame_bytes, stride, &user_data.format, user_data.profile) {
                 Ok(frame) => {
                     user_data.stats.captured_frames.fetch_add(1, Ordering::Relaxed);
                     let should_preview = user_data
