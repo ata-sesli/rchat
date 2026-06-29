@@ -1,12 +1,5 @@
-use std::num::NonZero;
-
+use rchat_libvpx::{EncodedPacket, Vp8Encoder, Vp8EncoderConfig};
 use serde::{Deserialize, Serialize};
-use vpx_rs::enc;
-use vpx_rs::enc::ctrl::EncoderControlSet;
-use vpx_rs::{
-    Encoder, EncoderConfig, EncoderFrameFlags, EncodingDeadline, ImageFormat, Packet, RateControl,
-    Timebase, YUVImageData,
-};
 
 pub const VIDEO_FPS: u32 = 30;
 pub const VIDEO_KEYFRAME_INTERVAL_FRAMES: u32 = 60;
@@ -125,8 +118,7 @@ pub struct Vp8VideoEncoder {
     profile: VideoProfile,
     width: u32,
     height: u32,
-    frame_index: i64,
-    encoder: Encoder<u8>,
+    encoder: Vp8Encoder,
 }
 
 impl Vp8VideoEncoder {
@@ -135,39 +127,21 @@ impl Vp8VideoEncoder {
         width: u32,
         height: u32,
     ) -> Result<Self, String> {
-        let mut config = EncoderConfig::<u8>::new(
-            enc::CodecId::VP8,
+        let encoder = Vp8Encoder::new(Vp8EncoderConfig {
             width,
             height,
-            Timebase {
-                num: NonZero::new(1).expect("non-zero numerator"),
-                den: NonZero::new(VIDEO_FPS).expect("non-zero denominator"),
-            },
-            RateControl::ConstantBitRate(profile.bitrate_kbps()),
-        )
+            bitrate_kbps: profile.bitrate_kbps(),
+            fps: VIDEO_FPS,
+            threads: VIDEO_ENCODER_THREADS,
+            keyframe_interval: VIDEO_KEYFRAME_INTERVAL_FRAMES,
+            cpu_used: VIDEO_ENCODER_CPU_USED,
+        })
         .map_err(|e| e.to_string())?;
-        config.threads = VIDEO_ENCODER_THREADS;
-        config.lag_in_frames = 0;
-        config.rc_dropframe_thresh = 0;
-        config.rc_resize_allowed = None;
-        config.kf_mode = enc::KeyFrameMode::Auto {
-            min_dist: VIDEO_KEYFRAME_INTERVAL_FRAMES,
-            max_dist: VIDEO_KEYFRAME_INTERVAL_FRAMES,
-        };
-
-        let mut encoder = Encoder::new(config).map_err(|e| e.to_string())?;
-        encoder
-            .codec_control_set(EncoderControlSet::CpuUsed(VIDEO_ENCODER_CPU_USED))
-            .map_err(|e| e.to_string())?;
-        encoder
-            .codec_control_set(EncoderControlSet::MaxIntraBitratePct(450))
-            .map_err(|e| e.to_string())?;
 
         Ok(Self {
             profile,
             width,
             height,
-            frame_index: 0,
             encoder,
         })
     }
@@ -185,8 +159,7 @@ impl Vp8VideoEncoder {
     }
 
     pub fn expected_i420_len(width: u32, height: u32) -> Option<usize> {
-        let pixels = width.checked_mul(height)? as usize;
-        Some(pixels + pixels / 2)
+        rchat_libvpx::expected_i420_len(width, height)
     }
 
     pub fn encode_i420(
@@ -210,40 +183,21 @@ impl Vp8VideoEncoder {
             ));
         }
 
-        let image = YUVImageData::<u8>::from_raw_data(
-            ImageFormat::I420,
-            width as usize,
-            height as usize,
-            data,
-        )
-        .map_err(|e| e.to_string())?;
-        let flags = if force_keyframe {
-            EncoderFrameFlags::FORCE_KF
-        } else {
-            EncoderFrameFlags::empty()
-        };
         let packets = self
             .encoder
-            .encode(
-                self.frame_index,
-                1,
-                image,
-                EncodingDeadline::Realtime,
-                flags,
-            )
+            .encode_i420(data, force_keyframe)
             .map_err(|e| e.to_string())?;
-        self.frame_index = self.frame_index.saturating_add(1);
 
-        let mut out = Vec::new();
-        for packet in packets {
-            if let Packet::CompressedFrame(frame) = packet {
-                out.push(Vp8EncodedPacket {
-                    payload: frame.data,
-                    is_key: frame.flags.is_key,
-                });
-            }
+        Ok(packets.into_iter().map(Vp8EncodedPacket::from).collect())
+    }
+}
+
+impl From<EncodedPacket> for Vp8EncodedPacket {
+    fn from(packet: EncodedPacket) -> Self {
+        Self {
+            payload: packet.payload,
+            is_key: packet.is_key,
         }
-        Ok(out)
     }
 }
 
@@ -330,8 +284,7 @@ impl VideoQualityController {
             let explicit_failures = window
                 .receiver_dropped_frames
                 .saturating_add(window.receiver_decode_errors);
-            missing_rendered.max(explicit_failures) as f64
-                / window.receiver_received_frames as f64
+            missing_rendered.max(explicit_failures) as f64 / window.receiver_received_frames as f64
         };
         let rendered_fps = if window.seconds > 0.0 {
             window.receiver_rendered_frames as f64 / window.seconds
@@ -435,15 +388,21 @@ mod tests {
             .expect("frame encodes");
         let packet = packets.first().expect("packet");
 
-        let mut decoder = vpx_rs::Decoder::new(vpx_rs::DecoderConfig::new(
-            vpx_rs::dec::CodecId::VP8,
-            width,
-            height,
-        ))
-        .expect("decoder starts");
-        let decoded = decoder.decode(&packet.payload).expect("packet decodes");
+        rchat_libvpx::probe_vp8_decode(&packet.payload).expect("packet decodes");
+    }
 
-        assert!(decoded.into_iter().next().is_some());
+    #[test]
+    fn vp8_encoder_rejects_invalid_i420_length() {
+        let profile = VideoProfile::P360;
+        let (width, height) = profile_dimensions(profile);
+        let mut encoder =
+            Vp8VideoEncoder::new_with_dimensions(profile, width, height).expect("encoder starts");
+
+        let err = encoder
+            .encode_i420(123, width, height, &[0, 1, 2, 3], true)
+            .expect_err("short frame fails");
+
+        assert!(err.contains("invalid I420 frame length"));
     }
 
     #[test]

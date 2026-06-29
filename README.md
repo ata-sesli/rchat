@@ -50,7 +50,7 @@ For a visual showcase, visit [ata-sesli.github.io/rchat](https://ata-sesli.githu
 - **octocrab** talks to GitHub Gists for remote discovery.
 - **rubato** handles sample-rate conversion for voice capture/playback.
 - **opus** encodes/decodes voice media.
-- **vpx-rs/libvpx** encodes VP8 video media.
+- **RChat's local libvpx wrapper** encodes VP8 video media through system libvpx.
 
 ## High-Level Architecture
 
@@ -346,7 +346,7 @@ The receiver decodes Opus packets back to PCM and feeds a playback queue. The vo
 1:1 video calls are being implemented on the same live-call model as voice:
 
 - the WebView owns camera capture, local preview, and remote frame rendering,
-- Rust owns VP8 encoding through `vpx-rs`/`libvpx`,
+- Rust owns VP8 encoding through RChat's local `libvpx` wrapper,
 - video media uses a long-lived libp2p QUIC stream:
 
 ```text
@@ -453,7 +453,7 @@ RChat uses native desktop, audio, video, and networking libraries through Rust c
 Notable native pieces:
 
 - `opus` links to native libopus through Rust bindings.
-- `vpx-rs` links to native libvpx for VP8 video encoding.
+- RChat's local `rchat-libvpx` crate links to native libvpx for VP8 video encoding.
 - `cpal` talks to platform audio backends.
 - `zeroconf` uses platform mDNS/Bonjour/Avahi-style functionality.
 - Tauri requires the usual platform WebView dependencies.

@@ -1,0 +1,9 @@
+[package]
+name = "rchat-libvpx"
+version = "0.1.0"
+edition = "2021"
+links = "rchat-libvpx"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
