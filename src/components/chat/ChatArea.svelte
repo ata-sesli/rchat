@@ -256,6 +256,20 @@
     });
   }
 
+  function describeError(error: unknown): string {
+    if (error instanceof Error) {
+      return `${error.name}: ${error.message}`;
+    }
+    if (typeof error === "string") {
+      return error;
+    }
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  }
+
   function detectScreenBroadcastSupport(): {
     supported: boolean;
     reason: string | null;
@@ -392,7 +406,9 @@
 
   function handleVideoCameraError(eventPayload: any) {
     if (!eventPayload || !activeCallId || eventPayload.call_id !== activeCallId) return;
-    localPreviewError = String(eventPayload.message || "Camera capture failed.");
+    const message = String(eventPayload.message || "Camera capture failed.");
+    logVideoCapture("camera error", { call_id: activeCallId, message });
+    localPreviewError = message;
   }
 
   function activeRemoteSessionId(): string | null {
@@ -460,6 +476,10 @@
       videoFrame.close();
     } catch (e) {
       console.error("Failed to render decoded frame:", e);
+      logVideoCapture("remote render failed", {
+        call_id: activeRemoteSessionId() || "none",
+        error: describeError(e),
+      });
       remoteVideoDecodeErrors += 1;
       remoteVideoStateError = "Remote video decode failed.";
       try {
@@ -502,6 +522,11 @@
         output: (frame: any) => renderDecodedFrame(frame),
         error: (err: unknown) => {
           console.error("Remote video decoder error:", err);
+          logVideoCapture("remote decoder callback error", {
+            call_id: activeRemoteSessionId() || "none",
+            codec,
+            error: describeError(err),
+          });
           remoteVideoDecodeErrors += 1;
           remoteVideoStateError = "Remote decoder error.";
         },
@@ -511,6 +536,11 @@
       return true;
     } catch (e) {
       console.error("Failed to initialize remote video decoder:", e);
+      logVideoCapture("remote decoder init failed", {
+        call_id: activeRemoteSessionId() || "none",
+        codec,
+        error: describeError(e),
+      });
       remoteVideoStateError = "Remote decoder init failed.";
       return false;
     }
@@ -531,6 +561,14 @@
       remoteVideoDecoder.decode(encoded);
     } catch (e) {
       console.error("Failed to decode incoming video frame:", e);
+      logVideoCapture("remote decode call failed", {
+        call_id: frame.call_id,
+        seq: frame.seq,
+        codec: frame.codec,
+        chunk_type: frame.chunk_type,
+        bytes: frame.payload.byteLength,
+        error: describeError(e),
+      });
       remoteVideoDecodeErrors += 1;
     }
   }
