@@ -55,13 +55,6 @@ function detectVideoCallSupport(): { supported: boolean; reason: string | null }
       reason: "Camera capture is unavailable on this device.",
     };
   }
-  const w = window as any;
-  if (!w.MediaStreamTrackProcessor) {
-    return {
-      supported: false,
-      reason: "Camera frame processing is unavailable on this client.",
-    };
-  }
   return { supported: true, reason: null };
 }
 
@@ -75,6 +68,13 @@ function detectScreenBroadcastSupport(): {
     return {
       supported: false,
       reason: "Screen capture is unavailable on this client.",
+    };
+  }
+  const w = window as any;
+  if (!w.MediaStreamTrackProcessor || !w.VideoEncoder) {
+    return {
+      supported: false,
+      reason: "Low-latency screen capture is unavailable on this client.",
     };
   }
   return { supported: true, reason: null };

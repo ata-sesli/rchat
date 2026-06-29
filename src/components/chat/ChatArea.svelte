@@ -24,6 +24,7 @@
   } from "$lib/tauri/api";
   import { getChatKind } from "$lib/chatKind";
   import { presencePeerKey } from "$lib/stores/presence";
+  import { rgbaToI420 } from "$lib/video/i420";
 
   // Types
   type Message = {
@@ -113,6 +114,9 @@
   let localVideoStream: MediaStream | null = null;
   let localVideoEncoder: any | null = null;
   let localVideoTrackReader: ReadableStreamDefaultReader<any> | null = null;
+  let localVideoCanvasTimer: ReturnType<typeof setTimeout> | null = null;
+  let localVideoFallbackCanvas: HTMLCanvasElement | null = null;
+  let localVideoFallbackCtx: CanvasRenderingContext2D | null = null;
   let localVideoCaptureLoopRunning = false;
   let localVideoCaptureKey: string | null = null;
   let localVideoSeq = 0;
@@ -243,12 +247,8 @@
     if (typeof window === "undefined") {
       return { supported: false, reason: "Video calls are not available in this environment." };
     }
-    const w = window as any;
     if (!navigator?.mediaDevices?.getUserMedia) {
       return { supported: false, reason: "Camera capture is unavailable on this device." };
-    }
-    if (!w.MediaStreamTrackProcessor) {
-      return { supported: false, reason: "Camera frame processing is unavailable on this client." };
     }
     return { supported: true, reason: null };
   }
@@ -268,6 +268,12 @@
       };
     }
     const w = window as any;
+    if (!w.MediaStreamTrackProcessor) {
+      return {
+        supported: false,
+        reason: "Track processing API is unavailable for screen sharing.",
+      };
+    }
     if (!w.VideoEncoder) {
       return {
         supported: false,
@@ -610,6 +616,12 @@
   function stopLocalVideoCapture() {
     localVideoCaptureLoopRunning = false;
     localVideoCaptureKey = null;
+    if (localVideoCanvasTimer) {
+      clearTimeout(localVideoCanvasTimer);
+      localVideoCanvasTimer = null;
+    }
+    localVideoFallbackCanvas = null;
+    localVideoFallbackCtx = null;
     if (localVideoTrackReader) {
       try {
         void localVideoTrackReader.cancel();
@@ -634,6 +646,32 @@
       localVideoStream = null;
     }
     setLocalVideoElementStream();
+  }
+
+  function localVideoReady(): boolean {
+    return Boolean(
+      localVideoEl &&
+        localVideoEl.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+        localVideoEl.videoWidth > 0 &&
+        localVideoEl.videoHeight > 0,
+    );
+  }
+
+  async function waitForLocalVideoReady(): Promise<void> {
+    if (localVideoReady()) return;
+    const video = localVideoEl;
+    if (!video) return;
+
+    await new Promise<void>((resolve) => {
+      const finish = () => {
+        video.removeEventListener("loadedmetadata", finish);
+        video.removeEventListener("canplay", finish);
+        resolve();
+      };
+      video.addEventListener("loadedmetadata", finish, { once: true });
+      video.addEventListener("canplay", finish, { once: true });
+      setTimeout(finish, 1000);
+    });
   }
 
   function currentVideoCaptureKey(): string | null {
@@ -737,6 +775,88 @@
     }
   }
 
+  function canvasCaptureSize(): { width: number; height: number } | null {
+    if (!localVideoEl?.videoWidth || !localVideoEl.videoHeight) return null;
+    const width = Math.floor(localVideoEl.videoWidth / 2) * 2;
+    const height = Math.floor(localVideoEl.videoHeight / 2) * 2;
+    if (width <= 0 || height <= 0) return null;
+    return { width, height };
+  }
+
+  async function submitCanvasVideoFrame(sessionId: string, captureKey: string) {
+    if (!localVideoEl || !localVideoReady()) return;
+    if (rawFrameSubmissionsInFlight >= MAX_RAW_FRAME_SUBMISSIONS_IN_FLIGHT) return;
+    const size = canvasCaptureSize();
+    if (!size) return;
+
+    rawFrameSubmissionsInFlight += 1;
+    try {
+      if (!localVideoFallbackCanvas) {
+        localVideoFallbackCanvas = document.createElement("canvas");
+      }
+      if (
+        localVideoFallbackCanvas.width !== size.width ||
+        localVideoFallbackCanvas.height !== size.height
+      ) {
+        localVideoFallbackCanvas.width = size.width;
+        localVideoFallbackCanvas.height = size.height;
+        localVideoFallbackCtx = null;
+      }
+      localVideoFallbackCtx =
+        localVideoFallbackCtx ||
+        localVideoFallbackCanvas.getContext("2d", { willReadFrequently: true });
+      if (!localVideoFallbackCtx) return;
+
+      localVideoFallbackCtx.drawImage(localVideoEl, 0, 0, size.width, size.height);
+      const image = localVideoFallbackCtx.getImageData(0, 0, size.width, size.height);
+      const data = rgbaToI420(image.data, size.width, size.height);
+      if (captureKey !== localVideoCaptureKey) return;
+      if (!isVideoCallActiveInThisChat || !activeCallCameraEnabled) return;
+
+      await api.submitVideoCallI420Frame(
+        sessionId,
+        Math.floor(performance.now() * 1000),
+        size.width,
+        size.height,
+        activeVideoProfile,
+        data,
+      );
+    } catch (e) {
+      console.error("Failed to submit canvas video frame:", e);
+    } finally {
+      rawFrameSubmissionsInFlight = Math.max(0, rawFrameSubmissionsInFlight - 1);
+    }
+  }
+
+  async function startCanvasVideoCaptureLoop(sessionId: string, captureKey: string) {
+    localVideoCaptureLoopRunning = true;
+    await waitForLocalVideoReady();
+
+    const tick = () => {
+      if (
+        !localVideoCaptureLoopRunning ||
+        captureKey !== localVideoCaptureKey ||
+        !isVideoCallActiveInThisChat ||
+        !activeCallCameraEnabled
+      ) {
+        return;
+      }
+
+      void submitCanvasVideoFrame(sessionId, captureKey).finally(() => {
+        if (
+          localVideoCaptureLoopRunning &&
+          captureKey === localVideoCaptureKey &&
+          isVideoCallActiveInThisChat &&
+          activeCallCameraEnabled
+        ) {
+          localVideoCanvasTimer = setTimeout(tick, 33);
+        }
+      });
+    };
+
+    tick();
+  }
+
   async function setVideoQualityMode(mode: VideoQualityMode) {
     videoQualityMode = mode;
     if (!activeCallId || !isVideoCallActiveInThisChat) return;
@@ -806,6 +926,14 @@
       };
 
       const processorCtor = (window as any).MediaStreamTrackProcessor;
+      if (!processorCtor) {
+        if (!isVideoCallMode) {
+          throw new Error("Track processing API is unavailable.");
+        }
+        await startCanvasVideoCaptureLoop(sessionId, captureKey);
+        return;
+      }
+
       const processor = new processorCtor({ track: videoTrack });
       localVideoTrackReader = processor.readable.getReader();
 
