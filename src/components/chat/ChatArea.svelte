@@ -24,6 +24,13 @@
   } from "$lib/tauri/api";
   import { getChatKind } from "$lib/chatKind";
   import { presencePeerKey } from "$lib/stores/presence";
+  import {
+    createRemoteVideoReceiveState,
+    hasRemoteVideoKeyframe,
+    markRemoteVideoDecoderFailed,
+    markRemoteVideoSequenceGap,
+    shouldDecodeRemoteVideoFrame,
+  } from "$lib/video/remoteReceive";
 
   // Types
   type Message = {
@@ -131,6 +138,7 @@
   let remoteVideoDecoderCodec: string | null = null;
   let remoteExpectedSeq: number | null = null;
   let remotePendingFrames = new Map<number, IncomingFrame>();
+  let remoteReceiveState = createRemoteVideoReceiveState();
   let videoQualityMode: VideoQualityMode = "auto";
   let activeVideoProfile: VideoProfile = "720p30";
   let videoQualityUnlisten: (() => void) | null = null;
@@ -421,9 +429,7 @@
     return null;
   }
 
-  function resetRemoteVideoDecodeState() {
-    remotePendingFrames.clear();
-    remoteExpectedSeq = null;
+  function closeRemoteVideoDecoder() {
     remoteVideoDecoderCodec = null;
     if (remoteVideoDecoder) {
       try {
@@ -433,6 +439,13 @@
       }
       remoteVideoDecoder = null;
     }
+  }
+
+  function resetRemoteVideoDecodeState() {
+    remotePendingFrames.clear();
+    remoteExpectedSeq = null;
+    remoteReceiveState = createRemoteVideoReceiveState();
+    closeRemoteVideoDecoder();
     if (remoteVideoCanvasCtx && remoteVideoCanvasEl) {
       remoteVideoCanvasCtx.clearRect(
         0,
@@ -441,6 +454,26 @@
         remoteVideoCanvasEl.height,
       );
     }
+  }
+
+  function waitForRemoteKeyframeAfterDecoderFailure() {
+    markRemoteVideoDecoderFailed(remoteReceiveState);
+    remotePendingFrames.clear();
+    remoteExpectedSeq = null;
+    closeRemoteVideoDecoder();
+    remoteVideoStateError = "Waiting for remote key frame.";
+  }
+
+  function waitForRemoteKeyframeAfterSequenceGap(details: Record<string, unknown>) {
+    markRemoteVideoSequenceGap(remoteReceiveState);
+    remotePendingFrames.clear();
+    remoteExpectedSeq = null;
+    closeRemoteVideoDecoder();
+    remoteVideoStateError = "Waiting for remote key frame.";
+    logVideoCapture("remote sequence gap waiting for keyframe", {
+      call_id: activeRemoteSessionId() || "none",
+      ...details,
+    });
   }
 
   function ensureRemoteCanvasContext(): CanvasRenderingContext2D | null {
@@ -473,6 +506,7 @@
         remoteVideoCanvasEl.height,
       );
       remoteVideoRenderedFrames += 1;
+      remoteVideoStateError = null;
       videoFrame.close();
     } catch (e) {
       console.error("Failed to render decoded frame:", e);
@@ -506,7 +540,7 @@
       return true;
     }
 
-    resetRemoteVideoDecodeState();
+    closeRemoteVideoDecoder();
     remoteVideoStateError = null;
     try {
       const config = { codec, optimizeForLatency: true };
@@ -528,7 +562,7 @@
             error: describeError(err),
           });
           remoteVideoDecodeErrors += 1;
-          remoteVideoStateError = "Remote decoder error.";
+          waitForRemoteKeyframeAfterDecoderFailure();
         },
       });
       remoteVideoDecoder.configure(config);
@@ -547,8 +581,17 @@
   }
 
   async function decodeIncomingFrame(frame: IncomingFrame) {
+    const decision = shouldDecodeRemoteVideoFrame(remoteReceiveState, frame.chunk_type);
+    if (!decision.decode) {
+      if (!remoteVideoStateError) {
+        remoteVideoStateError = "Waiting for remote key frame.";
+      }
+      return;
+    }
+
     if (!(await ensureRemoteVideoDecoder(frame.codec))) {
       remoteVideoDecodeErrors += 1;
+      markRemoteVideoDecoderFailed(remoteReceiveState);
       return;
     }
     try {
@@ -558,6 +601,7 @@
         timestamp: frame.timestamp,
         data: frame.payload,
       });
+      remoteVideoReceivedFrames += 1;
       remoteVideoDecoder.decode(encoded);
     } catch (e) {
       console.error("Failed to decode incoming video frame:", e);
@@ -570,6 +614,7 @@
         error: describeError(e),
       });
       remoteVideoDecodeErrors += 1;
+      waitForRemoteKeyframeAfterDecoderFailure();
     }
   }
 
@@ -608,18 +653,42 @@
       height: Number(eventPayload.height ?? 0),
       payload,
     };
-    remoteVideoReceivedFrames += 1;
+
+    const hasUsableKeyframe = hasRemoteVideoKeyframe(remoteReceiveState);
+    if (!hasUsableKeyframe && frame.chunk_type !== "key") {
+      if (!remoteVideoStateError) {
+        remoteVideoStateError = "Waiting for remote key frame.";
+      }
+      return;
+    }
+    if (!hasUsableKeyframe && frame.chunk_type === "key") {
+      remotePendingFrames.clear();
+      remoteExpectedSeq = frame.seq;
+    }
 
     if (remoteExpectedSeq === null) {
       remoteExpectedSeq = frame.seq;
     }
     if (frame.seq < remoteExpectedSeq) {
-      remoteVideoDroppedFrames += 1;
+      if (hasRemoteVideoKeyframe(remoteReceiveState)) {
+        remoteVideoDroppedFrames += 1;
+      }
       return;
     }
     if (frame.seq > remoteExpectedSeq + REMOTE_REORDER_WINDOW) {
-      remoteVideoDroppedFrames += Math.max(0, frame.seq - remoteExpectedSeq);
-      remoteExpectedSeq = frame.seq - REMOTE_REORDER_WINDOW;
+      const missingFrames = Math.max(0, frame.seq - remoteExpectedSeq);
+      if (hasRemoteVideoKeyframe(remoteReceiveState)) {
+        remoteVideoDroppedFrames += missingFrames;
+        waitForRemoteKeyframeAfterSequenceGap({
+          expected_seq: remoteExpectedSeq,
+          seq: frame.seq,
+          missing_frames: missingFrames,
+        });
+        if (frame.chunk_type !== "key") {
+          return;
+        }
+      }
+      remoteExpectedSeq = frame.seq;
     }
 
     remotePendingFrames.set(frame.seq, frame);
@@ -627,8 +696,28 @@
       const sorted = [...remotePendingFrames.keys()].sort((a, b) => a - b);
       const minSeq = sorted[0];
       if (remoteExpectedSeq !== null && minSeq > remoteExpectedSeq) {
-        remoteVideoDroppedFrames += Math.max(0, minSeq - remoteExpectedSeq);
-        remoteExpectedSeq = minSeq;
+        const missingFrames = Math.max(0, minSeq - remoteExpectedSeq);
+        if (hasRemoteVideoKeyframe(remoteReceiveState)) {
+          const nextKeySeq = sorted.find(
+            (pendingSeq) => remotePendingFrames.get(pendingSeq)?.chunk_type === "key",
+          );
+          const nextKeyFrame =
+            nextKeySeq === undefined ? null : remotePendingFrames.get(nextKeySeq);
+          remoteVideoDroppedFrames += missingFrames;
+          waitForRemoteKeyframeAfterSequenceGap({
+            expected_seq: remoteExpectedSeq,
+            seq: minSeq,
+            missing_frames: missingFrames,
+            overflow: true,
+          });
+          if (!nextKeyFrame || nextKeySeq === undefined) {
+            return;
+          }
+          remoteExpectedSeq = nextKeySeq;
+          remotePendingFrames.set(nextKeySeq, nextKeyFrame);
+        } else {
+          remoteExpectedSeq = minSeq;
+        }
       }
     }
     await flushIncomingFrameQueue();

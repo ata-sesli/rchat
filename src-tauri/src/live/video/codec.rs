@@ -6,6 +6,17 @@ pub const VIDEO_KEYFRAME_INTERVAL_FRAMES: u32 = 60;
 pub const VIDEO_ENCODER_THREADS: u32 = 4;
 pub const VIDEO_ENCODER_CPU_USED: i32 = 8;
 
+pub fn should_force_video_keyframe(
+    force_next_keyframe: bool,
+    needs_encoder: bool,
+    next_seq: u32,
+) -> bool {
+    force_next_keyframe
+        || needs_encoder
+        || next_seq == 0
+        || next_seq % VIDEO_KEYFRAME_INTERVAL_FRAMES == 0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum VideoProfile {
     #[serde(rename = "360p30")]
@@ -483,5 +494,18 @@ mod tests {
             decision.map(|change| change.profile),
             Some(VideoProfile::P480)
         );
+    }
+
+    #[test]
+    fn force_keyframe_after_restart_or_frame_drop() {
+        assert!(should_force_video_keyframe(false, false, 0));
+        assert!(should_force_video_keyframe(
+            false,
+            false,
+            VIDEO_KEYFRAME_INTERVAL_FRAMES
+        ));
+        assert!(should_force_video_keyframe(false, true, 37));
+        assert!(should_force_video_keyframe(true, false, 37));
+        assert!(!should_force_video_keyframe(false, false, 37));
     }
 }

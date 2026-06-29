@@ -523,6 +523,8 @@ pub struct NetworkManager {
     video_stream_writer_handle: Option<tauri::async_runtime::JoinHandle<()>>,
     // Sequence number for outgoing VP8 frames.
     video_next_seq: u32,
+    // Force the next successfully queued VP8 frame to be a keyframe.
+    video_force_next_keyframe: bool,
     // Expected next inbound video sequence for diagnostics.
     video_expected_inbound_seq: Option<u32>,
     // VP8 encoder for outbound camera frames.
@@ -761,6 +763,7 @@ impl NetworkManager {
             video_stream_call_id: None,
             video_stream_writer_handle: None,
             video_next_seq: 0,
+            video_force_next_keyframe: true,
             video_expected_inbound_seq: None,
             video_vp8_encoder: None,
             video_capture_start_task: None,

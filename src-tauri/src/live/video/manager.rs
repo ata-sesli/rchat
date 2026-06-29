@@ -1,8 +1,8 @@
 use super::*;
 use crate::app_state::{CallKind, VoiceCallPhase};
 use crate::live::video::codec::{
-    VideoAdaptationWindow, VideoProfile, VideoQualityChangeDecision, VideoQualityMode,
-    Vp8VideoEncoder, VIDEO_KEYFRAME_INTERVAL_FRAMES,
+    should_force_video_keyframe, VideoAdaptationWindow, VideoProfile, VideoQualityChangeDecision,
+    VideoQualityMode, Vp8VideoEncoder,
 };
 use crate::live::video::protocol::{
     read_video_stream_header, read_video_stream_record, write_video_stream_header,
@@ -91,6 +91,7 @@ impl NetworkManager {
             handle.abort();
         }
         self.video_next_seq = 0;
+        self.video_force_next_keyframe = true;
         self.video_expected_inbound_seq = None;
         self.video_vp8_encoder = None;
         self.video_quality_controller =
@@ -105,6 +106,7 @@ impl NetworkManager {
         camera_enabled: bool,
     ) -> bool {
         self.reset_video_network_diagnostics();
+        self.video_force_next_keyframe = true;
         let started = self.start_video_stream_writer(peer, call_id.clone());
         if started {
             self.queue_video_stream_record(VideoStreamRecord::CameraState(VideoCameraState {
@@ -437,6 +439,7 @@ impl NetworkManager {
         self.video_stream_tx = Some(tx);
         self.video_stream_call_id = Some(call_id);
         self.video_stream_writer_handle = Some(handle);
+        self.video_force_next_keyframe = true;
         true
     }
 
@@ -808,8 +811,6 @@ impl NetworkManager {
             return;
         }
 
-        let force_keyframe =
-            self.video_next_seq == 0 || self.video_next_seq % VIDEO_KEYFRAME_INTERVAL_FRAMES == 0;
         let needs_encoder = self
             .video_vp8_encoder
             .as_ref()
@@ -819,6 +820,11 @@ impl NetworkManager {
                     || encoder.height() != height
             })
             .unwrap_or(true);
+        let force_keyframe = should_force_video_keyframe(
+            self.video_force_next_keyframe,
+            needs_encoder,
+            self.video_next_seq,
+        );
         if needs_encoder {
             match Vp8VideoEncoder::new_with_dimensions(current_profile, width, height) {
                 Ok(encoder) => self.video_vp8_encoder = Some(encoder),
@@ -849,7 +855,10 @@ impl NetworkManager {
             }
         };
 
+        let mut queued_keyframe = false;
+        let mut dropped_video_frame = false;
         for packet in packets {
+            let packet_is_key = packet.is_key;
             let chunk_type = if packet.is_key {
                 self.video_network_stats.keyframes += 1;
                 VideoChunkType::Key
@@ -874,7 +883,18 @@ impl NetworkManager {
                 .outbound_bytes
                 .saturating_add(payload_len);
             self.video_window_counters.encoded_frames += 1;
-            let _ = self.queue_video_stream_record(record);
+            let queued = self.queue_video_stream_record(record);
+            if queued && packet_is_key {
+                queued_keyframe = true;
+            } else if !queued {
+                dropped_video_frame = true;
+            }
+        }
+        if queued_keyframe {
+            self.video_force_next_keyframe = false;
+        }
+        if dropped_video_frame {
+            self.video_force_next_keyframe = true;
         }
     }
 
@@ -969,6 +989,7 @@ impl NetworkManager {
     fn apply_video_quality_change(&mut self, call_id: &str, change: VideoQualityChangeDecision) {
         self.video_network_stats.quality_changes += 1;
         self.video_vp8_encoder = None;
+        self.video_force_next_keyframe = true;
         self.stop_video_capture();
         self.queue_video_stream_record(VideoStreamRecord::QualityChange(VideoQualityChange {
             profile: change.profile,
