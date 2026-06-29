@@ -119,6 +119,7 @@
   let localVideoFallbackCtx: CanvasRenderingContext2D | null = null;
   let localVideoCaptureLoopRunning = false;
   let localVideoCaptureKey: string | null = null;
+  let localVideoFirstFrameLogged = false;
   let localVideoSeq = 0;
   let localVideoMime = "video/webm;codecs=vp8";
   let localVideoCodec = "vp8";
@@ -251,6 +252,16 @@
       return { supported: false, reason: "Camera capture is unavailable on this device." };
     }
     return { supported: true, reason: null };
+  }
+
+  function logVideoCapture(message: string, data?: Record<string, unknown>) {
+    const details = data
+      ? " " +
+        Object.entries(data)
+          .map(([key, value]) => `${key}=${String(value)}`)
+          .join(" ")
+      : "";
+    console.log(`[Video][Capture] ${message}${details}`);
   }
 
   function detectScreenBroadcastSupport(): {
@@ -616,6 +627,7 @@
   function stopLocalVideoCapture() {
     localVideoCaptureLoopRunning = false;
     localVideoCaptureKey = null;
+    localVideoFirstFrameLogged = false;
     if (localVideoCanvasTimer) {
       clearTimeout(localVideoCanvasTimer);
       localVideoCanvasTimer = null;
@@ -658,9 +670,19 @@
   }
 
   async function waitForLocalVideoReady(): Promise<void> {
-    if (localVideoReady()) return;
     const video = localVideoEl;
-    if (!video) return;
+    if (!video) {
+      logVideoCapture("local video element missing");
+      return;
+    }
+    if (localVideoReady()) {
+      logVideoCapture("local video element ready", {
+        width: video.videoWidth,
+        height: video.videoHeight,
+        ready_state: video.readyState,
+      });
+      return;
+    }
 
     await new Promise<void>((resolve) => {
       const finish = () => {
@@ -672,6 +694,19 @@
       video.addEventListener("canplay", finish, { once: true });
       setTimeout(finish, 1000);
     });
+    if (localVideoReady()) {
+      logVideoCapture("local video element ready", {
+        width: video.videoWidth,
+        height: video.videoHeight,
+        ready_state: video.readyState,
+      });
+    } else {
+      logVideoCapture("local video element not ready", {
+        width: video.videoWidth,
+        height: video.videoHeight,
+        ready_state: video.readyState,
+      });
+    }
   }
 
   function currentVideoCaptureKey(): string | null {
@@ -761,6 +796,15 @@
         activeVideoProfile,
         copied.data,
       );
+      if (!localVideoFirstFrameLogged) {
+        localVideoFirstFrameLogged = true;
+        logVideoCapture("first processor frame submitted", {
+          call_id: sessionId,
+          width: copied.width,
+          height: copied.height,
+          profile: activeVideoProfile,
+        });
+      }
     } catch (e) {
       console.error("Failed to submit raw video frame:", e);
     } finally {
@@ -821,6 +865,15 @@
         activeVideoProfile,
         data,
       );
+      if (!localVideoFirstFrameLogged) {
+        localVideoFirstFrameLogged = true;
+        logVideoCapture("first canvas frame submitted", {
+          call_id: sessionId,
+          width: size.width,
+          height: size.height,
+          profile: activeVideoProfile,
+        });
+      }
     } catch (e) {
       console.error("Failed to submit canvas video frame:", e);
     } finally {
@@ -830,6 +883,10 @@
 
   async function startCanvasVideoCaptureLoop(sessionId: string, captureKey: string) {
     localVideoCaptureLoopRunning = true;
+    logVideoCapture("canvas fallback loop starting", {
+      call_id: sessionId,
+      capture_key: captureKey,
+    });
     await waitForLocalVideoReady();
 
     const tick = () => {
@@ -839,6 +896,12 @@
         !isVideoCallActiveInThisChat ||
         !activeCallCameraEnabled
       ) {
+        logVideoCapture("canvas fallback loop stopped", {
+          call_id: sessionId,
+          capture_key_matches: captureKey === localVideoCaptureKey,
+          active: isVideoCallActiveInThisChat,
+          camera_enabled: activeCallCameraEnabled,
+        });
         return;
       }
 
@@ -879,9 +942,19 @@
 
     if (isVideoCallMode) {
       if (voiceCallState.phase !== "active" || !callMatchesActivePeer) return;
-      if (!activeCallCameraEnabled) return;
+      if (!activeCallCameraEnabled) {
+        logVideoCapture("camera disabled by state", {
+          call_id: sessionId,
+          peer: activePeer,
+        });
+        return;
+      }
       if (!videoCallSupported) {
         remoteVideoStateError = videoCallUnsupportedReason || "Video capture unsupported.";
+        logVideoCapture("video capture unsupported", {
+          call_id: sessionId,
+          reason: remoteVideoStateError,
+        });
         await onEndVideoCall(sessionId);
         return;
       }
@@ -894,8 +967,19 @@
 
     try {
       const videoProfileSize = profileSize(activeVideoProfile);
+      const mediaDevices = navigator.mediaDevices;
+      const processorAvailable = Boolean((window as any).MediaStreamTrackProcessor);
+      logVideoCapture("getUserMedia requested", {
+        call_id: sessionId,
+        mode: isVideoCallMode ? "video_call" : "screen_broadcast",
+        profile: activeVideoProfile,
+        width: videoProfileSize.width,
+        height: videoProfileSize.height,
+        track_processor: processorAvailable,
+        fallback: isVideoCallMode && !processorAvailable ? "canvas" : "none",
+      });
       const stream = isVideoCallMode
-        ? await navigator.mediaDevices.getUserMedia({
+        ? await mediaDevices.getUserMedia({
             video: {
               width: { ideal: videoProfileSize.width, max: videoProfileSize.width },
               height: { ideal: videoProfileSize.height, max: videoProfileSize.height },
@@ -903,14 +987,19 @@
             },
             audio: false,
           })
-        : await navigator.mediaDevices.getDisplayMedia({
+        : await mediaDevices.getDisplayMedia({
             video: {
               frameRate: { ideal: 8, max: 12 },
             },
             audio: false,
           });
+      logVideoCapture("getUserMedia ok", {
+        call_id: sessionId,
+        tracks: stream.getVideoTracks().length,
+      });
       localVideoStream = stream;
       localVideoCaptureKey = captureKey;
+      localVideoFirstFrameLogged = false;
       setLocalVideoElementStream();
       localVideoSeq = 0;
       const videoTrack = stream.getVideoTracks()[0];
@@ -930,10 +1019,20 @@
         if (!isVideoCallMode) {
           throw new Error("Track processing API is unavailable.");
         }
+        logVideoCapture("using canvas fallback", {
+          call_id: sessionId,
+          track_label: videoTrack.label,
+          track_state: videoTrack.readyState,
+        });
         await startCanvasVideoCaptureLoop(sessionId, captureKey);
         return;
       }
 
+      logVideoCapture("using track processor", {
+        call_id: sessionId,
+        track_label: videoTrack.label,
+        track_state: videoTrack.readyState,
+      });
       const processor = new processorCtor({ track: videoTrack });
       localVideoTrackReader = processor.readable.getReader();
 
@@ -1005,8 +1104,18 @@
           }
         }
       }
+      logVideoCapture("track processor loop ended", {
+        call_id: sessionId,
+        frame_count: frameCount,
+      });
     } catch (e) {
       console.error("Failed to start local video capture:", e);
+      const err = e as { name?: string; message?: string };
+      logVideoCapture("getUserMedia/capture failed", {
+        call_id: sessionId,
+        name: err?.name || "Error",
+        message: err?.message || String(e),
+      });
       remoteVideoStateError = isVideoCallMode
         ? "Camera access failed for this call."
         : "Screen capture failed.";
@@ -1705,6 +1814,18 @@
     const broadcastSupport = detectScreenBroadcastSupport();
     screenBroadcastSupported = broadcastSupport.supported;
     screenBroadcastUnsupportedReason = broadcastSupport.reason;
+    const w = window as any;
+    logVideoCapture("support", {
+      camera: Boolean(navigator?.mediaDevices?.getUserMedia),
+      display: Boolean(navigator?.mediaDevices?.getDisplayMedia),
+      track_processor: Boolean(w.MediaStreamTrackProcessor),
+      video_encoder: Boolean(w.VideoEncoder),
+      video_decoder: Boolean(w.VideoDecoder),
+      encoded_video_chunk: Boolean(w.EncodedVideoChunk),
+      video_call_supported: videoCallSupported,
+      screen_broadcast_supported: screenBroadcastSupported,
+      fallback: videoCallSupported && !w.MediaStreamTrackProcessor ? "canvas" : "none",
+    });
     if (!canUseRecorderApi()) {
       recorderDisabledReason = "Recording is not supported on this device.";
     }
