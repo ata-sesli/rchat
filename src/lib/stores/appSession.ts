@@ -54,6 +54,22 @@ let initPromise: Promise<UnlistenFn> | null = null;
 let activeUnlisten: UnlistenFn | null = null;
 let protectedCleanups: UnlistenFn[] = [];
 let appReadyPromise: Promise<boolean> | null = null;
+let sessionRefreshSeq = 0;
+
+function startupErrorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === "string") return e;
+  try {
+    return JSON.stringify(e);
+  } catch {
+    return String(e);
+  }
+}
+
+function logStartupFailure(message: string) {
+  const line = `[Startup] ${message}`;
+  void api.frontendLog(line).catch(() => {});
+}
 
 export function resetProtectedStores() {
   while (protectedCleanups.length > 0) {
@@ -90,8 +106,13 @@ export async function refreshUserProfile(): Promise<UserProfile> {
 }
 
 export async function refreshAppSession(): Promise<boolean> {
+  const refreshSeq = ++sessionRefreshSeq;
   try {
     const authStatus = await api.checkAuthStatus();
+    if (refreshSeq !== sessionRefreshSeq) {
+      return appReadyPromise ?? get(appSession).appReady;
+    }
+
     const unlocked = authStatus.is_setup && authStatus.is_unlocked;
 
     appSession.update((state) => ({
@@ -111,14 +132,20 @@ export async function refreshAppSession(): Promise<boolean> {
 
     return ensureAppReady();
   } catch (e) {
+    if (refreshSeq !== sessionRefreshSeq) {
+      return appReadyPromise ?? get(appSession).appReady;
+    }
+
+    const message = startupErrorMessage(e);
     console.error("App session refresh failed:", e);
+    logStartupFailure(`session refresh failed: ${message}`);
     resetProtectedStores();
     appSession.update((state) => ({
       ...state,
       authPhase: "error",
       authChecked: true,
       appReady: false,
-      startupError: e instanceof Error ? e.message : String(e),
+      startupError: message,
     }));
     return false;
   }
@@ -163,14 +190,16 @@ export async function ensureAppReady(): Promise<boolean> {
       }));
       return true;
     } catch (e) {
+      const message = startupErrorMessage(e);
       console.error("App startup failed:", e);
+      logStartupFailure(`app startup failed: ${message}`);
       resetProtectedStores();
       appSession.update((state) => ({
         ...state,
         authPhase: "error",
         authChecked: true,
         appReady: false,
-        startupError: e instanceof Error ? e.message : String(e),
+        startupError: message,
       }));
       return false;
     } finally {

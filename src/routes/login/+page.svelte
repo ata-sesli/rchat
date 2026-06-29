@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
+  import { get } from "svelte/store";
   import GitHubButton from "../../components/GitHubButton.svelte";
   import { api } from "$lib/tauri/api";
-  import { refreshAppSession } from "$lib/stores";
+  import { appSession, refreshAppSession } from "$lib/stores";
 
   // State
   type ViewState = "loading" | "setup" | "unlock" | "login";
@@ -54,7 +55,10 @@
   async function refreshUnlockedSession(): Promise<boolean> {
     const ready = await refreshAppSession();
     if (!ready) {
-      error = "Vault unlocked, but RChat failed to finish startup. Check the backend logs.";
+      const startupError = get(appSession).startupError;
+      error = startupError
+        ? `Vault unlocked, but RChat failed to finish startup: ${startupError}`
+        : "Vault unlocked, but RChat failed to finish startup. Check the backend logs.";
       return false;
     }
     return true;
@@ -84,6 +88,7 @@
   }
 
   async function handleUnlock() {
+    if (isLoading) return;
     isLoading = true;
     error = "";
     try {
