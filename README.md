@@ -345,8 +345,9 @@ The receiver decodes Opus packets back to PCM and feeds a playback queue. The vo
 
 1:1 video calls are being implemented on the same live-call model as voice:
 
-- the WebView owns camera capture, local preview, and remote frame rendering,
+- Rust owns native camera capture through RChat's local `rchat-video-capture` crate,
 - Rust owns VP8 encoding through RChat's local `libvpx` wrapper,
+- the WebView owns remote VP8 decode/rendering and the local preview surface,
 - video media uses a long-lived libp2p QUIC stream:
 
 ```text
@@ -355,9 +356,9 @@ The receiver decodes Opus packets back to PCM and feeds a playback queue. The vo
 
 The video stream carries ordered records for VP8 frames, receiver reports, camera state, and quality changes. Auto quality starts at `720p30` and can shift between `720p30`, `480p30`, and `360p30` based on encode/render pressure. Video calls reuse the existing Opus voice path for audio, and a one-sided camera session is valid.
 
-Screen broadcasts are still work in progress. They remain separate from the 1:1 video-call path.
+Screen broadcasts are still work in progress. They remain separate from the 1:1 video-call path and still depend on browser/WebView screen-capture APIs.
 
-The UI detects whether the local client supports camera capture, screen capture, and the required browser media APIs. Unsupported incoming video or broadcast sessions are rejected automatically.
+The UI asks the backend whether native camera capture is available and separately checks whether the WebView can decode/render remote VP8. Unsupported incoming video or broadcast sessions are rejected automatically.
 
 ## Frontend State Structure
 
@@ -389,6 +390,7 @@ Routes consume stores. They should not each independently subscribe to backend e
 - `src-tauri/src/live/voice/` - voice capture, resampling, Opus, jitter/playback, stream protocol.
 - `src-tauri/src/live/video/` - video call protocol and manager.
 - `src-tauri/src/live/broadcast/` - screen broadcast protocol and manager.
+- `src-tauri/crates/rchat-video-capture/` - native camera capture and YUV/I420 conversion.
 - `src-tauri/src/commands/` - Tauri commands exposed to the frontend.
 
 ## Development
@@ -454,6 +456,7 @@ Notable native pieces:
 
 - `opus` links to native libopus through Rust bindings.
 - RChat's local `rchat-libvpx` crate links to native libvpx for VP8 video encoding.
+- RChat's local `rchat-video-capture` crate uses Nokhwa over AVFoundation on macOS and V4L2 on Linux for camera capture.
 - `cpal` talks to platform audio backends.
 - `zeroconf` uses platform mDNS/Bonjour/Avahi-style functionality.
 - Tauri requires the usual platform WebView dependencies.

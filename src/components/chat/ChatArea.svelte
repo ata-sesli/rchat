@@ -24,7 +24,6 @@
   } from "$lib/tauri/api";
   import { getChatKind } from "$lib/chatKind";
   import { presencePeerKey } from "$lib/stores/presence";
-  import { rgbaToI420 } from "$lib/video/i420";
 
   // Types
   type Message = {
@@ -74,6 +73,10 @@
   export let canStartVoiceCall = false;
   export let canStartVideoCall = false;
   export let canStartScreenBroadcast = false;
+  export let videoCallSupported = true;
+  export let videoCallUnsupportedReason: string | null = null;
+  export let screenBroadcastSupported = true;
+  export let screenBroadcastUnsupportedReason: string | null = null;
   export let onStartVoiceCall = () => {};
   export let onStartVideoCall = () => {};
   export let onStartScreenBroadcast = () => {};
@@ -108,18 +111,19 @@
   let callClockTimer: ReturnType<typeof setInterval> | null = null;
   let videoFrameUnlisten: (() => void) | null = null;
   let broadcastFrameUnlisten: (() => void) | null = null;
+  let localPreviewFrameUnlisten: (() => void) | null = null;
+  let cameraErrorUnlisten: (() => void) | null = null;
   let localVideoEl: HTMLVideoElement | null = null;
+  let localPreviewCanvasEl: HTMLCanvasElement | null = null;
+  let localPreviewCanvasCtx: CanvasRenderingContext2D | null = null;
+  let localPreviewError: string | null = null;
   let remoteVideoCanvasEl: HTMLCanvasElement | null = null;
   let remoteVideoCanvasCtx: CanvasRenderingContext2D | null = null;
   let localVideoStream: MediaStream | null = null;
   let localVideoEncoder: any | null = null;
   let localVideoTrackReader: ReadableStreamDefaultReader<any> | null = null;
-  let localVideoCanvasTimer: ReturnType<typeof setTimeout> | null = null;
-  let localVideoFallbackCanvas: HTMLCanvasElement | null = null;
-  let localVideoFallbackCtx: CanvasRenderingContext2D | null = null;
   let localVideoCaptureLoopRunning = false;
   let localVideoCaptureKey: string | null = null;
-  let localVideoFirstFrameLogged = false;
   let localVideoSeq = 0;
   let localVideoMime = "video/webm;codecs=vp8";
   let localVideoCodec = "vp8";
@@ -127,7 +131,6 @@
   let remoteVideoDecoderCodec: string | null = null;
   let remoteExpectedSeq: number | null = null;
   let remotePendingFrames = new Map<number, IncomingFrame>();
-  let rawFrameSubmissionsInFlight = 0;
   let videoQualityMode: VideoQualityMode = "auto";
   let activeVideoProfile: VideoProfile = "720p30";
   let videoQualityUnlisten: (() => void) | null = null;
@@ -145,13 +148,8 @@
     decodeErrors: 0,
   };
   let remoteVideoStateError: string | null = null;
-  let videoCallSupported = true;
-  let videoCallUnsupportedReason: string | null = null;
-  let screenBroadcastSupported = true;
-  let screenBroadcastUnsupportedReason: string | null = null;
 
   const REMOTE_REORDER_WINDOW = 6;
-  const MAX_RAW_FRAME_SUBMISSIONS_IN_FLIGHT = 2;
 
   type IncomingFrame = {
     call_id: string;
@@ -244,16 +242,6 @@
   $: canPressScreenBroadcastButton =
     canStartScreenBroadcast && screenBroadcastSupported;
 
-  function detectVideoCallSupport(): { supported: boolean; reason: string | null } {
-    if (typeof window === "undefined") {
-      return { supported: false, reason: "Video calls are not available in this environment." };
-    }
-    if (!navigator?.mediaDevices?.getUserMedia) {
-      return { supported: false, reason: "Camera capture is unavailable on this device." };
-    }
-    return { supported: true, reason: null };
-  }
-
   function logVideoCapture(message: string, data?: Record<string, unknown>) {
     const details = data
       ? " " +
@@ -272,10 +260,6 @@
     supported: boolean;
     reason: string | null;
   } {
-    const base = detectVideoCallSupport();
-    if (!base.supported) {
-      return base;
-    }
     if (!navigator?.mediaDevices?.getDisplayMedia) {
       return {
         supported: false,
@@ -296,12 +280,6 @@
       };
     }
     return { supported: true, reason: null };
-  }
-
-  function profileSize(profile: VideoProfile): { width: number; height: number } {
-    if (profile === "360p30") return { width: 640, height: 360 };
-    if (profile === "480p30") return { width: 854, height: 480 };
-    return { width: 1280, height: 720 };
   }
 
   function normalizeVideoProfile(value: unknown): VideoProfile {
@@ -372,6 +350,49 @@
     if ("srcObject" in localVideoEl) {
       localVideoEl.srcObject = localVideoStream;
     }
+  }
+
+  function clearLocalPreview() {
+    localPreviewError = null;
+    if (localPreviewCanvasCtx && localPreviewCanvasEl) {
+      localPreviewCanvasCtx.clearRect(
+        0,
+        0,
+        localPreviewCanvasEl.width,
+        localPreviewCanvasEl.height,
+      );
+    }
+  }
+
+  function handleLocalPreviewFrame(eventPayload: any) {
+    if (!eventPayload || !activeCallId || eventPayload.call_id !== activeCallId) {
+      return;
+    }
+    if (!isVideoCallActiveInThisChat || !activeCallCameraEnabled) {
+      return;
+    }
+    const payload = normalizeBinaryPayload(eventPayload.rgba);
+    const width = Number(eventPayload.width || 0);
+    const height = Number(eventPayload.height || 0);
+    if (!payload || width <= 0 || height <= 0 || payload.length !== width * height * 4) {
+      return;
+    }
+    if (!localPreviewCanvasEl) return;
+    localPreviewCanvasCtx =
+      localPreviewCanvasCtx || localPreviewCanvasEl.getContext("2d");
+    if (!localPreviewCanvasCtx) return;
+    if (localPreviewCanvasEl.width !== width || localPreviewCanvasEl.height !== height) {
+      localPreviewCanvasEl.width = width;
+      localPreviewCanvasEl.height = height;
+    }
+    const image = new ImageData(new Uint8ClampedArray(payload), width, height);
+    localPreviewCanvasCtx.putImageData(image, 0, 0);
+    localPreviewError = null;
+  }
+
+  function handleVideoCameraError(eventPayload: any) {
+    if (!eventPayload || !activeCallId || eventPayload.call_id !== activeCallId) return;
+    localPreviewError = String(eventPayload.message || "Camera capture failed.");
   }
 
   function activeRemoteSessionId(): string | null {
@@ -631,13 +652,6 @@
   function stopLocalVideoCapture() {
     localVideoCaptureLoopRunning = false;
     localVideoCaptureKey = null;
-    localVideoFirstFrameLogged = false;
-    if (localVideoCanvasTimer) {
-      clearTimeout(localVideoCanvasTimer);
-      localVideoCanvasTimer = null;
-    }
-    localVideoFallbackCanvas = null;
-    localVideoFallbackCtx = null;
     if (localVideoTrackReader) {
       try {
         void localVideoTrackReader.cancel();
@@ -664,264 +678,11 @@
     setLocalVideoElementStream();
   }
 
-  function localVideoReady(): boolean {
-    return Boolean(
-      localVideoEl &&
-        localVideoEl.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
-        localVideoEl.videoWidth > 0 &&
-        localVideoEl.videoHeight > 0,
-    );
-  }
-
-  async function waitForLocalVideoReady(): Promise<void> {
-    const video = localVideoEl;
-    if (!video) {
-      logVideoCapture("local video element missing");
-      return;
-    }
-    if (localVideoReady()) {
-      logVideoCapture("local video element ready", {
-        width: video.videoWidth,
-        height: video.videoHeight,
-        ready_state: video.readyState,
-      });
-      return;
-    }
-
-    await new Promise<void>((resolve) => {
-      const finish = () => {
-        video.removeEventListener("loadedmetadata", finish);
-        video.removeEventListener("canplay", finish);
-        resolve();
-      };
-      video.addEventListener("loadedmetadata", finish, { once: true });
-      video.addEventListener("canplay", finish, { once: true });
-      setTimeout(finish, 1000);
-    });
-    if (localVideoReady()) {
-      logVideoCapture("local video element ready", {
-        width: video.videoWidth,
-        height: video.videoHeight,
-        ready_state: video.readyState,
-      });
-    } else {
-      logVideoCapture("local video element not ready", {
-        width: video.videoWidth,
-        height: video.videoHeight,
-        ready_state: video.readyState,
-      });
-    }
-  }
-
   function currentVideoCaptureKey(): string | null {
-    if (isVideoCallActiveInThisChat && activeCallCameraEnabled && activeCallId) {
-      return `video:${activeCallId}:${activeVideoProfile}`;
-    }
     if (isBroadcastHostInThisChat && activeBroadcastSessionId) {
       return `broadcast:${activeBroadcastSessionId}`;
     }
     return null;
-  }
-
-  function i420LayoutFor(width: number, height: number) {
-    const yStride = width;
-    const uvStride = width / 2;
-    const ySize = yStride * height;
-    const uvSize = uvStride * (height / 2);
-    return {
-      length: ySize + uvSize * 2,
-      layout: [
-        { offset: 0, stride: yStride },
-        { offset: ySize, stride: uvStride },
-        { offset: ySize + uvSize, stride: uvStride },
-      ],
-    };
-  }
-
-  async function copyVideoFrameToI420(videoFrame: any): Promise<{
-    data: Uint8Array;
-    width: number;
-    height: number;
-  } | null> {
-    const visible = videoFrame.visibleRect || {
-      x: 0,
-      y: 0,
-      width: videoFrame.codedWidth || videoFrame.displayWidth,
-      height: videoFrame.codedHeight || videoFrame.displayHeight,
-    };
-    const width = Math.floor(Number(visible.width || videoFrame.displayWidth) / 2) * 2;
-    const height =
-      Math.floor(Number(visible.height || videoFrame.displayHeight) / 2) * 2;
-    if (!width || !height) return null;
-
-    const packed = i420LayoutFor(width, height);
-    const data = new Uint8Array(packed.length);
-    await videoFrame.copyTo(data, {
-      format: "I420",
-      rect: {
-        x: Number(visible.x || 0),
-        y: Number(visible.y || 0),
-        width,
-        height,
-      },
-      layout: packed.layout,
-    });
-    return { data, width, height };
-  }
-
-  async function submitRawVideoFrame(
-    sessionId: string,
-    captureKey: string,
-    videoFrame: any,
-  ) {
-    let countedInFlight = false;
-    if (rawFrameSubmissionsInFlight >= MAX_RAW_FRAME_SUBMISSIONS_IN_FLIGHT) {
-      try {
-        videoFrame.close();
-      } catch {
-        // no-op
-      }
-      return;
-    }
-
-    rawFrameSubmissionsInFlight += 1;
-    countedInFlight = true;
-    try {
-      const copied = await copyVideoFrameToI420(videoFrame);
-      if (!copied) return;
-      if (captureKey !== localVideoCaptureKey) return;
-      if (!isVideoCallActiveInThisChat || !activeCallCameraEnabled) return;
-
-      await api.submitVideoCallI420Frame(
-        sessionId,
-        Number(videoFrame.timestamp ?? Math.floor(performance.now() * 1000)),
-        copied.width,
-        copied.height,
-        activeVideoProfile,
-        copied.data,
-      );
-      if (!localVideoFirstFrameLogged) {
-        localVideoFirstFrameLogged = true;
-        logVideoCapture("first processor frame submitted", {
-          call_id: sessionId,
-          width: copied.width,
-          height: copied.height,
-          profile: activeVideoProfile,
-        });
-      }
-    } catch (e) {
-      console.error("Failed to submit raw video frame:", e);
-    } finally {
-      try {
-        videoFrame.close();
-      } catch {
-        // no-op
-      }
-      if (countedInFlight) {
-        rawFrameSubmissionsInFlight = Math.max(0, rawFrameSubmissionsInFlight - 1);
-      }
-    }
-  }
-
-  function canvasCaptureSize(): { width: number; height: number } | null {
-    if (!localVideoEl?.videoWidth || !localVideoEl.videoHeight) return null;
-    const width = Math.floor(localVideoEl.videoWidth / 2) * 2;
-    const height = Math.floor(localVideoEl.videoHeight / 2) * 2;
-    if (width <= 0 || height <= 0) return null;
-    return { width, height };
-  }
-
-  async function submitCanvasVideoFrame(sessionId: string, captureKey: string) {
-    if (!localVideoEl || !localVideoReady()) return;
-    if (rawFrameSubmissionsInFlight >= MAX_RAW_FRAME_SUBMISSIONS_IN_FLIGHT) return;
-    const size = canvasCaptureSize();
-    if (!size) return;
-
-    rawFrameSubmissionsInFlight += 1;
-    try {
-      if (!localVideoFallbackCanvas) {
-        localVideoFallbackCanvas = document.createElement("canvas");
-      }
-      if (
-        localVideoFallbackCanvas.width !== size.width ||
-        localVideoFallbackCanvas.height !== size.height
-      ) {
-        localVideoFallbackCanvas.width = size.width;
-        localVideoFallbackCanvas.height = size.height;
-        localVideoFallbackCtx = null;
-      }
-      localVideoFallbackCtx =
-        localVideoFallbackCtx ||
-        localVideoFallbackCanvas.getContext("2d", { willReadFrequently: true });
-      if (!localVideoFallbackCtx) return;
-
-      localVideoFallbackCtx.drawImage(localVideoEl, 0, 0, size.width, size.height);
-      const image = localVideoFallbackCtx.getImageData(0, 0, size.width, size.height);
-      const data = rgbaToI420(image.data, size.width, size.height);
-      if (captureKey !== localVideoCaptureKey) return;
-      if (!isVideoCallActiveInThisChat || !activeCallCameraEnabled) return;
-
-      await api.submitVideoCallI420Frame(
-        sessionId,
-        Math.floor(performance.now() * 1000),
-        size.width,
-        size.height,
-        activeVideoProfile,
-        data,
-      );
-      if (!localVideoFirstFrameLogged) {
-        localVideoFirstFrameLogged = true;
-        logVideoCapture("first canvas frame submitted", {
-          call_id: sessionId,
-          width: size.width,
-          height: size.height,
-          profile: activeVideoProfile,
-        });
-      }
-    } catch (e) {
-      console.error("Failed to submit canvas video frame:", e);
-    } finally {
-      rawFrameSubmissionsInFlight = Math.max(0, rawFrameSubmissionsInFlight - 1);
-    }
-  }
-
-  async function startCanvasVideoCaptureLoop(sessionId: string, captureKey: string) {
-    localVideoCaptureLoopRunning = true;
-    logVideoCapture("canvas fallback loop starting", {
-      call_id: sessionId,
-      capture_key: captureKey,
-    });
-    await waitForLocalVideoReady();
-
-    const tick = () => {
-      if (
-        !localVideoCaptureLoopRunning ||
-        captureKey !== localVideoCaptureKey ||
-        !isVideoCallActiveInThisChat ||
-        !activeCallCameraEnabled
-      ) {
-        logVideoCapture("canvas fallback loop stopped", {
-          call_id: sessionId,
-          capture_key_matches: captureKey === localVideoCaptureKey,
-          active: isVideoCallActiveInThisChat,
-          camera_enabled: activeCallCameraEnabled,
-        });
-        return;
-      }
-
-      void submitCanvasVideoFrame(sessionId, captureKey).finally(() => {
-        if (
-          localVideoCaptureLoopRunning &&
-          captureKey === localVideoCaptureKey &&
-          isVideoCallActiveInThisChat &&
-          activeCallCameraEnabled
-        ) {
-          localVideoCanvasTimer = setTimeout(tick, 33);
-        }
-      });
-    };
-
-    tick();
   }
 
   async function setVideoQualityMode(mode: VideoQualityMode) {
@@ -935,34 +696,14 @@
   }
 
   async function startLocalVideoCapture() {
-    const isVideoCallMode = isVideoCallActiveInThisChat;
-    const isBroadcastMode = isBroadcastHostInThisChat;
-    if (!isVideoCallMode && !isBroadcastMode) return;
+    if (!isBroadcastHostInThisChat) return;
     if (localVideoStream) return;
-    const sessionId = isVideoCallMode ? activeCallId : activeBroadcastSessionId;
+    const sessionId = activeBroadcastSessionId;
     if (!sessionId) return;
     const captureKey = currentVideoCaptureKey();
     if (!captureKey) return;
 
-    if (isVideoCallMode) {
-      if (voiceCallState.phase !== "active" || !callMatchesActivePeer) return;
-      if (!activeCallCameraEnabled) {
-        logVideoCapture("camera disabled by state", {
-          call_id: sessionId,
-          peer: activePeer,
-        });
-        return;
-      }
-      if (!videoCallSupported) {
-        remoteVideoStateError = videoCallUnsupportedReason || "Video capture unsupported.";
-        logVideoCapture("video capture unsupported", {
-          call_id: sessionId,
-          reason: remoteVideoStateError,
-        });
-        await onEndVideoCall(sessionId);
-        return;
-      }
-    } else if (!screenBroadcastSupported) {
+    if (!screenBroadcastSupported) {
       remoteVideoStateError =
         screenBroadcastUnsupportedReason || "Screen share is unsupported.";
       await onEndScreenBroadcast(sessionId);
@@ -970,40 +711,27 @@
     }
 
     try {
-      const videoProfileSize = profileSize(activeVideoProfile);
       const mediaDevices = navigator.mediaDevices;
       const processorAvailable = Boolean((window as any).MediaStreamTrackProcessor);
-      logVideoCapture("getUserMedia requested", {
+      const encoderAvailable = Boolean((window as any).VideoEncoder);
+      logVideoCapture("getDisplayMedia requested", {
         call_id: sessionId,
-        mode: isVideoCallMode ? "video_call" : "screen_broadcast",
-        profile: activeVideoProfile,
-        width: videoProfileSize.width,
-        height: videoProfileSize.height,
+        mode: "screen_broadcast",
         track_processor: processorAvailable,
-        fallback: isVideoCallMode && !processorAvailable ? "canvas" : "none",
+        video_encoder: encoderAvailable,
       });
-      const stream = isVideoCallMode
-        ? await mediaDevices.getUserMedia({
-            video: {
-              width: { ideal: videoProfileSize.width, max: videoProfileSize.width },
-              height: { ideal: videoProfileSize.height, max: videoProfileSize.height },
-              frameRate: { ideal: 30, max: 30 },
-            },
-            audio: false,
-          })
-        : await mediaDevices.getDisplayMedia({
-            video: {
-              frameRate: { ideal: 8, max: 12 },
-            },
-            audio: false,
-          });
-      logVideoCapture("getUserMedia ok", {
+      const stream = await mediaDevices.getDisplayMedia({
+        video: {
+          frameRate: { ideal: 8, max: 12 },
+        },
+        audio: false,
+      });
+      logVideoCapture("getDisplayMedia ok", {
         call_id: sessionId,
         tracks: stream.getVideoTracks().length,
       });
       localVideoStream = stream;
       localVideoCaptureKey = captureKey;
-      localVideoFirstFrameLogged = false;
       setLocalVideoElementStream();
       localVideoSeq = 0;
       const videoTrack = stream.getVideoTracks()[0];
@@ -1011,25 +739,14 @@
         throw new Error("No video track available.");
       }
       videoTrack.onended = () => {
-        if (isVideoCallMode && activeCallId) {
-          void onToggleVideoCamera(activeCallId, false);
-        } else if (isBroadcastMode && activeBroadcastSessionId) {
+        if (activeBroadcastSessionId) {
           void onEndScreenBroadcast(activeBroadcastSessionId);
         }
       };
 
       const processorCtor = (window as any).MediaStreamTrackProcessor;
       if (!processorCtor) {
-        if (!isVideoCallMode) {
-          throw new Error("Track processing API is unavailable.");
-        }
-        logVideoCapture("using canvas fallback", {
-          call_id: sessionId,
-          track_label: videoTrack.label,
-          track_state: videoTrack.readyState,
-        });
-        await startCanvasVideoCaptureLoop(sessionId, captureKey);
-        return;
+        throw new Error("Track processing API is unavailable.");
       }
 
       logVideoCapture("using track processor", {
@@ -1040,48 +757,43 @@
       const processor = new processorCtor({ track: videoTrack });
       localVideoTrackReader = processor.readable.getReader();
 
-      if (isBroadcastMode) {
-        const selected = await chooseEncoderConfig();
-        if (!selected) {
-          throw new Error("No supported low-latency encoder config.");
-        }
-        localVideoMime = selected.mime;
-        localVideoCodec = selected.codec;
-        const encoderCtor = (window as any).VideoEncoder;
-        localVideoEncoder = new encoderCtor({
-          output: (chunk: any) => {
-            if (!sessionId) {
-              return;
-            }
-            try {
-              const bytes = new Uint8Array(chunk.byteLength);
-              chunk.copyTo(bytes);
-              const chunkType: VideoChunkType = chunk.type === "key" ? "key" : "delta";
-              void api
-                .sendScreenBroadcastChunk(
-                  sessionId,
-                  localVideoSeq,
-                  Number(chunk.timestamp ?? Math.floor(performance.now() * 1000)),
-                  localVideoMime,
-                  localVideoCodec,
-                  chunkType as BroadcastChunkType,
-                  bytes,
-                )
-                .catch((err) => {
-                  console.error("Failed to send encoded screen chunk:", err);
-                });
-              localVideoSeq += 1;
-            } catch (e) {
-              console.error("Failed to package encoded chunk:", e);
-            }
-          },
-          error: (err: unknown) => {
-            console.error("Local video encoder error:", err);
-          },
-        });
-
-        localVideoEncoder.configure(selected.config);
+      const selected = await chooseEncoderConfig();
+      if (!selected) {
+        throw new Error("No supported low-latency encoder config.");
       }
+      localVideoMime = selected.mime;
+      localVideoCodec = selected.codec;
+      const encoderCtor = (window as any).VideoEncoder;
+      localVideoEncoder = new encoderCtor({
+        output: (chunk: any) => {
+          try {
+            const bytes = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(bytes);
+            const chunkType: VideoChunkType = chunk.type === "key" ? "key" : "delta";
+            void api
+              .sendScreenBroadcastChunk(
+                sessionId,
+                localVideoSeq,
+                Number(chunk.timestamp ?? Math.floor(performance.now() * 1000)),
+                localVideoMime,
+                localVideoCodec,
+                chunkType as BroadcastChunkType,
+                bytes,
+              )
+              .catch((err) => {
+                console.error("Failed to send encoded screen chunk:", err);
+              });
+            localVideoSeq += 1;
+          } catch (e) {
+            console.error("Failed to package encoded chunk:", e);
+          }
+        },
+        error: (err: unknown) => {
+          console.error("Local video encoder error:", err);
+        },
+      });
+
+      localVideoEncoder.configure(selected.config);
 
       localVideoCaptureLoopRunning = true;
       let frameCount = 0;
@@ -1089,23 +801,16 @@
         const { value: videoFrame, done } = await localVideoTrackReader.read();
         if (done || !videoFrame) break;
         try {
-          if (isVideoCallMode && !activeCallCameraEnabled) {
-            videoFrame.close();
-            continue;
+          if (captureKey !== localVideoCaptureKey) {
+            break;
           }
-          if (isVideoCallMode) {
-            void submitRawVideoFrame(sessionId, captureKey, videoFrame);
-            frameCount += 1;
-            continue;
-          } else if (localVideoEncoder) {
+          if (localVideoEncoder) {
             const forceKeyFrame = frameCount % 24 === 0;
             localVideoEncoder.encode(videoFrame, { keyFrame: forceKeyFrame });
           }
           frameCount += 1;
         } finally {
-          if (!isVideoCallMode) {
-            videoFrame.close();
-          }
+          videoFrame.close();
         }
       }
       logVideoCapture("track processor loop ended", {
@@ -1115,21 +820,14 @@
     } catch (e) {
       console.error("Failed to start local video capture:", e);
       const err = e as { name?: string; message?: string };
-      logVideoCapture("getUserMedia/capture failed", {
+      logVideoCapture("getDisplayMedia/capture failed", {
         call_id: sessionId,
         name: err?.name || "Error",
         message: err?.message || String(e),
       });
-      remoteVideoStateError = isVideoCallMode
-        ? "Camera access failed for this call."
-        : "Screen capture failed.";
-      if (sessionId) {
-        if (isVideoCallMode) {
-          await onEndVideoCall(sessionId);
-        } else {
-          await onEndScreenBroadcast(sessionId);
-        }
-      }
+      remoteVideoStateError = "Screen capture failed.";
+      stopLocalVideoCapture();
+      await onEndScreenBroadcast(sessionId);
     }
   }
 
@@ -1152,6 +850,7 @@
       activeRemoteSessionKey = sessionKey;
       resetRemoteVideoDecodeState();
       resetVideoRenderCounters();
+      clearLocalPreview();
       remoteCameraEnabled = true;
       remoteVideoStateError = null;
     }
@@ -1812,15 +1511,15 @@
   }
 
   onMount(async () => {
-    const support = detectVideoCallSupport();
-    videoCallSupported = support.supported;
-    videoCallUnsupportedReason = support.reason;
     const broadcastSupport = detectScreenBroadcastSupport();
-    screenBroadcastSupported = broadcastSupport.supported;
-    screenBroadcastUnsupportedReason = broadcastSupport.reason;
+    if (!screenBroadcastSupported || broadcastSupport.supported === false) {
+      screenBroadcastSupported = screenBroadcastSupported && broadcastSupport.supported;
+      screenBroadcastUnsupportedReason =
+        screenBroadcastUnsupportedReason || broadcastSupport.reason;
+    }
     const w = window as any;
     logVideoCapture("support", {
-      camera: Boolean(navigator?.mediaDevices?.getUserMedia),
+      native_camera: videoCallSupported,
       display: Boolean(navigator?.mediaDevices?.getDisplayMedia),
       track_processor: Boolean(w.MediaStreamTrackProcessor),
       video_encoder: Boolean(w.VideoEncoder),
@@ -1828,7 +1527,7 @@
       encoded_video_chunk: Boolean(w.EncodedVideoChunk),
       video_call_supported: videoCallSupported,
       screen_broadcast_supported: screenBroadcastSupported,
-      fallback: videoCallSupported && !w.MediaStreamTrackProcessor ? "canvas" : "none",
+      outbound_video_capture: "native",
     });
     if (!canUseRecorderApi()) {
       recorderDisabledReason = "Recording is not supported on this device.";
@@ -1840,20 +1539,20 @@
     broadcastFrameUnlisten = await listen("broadcast-frame", (event: any) => {
       void handleIncomingBroadcastFrame(event.payload);
     });
+    localPreviewFrameUnlisten = await listen(
+      "video-call-local-preview-frame",
+      (event: any) => {
+        handleLocalPreviewFrame(event.payload);
+      },
+    );
+    cameraErrorUnlisten = await listen("video-call-camera-error", (event: any) => {
+      handleVideoCameraError(event.payload);
+    });
     videoQualityUnlisten = await listen("video-call-quality-updated", (event: any) => {
       const payload = event.payload || {};
       if (!activeCallId || payload.call_id !== activeCallId) return;
-      const previousProfile = activeVideoProfile;
       videoQualityMode = normalizeVideoQualityMode(payload.mode);
       activeVideoProfile = normalizeVideoProfile(payload.profile);
-      if (
-        isVideoCallActiveInThisChat &&
-        activeCallCameraEnabled &&
-        previousProfile !== activeVideoProfile
-      ) {
-        stopLocalVideoCapture();
-        void startLocalVideoCapture();
-      }
     });
     videoCameraStateUnlisten = await listen("video-call-camera-state", (event: any) => {
       const payload = event.payload || {};
@@ -1885,6 +1584,14 @@
     if (broadcastFrameUnlisten) {
       broadcastFrameUnlisten();
       broadcastFrameUnlisten = null;
+    }
+    if (localPreviewFrameUnlisten) {
+      localPreviewFrameUnlisten();
+      localPreviewFrameUnlisten = null;
+    }
+    if (cameraErrorUnlisten) {
+      cameraErrorUnlisten();
+      cameraErrorUnlisten = null;
     }
     if (videoQualityUnlisten) {
       videoQualityUnlisten();
@@ -2124,13 +1831,14 @@
 
       <div class="absolute bottom-2 right-2 w-28 h-20 rounded-lg border border-theme-base-700 bg-black/60 overflow-hidden flex items-center justify-center">
         {#if activeCallCameraEnabled}
-          <video
-            bind:this={localVideoEl}
-            autoplay
-            muted
-            playsinline
-            class="w-full h-full object-cover"
-          ></video>
+          {#if localPreviewError}
+            <span class="text-[11px] text-theme-base-300 px-2 text-center">{localPreviewError}</span>
+          {:else}
+            <canvas
+              bind:this={localPreviewCanvasEl}
+              class="w-full h-full object-cover"
+            ></canvas>
+          {/if}
         {:else}
           <span class="text-[11px] text-theme-base-300">Camera off</span>
         {/if}

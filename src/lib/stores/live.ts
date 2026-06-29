@@ -2,7 +2,6 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { get } from "svelte/store";
 import { writable } from "svelte/store";
 import { getChatKind } from "$lib/chatKind";
-import { ensureVideoCallCameraAccess } from "$lib/media/callPermissions";
 import { isChatConnected, presencePeerKey } from "$lib/stores/presence";
 import {
   api,
@@ -32,8 +31,8 @@ const idleBroadcastState: BroadcastState = { phase: "idle", is_host: false };
 const defaultLiveState: LiveState = {
   voiceCallState: idleVoiceCallState,
   broadcastState: idleBroadcastState,
-  videoCallSupported: true,
-  videoCallUnsupportedReason: null,
+  videoCallSupported: false,
+  videoCallUnsupportedReason: "Checking native camera support.",
   screenBroadcastSupported: true,
   screenBroadcastUnsupportedReason: null,
   diagnostics: null,
@@ -53,25 +52,47 @@ function logLive(message: string, data?: Record<string, unknown>) {
   void api.frontendLog(line).catch(() => {});
 }
 
-function detectVideoCallSupport(): { supported: boolean; reason: string | null } {
+async function detectVideoCallSupport(): Promise<{
+  supported: boolean;
+  reason: string | null;
+}> {
   if (typeof window === "undefined") {
     return { supported: false, reason: "Unavailable in this environment." };
   }
-  if (!navigator?.mediaDevices?.getUserMedia) {
+  const w = window as any;
+  if (!w.VideoDecoder || !w.EncodedVideoChunk) {
     return {
       supported: false,
-      reason: "Camera capture is unavailable on this device.",
+      reason: "WebCodecs video decode is unavailable on this client.",
     };
   }
-  return { supported: true, reason: null };
+  try {
+    const support = await api.getVideoCaptureSupport();
+    if (!support.supported) {
+      return {
+        supported: false,
+        reason: support.reason || "Native camera capture is unavailable.",
+      };
+    }
+    if (support.devices.length === 0) {
+      return {
+        supported: false,
+        reason: "No camera device was found.",
+      };
+    }
+    return { supported: true, reason: null };
+  } catch (e) {
+    return {
+      supported: false,
+      reason: e instanceof Error ? e.message : "Native camera capture check failed.",
+    };
+  }
 }
 
 function detectScreenBroadcastSupport(): {
   supported: boolean;
   reason: string | null;
 } {
-  const base = detectVideoCallSupport();
-  if (!base.supported) return base;
   if (!navigator?.mediaDevices?.getDisplayMedia) {
     return {
       supported: false,
@@ -88,8 +109,8 @@ function detectScreenBroadcastSupport(): {
   return { supported: true, reason: null };
 }
 
-function applySupportDetection() {
-  const video = detectVideoCallSupport();
+async function applySupportDetection() {
+  const video = await detectVideoCallSupport();
   const broadcast = detectScreenBroadcastSupport();
   liveState.update((state) => ({
     ...state,
@@ -151,7 +172,7 @@ export async function initLiveStore(): Promise<UnlistenFn> {
   if (initPromise) return initPromise;
 
   initPromise = (async () => {
-    applySupportDetection();
+    await applySupportDetection();
     try {
       const [voiceCallState, broadcastState] = await Promise.all([
         api.getVoiceCallState(),
@@ -256,17 +277,7 @@ export const liveActions = {
   setVoiceCallMuted: (callId: string, muted: boolean) =>
     api.setVoiceCallMuted(callId, muted),
   startVideoCall: async (peerId: string) => {
-    logLive("video camera preflight requested", { peer_id: peerId });
-    try {
-      await ensureVideoCallCameraAccess();
-    } catch (e) {
-      logLive("video camera preflight failed", {
-        peer_id: peerId,
-        error: e instanceof Error ? e.message : String(e),
-      });
-      throw e;
-    }
-    logLive("video camera preflight ok", { peer_id: peerId });
+    logLive("native video call requested", { peer_id: peerId });
     return api.startVideoCall(peerId);
   },
   acceptVideoCall: (callId: string) => api.acceptVideoCall(callId),
@@ -275,19 +286,7 @@ export const liveActions = {
   setVideoCallMuted: (callId: string, muted: boolean) =>
     api.setVideoCallMuted(callId, muted),
   setVideoCallCameraEnabled: async (callId: string, enabled: boolean) => {
-    if (enabled) {
-      logLive("video camera preflight requested", { call_id: callId });
-      try {
-        await ensureVideoCallCameraAccess();
-      } catch (e) {
-        logLive("video camera preflight failed", {
-          call_id: callId,
-          error: e instanceof Error ? e.message : String(e),
-        });
-        throw e;
-      }
-      logLive("video camera preflight ok", { call_id: callId });
-    }
+    logLive("native video camera toggle requested", { call_id: callId, enabled });
     return api.setVideoCallCameraEnabled(callId, enabled);
   },
   startScreenBroadcast: (peerId: string) => api.startScreenBroadcast(peerId),

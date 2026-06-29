@@ -14,6 +14,22 @@ pub struct VideoRenderStatsInput {
     pub decode_errors: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VideoCaptureDeviceInfo {
+    pub id: String,
+    pub index: u32,
+    pub name: String,
+    pub description: String,
+    pub backend: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VideoCaptureSupport {
+    pub supported: bool,
+    pub reason: Option<String>,
+    pub devices: Vec<VideoCaptureDeviceInfo>,
+}
+
 fn direct_presence_key(chat_id: &str) -> String {
     let normalized = if chat_id == "self" { "Me" } else { chat_id };
     chat_identity::extract_peer_id_from_chat_id(normalized)
@@ -272,6 +288,44 @@ pub async fn report_video_call_render_stats(
         })
         .await
         .map_err(|e| format!("Failed to report video render stats: {}", e))
+}
+
+#[tauri::command]
+pub async fn get_video_capture_support() -> Result<VideoCaptureSupport, String> {
+    match rchat_video_capture::list_devices() {
+        Ok(devices) => {
+            let devices = devices.into_iter().map(video_capture_device_info).collect();
+            Ok(VideoCaptureSupport {
+                supported: true,
+                reason: None,
+                devices,
+            })
+        }
+        Err(error) => Ok(VideoCaptureSupport {
+            supported: false,
+            reason: Some(error.to_string()),
+            devices: Vec::new(),
+        }),
+    }
+}
+
+#[tauri::command]
+pub async fn get_video_capture_devices() -> Result<Vec<VideoCaptureDeviceInfo>, String> {
+    rchat_video_capture::list_devices()
+        .map(|devices| devices.into_iter().map(video_capture_device_info).collect())
+        .map_err(|error| error.to_string())
+}
+
+fn video_capture_device_info(
+    device: rchat_video_capture::CaptureDeviceInfo,
+) -> VideoCaptureDeviceInfo {
+    VideoCaptureDeviceInfo {
+        id: device.id,
+        index: device.index,
+        name: device.name,
+        description: device.description,
+        backend: device.backend,
+    }
 }
 
 #[tauri::command]

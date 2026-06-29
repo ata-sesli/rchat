@@ -120,6 +120,7 @@ enum VoiceStreamEvent {
 
 #[derive(Debug, Default)]
 struct VideoNetworkStats {
+    capture_start_failures: u64,
     submitted_frames: u64,
     raw_frames_dropped: u64,
     encoded_frames: u64,
@@ -526,6 +527,16 @@ pub struct NetworkManager {
     video_expected_inbound_seq: Option<u32>,
     // VP8 encoder for outbound camera frames.
     video_vp8_encoder: Option<crate::live::video::codec::Vp8VideoEncoder>,
+    // Pending native camera startup task; polled from the video tick without blocking the network loop.
+    video_capture_start_task: Option<video_call::VideoCaptureStartTask>,
+    // Native local camera capture for active video calls.
+    video_capture_session: Option<rchat_video_capture::VideoCaptureSession>,
+    // Capture session metadata for diagnostics.
+    video_capture_info: Option<rchat_video_capture::CaptureSessionInfo>,
+    // Last capture session stats snapshot, retained after stopping.
+    video_capture_last_stats: rchat_video_capture::CaptureSessionStats,
+    // Start time for current local capture session.
+    video_capture_started_at: Option<std::time::Instant>,
     // Local video quality/adaptation controller.
     video_quality_controller: crate::live::video::codec::VideoQualityController,
     // Aggregated video transport diagnostics.
@@ -752,6 +763,11 @@ impl NetworkManager {
             video_next_seq: 0,
             video_expected_inbound_seq: None,
             video_vp8_encoder: None,
+            video_capture_start_task: None,
+            video_capture_session: None,
+            video_capture_info: None,
+            video_capture_last_stats: rchat_video_capture::CaptureSessionStats::default(),
+            video_capture_started_at: None,
             video_quality_controller: crate::live::video::codec::VideoQualityController::new(
                 crate::live::video::codec::VideoQualityMode::Auto,
             ),

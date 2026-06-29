@@ -40,6 +40,10 @@
     canStartVoiceCall={callAvailability.canStartVoiceCall}
     canStartVideoCall={callAvailability.canStartVideoCall}
     canStartScreenBroadcast={callAvailability.canStartScreenBroadcast}
+    videoCallSupported={$liveState.videoCallSupported}
+    videoCallUnsupportedReason={$liveState.videoCallUnsupportedReason}
+    screenBroadcastSupported={$liveState.screenBroadcastSupported}
+    screenBroadcastUnsupportedReason={$liveState.screenBroadcastUnsupportedReason}
     onStartVoiceCall={async () => {
       try {
         await liveActions.startVoiceCall(activePeer);
