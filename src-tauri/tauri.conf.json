@@ -56,7 +56,9 @@
           "libopus0",
           "libvpx9 | libvpx8 | libvpx7",
           "libavahi-client3",
-          "libavahi-compat-libdnssd1"
+          "libavahi-compat-libdnssd1",
+          "pipewire",
+          "xdg-desktop-portal"
         ]
       },
       "rpm": {
@@ -73,7 +75,10 @@
           "openssl-libs",
           "opus",
           "libvpx",
-          "avahi-compat-libdns_sd"
+          "avahi-compat-libdns_sd",
+          "pipewire",
+          "xdg-desktop-portal",
+          "xdg-desktop-portal-gnome"
         ]
       }
     },

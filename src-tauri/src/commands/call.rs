@@ -30,6 +30,13 @@ pub struct VideoCaptureSupport {
     pub devices: Vec<VideoCaptureDeviceInfo>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScreenCaptureSupport {
+    pub supported: bool,
+    pub reason: Option<String>,
+    pub backend: String,
+}
+
 fn direct_presence_key(chat_id: &str) -> String {
     let normalized = if chat_id == "self" { "Me" } else { chat_id };
     chat_identity::extract_peer_id_from_chat_id(normalized)
@@ -307,6 +314,16 @@ pub async fn get_video_capture_support() -> Result<VideoCaptureSupport, String> 
             devices: Vec::new(),
         }),
     }
+}
+
+#[tauri::command]
+pub async fn get_screen_capture_support() -> Result<ScreenCaptureSupport, String> {
+    let support = rchat_screen_capture::screen_capture_support();
+    Ok(ScreenCaptureSupport {
+        supported: support.supported,
+        reason: support.reason,
+        backend: support.backend.label().to_string(),
+    })
 }
 
 #[tauri::command]

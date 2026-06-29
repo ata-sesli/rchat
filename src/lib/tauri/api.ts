@@ -98,6 +98,7 @@ export const COMMANDS = {
   reportVideoCallRenderStats: "report_video_call_render_stats",
   getVideoCaptureSupport: "get_video_capture_support",
   getVideoCaptureDevices: "get_video_capture_devices",
+  getScreenCaptureSupport: "get_screen_capture_support",
   getVoiceCallState: "get_voice_call_state",
   startScreenBroadcast: "start_screen_broadcast",
   acceptScreenBroadcast: "accept_screen_broadcast",
@@ -327,6 +328,11 @@ export type VideoCaptureSupport = {
   supported: boolean;
   reason?: string | null;
   devices: VideoCaptureDeviceInfo[];
+};
+export type ScreenCaptureSupport = {
+  supported: boolean;
+  reason?: string | null;
+  backend: string;
 };
 export type BroadcastPhase =
   | "idle"
@@ -667,6 +673,10 @@ type CommandSpec = {
   [COMMANDS.getVideoCaptureDevices]: {
     args?: undefined;
     result: VideoCaptureDeviceInfo[];
+  };
+  [COMMANDS.getScreenCaptureSupport]: {
+    args?: undefined;
+    result: ScreenCaptureSupport;
   };
   [COMMANDS.getVoiceCallState]: { args?: undefined; result: VoiceCallState };
   [COMMANDS.startScreenBroadcast]: { args: { peer_id: string }; result: void };
@@ -1015,6 +1025,7 @@ export const api = {
     }),
   getVideoCaptureSupport: () => invokeCommand(COMMANDS.getVideoCaptureSupport),
   getVideoCaptureDevices: () => invokeCommand(COMMANDS.getVideoCaptureDevices),
+  getScreenCaptureSupport: () => invokeCommand(COMMANDS.getScreenCaptureSupport),
   getVoiceCallState: () => invokeCommand(COMMANDS.getVoiceCallState),
   startScreenBroadcast: (peerId: string) =>
     invokeCommand(COMMANDS.startScreenBroadcast, { peer_id: peerId }),

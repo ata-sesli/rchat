@@ -21,7 +21,7 @@ For a visual showcase, visit [ata-sesli.github.io/rchat](https://ata-sesli.githu
 - **File and media messages** for images, documents, videos, audio, and stickers.
 - **Voice calls** over a dedicated QUIC media stream using Opus at 48 kHz mono.
 - **1:1 video calls** over a dedicated QUIC media stream using VP8.
-- **Screen broadcast** protocol scaffolding. This remains work in progress.
+- **Screen broadcasts** using native capture and VP8. This remains work in progress.
 - **Local peer discovery** with mDNS.
 - **Remote peer discovery** with encrypted GitHub Gist publication.
 - **Encrypted local configuration** protected by the vault password.
@@ -51,6 +51,7 @@ For a visual showcase, visit [ata-sesli.github.io/rchat](https://ata-sesli.githu
 - **rubato** handles sample-rate conversion for voice capture/playback.
 - **opus** encodes/decodes voice media.
 - **RChat's local libvpx wrapper** encodes VP8 video media through system libvpx.
+- **RChat's native capture crates** handle camera capture and screen capture outside the WebView.
 
 ## High-Level Architecture
 
@@ -66,7 +67,7 @@ flowchart TB
     appstate["Shared app state<br/>vault · database · network runtime"]
     storage["Storage layer"]
     network["Network manager<br/>libp2p swarm"]
-    live["Live media engines<br/>voice · 1:1 VP8 video · screen WIP"]
+    live["Live media engines<br/>voice · 1:1 VP8 video · native screen broadcast WIP"]
   end
 
   subgraph disk["Local disk"]
@@ -87,7 +88,7 @@ flowchart TB
     group["Group messages<br/>Gossipsub"]
     voice["Voice calls<br/>QUIC stream · Opus 48 kHz"]
     video["Video calls<br/>QUIC stream · VP8"]
-    wipmedia["Screen broadcast protocol<br/>work in progress"]
+    wipmedia["Screen broadcasts<br/>native capture · VP8 · WIP"]
     remote["Remote RChat peers"]
   end
 
@@ -356,9 +357,17 @@ The receiver decodes Opus packets back to PCM and feeds a playback queue. The vo
 
 The video stream carries ordered records for VP8 frames, receiver reports, camera state, and quality changes. Auto quality starts at `720p30` and can shift between `720p30`, `480p30`, and `360p30` based on encode/render pressure. Video calls reuse the existing Opus voice path for audio, and a one-sided camera session is valid.
 
-Screen broadcasts are still work in progress. They remain separate from the 1:1 video-call path and still depend on browser/WebView screen-capture APIs.
+Screen broadcasts are also moving to a native host-capture path:
 
-The UI asks the backend whether native camera capture is available and separately checks whether the WebView can decode/render remote VP8. Unsupported incoming video or broadcast sessions are rejected automatically.
+- macOS uses ScreenCaptureKit through RChat's local `rchat-screen-capture` crate,
+- Linux targets XDG Desktop Portal + PipeWire, which works with Wayland portal sessions such as Fedora GNOME,
+- Rust converts captured frames to I420 and encodes VP8 through `rchat-libvpx`,
+- the receiver still decodes/render incoming VP8 frames in the WebView with WebCodecs/canvas,
+- screen audio sharing is not implemented yet.
+
+Screen broadcasts remain work in progress, but the production host path no longer uses `getDisplayMedia`, `MediaStreamTrackProcessor`, or WebView-side `VideoEncoder`.
+
+The UI asks the backend whether native camera/screen capture is available and separately checks whether the WebView can decode/render remote VP8. Unsupported incoming video or broadcast sessions are rejected automatically.
 
 ## Frontend State Structure
 
@@ -391,6 +400,7 @@ Routes consume stores. They should not each independently subscribe to backend e
 - `src-tauri/src/live/video/` - video call protocol and manager.
 - `src-tauri/src/live/broadcast/` - screen broadcast protocol and manager.
 - `src-tauri/crates/rchat-video-capture/` - native camera capture and YUV/I420 conversion.
+- `src-tauri/crates/rchat-screen-capture/` - native screen capture, preview frames, and I420 conversion.
 - `src-tauri/src/commands/` - Tauri commands exposed to the frontend.
 
 ## Development
@@ -457,6 +467,7 @@ Notable native pieces:
 - `opus` links to native libopus through Rust bindings.
 - RChat's local `rchat-libvpx` crate links to native libvpx for VP8 video encoding.
 - RChat's local `rchat-video-capture` crate uses Nokhwa over AVFoundation on macOS and V4L2 on Linux for camera capture.
+- RChat's local `rchat-screen-capture` crate uses ScreenCaptureKit on macOS and XDG Desktop Portal + PipeWire on Linux for screen broadcasts.
 - `cpal` talks to platform audio backends.
 - `zeroconf` uses platform mDNS/Bonjour/Avahi-style functionality.
 - Tauri requires the usual platform WebView dependencies.

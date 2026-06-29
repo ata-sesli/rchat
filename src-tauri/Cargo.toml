@@ -8,14 +8,17 @@ edition = "2021"
 [workspace]
 members = [
     ".",
+    "crates/apple-metal-shim",
     "crates/rchat-audio-processing",
     "crates/rchat-libvpx",
+    "crates/rchat-screen-capture",
     "crates/rchat-video-capture",
     "crates/sonora-aec3",
 ]
 resolver = "2"
 
 [patch.crates-io]
+apple-metal = { path = "crates/apple-metal-shim" }
 sonora-aec3 = { path = "crates/sonora-aec3" }
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -83,6 +86,7 @@ cpal = "0.15.3"
 opus = "0.3.1"
 rchat-audio-processing = { path = "crates/rchat-audio-processing" }
 rchat-libvpx = { path = "crates/rchat-libvpx" }
+rchat-screen-capture = { path = "crates/rchat-screen-capture" }
 rchat-video-capture = { path = "crates/rchat-video-capture" }
 rubato = { version = "2.0.0", default-features = false }
 [dev-dependencies]

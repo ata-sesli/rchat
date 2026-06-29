@@ -1,9 +1,9 @@
 #!/usr/bin/env sh
 set -eu
 
-DEB_DEPS="libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 libasound2 libssl3 libopus0 libavahi-client3 libavahi-compat-libdnssd1"
+DEB_DEPS="libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 libasound2 libssl3 libopus0 libavahi-client3 libavahi-compat-libdnssd1 pipewire xdg-desktop-portal"
 DEB_LIBVPX_DEPS="libvpx9 libvpx8 libvpx7"
-RPM_DEPS="webkit2gtk4.1 gtk3 libayatana-appindicator-gtk3 librsvg2 alsa-lib openssl-libs opus libvpx avahi-compat-libdns_sd"
+RPM_DEPS="webkit2gtk4.1 gtk3 libayatana-appindicator-gtk3 librsvg2 alsa-lib openssl-libs opus libvpx avahi-compat-libdns_sd pipewire xdg-desktop-portal xdg-desktop-portal-gnome"
 
 usage() {
   cat <<USAGE

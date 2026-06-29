@@ -26,6 +26,7 @@ assert_contains alsa-lib-devel
 assert_contains openssl-devel
 assert_contains opus-devel
 assert_contains libvpx-devel
+assert_contains pipewire-devel
 assert_contains avahi-compat-libdns_sd-devel
 assert_contains clang
 assert_contains clang-devel

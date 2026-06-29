@@ -181,6 +181,25 @@ impl VideoWindowCounters {
     }
 }
 
+#[derive(Debug, Default)]
+struct ScreenBroadcastStats {
+    capture_start_failures: u64,
+    encoded_frames: u64,
+    keyframes: u64,
+    delta_frames: u64,
+    outbound_bytes: u64,
+    encode_errors: u64,
+    outbound_failures: u64,
+    inbound_failures: u64,
+    rejected_responses: u64,
+}
+
+impl ScreenBroadcastStats {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 enum VideoStreamEvent {
     InboundRecord {
         peer: PeerId,
@@ -481,6 +500,26 @@ pub struct NetworkManager {
     active_call: Option<ActiveCall>,
     // Current DM broadcast runtime state (single broadcast session).
     active_broadcast: Option<ActiveBroadcast>,
+    // Pending native screen-capture startup task; polled from the broadcast tick.
+    screen_capture_start_task: Option<broadcast::ScreenCaptureStartTask>,
+    // Native screen capture for the active host broadcast.
+    screen_capture_session: Option<rchat_screen_capture::ScreenCaptureSession>,
+    // Capture session metadata for diagnostics.
+    screen_capture_info: Option<rchat_screen_capture::ScreenCaptureSessionInfo>,
+    // Last capture stats snapshot, retained after stopping.
+    screen_capture_last_stats: rchat_screen_capture::ScreenCaptureSessionStats,
+    // Start time for the current native screen-capture session.
+    screen_capture_started_at: Option<std::time::Instant>,
+    // VP8 encoder for outbound screen-broadcast frames.
+    screen_broadcast_vp8_encoder: Option<broadcast::ScreenBroadcastVp8Encoder>,
+    // Sequence number for outgoing screen-broadcast VP8 frames.
+    screen_broadcast_next_seq: u32,
+    // Force next screen-broadcast packet to be a keyframe.
+    screen_broadcast_force_next_keyframe: bool,
+    // Aggregated screen-broadcast diagnostics.
+    screen_broadcast_stats: ScreenBroadcastStats,
+    // Last time screen-broadcast diagnostics were printed.
+    screen_broadcast_last_summary_at: Option<std::time::Instant>,
     // Backend audio engine for current active call.
     voice_audio_engine: Option<crate::live::voice::voice::VoiceAudioEngine>,
     // Captured local PCM16 frames from audio engine.
@@ -743,6 +782,16 @@ impl NetworkManager {
             persistence_worker_handles,
             active_call: None,
             active_broadcast: None,
+            screen_capture_start_task: None,
+            screen_capture_session: None,
+            screen_capture_info: None,
+            screen_capture_last_stats: rchat_screen_capture::ScreenCaptureSessionStats::default(),
+            screen_capture_started_at: None,
+            screen_broadcast_vp8_encoder: None,
+            screen_broadcast_next_seq: 0,
+            screen_broadcast_force_next_keyframe: true,
+            screen_broadcast_stats: ScreenBroadcastStats::default(),
+            screen_broadcast_last_summary_at: None,
             voice_audio_engine: None,
             voice_capture_rx: None,
             voice_stream_event_rx,

@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-REQUIRED_PACKAGES="libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 libasound2 libssl3 libopus0 libavahi-client3 libavahi-compat-libdnssd1"
+REQUIRED_PACKAGES="libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 libasound2 libssl3 libopus0 libavahi-client3 libavahi-compat-libdnssd1 pipewire xdg-desktop-portal"
 LIBVPX_PACKAGES="libvpx9 libvpx8 libvpx7"
 
 missing=""

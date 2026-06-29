@@ -119,21 +119,14 @@
   let videoFrameUnlisten: (() => void) | null = null;
   let broadcastFrameUnlisten: (() => void) | null = null;
   let localPreviewFrameUnlisten: (() => void) | null = null;
+  let screenPreviewFrameUnlisten: (() => void) | null = null;
   let cameraErrorUnlisten: (() => void) | null = null;
-  let localVideoEl: HTMLVideoElement | null = null;
+  let screenCaptureErrorUnlisten: (() => void) | null = null;
   let localPreviewCanvasEl: HTMLCanvasElement | null = null;
   let localPreviewCanvasCtx: CanvasRenderingContext2D | null = null;
   let localPreviewError: string | null = null;
   let remoteVideoCanvasEl: HTMLCanvasElement | null = null;
   let remoteVideoCanvasCtx: CanvasRenderingContext2D | null = null;
-  let localVideoStream: MediaStream | null = null;
-  let localVideoEncoder: any | null = null;
-  let localVideoTrackReader: ReadableStreamDefaultReader<any> | null = null;
-  let localVideoCaptureLoopRunning = false;
-  let localVideoCaptureKey: string | null = null;
-  let localVideoSeq = 0;
-  let localVideoMime = "video/webm;codecs=vp8";
-  let localVideoCodec = "vp8";
   let remoteVideoDecoder: any | null = null;
   let remoteVideoDecoderCodec: string | null = null;
   let remoteExpectedSeq: number | null = null;
@@ -242,7 +235,6 @@
     broadcastState.ring_expires_at && broadcastState.phase !== "active"
       ? Math.max(0, broadcastState.ring_expires_at - callClockSec)
       : 0;
-  $: setLocalVideoElementStream();
   $: canPressVideoCallButton =
     canStartVideoCall &&
     (voiceCallState.phase === "idle" || canUpgradeVoiceToVideo) &&
@@ -276,32 +268,6 @@
     } catch {
       return String(error);
     }
-  }
-
-  function detectScreenBroadcastSupport(): {
-    supported: boolean;
-    reason: string | null;
-  } {
-    if (!navigator?.mediaDevices?.getDisplayMedia) {
-      return {
-        supported: false,
-        reason: "Screen capture is unavailable on this client.",
-      };
-    }
-    const w = window as any;
-    if (!w.MediaStreamTrackProcessor) {
-      return {
-        supported: false,
-        reason: "Track processing API is unavailable for screen sharing.",
-      };
-    }
-    if (!w.VideoEncoder) {
-      return {
-        supported: false,
-        reason: "WebCodecs video encode is unavailable for screen sharing.",
-      };
-    }
-    return { supported: true, reason: null };
   }
 
   function normalizeVideoProfile(value: unknown): VideoProfile {
@@ -367,13 +333,6 @@
     return null;
   }
 
-  function setLocalVideoElementStream() {
-    if (!localVideoEl) return;
-    if ("srcObject" in localVideoEl) {
-      localVideoEl.srcObject = localVideoStream;
-    }
-  }
-
   function clearLocalPreview() {
     localPreviewError = null;
     if (localPreviewCanvasCtx && localPreviewCanvasEl) {
@@ -416,6 +375,50 @@
     if (!eventPayload || !activeCallId || eventPayload.call_id !== activeCallId) return;
     const message = String(eventPayload.message || "Camera capture failed.");
     logVideoCapture("camera error", { call_id: activeCallId, message });
+    localPreviewError = message;
+  }
+
+  function handleScreenBroadcastPreviewFrame(eventPayload: any) {
+    if (
+      !eventPayload ||
+      !activeBroadcastSessionId ||
+      eventPayload.session_id !== activeBroadcastSessionId
+    ) {
+      return;
+    }
+    if (!isBroadcastHostInThisChat) return;
+    const payload = normalizeBinaryPayload(eventPayload.rgba);
+    const width = Number(eventPayload.width || 0);
+    const height = Number(eventPayload.height || 0);
+    if (!payload || width <= 0 || height <= 0 || payload.length !== width * height * 4) {
+      return;
+    }
+    if (!localPreviewCanvasEl) return;
+    localPreviewCanvasCtx =
+      localPreviewCanvasCtx || localPreviewCanvasEl.getContext("2d");
+    if (!localPreviewCanvasCtx) return;
+    if (localPreviewCanvasEl.width !== width || localPreviewCanvasEl.height !== height) {
+      localPreviewCanvasEl.width = width;
+      localPreviewCanvasEl.height = height;
+    }
+    const image = new ImageData(new Uint8ClampedArray(payload), width, height);
+    localPreviewCanvasCtx.putImageData(image, 0, 0);
+    localPreviewError = null;
+  }
+
+  function handleScreenBroadcastCaptureError(eventPayload: any) {
+    if (
+      !eventPayload ||
+      !activeBroadcastSessionId ||
+      eventPayload.session_id !== activeBroadcastSessionId
+    ) {
+      return;
+    }
+    const message = String(eventPayload.message || "Screen capture failed.");
+    logVideoCapture("screen capture error", {
+      session_id: activeBroadcastSessionId,
+      message,
+    });
     localPreviewError = message;
   }
 
@@ -525,7 +528,12 @@
   }
 
   async function ensureRemoteVideoDecoder(codec: string): Promise<boolean> {
-    if (!videoCallSupported) {
+    if (isBroadcastViewerInThisChat && !screenBroadcastSupported) {
+      remoteVideoStateError =
+        screenBroadcastUnsupportedReason || "Screen sharing is unsupported.";
+      return false;
+    }
+    if (!isBroadcastViewerInThisChat && !videoCallSupported) {
       remoteVideoStateError = videoCallUnsupportedReason || "Video calls are unsupported.";
       return false;
     }
@@ -740,78 +748,6 @@
     await handleIncomingVideoFrame(normalized);
   }
 
-  async function chooseEncoderConfig(): Promise<{
-    codec: string;
-    mime: string;
-    config: any;
-  } | null> {
-    const encoderCtor = (window as any).VideoEncoder;
-    if (!encoderCtor) return null;
-
-    const candidates = [
-      { codec: "vp8", mime: "video/webm;codecs=vp8" },
-      { codec: "avc1.42E01E", mime: "video/mp4;codecs=avc1.42E01E" },
-    ];
-
-    for (const candidate of candidates) {
-      const config = {
-        codec: candidate.codec,
-        width: 640,
-        height: 360,
-        framerate: 8,
-        bitrate: 480_000,
-        latencyMode: "realtime",
-      };
-      try {
-        if (encoderCtor.isConfigSupported) {
-          const support = await encoderCtor.isConfigSupported(config);
-          if (!support?.supported) continue;
-        }
-        return { codec: candidate.codec, mime: candidate.mime, config };
-      } catch {
-        // try next
-      }
-    }
-
-    return null;
-  }
-
-  function stopLocalVideoCapture() {
-    localVideoCaptureLoopRunning = false;
-    localVideoCaptureKey = null;
-    if (localVideoTrackReader) {
-      try {
-        void localVideoTrackReader.cancel();
-      } catch (e) {
-        console.error("Failed stopping video track reader:", e);
-      }
-      localVideoTrackReader = null;
-    }
-    if (localVideoEncoder) {
-      try {
-        localVideoEncoder.flush?.();
-        localVideoEncoder.close?.();
-      } catch (e) {
-        console.error("Failed stopping local video encoder:", e);
-      }
-      localVideoEncoder = null;
-    }
-    if (localVideoStream) {
-      for (const track of localVideoStream.getTracks()) {
-        track.stop();
-      }
-      localVideoStream = null;
-    }
-    setLocalVideoElementStream();
-  }
-
-  function currentVideoCaptureKey(): string | null {
-    if (isBroadcastHostInThisChat && activeBroadcastSessionId) {
-      return `broadcast:${activeBroadcastSessionId}`;
-    }
-    return null;
-  }
-
   async function setVideoQualityMode(mode: VideoQualityMode) {
     videoQualityMode = mode;
     if (!activeCallId || !isVideoCallActiveInThisChat) return;
@@ -819,154 +755,6 @@
       await api.setVideoCallQuality(activeCallId, mode);
     } catch (e) {
       console.error("Failed to set video quality:", e);
-    }
-  }
-
-  async function startLocalVideoCapture() {
-    if (!isBroadcastHostInThisChat) return;
-    if (localVideoStream) return;
-    const sessionId = activeBroadcastSessionId;
-    if (!sessionId) return;
-    const captureKey = currentVideoCaptureKey();
-    if (!captureKey) return;
-
-    if (!screenBroadcastSupported) {
-      remoteVideoStateError =
-        screenBroadcastUnsupportedReason || "Screen share is unsupported.";
-      await onEndScreenBroadcast(sessionId);
-      return;
-    }
-
-    try {
-      const mediaDevices = navigator.mediaDevices;
-      const processorAvailable = Boolean((window as any).MediaStreamTrackProcessor);
-      const encoderAvailable = Boolean((window as any).VideoEncoder);
-      logVideoCapture("getDisplayMedia requested", {
-        call_id: sessionId,
-        mode: "screen_broadcast",
-        track_processor: processorAvailable,
-        video_encoder: encoderAvailable,
-      });
-      const stream = await mediaDevices.getDisplayMedia({
-        video: {
-          frameRate: { ideal: 8, max: 12 },
-        },
-        audio: false,
-      });
-      logVideoCapture("getDisplayMedia ok", {
-        call_id: sessionId,
-        tracks: stream.getVideoTracks().length,
-      });
-      localVideoStream = stream;
-      localVideoCaptureKey = captureKey;
-      setLocalVideoElementStream();
-      localVideoSeq = 0;
-      const videoTrack = stream.getVideoTracks()[0];
-      if (!videoTrack) {
-        throw new Error("No video track available.");
-      }
-      videoTrack.onended = () => {
-        if (activeBroadcastSessionId) {
-          void onEndScreenBroadcast(activeBroadcastSessionId);
-        }
-      };
-
-      const processorCtor = (window as any).MediaStreamTrackProcessor;
-      if (!processorCtor) {
-        throw new Error("Track processing API is unavailable.");
-      }
-
-      logVideoCapture("using track processor", {
-        call_id: sessionId,
-        track_label: videoTrack.label,
-        track_state: videoTrack.readyState,
-      });
-      const processor = new processorCtor({ track: videoTrack });
-      localVideoTrackReader = processor.readable.getReader();
-
-      const selected = await chooseEncoderConfig();
-      if (!selected) {
-        throw new Error("No supported low-latency encoder config.");
-      }
-      localVideoMime = selected.mime;
-      localVideoCodec = selected.codec;
-      const encoderCtor = (window as any).VideoEncoder;
-      localVideoEncoder = new encoderCtor({
-        output: (chunk: any) => {
-          try {
-            const bytes = new Uint8Array(chunk.byteLength);
-            chunk.copyTo(bytes);
-            const chunkType: VideoChunkType = chunk.type === "key" ? "key" : "delta";
-            void api
-              .sendScreenBroadcastChunk(
-                sessionId,
-                localVideoSeq,
-                Number(chunk.timestamp ?? Math.floor(performance.now() * 1000)),
-                localVideoMime,
-                localVideoCodec,
-                chunkType as BroadcastChunkType,
-                bytes,
-              )
-              .catch((err) => {
-                console.error("Failed to send encoded screen chunk:", err);
-              });
-            localVideoSeq += 1;
-          } catch (e) {
-            console.error("Failed to package encoded chunk:", e);
-          }
-        },
-        error: (err: unknown) => {
-          console.error("Local video encoder error:", err);
-        },
-      });
-
-      localVideoEncoder.configure(selected.config);
-
-      localVideoCaptureLoopRunning = true;
-      let frameCount = 0;
-      while (localVideoCaptureLoopRunning && localVideoTrackReader) {
-        const { value: videoFrame, done } = await localVideoTrackReader.read();
-        if (done || !videoFrame) break;
-        try {
-          if (captureKey !== localVideoCaptureKey) {
-            break;
-          }
-          if (localVideoEncoder) {
-            const forceKeyFrame = frameCount % 24 === 0;
-            localVideoEncoder.encode(videoFrame, { keyFrame: forceKeyFrame });
-          }
-          frameCount += 1;
-        } finally {
-          videoFrame.close();
-        }
-      }
-      logVideoCapture("track processor loop ended", {
-        call_id: sessionId,
-        frame_count: frameCount,
-      });
-    } catch (e) {
-      console.error("Failed to start local video capture:", e);
-      const err = e as { name?: string; message?: string };
-      logVideoCapture("getDisplayMedia/capture failed", {
-        call_id: sessionId,
-        name: err?.name || "Error",
-        message: err?.message || String(e),
-      });
-      remoteVideoStateError = "Screen capture failed.";
-      stopLocalVideoCapture();
-      await onEndScreenBroadcast(sessionId);
-    }
-  }
-
-  $: {
-    const desiredCaptureKey = currentVideoCaptureKey();
-    if (desiredCaptureKey) {
-      if (localVideoCaptureKey && localVideoCaptureKey !== desiredCaptureKey) {
-        stopLocalVideoCapture();
-      }
-      void startLocalVideoCapture();
-    } else if (localVideoEncoder || localVideoStream) {
-      stopLocalVideoCapture();
     }
   }
 
@@ -1638,23 +1426,16 @@
   }
 
   onMount(async () => {
-    const broadcastSupport = detectScreenBroadcastSupport();
-    if (!screenBroadcastSupported || broadcastSupport.supported === false) {
-      screenBroadcastSupported = screenBroadcastSupported && broadcastSupport.supported;
-      screenBroadcastUnsupportedReason =
-        screenBroadcastUnsupportedReason || broadcastSupport.reason;
-    }
     const w = window as any;
     logVideoCapture("support", {
       native_camera: videoCallSupported,
-      display: Boolean(navigator?.mediaDevices?.getDisplayMedia),
-      track_processor: Boolean(w.MediaStreamTrackProcessor),
-      video_encoder: Boolean(w.VideoEncoder),
+      native_screen_capture: screenBroadcastSupported,
       video_decoder: Boolean(w.VideoDecoder),
       encoded_video_chunk: Boolean(w.EncodedVideoChunk),
       video_call_supported: videoCallSupported,
       screen_broadcast_supported: screenBroadcastSupported,
       outbound_video_capture: "native",
+      outbound_screen_capture: "native",
     });
     if (!canUseRecorderApi()) {
       recorderDisabledReason = "Recording is not supported on this device.";
@@ -1672,9 +1453,21 @@
         handleLocalPreviewFrame(event.payload);
       },
     );
+    screenPreviewFrameUnlisten = await listen(
+      "screen-broadcast-local-preview-frame",
+      (event: any) => {
+        handleScreenBroadcastPreviewFrame(event.payload);
+      },
+    );
     cameraErrorUnlisten = await listen("video-call-camera-error", (event: any) => {
       handleVideoCameraError(event.payload);
     });
+    screenCaptureErrorUnlisten = await listen(
+      "screen-broadcast-capture-error",
+      (event: any) => {
+        handleScreenBroadcastCaptureError(event.payload);
+      },
+    );
     videoQualityUnlisten = await listen("video-call-quality-updated", (event: any) => {
       const payload = event.payload || {};
       if (!activeCallId || payload.call_id !== activeCallId) return;
@@ -1702,7 +1495,6 @@
     stopRecordingStream();
     clearRecordedPreviewUrl();
     void cleanupTempRecording();
-    stopLocalVideoCapture();
     resetRemoteVideoDecodeState();
     if (videoFrameUnlisten) {
       videoFrameUnlisten();
@@ -1716,9 +1508,17 @@
       localPreviewFrameUnlisten();
       localPreviewFrameUnlisten = null;
     }
+    if (screenPreviewFrameUnlisten) {
+      screenPreviewFrameUnlisten();
+      screenPreviewFrameUnlisten = null;
+    }
     if (cameraErrorUnlisten) {
       cameraErrorUnlisten();
       cameraErrorUnlisten = null;
+    }
+    if (screenCaptureErrorUnlisten) {
+      screenCaptureErrorUnlisten();
+      screenCaptureErrorUnlisten = null;
     }
     if (videoQualityUnlisten) {
       videoQualityUnlisten();
@@ -1978,18 +1778,12 @@
   <div class="px-6 pt-3">
     <div class="relative rounded-xl border border-theme-base-700 bg-theme-base-900/70 overflow-hidden h-36 flex items-center justify-center">
       {#if isBroadcastHostInThisChat}
-        {#if localVideoStream}
-          <video
-            bind:this={localVideoEl}
-            autoplay
-            muted
-            playsinline
-            class="w-full h-full object-cover"
-          ></video>
-        {:else}
+        {#if localPreviewError}
           <div class="text-xs text-theme-base-300 px-3 text-center">
-            Waiting for display capture…
+            {localPreviewError}
           </div>
+        {:else}
+          <canvas bind:this={localPreviewCanvasEl} class="w-full h-full object-cover"></canvas>
         {/if}
       {:else if remoteVideoStateError}
         <div class="text-xs text-theme-base-300 px-3 text-center">

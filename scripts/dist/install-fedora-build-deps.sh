@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-FEDORA_BUILD_DEPS="webkit2gtk4.1-devel gtk3-devel libayatana-appindicator-gtk3-devel librsvg2-devel alsa-lib-devel openssl-devel opus-devel libvpx-devel avahi-compat-libdns_sd-devel clang clang-devel pkgconf-pkg-config gcc gcc-c++ make patchelf rpm-build git"
+FEDORA_BUILD_DEPS="webkit2gtk4.1-devel gtk3-devel libayatana-appindicator-gtk3-devel librsvg2-devel alsa-lib-devel openssl-devel opus-devel libvpx-devel pipewire-devel avahi-compat-libdns_sd-devel clang clang-devel pkgconf-pkg-config gcc gcc-c++ make patchelf rpm-build git"
 
 usage() {
   cat <<USAGE

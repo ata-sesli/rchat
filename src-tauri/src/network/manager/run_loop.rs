@@ -71,8 +71,8 @@ impl NetworkManager {
         let mut voice_call_tick = tokio::time::interval(std::time::Duration::from_millis(20));
         // Video-call tick: native camera frame pump + stream lifecycle + diagnostics/adaptation.
         let mut video_call_tick = tokio::time::interval(std::time::Duration::from_millis(15));
-        // Broadcast tick: ring timeout lifecycle.
-        let mut broadcast_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        // Broadcast tick: ring timeout lifecycle + native screen-capture pump.
+        let mut broadcast_tick = tokio::time::interval(std::time::Duration::from_millis(33));
         // Ensure mDNS runtime reflects current connectivity settings.
         let mut mdns_reconcile_interval = tokio::time::interval(std::time::Duration::from_secs(2));
 

@@ -33,8 +33,8 @@ const defaultLiveState: LiveState = {
   broadcastState: idleBroadcastState,
   videoCallSupported: false,
   videoCallUnsupportedReason: "Checking native camera support.",
-  screenBroadcastSupported: true,
-  screenBroadcastUnsupportedReason: null,
+  screenBroadcastSupported: false,
+  screenBroadcastUnsupportedReason: "Checking native screen capture support.",
   diagnostics: null,
 };
 
@@ -89,29 +89,41 @@ async function detectVideoCallSupport(): Promise<{
   }
 }
 
-function detectScreenBroadcastSupport(): {
+async function detectScreenBroadcastSupport(): Promise<{
   supported: boolean;
   reason: string | null;
-} {
-  if (!navigator?.mediaDevices?.getDisplayMedia) {
-    return {
-      supported: false,
-      reason: "Screen capture is unavailable on this client.",
-    };
+}> {
+  if (typeof window === "undefined") {
+    return { supported: false, reason: "Unavailable in this environment." };
   }
   const w = window as any;
-  if (!w.MediaStreamTrackProcessor || !w.VideoEncoder) {
+  if (!w.VideoDecoder || !w.EncodedVideoChunk) {
     return {
       supported: false,
-      reason: "Low-latency screen capture is unavailable on this client.",
+      reason: "WebCodecs video decode is unavailable on this client.",
     };
   }
-  return { supported: true, reason: null };
+  try {
+    const support = await api.getScreenCaptureSupport();
+    if (!support.supported) {
+      return {
+        supported: false,
+        reason: support.reason || "Native screen capture is unavailable.",
+      };
+    }
+    return { supported: true, reason: null };
+  } catch (e) {
+    return {
+      supported: false,
+      reason:
+        e instanceof Error ? e.message : "Native screen capture support check failed.",
+    };
+  }
 }
 
 async function applySupportDetection() {
   const video = await detectVideoCallSupport();
-  const broadcast = detectScreenBroadcastSupport();
+  const broadcast = await detectScreenBroadcastSupport();
   liveState.update((state) => ({
     ...state,
     videoCallSupported: video.supported,
