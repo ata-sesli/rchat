@@ -1,0 +1,9 @@
+[package]
+name = "rchat-video-capture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+nokhwa = { version = "0.10.11", default-features = false, features = ["input-native", "decoding"] }
+thiserror = "2.0"
