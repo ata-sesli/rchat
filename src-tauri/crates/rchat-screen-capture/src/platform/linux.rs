@@ -15,7 +15,7 @@ use pipewire as pw;
 use pw::{properties::properties, spa};
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
@@ -354,12 +354,12 @@ fn run_pipewire_capture(
             Range,
             Fraction,
             pw::spa::utils::Fraction {
-                num: profile.fps() as i32,
+                num: profile.fps(),
                 denom: 1
             },
             pw::spa::utils::Fraction { num: 0, denom: 1 },
             pw::spa::utils::Fraction {
-                num: profile.fps() as i32,
+                num: profile.fps(),
                 denom: 1
             }
         ),
@@ -371,8 +371,9 @@ fn run_pipewire_capture(
     .map_err(|e| ScreenCaptureError::Backend(e.to_string()))?
     .0
     .into_inner();
-    let mut params = [spa::pod::Pod::from_bytes(&values)
-        .map_err(|e| ScreenCaptureError::Backend(e.to_string()))?];
+    let mut params = [spa::pod::Pod::from_bytes(&values).ok_or_else(|| {
+        ScreenCaptureError::Backend("failed to build PipeWire stream format parameter".to_string())
+    })?];
 
     stream
         .connect(

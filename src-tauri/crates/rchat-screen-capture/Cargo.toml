@@ -12,5 +12,5 @@ apple-metal = "=0.8.7"
 screencapturekit = { version = "8.0.0", features = ["async", "macos_14_0"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-ashpd = "0.13.12"
+ashpd = { version = "0.13.12", features = ["screencast"] }
 pipewire = "0.10.0"
