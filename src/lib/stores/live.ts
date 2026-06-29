@@ -2,6 +2,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { get } from "svelte/store";
 import { writable } from "svelte/store";
 import { getChatKind } from "$lib/chatKind";
+import { screenBroadcastCapabilitiesFromChecks } from "$lib/stores/liveSupport";
 import { isChatConnected, presencePeerKey } from "$lib/stores/presence";
 import {
   api,
@@ -22,6 +23,8 @@ export type LiveState = {
   videoCallUnsupportedReason: string | null;
   screenBroadcastSupported: boolean;
   screenBroadcastUnsupportedReason: string | null;
+  screenBroadcastViewerSupported: boolean;
+  screenBroadcastViewerUnsupportedReason: string | null;
   diagnostics: null;
 };
 
@@ -35,6 +38,8 @@ const defaultLiveState: LiveState = {
   videoCallUnsupportedReason: "Checking native camera support.",
   screenBroadcastSupported: false,
   screenBroadcastUnsupportedReason: "Checking native screen capture support.",
+  screenBroadcastViewerSupported: false,
+  screenBroadcastViewerUnsupportedReason: "Checking screen share viewer support.",
   diagnostics: null,
 };
 
@@ -90,34 +95,46 @@ async function detectVideoCallSupport(): Promise<{
 }
 
 async function detectScreenBroadcastSupport(): Promise<{
-  supported: boolean;
-  reason: string | null;
+  hostSupported: boolean;
+  hostReason: string | null;
+  viewerSupported: boolean;
+  viewerReason: string | null;
 }> {
   if (typeof window === "undefined") {
-    return { supported: false, reason: "Unavailable in this environment." };
+    return screenBroadcastCapabilitiesFromChecks({
+      decodeSupported: false,
+      decodeReason: "Unavailable in this environment.",
+      captureSupported: false,
+      captureReason: "Unavailable in this environment.",
+    });
   }
   const w = window as any;
   if (!w.VideoDecoder || !w.EncodedVideoChunk) {
-    return {
-      supported: false,
-      reason: "WebCodecs video decode is unavailable on this client.",
-    };
+    return screenBroadcastCapabilitiesFromChecks({
+      decodeSupported: false,
+      decodeReason: "WebCodecs video decode is unavailable on this client.",
+      captureSupported: false,
+      captureReason: null,
+    });
   }
   try {
     const support = await api.getScreenCaptureSupport();
-    if (!support.supported) {
-      return {
-        supported: false,
-        reason: support.reason || "Native screen capture is unavailable.",
-      };
-    }
-    return { supported: true, reason: null };
+    return screenBroadcastCapabilitiesFromChecks({
+      decodeSupported: true,
+      decodeReason: null,
+      captureSupported: support.supported,
+      captureReason: support.supported
+        ? null
+        : support.reason || "Native screen capture is unavailable.",
+    });
   } catch (e) {
-    return {
-      supported: false,
-      reason:
+    return screenBroadcastCapabilitiesFromChecks({
+      decodeSupported: true,
+      decodeReason: null,
+      captureSupported: false,
+      captureReason:
         e instanceof Error ? e.message : "Native screen capture support check failed.",
-    };
+    });
   }
 }
 
@@ -128,8 +145,10 @@ async function applySupportDetection() {
     ...state,
     videoCallSupported: video.supported,
     videoCallUnsupportedReason: video.reason,
-    screenBroadcastSupported: broadcast.supported,
-    screenBroadcastUnsupportedReason: broadcast.reason,
+    screenBroadcastSupported: broadcast.hostSupported,
+    screenBroadcastUnsupportedReason: broadcast.hostReason,
+    screenBroadcastViewerSupported: broadcast.viewerSupported,
+    screenBroadcastViewerUnsupportedReason: broadcast.viewerReason,
   }));
 }
 
@@ -161,7 +180,7 @@ function maybeAutoRejectUnsupportedCalls() {
   const incomingUnsupportedBroadcastId =
     broadcast.phase === "incoming_ringing" &&
     broadcast.session_id &&
-    !state.screenBroadcastSupported
+    !state.screenBroadcastViewerSupported
       ? broadcast.session_id
       : null;
 

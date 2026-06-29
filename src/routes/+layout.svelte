@@ -102,9 +102,9 @@
   $: broadcastState = $liveState.broadcastState;
   $: videoCallSupported = $liveState.videoCallSupported;
   $: videoCallUnsupportedReason = $liveState.videoCallUnsupportedReason;
-  $: screenBroadcastSupported = $liveState.screenBroadcastSupported;
-  $: screenBroadcastUnsupportedReason =
-    $liveState.screenBroadcastUnsupportedReason;
+  $: screenBroadcastViewerSupported = $liveState.screenBroadcastViewerSupported;
+  $: screenBroadcastViewerUnsupportedReason =
+    $liveState.screenBroadcastViewerUnsupportedReason;
   $: if (
     !isLoginRoute &&
     $appSession.authChecked &&
@@ -705,9 +705,9 @@
             <div class="text-lg font-semibold text-theme-base-100 mb-2 truncate">
               {broadcastState.peer_id || "Unknown peer"}
             </div>
-            {#if !screenBroadcastSupported}
+            {#if !screenBroadcastViewerSupported}
               <div class="text-xs text-theme-base-400 mb-2">
-                {screenBroadcastUnsupportedReason || "Screen share is not supported on this client."}
+                {screenBroadcastViewerUnsupportedReason || "Screen share is not supported on this client."}
               </div>
             {/if}
             <div class="text-xs text-theme-base-400 mb-4">
@@ -725,7 +725,7 @@
               <button
                 onclick={acceptIncomingBroadcast}
                 class="px-4 py-2 rounded-lg bg-theme-success-600 hover:bg-theme-success-500 text-white"
-                disabled={!screenBroadcastSupported}
+                disabled={!screenBroadcastViewerSupported}
               >
                 Accept
               </button>

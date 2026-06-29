@@ -84,6 +84,8 @@
   export let videoCallUnsupportedReason: string | null = null;
   export let screenBroadcastSupported = true;
   export let screenBroadcastUnsupportedReason: string | null = null;
+  export let screenBroadcastViewerSupported = true;
+  export let screenBroadcastViewerUnsupportedReason: string | null = null;
   export let onStartVoiceCall = () => {};
   export let onStartVideoCall = () => {};
   export let onStartScreenBroadcast = () => {};
@@ -528,9 +530,9 @@
   }
 
   async function ensureRemoteVideoDecoder(codec: string): Promise<boolean> {
-    if (isBroadcastViewerInThisChat && !screenBroadcastSupported) {
+    if (isBroadcastViewerInThisChat && !screenBroadcastViewerSupported) {
       remoteVideoStateError =
-        screenBroadcastUnsupportedReason || "Screen sharing is unsupported.";
+        screenBroadcastViewerUnsupportedReason || "Screen sharing is unsupported.";
       return false;
     }
     if (!isBroadcastViewerInThisChat && !videoCallSupported) {

@@ -44,6 +44,8 @@
     videoCallUnsupportedReason={$liveState.videoCallUnsupportedReason}
     screenBroadcastSupported={$liveState.screenBroadcastSupported}
     screenBroadcastUnsupportedReason={$liveState.screenBroadcastUnsupportedReason}
+    screenBroadcastViewerSupported={$liveState.screenBroadcastViewerSupported}
+    screenBroadcastViewerUnsupportedReason={$liveState.screenBroadcastViewerUnsupportedReason}
     onStartVoiceCall={async () => {
       try {
         await liveActions.startVoiceCall(activePeer);
