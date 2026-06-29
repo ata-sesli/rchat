@@ -25,7 +25,9 @@
   import { getChatKind } from "$lib/chatKind";
   import { presencePeerKey } from "$lib/stores/presence";
   import {
+    createRemoteVideoReceiveQueue,
     createRemoteVideoReceiveState,
+    enqueueRemoteVideoReceiveTask,
     hasRemoteVideoKeyframe,
     markRemoteVideoDecoderFailed,
     markRemoteVideoSequenceGap,
@@ -134,6 +136,8 @@
   let remoteExpectedSeq: number | null = null;
   let remotePendingFrames = new Map<number, IncomingFrame>();
   let remoteReceiveState = createRemoteVideoReceiveState();
+  let remoteReceiveQueue = createRemoteVideoReceiveQueue();
+  let remoteLastSubmittedFrame: IncomingFrame | null = null;
   let videoQualityMode: VideoQualityMode = "auto";
   let activeVideoProfile: VideoProfile = "720p30";
   let videoQualityUnlisten: (() => void) | null = null;
@@ -450,6 +454,8 @@
     remotePendingFrames.clear();
     remoteExpectedSeq = null;
     remoteReceiveState = createRemoteVideoReceiveState();
+    remoteReceiveQueue = createRemoteVideoReceiveQueue();
+    remoteLastSubmittedFrame = null;
     closeRemoteVideoDecoder();
     if (remoteVideoCanvasCtx && remoteVideoCanvasEl) {
       remoteVideoCanvasCtx.clearRect(
@@ -569,6 +575,9 @@
           logVideoCapture("remote decoder callback error", {
             call_id: activeRemoteSessionId() || "none",
             codec,
+            seq: remoteLastSubmittedFrame?.seq ?? "none",
+            chunk_type: remoteLastSubmittedFrame?.chunk_type ?? "none",
+            bytes: remoteLastSubmittedFrame?.payload.byteLength ?? 0,
             error: describeError(err),
           });
           remoteVideoDecodeErrors += 1;
@@ -612,6 +621,7 @@
         data: frame.payload,
       });
       remoteVideoReceivedFrames += 1;
+      remoteLastSubmittedFrame = frame;
       remoteVideoDecoder.decode(encoded);
     } catch (e) {
       console.error("Failed to decode incoming video frame:", e);
@@ -748,6 +758,34 @@
       payload: eventPayload.payload,
     };
     await handleIncomingVideoFrame(normalized);
+  }
+
+  function enqueueIncomingVideoFrame(eventPayload: any) {
+    void enqueueRemoteVideoReceiveTask(
+      remoteReceiveQueue,
+      () => handleIncomingVideoFrame(eventPayload),
+      (error) => {
+        console.error("Remote video receive task failed:", error);
+        logVideoCapture("remote receive task failed", {
+          call_id: activeRemoteSessionId() || "none",
+          error: describeError(error),
+        });
+      },
+    );
+  }
+
+  function enqueueIncomingBroadcastFrame(eventPayload: any) {
+    void enqueueRemoteVideoReceiveTask(
+      remoteReceiveQueue,
+      () => handleIncomingBroadcastFrame(eventPayload),
+      (error) => {
+        console.error("Remote broadcast receive task failed:", error);
+        logVideoCapture("remote broadcast receive task failed", {
+          call_id: activeRemoteSessionId() || "none",
+          error: describeError(error),
+        });
+      },
+    );
   }
 
   async function setVideoQualityMode(mode: VideoQualityMode) {
@@ -1444,10 +1482,10 @@
     }
     void cleanupStaleTempRecordings();
     videoFrameUnlisten = await listen("video-call-frame", (event: any) => {
-      void handleIncomingVideoFrame(event.payload);
+      enqueueIncomingVideoFrame(event.payload);
     });
     broadcastFrameUnlisten = await listen("broadcast-frame", (event: any) => {
-      void handleIncomingBroadcastFrame(event.payload);
+      enqueueIncomingBroadcastFrame(event.payload);
     });
     localPreviewFrameUnlisten = await listen(
       "video-call-local-preview-frame",

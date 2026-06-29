@@ -1,7 +1,9 @@
 // @ts-nocheck
 import { describe, expect, test } from "bun:test";
 import {
+  createRemoteVideoReceiveQueue,
   createRemoteVideoReceiveState,
+  enqueueRemoteVideoReceiveTask,
   markRemoteVideoDecoderFailed,
   markRemoteVideoSequenceGap,
   shouldDecodeRemoteVideoFrame,
@@ -59,5 +61,31 @@ describe("remote video receive state", () => {
       decode: true,
       waitingForKeyframe: false,
     });
+  });
+
+  test("serializes async frame processing in arrival order", async () => {
+    const queue = createRemoteVideoReceiveQueue();
+    const events: string[] = [];
+    let releaseFirst = () => {};
+    const firstCanFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    const first = enqueueRemoteVideoReceiveTask(queue, async () => {
+      events.push("first:start");
+      await firstCanFinish;
+      events.push("first:end");
+    });
+    const second = enqueueRemoteVideoReceiveTask(queue, async () => {
+      events.push("second:start");
+    });
+
+    await Promise.resolve();
+    expect(events).toEqual(["first:start"]);
+
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    expect(events).toEqual(["first:start", "first:end", "second:start"]);
   });
 });
