@@ -3,7 +3,8 @@ set -eu
 
 DEB_DEPS="libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 libasound2 libssl3 libopus0 libavahi-client3 libavahi-compat-libdnssd1 pipewire xdg-desktop-portal"
 DEB_LIBVPX_DEPS="libvpx9 libvpx8 libvpx7"
-RPM_DEPS="webkit2gtk4.1 gtk3 libayatana-appindicator-gtk3 librsvg2 alsa-lib openssl-libs opus libvpx avahi-compat-libdns_sd pipewire xdg-desktop-portal xdg-desktop-portal-gnome"
+RPM_DEPS="webkit2gtk4.1 gtk3 libayatana-appindicator-gtk3 librsvg2 alsa-lib openssl-libs opus libvpx avahi-compat-libdns_sd pipewire xdg-desktop-portal"
+RPM_PORTAL_BACKENDS="xdg-desktop-portal-gnome xdg-desktop-portal-gtk xdg-desktop-portal-kde xdg-desktop-portal-wlr"
 
 usage() {
   cat <<USAGE
@@ -27,8 +28,12 @@ fail_missing_deb() {
 
 fail_missing_rpm() {
   missing="$1"
+  portal_note="${2:-}"
   echo "Missing RPM runtime dependencies:" >&2
   echo "  $missing" >&2
+  if [ -n "$portal_note" ]; then
+    echo "$portal_note" >&2
+  fi
   echo "Install them first:" >&2
   if command -v dnf >/dev/null 2>&1; then
     echo "  sudo dnf install -y $missing" >&2
@@ -93,8 +98,19 @@ case "$PKG_FILE" in
         missing="$missing $pkg"
       fi
     done
+    portal_backend_found=""
+    for pkg in $RPM_PORTAL_BACKENDS; do
+      if rpm -q "$pkg" >/dev/null 2>&1; then
+        portal_backend_found="yes"
+      fi
+    done
+    portal_note=""
+    if [ -z "$portal_backend_found" ]; then
+      missing="$missing xdg-desktop-portal-gtk"
+      portal_note="Portal backend note: install xdg-desktop-portal-gtk for XFCE/GTK sessions, or another backend matching your desktop."
+    fi
     if [ -n "$missing" ]; then
-      fail_missing_rpm "$(echo "$missing" | xargs)"
+      fail_missing_rpm "$(echo "$missing" | xargs)" "$portal_note"
     fi
 
     echo "Dependencies satisfied. Installing package: $PKG_FILE"

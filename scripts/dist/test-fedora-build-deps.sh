@@ -36,6 +36,15 @@ assert_contains gcc-c++
 assert_contains make
 assert_contains patchelf
 assert_contains rpm-build
+assert_contains git
+assert_contains pipewire
+assert_contains xdg-desktop-portal
+assert_contains xdg-desktop-portal-gtk
+
+if ! grep -q "libpipewire-0.3" "$INSTALLER"; then
+  echo "Expected Fedora helper to verify pkg-config module: libpipewire-0.3" >&2
+  exit 1
+fi
 
 dry_run="$("$INSTALLER" --dry-run)"
 case "$dry_run" in

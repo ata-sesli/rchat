@@ -360,7 +360,7 @@ The video stream carries ordered records for VP8 frames, receiver reports, camer
 Screen broadcasts are also moving to a native host-capture path:
 
 - macOS uses ScreenCaptureKit through RChat's local `rchat-screen-capture` crate,
-- Linux targets XDG Desktop Portal + PipeWire, which works with Wayland portal sessions such as Fedora GNOME,
+- Linux targets XDG Desktop Portal + PipeWire; the exact portal backend depends on the desktop session,
 - Rust converts captured frames to I420 and encodes VP8 through `rchat-libvpx`,
 - the receiver still decodes/render incoming VP8 frames in the WebView with WebCodecs/canvas,
 - screen audio sharing is not implemented yet.
@@ -413,6 +413,8 @@ Install native build dependencies first:
 scripts/dist/install-fedora-build-deps.sh
 ```
 
+This includes `pipewire-devel` and `pkgconf-pkg-config`, which provide the `libpipewire-0.3.pc` metadata required by the PipeWire Rust bindings. It also installs the GTK portal backend used by Fedora XFCE/GTK dev sessions.
+
 Then install the JavaScript dependencies and run RChat:
 
 ```bash
@@ -426,7 +428,7 @@ For a release-style local build:
 bun run tauri build
 ```
 
-The Fedora helper installs native libraries and compilers only. If `cargo`, `rustc`, or `bun` are missing, install Rust with `rustup` and Bun from the official Bun installer before building.
+The Fedora helper installs native libraries, compilers, and Linux dev-runtime portal packages. If `cargo`, `rustc`, or `bun` are missing, install Rust with `rustup` and Bun from the official Bun installer before building.
 
 Install JavaScript dependencies:
 

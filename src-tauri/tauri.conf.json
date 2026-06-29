@@ -77,8 +77,7 @@
           "libvpx",
           "avahi-compat-libdns_sd",
           "pipewire",
-          "xdg-desktop-portal",
-          "xdg-desktop-portal-gnome"
+          "xdg-desktop-portal"
         ]
       }
     },
