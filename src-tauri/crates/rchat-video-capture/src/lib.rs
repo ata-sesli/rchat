@@ -14,6 +14,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const CAPTURE_FPS: u32 = 30;
 pub const PREVIEW_MAX_WIDTH: u32 = 320;
 pub const PREVIEW_INTERVAL: Duration = Duration::from_millis(200);
+const SUPPORTED_CAMERA_FRAME_FORMATS: &[FrameFormat] = &[
+    FrameFormat::YUYV,
+    FrameFormat::NV12,
+    FrameFormat::RAWRGB,
+    FrameFormat::RAWBGR,
+    FrameFormat::MJPEG,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureProfile {
@@ -366,14 +373,11 @@ fn open_camera(config: &CaptureConfig) -> Result<Camera, VideoCaptureError> {
     initialize_platform()?;
     let backend = native_backend().ok_or(VideoCaptureError::UnsupportedPlatform)?;
     let index = CameraIndex::Index(config.device_index.unwrap_or(0));
-    let requested = requested_format(config.profile, FrameFormat::YUYV);
+    let requested = initial_camera_open_request();
     let mut camera = Camera::with_backend(index, requested, backend).map_err(map_nokhwa_error)?;
     let format = select_camera_format(&mut camera, config.profile)?;
     camera
-        .set_camera_requset(RequestedFormat::with_formats(
-            RequestedFormatType::Exact(format),
-            &[format.format()],
-        ))
+        .set_camera_requset(exact_camera_format_request(format))
         .map_err(map_nokhwa_error)?;
     Ok(camera)
 }
@@ -416,7 +420,8 @@ fn select_camera_format_from_formats(
         let dimension_delta = target_width.abs_diff(format.width()) as u64
             + target_height.abs_diff(format.height()) as u64;
         let fps_delta = CAPTURE_FPS.abs_diff(format.frame_rate()) as u64;
-        let undersize_penalty = if format.width() < target_width || format.height() < target_height {
+        let undersize_penalty = if format.width() < target_width || format.height() < target_height
+        {
             250_000
         } else {
             0
@@ -448,19 +453,21 @@ fn frame_format_rank(format: FrameFormat) -> Option<u64> {
     }
 }
 
-fn requested_format(profile: CaptureProfile, format: FrameFormat) -> RequestedFormat<'static> {
-    let (width, height) = profile.dimensions();
+fn initial_camera_open_request() -> RequestedFormat<'static> {
+    RequestedFormat::with_formats(RequestedFormatType::None, SUPPORTED_CAMERA_FRAME_FORMATS)
+}
+
+fn exact_camera_format_request(format: CameraFormat) -> RequestedFormat<'static> {
     RequestedFormat::with_formats(
-        RequestedFormatType::Closest(CameraFormat::new(
-            Resolution::new(width, height),
-            format,
-            CAPTURE_FPS,
-        )),
-        &[FrameFormat::YUYV, FrameFormat::NV12, FrameFormat::RAWRGB, FrameFormat::RAWBGR, FrameFormat::MJPEG],
+        RequestedFormatType::Exact(format),
+        SUPPORTED_CAMERA_FRAME_FORMATS,
     )
 }
 
-fn raw_to_i420_frame(raw: &Cow<'_, [u8]>, format: CameraFormat) -> Result<I420Frame, VideoCaptureError> {
+fn raw_to_i420_frame(
+    raw: &Cow<'_, [u8]>,
+    format: CameraFormat,
+) -> Result<I420Frame, VideoCaptureError> {
     let width = format.width();
     let height = format.height();
     let data = match format.format() {
@@ -564,7 +571,9 @@ fn mjpeg_to_i420(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, VideoC
         .map_err(|e| VideoCaptureError::Conversion(e.to_string()))?
         .to_rgba8();
     if decoded.width() != width || decoded.height() != height {
-        return Err(VideoCaptureError::Conversion("MJPEG decoded dimensions mismatch".into()));
+        return Err(VideoCaptureError::Conversion(
+            "MJPEG decoded dimensions mismatch".into(),
+        ));
     }
     rgba_like_to_i420(decoded.as_raw(), width, height, 4, false)
 }
@@ -644,7 +653,8 @@ fn i420_to_preview(frame: &I420Frame, max_width: u32) -> Result<PreviewFrame, Vi
         let src_y = (y * scale).min(frame.height - 1);
         for x in 0..width {
             let src_x = (x * scale).min(frame.width - 1);
-            let (r, g, b) = i420_pixel_to_rgb(&frame.data, frame.width, frame.height, src_x, src_y)?;
+            let (r, g, b) =
+                i420_pixel_to_rgb(&frame.data, frame.width, frame.height, src_x, src_y)?;
             rgba.extend_from_slice(&[r, g, b, 255]);
         }
     }
@@ -666,7 +676,9 @@ fn i420_pixel_to_rgb(
     let expected_len = expected_i420_len(width, height)
         .ok_or_else(|| VideoCaptureError::Conversion("invalid preview dimensions".into()))?;
     if data.len() < expected_len {
-        return Err(VideoCaptureError::Conversion("short I420 preview frame".into()));
+        return Err(VideoCaptureError::Conversion(
+            "short I420 preview frame".into(),
+        ));
     }
     let width_usize = width as usize;
     let height_usize = height as usize;
@@ -819,15 +831,28 @@ mod tests {
     }
 
     #[test]
+    fn initial_camera_open_request_accepts_non_yuyv_formats() {
+        let formats = [CameraFormat::new(
+            Resolution::new(640, 360),
+            FrameFormat::MJPEG,
+            30,
+        )];
+        let selected = initial_camera_open_request()
+            .fulfill(&formats)
+            .expect("initial request accepts available supported format");
+
+        assert_eq!(selected.format(), FrameFormat::MJPEG);
+    }
+
+    #[test]
     #[ignore]
     fn hardware_smoke_test() {
         if std::env::var("RCHAT_CAMERA_TEST").ok().as_deref() != Some("1") {
             return;
         }
-        let session = VideoCaptureSession::start(CaptureConfig::default_for_profile(
-            CaptureProfile::P360,
-        ))
-        .expect("camera starts");
+        let session =
+            VideoCaptureSession::start(CaptureConfig::default_for_profile(CaptureProfile::P360))
+                .expect("camera starts");
         std::thread::sleep(Duration::from_millis(250));
         assert!(session.try_recv_latest_i420().is_some());
     }
