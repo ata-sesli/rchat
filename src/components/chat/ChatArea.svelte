@@ -34,6 +34,11 @@
     markRemoteVideoSequenceGap,
     shouldDecodeRemoteVideoFrame,
   } from "$lib/video/remoteReceive";
+  import {
+    createLocalCameraToggleState,
+    markLocalCameraToggleSettled,
+    requestLocalCameraToggle,
+  } from "$lib/video/cameraToggle";
 
   // Types
   type Message = {
@@ -97,7 +102,10 @@
   export let onEndScreenBroadcast = (_sessionId: string) => {};
   export let onToggleVoiceMute = (_callId: string, _muted: boolean) => {};
   export let onToggleVideoMute = (_callId: string, _muted: boolean) => {};
-  export let onToggleVideoCamera = (_callId: string, _enabled: boolean) => {};
+  export let onToggleVideoCamera = (
+    _callId: string,
+    _enabled: boolean,
+  ): void | Promise<void> => {};
 
   type RecorderState = "idle" | "recording" | "recorded_pending" | "sending";
   const RECORDING_TMP_DIR = "recordings/tmp";
@@ -130,6 +138,8 @@
   let localPreviewCanvasEl: HTMLCanvasElement | null = null;
   let localPreviewCanvasCtx: CanvasRenderingContext2D | null = null;
   let localPreviewError: string | null = null;
+  let localCameraToggleState = createLocalCameraToggleState();
+  $: localCameraStarting = localCameraToggleState.starting;
   let remoteVideoCanvasEl: HTMLCanvasElement | null = null;
   let remoteVideoCanvasCtx: CanvasRenderingContext2D | null = null;
   let remoteVideoDecoder: any | null = null;
@@ -344,6 +354,7 @@
 
   function clearLocalPreview() {
     localPreviewError = null;
+    localCameraToggleState = markLocalCameraToggleSettled(localCameraToggleState);
     if (localPreviewCanvasCtx && localPreviewCanvasEl) {
       localPreviewCanvasCtx.clearRect(
         0,
@@ -377,6 +388,7 @@
     }
     const image = new ImageData(new Uint8ClampedArray(payload), width, height);
     localPreviewCanvasCtx.putImageData(image, 0, 0);
+    localCameraToggleState = markLocalCameraToggleSettled(localCameraToggleState);
     localPreviewError = null;
   }
 
@@ -384,7 +396,25 @@
     if (!eventPayload || !activeCallId || eventPayload.call_id !== activeCallId) return;
     const message = String(eventPayload.message || "Camera capture failed.");
     logVideoCapture("camera error", { call_id: activeCallId, message });
+    localCameraToggleState = markLocalCameraToggleSettled(localCameraToggleState);
     localPreviewError = message;
+  }
+
+  function requestToggleVideoCamera() {
+    if (!activeCallId) return;
+    const decision = requestLocalCameraToggle(
+      localCameraToggleState,
+      activeCallCameraEnabled,
+    );
+    localCameraToggleState = decision.state;
+    if (!decision.command) return;
+
+    Promise.resolve(onToggleVideoCamera(activeCallId, decision.command.enabled)).catch(
+      (error) => {
+        console.error("Failed to toggle camera:", error);
+        localCameraToggleState = markLocalCameraToggleSettled(localCameraToggleState);
+      },
+    );
   }
 
   function handleScreenBroadcastPreviewFrame(eventPayload: any) {
@@ -1713,11 +1743,20 @@
           </button>
           {#if activeCallKind === "video"}
             <button
-              onclick={() => activeCallId && onToggleVideoCamera(activeCallId, !activeCallCameraEnabled)}
-              class="rounded-md px-2 py-1 text-[11px] bg-theme-base-800 hover:bg-theme-base-700 text-theme-base-200"
-              title={activeCallCameraEnabled ? "Turn camera off" : "Turn camera on"}
+              onclick={requestToggleVideoCamera}
+              disabled={localCameraStarting}
+              class="rounded-md px-2 py-1 text-[11px] bg-theme-base-800 hover:bg-theme-base-700 text-theme-base-200 disabled:opacity-50 disabled:cursor-not-allowed"
+              title={localCameraStarting
+                ? "Starting camera"
+                : activeCallCameraEnabled
+                  ? "Turn camera off"
+                  : "Turn camera on"}
             >
-              {activeCallCameraEnabled ? "Camera off" : "Camera on"}
+              {localCameraStarting
+                ? "Starting…"
+                : activeCallCameraEnabled
+                  ? "Camera off"
+                  : "Camera on"}
             </button>
             <select
               value={videoQualityMode}
@@ -1883,7 +1922,9 @@
 
       <div class="absolute bottom-2 right-2 w-28 h-20 rounded-lg border border-theme-base-700 bg-black/60 overflow-hidden flex items-center justify-center">
         {#if activeCallCameraEnabled}
-          {#if localPreviewError}
+          {#if localCameraStarting}
+            <span class="text-[11px] text-theme-base-300 px-2 text-center">Starting…</span>
+          {:else if localPreviewError}
             <span class="text-[11px] text-theme-base-300 px-2 text-center">{localPreviewError}</span>
           {:else}
             <canvas
