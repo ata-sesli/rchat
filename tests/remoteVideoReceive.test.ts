@@ -1,10 +1,13 @@
 // @ts-nocheck
 import { describe, expect, test } from "bun:test";
 import {
+  createRemoteVideoDecoderConfigAttempts,
+  createRemoteVideoDecoderConfigRetryState,
   createRemoteVideoReceiveQueue,
   createRemoteVideoReceiveState,
   createRemoteVideoDecoderConfigCandidates,
   enqueueRemoteVideoReceiveTask,
+  markRemoteVideoDecoderConfigAttemptFailed,
   markRemoteVideoDecoderFailed,
   markRemoteVideoSequenceGap,
   shouldDecodeRemoteVideoFrame,
@@ -97,18 +100,43 @@ describe("remote video receive state", () => {
         codedWidth: 1280,
         codedHeight: 720,
         optimizeForLatency: true,
-        hardwareAcceleration: "prefer-software",
+      },
+      {
+        codec: "vp8",
+        optimizeForLatency: true,
       },
       {
         codec: "vp8",
         codedWidth: 1280,
         codedHeight: 720,
         optimizeForLatency: true,
+        hardwareAcceleration: "prefer-hardware",
       },
       {
         codec: "vp8",
+        codedWidth: 1280,
+        codedHeight: 720,
         optimizeForLatency: true,
+        hardwareAcceleration: "prefer-software",
       },
     ]);
+  });
+
+  test("advances decoder config attempts after runtime failure", () => {
+    const retryState = createRemoteVideoDecoderConfigRetryState();
+
+    expect(
+      createRemoteVideoDecoderConfigAttempts("vp8", 640, 360, retryState).map(
+        (attempt) => attempt.index,
+      ),
+    ).toEqual([0, 1, 2, 3]);
+
+    markRemoteVideoDecoderConfigAttemptFailed(retryState, "vp8", 640, 360, 0);
+
+    expect(
+      createRemoteVideoDecoderConfigAttempts("vp8", 640, 360, retryState).map(
+        (attempt) => attempt.index,
+      ),
+    ).toEqual([1, 2, 3]);
   });
 });

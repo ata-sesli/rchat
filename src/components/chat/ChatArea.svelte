@@ -25,13 +25,16 @@
   import { getChatKind } from "$lib/chatKind";
   import { presencePeerKey } from "$lib/stores/presence";
   import {
+    createRemoteVideoDecoderConfigAttempts,
+    createRemoteVideoDecoderConfigRetryState,
     createRemoteVideoReceiveQueue,
-    createRemoteVideoDecoderConfigCandidates,
     createRemoteVideoReceiveState,
     enqueueRemoteVideoReceiveTask,
     hasRemoteVideoKeyframe,
+    markRemoteVideoDecoderConfigAttemptFailed,
     markRemoteVideoDecoderFailed,
     markRemoteVideoSequenceGap,
+    resetRemoteVideoDecoderConfigAttempts,
     shouldDecodeRemoteVideoFrame,
   } from "$lib/video/remoteReceive";
   import {
@@ -152,10 +155,12 @@
   let remoteVideoDecoderCodec: string | null = null;
   let remoteVideoDecoderWidth: number | null = null;
   let remoteVideoDecoderHeight: number | null = null;
+  let remoteVideoDecoderConfigIndex: number | null = null;
   let remoteExpectedSeq: number | null = null;
   let remotePendingFrames = new Map<number, IncomingFrame>();
   let remoteReceiveState = createRemoteVideoReceiveState();
   let remoteReceiveQueue = createRemoteVideoReceiveQueue();
+  let remoteDecoderConfigRetryState = createRemoteVideoDecoderConfigRetryState();
   let remoteLastSubmittedFrame: IncomingFrame | null = null;
   let videoQualityMode: VideoQualityMode = "auto";
   let activeVideoProfile: VideoProfile = "720p30";
@@ -503,6 +508,7 @@
     remoteVideoDecoderCodec = null;
     remoteVideoDecoderWidth = null;
     remoteVideoDecoderHeight = null;
+    remoteVideoDecoderConfigIndex = null;
     if (remoteVideoDecoder) {
       try {
         remoteVideoDecoder.close();
@@ -518,6 +524,7 @@
     remoteExpectedSeq = null;
     remoteReceiveState = createRemoteVideoReceiveState();
     remoteReceiveQueue = createRemoteVideoReceiveQueue();
+    resetRemoteVideoDecoderConfigAttempts(remoteDecoderConfigRetryState);
     remoteLastSubmittedFrame = null;
     closeRemoteVideoDecoder();
     if (remoteVideoCanvasCtx && remoteVideoCanvasEl) {
@@ -679,15 +686,21 @@
 
     closeRemoteVideoDecoder();
     remoteVideoStateError = null;
-    const candidates = createRemoteVideoDecoderConfigCandidates(
+    const attempts = createRemoteVideoDecoderConfigAttempts(
       frame.codec,
       frame.width,
       frame.height,
+      remoteDecoderConfigRetryState,
     );
+    if (attempts.length === 0) {
+      remoteVideoStateError = `Remote decoder failed all configs (${frame.codec}).`;
+      return false;
+    }
     let unsupported = false;
     let lastError: unknown = null;
 
-    for (const config of candidates) {
+    for (const attempt of attempts) {
+      const { config, index } = attempt;
       try {
         if (decoderCtor.isConfigSupported) {
           const support = await decoderCtor.isConfigSupported(config);
@@ -706,11 +719,26 @@
               codec: frame.codec,
               configured_width: remoteVideoDecoderWidth ?? "none",
               configured_height: remoteVideoDecoderHeight ?? "none",
+              config_index: remoteVideoDecoderConfigIndex ?? "none",
               seq: remoteLastSubmittedFrame?.seq ?? "none",
               chunk_type: remoteLastSubmittedFrame?.chunk_type ?? "none",
               bytes: remoteLastSubmittedFrame?.payload.byteLength ?? 0,
               error: describeError(err),
             });
+            if (
+              remoteVideoDecoderCodec &&
+              remoteVideoDecoderWidth !== null &&
+              remoteVideoDecoderHeight !== null &&
+              remoteVideoDecoderConfigIndex !== null
+            ) {
+              markRemoteVideoDecoderConfigAttemptFailed(
+                remoteDecoderConfigRetryState,
+                remoteVideoDecoderCodec,
+                remoteVideoDecoderWidth,
+                remoteVideoDecoderHeight,
+                remoteVideoDecoderConfigIndex,
+              );
+            }
             remoteVideoDecodeErrors += 1;
             waitForRemoteKeyframeAfterDecoderFailure();
           },
@@ -720,11 +748,13 @@
         remoteVideoDecoderCodec = frame.codec;
         remoteVideoDecoderWidth = frame.width;
         remoteVideoDecoderHeight = frame.height;
+        remoteVideoDecoderConfigIndex = index;
         logVideoCapture("remote decoder configured", {
           call_id: activeRemoteSessionId() || "none",
           codec: frame.codec,
           width: frame.width,
           height: frame.height,
+          config_index: index,
           hardware: (config as any).hardwareAcceleration || "default",
         });
         return true;

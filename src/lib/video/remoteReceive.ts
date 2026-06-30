@@ -12,6 +12,10 @@ export type RemoteVideoReceiveQueue = {
   tail: Promise<void>;
 };
 
+export type RemoteVideoDecoderConfigRetryState = {
+  nextIndexByKey: Map<string, number>;
+};
+
 export type RemoteVideoDecoderConfig = {
   codec: string;
   codedWidth?: number;
@@ -20,8 +24,21 @@ export type RemoteVideoDecoderConfig = {
   hardwareAcceleration?: "no-preference" | "prefer-hardware" | "prefer-software";
 };
 
+export type RemoteVideoDecoderConfigAttempt = {
+  config: RemoteVideoDecoderConfig;
+  index: number;
+};
+
 export function createRemoteVideoReceiveState(): RemoteVideoReceiveState {
   return { hasKeyframe: false };
+}
+
+export function createRemoteVideoDecoderConfigRetryState(): RemoteVideoDecoderConfigRetryState {
+  return { nextIndexByKey: new Map() };
+}
+
+function remoteVideoDecoderConfigKey(codec: string, width: number, height: number): string {
+  return `${codec}:${Math.trunc(width)}x${Math.trunc(height)}`;
 }
 
 export function createRemoteVideoDecoderConfigCandidates(
@@ -39,10 +56,44 @@ export function createRemoteVideoDecoderConfigCandidates(
     codedHeight: Math.trunc(height),
   };
   return [
-    { ...coded, hardwareAcceleration: "prefer-software" },
     coded,
     base,
+    { ...coded, hardwareAcceleration: "prefer-hardware" },
+    { ...coded, hardwareAcceleration: "prefer-software" },
   ];
+}
+
+export function createRemoteVideoDecoderConfigAttempts(
+  codec: string,
+  width: number,
+  height: number,
+  retryState: RemoteVideoDecoderConfigRetryState,
+): RemoteVideoDecoderConfigAttempt[] {
+  const candidates = createRemoteVideoDecoderConfigCandidates(codec, width, height);
+  const key = remoteVideoDecoderConfigKey(codec, width, height);
+  const startIndex = Math.min(retryState.nextIndexByKey.get(key) ?? 0, candidates.length);
+  return candidates.slice(startIndex).map((config, offset) => ({
+    config,
+    index: startIndex + offset,
+  }));
+}
+
+export function markRemoteVideoDecoderConfigAttemptFailed(
+  retryState: RemoteVideoDecoderConfigRetryState,
+  codec: string,
+  width: number,
+  height: number,
+  failedIndex: number,
+) {
+  const key = remoteVideoDecoderConfigKey(codec, width, height);
+  const current = retryState.nextIndexByKey.get(key) ?? 0;
+  retryState.nextIndexByKey.set(key, Math.max(current, failedIndex + 1));
+}
+
+export function resetRemoteVideoDecoderConfigAttempts(
+  retryState: RemoteVideoDecoderConfigRetryState,
+) {
+  retryState.nextIndexByKey.clear();
 }
 
 export function createRemoteVideoReceiveQueue(): RemoteVideoReceiveQueue {
