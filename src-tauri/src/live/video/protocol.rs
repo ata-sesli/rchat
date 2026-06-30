@@ -328,6 +328,19 @@ mod tests {
     }
 
     #[test]
+    fn video_quality_change_round_trips_receiver_request() {
+        let record = VideoStreamRecord::QualityChange(VideoQualityChange {
+            profile: crate::live::video::codec::VideoProfile::P480,
+            reason: "receiver_request".to_string(),
+        });
+
+        let encoded = encode_video_stream_record(&record);
+        let decoded = decode_video_stream_record(&encoded).expect("record decodes");
+
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
     fn video_stream_record_rejects_truncated_payload() {
         let record = VideoStreamRecord::Frame(VideoStreamFrame {
             seq: 7,

@@ -143,6 +143,8 @@ struct VideoNetworkStats {
     receiver_dropped_frames: u64,
     receiver_decode_errors: u64,
     quality_changes: u64,
+    last_encoded_width: Option<u32>,
+    last_encoded_height: Option<u32>,
 }
 
 impl VideoNetworkStats {
@@ -590,6 +592,13 @@ pub struct NetworkManager {
     video_capture_started_at: Option<std::time::Instant>,
     // Local video quality/adaptation controller.
     video_quality_controller: crate::live::video::codec::VideoQualityController,
+    // Receiver-requested cap for the outbound camera encoder.
+    video_remote_requested_profile: crate::live::video::codec::VideoProfile,
+    // Local receiver preference sent to the remote sender.
+    video_receiver_preference_controller:
+        crate::live::video::codec::VideoReceiverPreferenceController,
+    // Rust-side inbound frame delta used for receiver reports.
+    video_receiver_report_pending_inbound_frames: u64,
     // Aggregated video transport diagnostics.
     video_network_stats: VideoNetworkStats,
     // Per-adaptation-window counters.
@@ -842,6 +851,10 @@ impl NetworkManager {
             video_quality_controller: crate::live::video::codec::VideoQualityController::new(
                 crate::live::video::codec::VideoQualityMode::Auto,
             ),
+            video_remote_requested_profile: crate::live::video::codec::VideoProfile::P720,
+            video_receiver_preference_controller:
+                crate::live::video::codec::VideoReceiverPreferenceController::default(),
+            video_receiver_report_pending_inbound_frames: 0,
             video_network_stats: VideoNetworkStats::default(),
             video_window_counters: VideoWindowCounters::default(),
             video_window_started_at: None,

@@ -1,9 +1,9 @@
 use super::*;
 use crate::app_state::{CallKind, VoiceCallPhase};
 use crate::live::video::codec::{
-    should_force_video_keyframe, RgbaVideoFrame, VideoAdaptationWindow, VideoProfile,
-    VideoQualityChangeDecision, VideoQualityMode, Vp8EncodedPacket, Vp8VideoDecoder,
-    Vp8VideoEncoder,
+    prepare_i420_for_profile, should_force_video_keyframe, RgbaVideoFrame, VideoAdaptationWindow,
+    VideoProfile, VideoQualityChangeDecision, VideoQualityMode, VideoReceiverPreferenceWindow,
+    Vp8EncodedPacket, Vp8VideoDecoder, Vp8VideoEncoder,
 };
 use crate::live::video::protocol::{
     read_video_stream_header, read_video_stream_record, write_video_stream_header,
@@ -21,6 +21,7 @@ const VIDEO_ENCODE_QUEUE_CAPACITY: usize = 2;
 const VIDEO_ENCODE_EVENT_QUEUE_CAPACITY: usize = 8;
 const VIDEO_REMOTE_DECODE_QUEUE_CAPACITY: usize = 4;
 const VIDEO_SUMMARY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const VIDEO_RECEIVER_REQUEST_REASON: &str = "receiver_request";
 
 #[derive(Debug, Clone, Serialize)]
 struct VideoQualityEvent {
@@ -134,12 +135,16 @@ impl OutboundVideoEncoderState {
             call_id,
             generation,
             timestamp_us,
-            width,
-            height,
+            width: captured_width,
+            height: captured_height,
             profile,
             data,
             force_keyframe,
         } = frame;
+        let prepared = prepare_i420_for_profile(&data, captured_width, captured_height, profile)?;
+        let width = prepared.width;
+        let height = prepared.height;
+        let data = prepared.data;
 
         let needs_encoder = self
             .encoder
@@ -371,6 +376,33 @@ fn take_finished_video_capture_start(
     }
 }
 
+fn effective_video_profile(
+    local_profile: VideoProfile,
+    remote_requested_profile: VideoProfile,
+) -> VideoProfile {
+    local_profile.min(remote_requested_profile)
+}
+
+fn build_video_receiver_report(
+    pending_inbound_frames: &mut u64,
+    frontend_received_frames: u64,
+    rendered_frames: u64,
+    dropped_frames: u64,
+    decode_errors: u64,
+) -> VideoReceiverReport {
+    let received_frames = if *pending_inbound_frames > 0 {
+        std::mem::take(pending_inbound_frames)
+    } else {
+        frontend_received_frames
+    };
+    VideoReceiverReport {
+        received_frames,
+        rendered_frames,
+        dropped_frames,
+        decode_errors,
+    }
+}
+
 fn should_restart_running_video_capture_for_profile_change(
     current_requested_profile: Option<&str>,
     _current_profile: VideoProfile,
@@ -383,8 +415,16 @@ impl NetworkManager {
         self.video_network_stats.reset();
         self.video_window_counters.reset();
         self.video_expected_inbound_seq = None;
+        self.video_receiver_report_pending_inbound_frames = 0;
         self.video_window_started_at = Some(std::time::Instant::now());
         self.video_last_summary_at = Some(std::time::Instant::now());
+    }
+
+    fn effective_outbound_video_profile(&self) -> VideoProfile {
+        effective_video_profile(
+            self.video_quality_controller.current_profile(),
+            self.video_remote_requested_profile,
+        )
     }
 
     fn reset_outbound_video_encoder(&mut self) {
@@ -417,6 +457,9 @@ impl NetworkManager {
             .try_send(RemoteVideoDecodeTask::Reset);
         self.video_quality_controller =
             crate::live::video::codec::VideoQualityController::new(VideoQualityMode::Auto);
+        self.video_remote_requested_profile = VideoProfile::P720;
+        self.video_receiver_preference_controller =
+            crate::live::video::codec::VideoReceiverPreferenceController::default();
         self.reset_video_network_diagnostics();
     }
 
@@ -427,6 +470,9 @@ impl NetworkManager {
         camera_enabled: bool,
     ) -> bool {
         self.reset_video_network_diagnostics();
+        self.video_remote_requested_profile = VideoProfile::P720;
+        self.video_receiver_preference_controller =
+            crate::live::video::codec::VideoReceiverPreferenceController::default();
         self.reset_outbound_video_encoder();
         let _ = self
             .video_remote_decode_tx
@@ -440,6 +486,7 @@ impl NetworkManager {
                 profile: self.video_quality_controller.current_profile(),
                 reason: "initial".to_string(),
             }));
+            self.queue_receiver_video_profile_request();
             self.emit_video_quality_event(&call_id, "initial");
         }
         started
@@ -797,14 +844,17 @@ impl NetworkManager {
         let event = VideoQualityEvent {
             call_id: call_id.to_string(),
             mode: self.video_quality_controller.mode().label().to_string(),
-            profile: self
-                .video_quality_controller
-                .current_profile()
-                .label()
-                .to_string(),
+            profile: self.effective_outbound_video_profile().label().to_string(),
             reason: reason.to_string(),
         };
         let _ = self.app_handle.emit("video-call-quality-updated", event);
+    }
+
+    fn queue_receiver_video_profile_request(&mut self) -> bool {
+        self.queue_video_stream_record(VideoStreamRecord::QualityChange(VideoQualityChange {
+            profile: self.video_receiver_preference_controller.current_profile(),
+            reason: VIDEO_RECEIVER_REQUEST_REASON.to_string(),
+        }))
     }
 
     fn emit_remote_camera_state(&self, call_id: &str, peer_id: &PeerId, enabled: bool) {
@@ -1164,7 +1214,7 @@ impl NetworkManager {
         self.video_network_stats.submitted_frames += 1;
         self.video_window_counters.submitted_frames += 1;
 
-        let current_profile = self.video_quality_controller.current_profile();
+        let current_profile = self.effective_outbound_video_profile();
         let expected_len = Vp8VideoEncoder::expected_i420_len(width, height).unwrap_or(0);
         if expected_len == 0 || data.len() != expected_len {
             self.video_network_stats.raw_frames_dropped += 1;
@@ -1263,6 +1313,8 @@ impl NetworkManager {
                 .video_network_stats
                 .outbound_bytes
                 .saturating_add(payload_len);
+            self.video_network_stats.last_encoded_width = Some(output.width);
+            self.video_network_stats.last_encoded_height = Some(output.height);
             self.video_window_counters.encoded_frames += 1;
             let queued = self.queue_video_stream_record(record);
             if queued && packet_is_key {
@@ -1305,12 +1357,31 @@ impl NetworkManager {
             .video_network_stats
             .local_decode_errors
             .saturating_add(decode_errors);
-        self.queue_video_stream_record(VideoStreamRecord::ReceiverReport(VideoReceiverReport {
+        let report = build_video_receiver_report(
+            &mut self.video_receiver_report_pending_inbound_frames,
             received_frames,
             rendered_frames,
             dropped_frames,
             decode_errors,
-        }));
+        );
+        if let Some(change) = self.video_receiver_preference_controller.evaluate_window(
+            VideoReceiverPreferenceWindow {
+                seconds: VIDEO_SUMMARY_INTERVAL.as_secs_f64(),
+                received_frames: report.received_frames,
+                rendered_frames: report.rendered_frames,
+                dropped_frames: report.dropped_frames,
+                decode_errors: report.decode_errors,
+            },
+        ) {
+            self.queue_receiver_video_profile_request();
+            eprintln!(
+                "[Video][ReceiverQuality] call_id={} requested_profile={} reason={}",
+                call_id,
+                change.profile.label(),
+                change.reason
+            );
+        }
+        self.queue_video_stream_record(VideoStreamRecord::ReceiverReport(report));
     }
 
     pub(super) async fn tick_video_call(&mut self) {
@@ -1409,6 +1480,9 @@ impl NetworkManager {
                         .video_network_stats
                         .inbound_bytes
                         .saturating_add(frame.payload.len() as u64);
+                    self.video_receiver_report_pending_inbound_frames = self
+                        .video_receiver_report_pending_inbound_frames
+                        .saturating_add(1);
                     self.video_window_counters.inbound_frames += 1;
                     if let Some(expected) = self.video_expected_inbound_seq {
                         if frame.seq != expected {
@@ -1460,6 +1534,14 @@ impl NetworkManager {
                     self.emit_remote_camera_state(&call_id, &peer, state.enabled);
                 }
                 VideoStreamRecord::QualityChange(change) => {
+                    if change.reason == VIDEO_RECEIVER_REQUEST_REASON {
+                        let previous = self.video_remote_requested_profile;
+                        self.video_remote_requested_profile = change.profile;
+                        if change.profile != previous {
+                            self.reset_outbound_video_encoder();
+                            self.emit_video_quality_event(&call_id, VIDEO_RECEIVER_REQUEST_REASON);
+                        }
+                    }
                     eprintln!(
                         "[Video][RemoteQuality] peer={} call_id={} profile={} reason={}",
                         peer,
@@ -1543,7 +1625,16 @@ impl NetworkManager {
             self.video_network_stats.inbound_bytes as f64
                 / self.video_network_stats.inbound_frames as f64
         };
-        let profile = self.video_quality_controller.current_profile();
+        let local_profile = self.video_quality_controller.current_profile();
+        let remote_requested_profile = self.video_remote_requested_profile;
+        let effective_profile = self.effective_outbound_video_profile();
+        let encoded_actual = match (
+            self.video_network_stats.last_encoded_width,
+            self.video_network_stats.last_encoded_height,
+        ) {
+            (Some(width), Some(height)) => format!("{}x{}", width, height),
+            _ => "none".to_string(),
+        };
         let capture_stats = self
             .video_capture_session
             .as_ref()
@@ -1573,14 +1664,18 @@ impl NetworkManager {
                 })
                 .unwrap_or(("none", "none", "none", "none", "none".to_string()));
         eprintln!(
-            "[Video][Network][{}] peer={}, quic_connections={}, tcp_connections={}, profile={}, target_kbps={}, actual_kbps={:.1}, capture_backend={}, capture_device='{}', capture_requested_profile={}, capture_actual={}, capture_format={}, captured_frames={}, captured_fps={:.1}, capture_dropped_i420={}, capture_dropped_preview={}, capture_conversion_errors={}, capture_preview_frames={}, capture_start_failures={}, submitted_frames={}, raw_frames_dropped={}, encoded_frames={}, keyframes={}, delta_frames={}, inbound_frames={}, inbound_seq_gaps={}, inbound_out_of_order_frames={}, outbound_failures={}, inbound_failures={}, encode_errors={}, encoded_queue_drops={}, local_rendered_frames={}, local_dropped_frames={}, local_decode_errors={}, receiver_received_frames={}, receiver_rendered_frames={}, receiver_dropped_frames={}, receiver_decode_errors={}, quality_changes={}, outbound_bytes={}, inbound_bytes={}, avg_out_bytes={:.1}, avg_in_bytes={:.1}, encode_p95_ms={:.1}",
+            "[Video][Network][{}] peer={}, quic_connections={}, tcp_connections={}, profile={}, local_profile={}, remote_requested_profile={}, effective_profile={}, target_kbps={}, actual_kbps={:.1}, encoded_actual={}, capture_backend={}, capture_device='{}', capture_requested_profile={}, capture_actual={}, capture_format={}, captured_frames={}, captured_fps={:.1}, capture_dropped_i420={}, capture_dropped_preview={}, capture_conversion_errors={}, capture_preview_frames={}, capture_start_failures={}, submitted_frames={}, raw_frames_dropped={}, encoded_frames={}, keyframes={}, delta_frames={}, inbound_frames={}, inbound_seq_gaps={}, inbound_out_of_order_frames={}, outbound_failures={}, inbound_failures={}, encode_errors={}, encoded_queue_drops={}, local_rendered_frames={}, local_dropped_frames={}, local_decode_errors={}, receiver_received_frames={}, receiver_rendered_frames={}, receiver_dropped_frames={}, receiver_decode_errors={}, quality_changes={}, outbound_bytes={}, inbound_bytes={}, avg_out_bytes={:.1}, avg_in_bytes={:.1}, encode_p95_ms={:.1}",
             label,
             peer_id,
             quic_count,
             tcp_count,
-            profile.label(),
-            profile.bitrate_kbps(),
+            effective_profile.label(),
+            local_profile.label(),
+            remote_requested_profile.label(),
+            effective_profile.label(),
+            effective_profile.bitrate_kbps(),
             actual_kbps,
+            encoded_actual,
             capture_backend,
             capture_device,
             capture_requested,
@@ -1837,5 +1932,90 @@ mod tests {
             })
             .expect("frame after reset encodes");
         assert!(after_reset.packets.iter().any(|packet| packet.is_key));
+    }
+
+    #[test]
+    fn outbound_video_encoder_state_downscales_to_profile() {
+        let mut state = OutboundVideoEncoderState::default();
+
+        let output = state
+            .encode_frame(OutboundVideoEncodeFrame {
+                call_id: "call-1".to_string(),
+                generation: 0,
+                timestamp_us: 1,
+                width: 1280,
+                height: 720,
+                profile: VideoProfile::P360,
+                data: synthetic_i420(1280, 720),
+                force_keyframe: false,
+            })
+            .expect("frame encodes");
+
+        assert_eq!((output.width, output.height), (640, 360));
+        assert_eq!(output.profile, VideoProfile::P360);
+        assert!(output.packets.iter().any(|packet| packet.is_key));
+    }
+
+    #[test]
+    fn outbound_video_encoder_state_forces_keyframe_after_profile_change() {
+        let mut state = OutboundVideoEncoderState::default();
+
+        state
+            .encode_frame(OutboundVideoEncodeFrame {
+                call_id: "call-1".to_string(),
+                generation: 0,
+                timestamp_us: 1,
+                width: 1280,
+                height: 720,
+                profile: VideoProfile::P720,
+                data: synthetic_i420(1280, 720),
+                force_keyframe: false,
+            })
+            .expect("first frame encodes");
+
+        let downshifted = state
+            .encode_frame(OutboundVideoEncodeFrame {
+                call_id: "call-1".to_string(),
+                generation: 0,
+                timestamp_us: 2,
+                width: 1280,
+                height: 720,
+                profile: VideoProfile::P360,
+                data: synthetic_i420(1280, 720),
+                force_keyframe: false,
+            })
+            .expect("downshifted frame encodes");
+
+        assert_eq!((downshifted.width, downshifted.height), (640, 360));
+        assert!(downshifted.packets.iter().any(|packet| packet.is_key));
+    }
+
+    #[test]
+    fn effective_video_profile_uses_receiver_cap() {
+        assert_eq!(
+            effective_video_profile(VideoProfile::P720, VideoProfile::P360),
+            VideoProfile::P360
+        );
+        assert_eq!(
+            effective_video_profile(VideoProfile::P360, VideoProfile::P720),
+            VideoProfile::P360
+        );
+        assert_eq!(
+            effective_video_profile(VideoProfile::P480, VideoProfile::P480),
+            VideoProfile::P480
+        );
+    }
+
+    #[test]
+    fn receiver_report_uses_pending_inbound_frame_count() {
+        let mut pending_inbound_frames = 12;
+
+        let report = build_video_receiver_report(&mut pending_inbound_frames, 3, 8, 2, 1);
+
+        assert_eq!(report.received_frames, 12);
+        assert_eq!(report.rendered_frames, 8);
+        assert_eq!(report.dropped_frames, 2);
+        assert_eq!(report.decode_errors, 1);
+        assert_eq!(pending_inbound_frames, 0);
     }
 }

@@ -44,6 +44,14 @@ impl VideoProfile {
         }
     }
 
+    pub fn dimensions(self) -> (u32, u32) {
+        match self {
+            Self::P360 => (640, 360),
+            Self::P480 => (854, 480),
+            Self::P720 => (1280, 720),
+        }
+    }
+
     pub fn downshift(self) -> Self {
         match self {
             Self::P720 => Self::P480,
@@ -117,6 +125,121 @@ impl Default for VideoQualityMode {
     fn default() -> Self {
         Self::Auto
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedI420Frame {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
+pub fn clamp_dimensions_to_profile(
+    width: u32,
+    height: u32,
+    profile: VideoProfile,
+) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let width = width & !1;
+    let height = height & !1;
+    if width < 2 || height < 2 {
+        return None;
+    }
+
+    let (max_width, max_height) = profile.dimensions();
+    if width <= max_width && height <= max_height {
+        return Some((width, height));
+    }
+
+    let scale = (max_width as f64 / width as f64).min(max_height as f64 / height as f64);
+    let out_width = ((width as f64 * scale).floor() as u32).max(2) & !1;
+    let out_height = ((height as f64 * scale).floor() as u32).max(2) & !1;
+    if out_width < 2 || out_height < 2 {
+        return None;
+    }
+    Some((out_width, out_height))
+}
+
+pub fn scale_i420_nearest(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> Result<Vec<u8>, String> {
+    let src_len = rchat_libvpx::expected_i420_len(src_width, src_height)
+        .ok_or_else(|| "invalid source I420 frame size".to_string())?;
+    let dst_len = rchat_libvpx::expected_i420_len(dst_width, dst_height)
+        .ok_or_else(|| "invalid destination I420 frame size".to_string())?;
+    if src.len() != src_len {
+        return Err(format!(
+            "I420 scale input length mismatch: expected {}, got {}",
+            src_len,
+            src.len()
+        ));
+    }
+
+    let sw = src_width as usize;
+    let sh = src_height as usize;
+    let dw = dst_width as usize;
+    let dh = dst_height as usize;
+    let src_y_len = sw * sh;
+    let src_uv_width = sw / 2;
+    let dst_y_len = dw * dh;
+    let dst_uv_width = dw / 2;
+    let mut out = vec![0_u8; dst_len];
+
+    for y in 0..dh {
+        let sy = y * sh / dh;
+        for x in 0..dw {
+            let sx = x * sw / dw;
+            out[y * dw + x] = src[sy * sw + sx];
+        }
+    }
+    for y in 0..dh / 2 {
+        let sy = y * (sh / 2) / (dh / 2);
+        for x in 0..dw / 2 {
+            let sx = x * (sw / 2) / (dw / 2);
+            out[dst_y_len + y * dst_uv_width + x] = src[src_y_len + sy * src_uv_width + sx];
+            out[dst_y_len + dst_y_len / 4 + y * dst_uv_width + x] =
+                src[src_y_len + src_y_len / 4 + sy * src_uv_width + sx];
+        }
+    }
+
+    Ok(out)
+}
+
+pub fn prepare_i420_for_profile(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    profile: VideoProfile,
+) -> Result<PreparedI420Frame, String> {
+    let expected_len = rchat_libvpx::expected_i420_len(width, height)
+        .ok_or_else(|| "invalid I420 frame size".to_string())?;
+    if data.len() != expected_len {
+        return Err(format!(
+            "invalid I420 frame length: expected {}, got {}",
+            expected_len,
+            data.len()
+        ));
+    }
+
+    let (target_width, target_height) = clamp_dimensions_to_profile(width, height, profile)
+        .ok_or_else(|| "invalid target I420 frame size".to_string())?;
+    let prepared_data = if target_width == width && target_height == height {
+        data.to_vec()
+    } else {
+        scale_i420_nearest(data, width, height, target_width, target_height)?
+    };
+
+    Ok(PreparedI420Frame {
+        width: target_width,
+        height: target_height,
+        data: prepared_data,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,6 +540,94 @@ impl VideoQualityController {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VideoReceiverPreferenceWindow {
+    pub seconds: f64,
+    pub received_frames: u64,
+    pub rendered_frames: u64,
+    pub dropped_frames: u64,
+    pub decode_errors: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct VideoReceiverPreferenceController {
+    current_profile: VideoProfile,
+    stable_seconds: f64,
+}
+
+impl Default for VideoReceiverPreferenceController {
+    fn default() -> Self {
+        Self {
+            current_profile: VideoProfile::P720,
+            stable_seconds: 0.0,
+        }
+    }
+}
+
+impl VideoReceiverPreferenceController {
+    pub fn current_profile(&self) -> VideoProfile {
+        self.current_profile
+    }
+
+    pub fn evaluate_window(
+        &mut self,
+        window: VideoReceiverPreferenceWindow,
+    ) -> Option<VideoQualityChangeDecision> {
+        if window.received_frames == 0 || window.seconds <= 0.0 {
+            self.stable_seconds = 0.0;
+            return None;
+        }
+
+        let missing_rendered = window
+            .received_frames
+            .saturating_sub(window.rendered_frames);
+        let explicit_pressure = window.dropped_frames.saturating_add(window.decode_errors);
+        let pressure =
+            missing_rendered.max(explicit_pressure) as f64 / window.received_frames as f64;
+        let rendered_fps = window.rendered_frames as f64 / window.seconds;
+        let should_downshift = pressure > 0.05
+            || (window.rendered_frames > 0 && rendered_fps < 24.0)
+            || (explicit_pressure as f64 / window.received_frames as f64) > 0.05;
+
+        if should_downshift {
+            self.stable_seconds = 0.0;
+            let next = self.current_profile.downshift();
+            if next != self.current_profile {
+                self.current_profile = next;
+                return Some(VideoQualityChangeDecision {
+                    profile: next,
+                    reason: "receiver_request".to_string(),
+                });
+            }
+            return None;
+        }
+
+        let stable = pressure < 0.01
+            && rendered_fps >= 28.0
+            && window.dropped_frames == 0
+            && window.decode_errors == 0;
+        if stable {
+            self.stable_seconds += window.seconds;
+        } else {
+            self.stable_seconds = 0.0;
+        }
+
+        if self.stable_seconds >= 30.0 {
+            let next = self.current_profile.upshift();
+            if next != self.current_profile {
+                self.current_profile = next;
+                self.stable_seconds = 0.0;
+                return Some(VideoQualityChangeDecision {
+                    profile: next,
+                    reason: "receiver_request".to_string(),
+                });
+            }
+        }
+
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +651,84 @@ mod tests {
             VideoProfile::P480 => (854, 480),
             VideoProfile::P720 => (1280, 720),
         }
+    }
+
+    #[test]
+    fn video_profile_dimensions_match_labels() {
+        assert_eq!(VideoProfile::P360.dimensions(), (640, 360));
+        assert_eq!(VideoProfile::P480.dimensions(), (854, 480));
+        assert_eq!(VideoProfile::P720.dimensions(), (1280, 720));
+    }
+
+    #[test]
+    fn clamp_dimensions_to_profile_preserves_aspect_ratio() {
+        assert_eq!(
+            clamp_dimensions_to_profile(1280, 720, VideoProfile::P360),
+            Some((640, 360))
+        );
+        assert_eq!(
+            clamp_dimensions_to_profile(640, 480, VideoProfile::P360),
+            Some((480, 360))
+        );
+    }
+
+    #[test]
+    fn scale_i420_nearest_downscales_even_frame() {
+        let y: Vec<u8> = (0..16).collect();
+        let u = vec![100, 101, 102, 103];
+        let v = vec![200, 201, 202, 203];
+        let mut src = y;
+        src.extend(u);
+        src.extend(v);
+
+        let out = scale_i420_nearest(&src, 4, 4, 2, 2).expect("scales frame");
+
+        assert_eq!(out, vec![0, 2, 8, 10, 100, 200]);
+    }
+
+    #[test]
+    fn prepare_i420_for_profile_downscales_capture_frame() {
+        let data = synthetic_i420(1280, 720);
+
+        let prepared =
+            prepare_i420_for_profile(&data, 1280, 720, VideoProfile::P360).expect("prepares frame");
+
+        assert_eq!(prepared.width, 640);
+        assert_eq!(prepared.height, 360);
+        assert_eq!(
+            prepared.data.len(),
+            Vp8VideoEncoder::expected_i420_len(640, 360).unwrap()
+        );
+    }
+
+    #[test]
+    fn receiver_preference_controller_downshifts_and_upshifts() {
+        let mut controller = VideoReceiverPreferenceController::default();
+
+        let downshift = controller.evaluate_window(VideoReceiverPreferenceWindow {
+            seconds: 5.0,
+            received_frames: 150,
+            rendered_frames: 120,
+            dropped_frames: 0,
+            decode_errors: 0,
+        });
+
+        assert_eq!(
+            downshift.map(|change| (change.profile, change.reason)),
+            Some((VideoProfile::P480, "receiver_request".to_string()))
+        );
+
+        for _ in 0..6 {
+            controller.evaluate_window(VideoReceiverPreferenceWindow {
+                seconds: 5.0,
+                received_frames: 150,
+                rendered_frames: 150,
+                dropped_frames: 0,
+                decode_errors: 0,
+            });
+        }
+
+        assert_eq!(controller.current_profile(), VideoProfile::P720);
     }
 
     #[test]
