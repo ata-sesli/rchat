@@ -371,6 +371,13 @@ fn take_finished_video_capture_start(
     }
 }
 
+fn should_restart_running_video_capture_for_profile_change(
+    current_requested_profile: Option<&str>,
+    _current_profile: VideoProfile,
+) -> bool {
+    current_requested_profile.is_none()
+}
+
 impl NetworkManager {
     pub(super) fn reset_video_network_diagnostics(&mut self) {
         self.video_network_stats.reset();
@@ -474,7 +481,12 @@ impl NetworkManager {
         let needs_restart = self
             .video_capture_info
             .as_ref()
-            .map(|info| info.requested_profile != current_profile.label())
+            .map(|info| {
+                should_restart_running_video_capture_for_profile_change(
+                    Some(info.requested_profile.as_str()),
+                    current_profile,
+                )
+            })
             .unwrap_or(true);
         if self.video_capture_session.is_some() && !needs_restart {
             return;
@@ -1358,7 +1370,6 @@ impl NetworkManager {
     fn apply_video_quality_change(&mut self, call_id: &str, change: VideoQualityChangeDecision) {
         self.video_network_stats.quality_changes += 1;
         self.reset_outbound_video_encoder();
-        self.stop_video_capture();
         self.queue_video_stream_record(VideoStreamRecord::QualityChange(VideoQualityChange {
             profile: change.profile,
             reason: change.reason.clone(),
@@ -1773,6 +1784,22 @@ mod tests {
                 .expect("delta waits for keyframe"),
             None
         );
+    }
+
+    #[test]
+    fn running_video_capture_survives_quality_profile_change() {
+        assert!(!should_restart_running_video_capture_for_profile_change(
+            Some("720p30"),
+            VideoProfile::P480,
+        ));
+        assert!(!should_restart_running_video_capture_for_profile_change(
+            Some("720p30"),
+            VideoProfile::P720,
+        ));
+        assert!(should_restart_running_video_capture_for_profile_change(
+            None,
+            VideoProfile::P720,
+        ));
     }
 
     #[test]
