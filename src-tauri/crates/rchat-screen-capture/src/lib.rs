@@ -149,6 +149,18 @@ pub struct ScreenCaptureSessionStats {
     pub dropped_preview_frames: u64,
     pub conversion_errors: u64,
     pub preview_frames: u64,
+    pub raw_samples: u64,
+    pub screen_samples: u64,
+    pub complete_samples: u64,
+    pub started_samples: u64,
+    pub idle_samples: u64,
+    pub blank_samples: u64,
+    pub suspended_samples: u64,
+    pub stopped_samples: u64,
+    pub unknown_status_samples: u64,
+    pub non_screen_samples: u64,
+    pub no_image_buffer_samples: u64,
+    pub converted_frames: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,16 +286,40 @@ struct CaptureStatsAtomic {
     captured_frames: AtomicU64,
     conversion_errors: AtomicU64,
     preview_frames: AtomicU64,
+    raw_samples: AtomicU64,
+    screen_samples: AtomicU64,
+    complete_samples: AtomicU64,
+    started_samples: AtomicU64,
+    idle_samples: AtomicU64,
+    blank_samples: AtomicU64,
+    suspended_samples: AtomicU64,
+    stopped_samples: AtomicU64,
+    unknown_status_samples: AtomicU64,
+    non_screen_samples: AtomicU64,
+    no_image_buffer_samples: AtomicU64,
 }
 
 impl CaptureStatsAtomic {
     fn snapshot(&self, i420_drops: u64, preview_drops: u64) -> ScreenCaptureSessionStats {
+        let captured_frames = self.captured_frames.load(Ordering::Relaxed);
         ScreenCaptureSessionStats {
-            captured_frames: self.captured_frames.load(Ordering::Relaxed),
+            captured_frames,
             dropped_i420_frames: i420_drops,
             dropped_preview_frames: preview_drops,
             conversion_errors: self.conversion_errors.load(Ordering::Relaxed),
             preview_frames: self.preview_frames.load(Ordering::Relaxed),
+            raw_samples: self.raw_samples.load(Ordering::Relaxed),
+            screen_samples: self.screen_samples.load(Ordering::Relaxed),
+            complete_samples: self.complete_samples.load(Ordering::Relaxed),
+            started_samples: self.started_samples.load(Ordering::Relaxed),
+            idle_samples: self.idle_samples.load(Ordering::Relaxed),
+            blank_samples: self.blank_samples.load(Ordering::Relaxed),
+            suspended_samples: self.suspended_samples.load(Ordering::Relaxed),
+            stopped_samples: self.stopped_samples.load(Ordering::Relaxed),
+            unknown_status_samples: self.unknown_status_samples.load(Ordering::Relaxed),
+            non_screen_samples: self.non_screen_samples.load(Ordering::Relaxed),
+            no_image_buffer_samples: self.no_image_buffer_samples.load(Ordering::Relaxed),
+            converted_frames: captured_frames,
         }
     }
 }

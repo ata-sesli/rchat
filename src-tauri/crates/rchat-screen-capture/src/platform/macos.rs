@@ -9,7 +9,7 @@ use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt, CMTime, SCFra
 use screencapturekit::content_sharing_picker::{
     SCContentSharingPickerConfiguration, SCContentSharingPickerMode, SCPickerOutcome,
 };
-use screencapturekit::cv::CVPixelBufferLockFlags;
+use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
 use screencapturekit::stream::configuration::{PixelFormat, SCStreamConfiguration};
 use screencapturekit::stream::output_type::SCStreamOutputType;
 use std::sync::atomic::Ordering;
@@ -29,18 +29,31 @@ impl PlatformScreenCaptureSession {
     }
 
     pub fn try_recv_latest_i420(&mut self) -> Option<I420ScreenFrame> {
-        let mut latest = None;
-        while let Some(sample) = self.stream.try_next() {
-            match self.convert_sample(sample) {
-                Ok(Some(frame)) => latest = Some(frame),
-                Ok(None) => {}
-                Err(error) => {
-                    self.stats.conversion_errors.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[Screen][Capture] macOS frame conversion failed: {}", error);
-                }
+        let mut latest_pixel_buffer = None;
+        while let Some((sample, output_type)) = self.stream.try_next_typed() {
+            let status = sample.frame_status();
+            let pixel_buffer = if output_type == SCStreamOutputType::Screen
+                && is_convertible_sample_status(status)
+            {
+                sample.image_buffer()
+            } else {
+                None
+            };
+            let decision = classify_macos_sample(output_type, status, pixel_buffer.is_some());
+            record_macos_sample_stats(&self.stats, output_type, status, decision);
+            if decision == MacosSampleDecision::Convert {
+                latest_pixel_buffer = pixel_buffer;
             }
         }
-        latest
+
+        latest_pixel_buffer.and_then(|pixel_buffer| match self.convert_pixel_buffer(pixel_buffer) {
+            Ok(frame) => Some(frame),
+            Err(error) => {
+                self.stats.conversion_errors.fetch_add(1, Ordering::Relaxed);
+                eprintln!("[Screen][Capture] macOS frame conversion failed: {}", error);
+                None
+            }
+        })
     }
 
     pub fn try_recv_latest_preview(&mut self) -> Option<PreviewFrame> {
@@ -51,17 +64,10 @@ impl PlatformScreenCaptureSession {
         self.stats.snapshot(0, self.preview_slot.dropped())
     }
 
-    fn convert_sample(
+    fn convert_pixel_buffer(
         &mut self,
-        sample: screencapturekit::cm::CMSampleBuffer,
-    ) -> Result<Option<I420ScreenFrame>, ScreenCaptureError> {
-        if should_skip_sample_status(sample.frame_status()) {
-            return Ok(None);
-        }
-
-        let pixel_buffer = sample.image_buffer().ok_or_else(|| {
-            ScreenCaptureError::Conversion("sample has no image buffer".to_string())
-        })?;
+        pixel_buffer: CVPixelBuffer,
+    ) -> Result<I420ScreenFrame, ScreenCaptureError> {
         let guard = pixel_buffer
             .lock(CVPixelBufferLockFlags::READ_ONLY)
             .map_err(|e| {
@@ -107,7 +113,7 @@ impl PlatformScreenCaptureSession {
             }
         }
 
-        Ok(Some(frame))
+        Ok(frame)
     }
 
     fn info_profile(&self) -> crate::ScreenCaptureProfile {
@@ -116,8 +122,127 @@ impl PlatformScreenCaptureSession {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosSampleDecision {
+    Convert,
+    Skip(MacosSampleSkipReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosSampleSkipReason {
+    NonScreen,
+    Started,
+    Idle,
+    Blank,
+    Suspended,
+    Stopped,
+    UnknownStatus,
+    NoImageBuffer,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct MacosSampleDescriptor {
+    output_type: SCStreamOutputType,
+    status: Option<SCFrameStatus>,
+    has_image_buffer: bool,
+}
+
+fn is_convertible_sample_status(status: Option<SCFrameStatus>) -> bool {
+    matches!(status, Some(SCFrameStatus::Complete))
+}
+
+#[cfg(test)]
 fn should_skip_sample_status(status: Option<SCFrameStatus>) -> bool {
-    matches!(status, Some(status) if !status.has_content())
+    !is_convertible_sample_status(status)
+}
+
+fn classify_macos_sample(
+    output_type: SCStreamOutputType,
+    status: Option<SCFrameStatus>,
+    has_image_buffer: bool,
+) -> MacosSampleDecision {
+    if output_type != SCStreamOutputType::Screen {
+        return MacosSampleDecision::Skip(MacosSampleSkipReason::NonScreen);
+    }
+
+    match status {
+        Some(SCFrameStatus::Complete) if has_image_buffer => MacosSampleDecision::Convert,
+        Some(SCFrameStatus::Complete) => {
+            MacosSampleDecision::Skip(MacosSampleSkipReason::NoImageBuffer)
+        }
+        Some(SCFrameStatus::Started) => MacosSampleDecision::Skip(MacosSampleSkipReason::Started),
+        Some(SCFrameStatus::Idle) => MacosSampleDecision::Skip(MacosSampleSkipReason::Idle),
+        Some(SCFrameStatus::Blank) => MacosSampleDecision::Skip(MacosSampleSkipReason::Blank),
+        Some(SCFrameStatus::Suspended) => {
+            MacosSampleDecision::Skip(MacosSampleSkipReason::Suspended)
+        }
+        Some(SCFrameStatus::Stopped) => MacosSampleDecision::Skip(MacosSampleSkipReason::Stopped),
+        None => MacosSampleDecision::Skip(MacosSampleSkipReason::UnknownStatus),
+    }
+}
+
+fn record_macos_sample_stats(
+    stats: &CaptureStatsAtomic,
+    output_type: SCStreamOutputType,
+    status: Option<SCFrameStatus>,
+    decision: MacosSampleDecision,
+) {
+    stats.raw_samples.fetch_add(1, Ordering::Relaxed);
+
+    if output_type != SCStreamOutputType::Screen {
+        stats.non_screen_samples.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    stats.screen_samples.fetch_add(1, Ordering::Relaxed);
+    match status {
+        Some(SCFrameStatus::Complete) => {
+            stats.complete_samples.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(SCFrameStatus::Started) => {
+            stats.started_samples.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(SCFrameStatus::Idle) => {
+            stats.idle_samples.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(SCFrameStatus::Blank) => {
+            stats.blank_samples.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(SCFrameStatus::Suspended) => {
+            stats.suspended_samples.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(SCFrameStatus::Stopped) => {
+            stats.stopped_samples.fetch_add(1, Ordering::Relaxed);
+        }
+        None => {
+            stats
+                .unknown_status_samples
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    if decision == MacosSampleDecision::Skip(MacosSampleSkipReason::NoImageBuffer) {
+        stats
+            .no_image_buffer_samples
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+fn latest_convertible_sample_index(samples: &[MacosSampleDescriptor]) -> Option<usize> {
+    samples
+        .iter()
+        .enumerate()
+        .filter_map(|(index, sample)| {
+            (classify_macos_sample(
+                sample.output_type,
+                sample.status,
+                sample.has_image_buffer,
+            ) == MacosSampleDecision::Convert)
+                .then_some(index)
+        })
+        .last()
 }
 
 impl Drop for PlatformScreenCaptureSession {
@@ -206,13 +331,141 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_complete_screencapturekit_samples_are_convertible() {
+        assert!(is_convertible_sample_status(Some(SCFrameStatus::Complete)));
+        assert!(!is_convertible_sample_status(None));
+        assert!(!is_convertible_sample_status(Some(SCFrameStatus::Started)));
+        assert!(!is_convertible_sample_status(Some(SCFrameStatus::Idle)));
+        assert!(!is_convertible_sample_status(Some(SCFrameStatus::Blank)));
+        assert!(!is_convertible_sample_status(Some(SCFrameStatus::Suspended)));
+        assert!(!is_convertible_sample_status(Some(SCFrameStatus::Stopped)));
+    }
+
+    #[test]
+    fn classifies_complete_screen_sample_with_image_as_convertible() {
+        assert_eq!(
+            classify_macos_sample(
+                SCStreamOutputType::Screen,
+                Some(SCFrameStatus::Complete),
+                true,
+            ),
+            MacosSampleDecision::Convert
+        );
+    }
+
+    #[test]
+    fn classifies_started_screen_sample_as_skipped() {
+        assert_eq!(
+            classify_macos_sample(
+                SCStreamOutputType::Screen,
+                Some(SCFrameStatus::Started),
+                true,
+            ),
+            MacosSampleDecision::Skip(MacosSampleSkipReason::Started)
+        );
+    }
+
+    #[test]
+    fn classifies_non_complete_statuses_as_skipped() {
+        assert_eq!(
+            classify_macos_sample(SCStreamOutputType::Screen, Some(SCFrameStatus::Idle), true),
+            MacosSampleDecision::Skip(MacosSampleSkipReason::Idle)
+        );
+        assert_eq!(
+            classify_macos_sample(SCStreamOutputType::Screen, Some(SCFrameStatus::Blank), true),
+            MacosSampleDecision::Skip(MacosSampleSkipReason::Blank)
+        );
+        assert_eq!(
+            classify_macos_sample(
+                SCStreamOutputType::Screen,
+                Some(SCFrameStatus::Suspended),
+                true,
+            ),
+            MacosSampleDecision::Skip(MacosSampleSkipReason::Suspended)
+        );
+        assert_eq!(
+            classify_macos_sample(
+                SCStreamOutputType::Screen,
+                Some(SCFrameStatus::Stopped),
+                true,
+            ),
+            MacosSampleDecision::Skip(MacosSampleSkipReason::Stopped)
+        );
+        assert_eq!(
+            classify_macos_sample(SCStreamOutputType::Screen, None, true),
+            MacosSampleDecision::Skip(MacosSampleSkipReason::UnknownStatus)
+        );
+    }
+
+    #[test]
+    fn classifies_complete_screen_sample_without_image_as_skipped() {
+        assert_eq!(
+            classify_macos_sample(
+                SCStreamOutputType::Screen,
+                Some(SCFrameStatus::Complete),
+                false,
+            ),
+            MacosSampleDecision::Skip(MacosSampleSkipReason::NoImageBuffer)
+        );
+    }
+
+    #[test]
+    fn classifies_non_screen_samples_as_skipped() {
+        assert_eq!(
+            classify_macos_sample(SCStreamOutputType::Audio, Some(SCFrameStatus::Complete), true),
+            MacosSampleDecision::Skip(MacosSampleSkipReason::NonScreen)
+        );
+        assert_eq!(
+            classify_macos_sample(
+                SCStreamOutputType::Microphone,
+                Some(SCFrameStatus::Complete),
+                true,
+            ),
+            MacosSampleDecision::Skip(MacosSampleSkipReason::NonScreen)
+        );
+    }
+
+    #[test]
+    fn selects_latest_convertible_macos_sample() {
+        let samples = [
+            MacosSampleDescriptor {
+                output_type: SCStreamOutputType::Screen,
+                status: Some(SCFrameStatus::Complete),
+                has_image_buffer: true,
+            },
+            MacosSampleDescriptor {
+                output_type: SCStreamOutputType::Screen,
+                status: Some(SCFrameStatus::Started),
+                has_image_buffer: true,
+            },
+            MacosSampleDescriptor {
+                output_type: SCStreamOutputType::Audio,
+                status: Some(SCFrameStatus::Complete),
+                has_image_buffer: true,
+            },
+            MacosSampleDescriptor {
+                output_type: SCStreamOutputType::Screen,
+                status: Some(SCFrameStatus::Complete),
+                has_image_buffer: false,
+            },
+            MacosSampleDescriptor {
+                output_type: SCStreamOutputType::Screen,
+                status: Some(SCFrameStatus::Complete),
+                has_image_buffer: true,
+            },
+        ];
+
+        assert_eq!(latest_convertible_sample_index(&samples), Some(4));
+    }
+
+    #[test]
     fn skips_non_content_screencapturekit_samples() {
-        assert!(!should_skip_sample_status(None));
-        assert!(!should_skip_sample_status(Some(SCFrameStatus::Complete)));
-        assert!(!should_skip_sample_status(Some(SCFrameStatus::Started)));
         assert!(should_skip_sample_status(Some(SCFrameStatus::Idle)));
         assert!(should_skip_sample_status(Some(SCFrameStatus::Blank)));
         assert!(should_skip_sample_status(Some(SCFrameStatus::Suspended)));
         assert!(should_skip_sample_status(Some(SCFrameStatus::Stopped)));
+        assert!(should_skip_sample_status(Some(SCFrameStatus::Started)));
+        assert!(should_skip_sample_status(None));
+        assert!(!should_skip_sample_status(Some(SCFrameStatus::Complete)));
     }
 }

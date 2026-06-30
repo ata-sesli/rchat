@@ -621,7 +621,7 @@ impl NetworkManager {
             };
         let stats = &self.screen_broadcast_worker_stats;
         println!(
-            "[Broadcast][Screen][{}] peer={}, backend={}, source='{}', profile={}, actual_width={}, actual_height={}, actual_fps={}, format={}, target_kbps={}, actual_kbps={:.1}, captured_frames={}, captured_fps={:.1}, encode_fps={:.1}, encode_p95_ms={:.1}, capture_drops={}, preview_drops={}, conversion_errors={}, preview_frames={}, skipped_frames={}, encoded_frames={}, keyframes={}, delta_frames={}, outbound_bytes={}, encode_errors={}, worker_event_drops={}, stream_queue_drops={}, outbound_failures={}, inbound_failures={}, rejected_responses={}",
+            "[Broadcast][Screen][{}] peer={}, backend={}, source='{}', profile={}, actual_width={}, actual_height={}, actual_fps={}, format={}, target_kbps={}, actual_kbps={:.1}, captured_frames={}, captured_fps={:.1}, encode_fps={:.1}, encode_p95_ms={:.1}, capture_drops={}, preview_drops={}, conversion_errors={}, preview_frames={}, sample_counts=raw:{},screen:{},complete:{},started:{},idle:{},blank:{},suspended:{},stopped:{},unknown:{},non_screen:{},no_image:{}, converted_frames={}, skipped_frames={}, encoded_frames={}, keyframes={}, delta_frames={}, outbound_bytes={}, encode_errors={}, worker_event_drops={}, stream_queue_drops={}, outbound_failures={}, inbound_failures={}, rejected_responses={}",
             label,
             session.remote_peer_id,
             backend,
@@ -641,6 +641,18 @@ impl NetworkManager {
             stats.capture_stats.dropped_preview_frames,
             stats.capture_stats.conversion_errors,
             stats.capture_stats.preview_frames,
+            stats.capture_stats.raw_samples,
+            stats.capture_stats.screen_samples,
+            stats.capture_stats.complete_samples,
+            stats.capture_stats.started_samples,
+            stats.capture_stats.idle_samples,
+            stats.capture_stats.blank_samples,
+            stats.capture_stats.suspended_samples,
+            stats.capture_stats.stopped_samples,
+            stats.capture_stats.unknown_status_samples,
+            stats.capture_stats.non_screen_samples,
+            stats.capture_stats.no_image_buffer_samples,
+            stats.capture_stats.converted_frames,
             stats.skipped_frames,
             stats.encoded_frames,
             stats.keyframes,
