@@ -3,9 +3,36 @@ import { sveltekit } from "@sveltejs/kit/vite";
 import tailwindcss from "@tailwindcss/vite";
 const host = process.env.TAURI_DEV_HOST;
 
+/**
+ * @param {string} code
+ */
+function extractSvelteStyle(code) {
+  const match = code.match(/<style(?:\s[^>]*)?>([\s\S]*?)<\/style>/i);
+  return match?.[1]?.trim() ?? "";
+}
+
+/**
+ * @returns {import("vite").Plugin}
+ */
+function svelteStyleCssGuard() {
+  return {
+    name: "rchat:svelte-style-css-guard",
+    enforce: "pre",
+    transform(code, id) {
+      const isSvelteStyleRequest =
+        id.includes("?svelte") &&
+        id.includes("type=style") &&
+        id.includes("lang.css");
+      if (!isSvelteStyleRequest || !code.includes("<script")) return;
+
+      return { code: extractSvelteStyle(code), map: null };
+    },
+  };
+}
+
 // https://vite.dev/config/
 export default defineConfig(async () => ({
-  plugins: [tailwindcss(),sveltekit()],
+  plugins: [svelteStyleCssGuard(), tailwindcss(), sveltekit()],
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
