@@ -11,6 +11,11 @@ export type LocalCameraToggleDecision = {
   command: LocalCameraToggleCommand | null;
 };
 
+export type LocalPreviewCanvasState = {
+  cameraEnabled: boolean;
+  hasPreviewError: boolean;
+};
+
 export function createLocalCameraToggleState(): LocalCameraToggleState {
   return { starting: false };
 }
@@ -35,4 +40,11 @@ export function markLocalCameraToggleSettled(
 ): LocalCameraToggleState {
   if (!state.starting) return state;
   return { starting: false };
+}
+
+export function shouldRenderLocalPreviewCanvas({
+  cameraEnabled,
+  hasPreviewError,
+}: LocalPreviewCanvasState): boolean {
+  return cameraEnabled && !hasPreviewError;
 }

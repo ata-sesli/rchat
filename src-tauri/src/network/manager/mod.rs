@@ -566,10 +566,18 @@ pub struct NetworkManager {
     video_force_next_keyframe: bool,
     // Expected next inbound video sequence for diagnostics.
     video_expected_inbound_seq: Option<u32>,
-    // VP8 encoder for outbound camera frames.
-    video_vp8_encoder: Option<crate::live::video::codec::Vp8VideoEncoder>,
-    // VP8 decoder for inbound camera frames.
-    video_vp8_decoder: Option<crate::live::video::codec::Vp8VideoDecoder>,
+    // Generation token for discarding stale encoded frames after stream/camera resets.
+    video_encode_generation: u64,
+    // Outbound camera encode worker queue; keeps heavy VP8 work off the network manager loop.
+    video_encode_tx: tokio::sync::mpsc::Sender<video_call::OutboundVideoEncodeTask>,
+    // Outbound camera encode worker events returned to the network manager loop.
+    video_encode_event_rx: tokio::sync::mpsc::Receiver<video_call::OutboundVideoEncodeEvent>,
+    // Outbound camera encode worker task.
+    video_encode_worker_handle: tauri::async_runtime::JoinHandle<()>,
+    // Remote camera decode worker queue; keeps heavy VP8/RGBA work off the network manager loop.
+    video_remote_decode_tx: tokio::sync::mpsc::Sender<video_call::RemoteVideoDecodeTask>,
+    // Remote camera decode worker task.
+    video_remote_decode_worker_handle: tauri::async_runtime::JoinHandle<()>,
     // Pending native camera startup task; polled from the video tick without blocking the network loop.
     video_capture_start_task: Option<video_call::VideoCaptureStartTask>,
     // Native local camera capture for active video calls.
@@ -738,6 +746,10 @@ impl NetworkManager {
         } else {
             eprintln!("[Video] Video stream incoming receiver was already taken");
         }
+        let (video_encode_tx, video_encode_event_rx, video_encode_worker_handle) =
+            video_call::start_outbound_video_encode_worker();
+        let (video_remote_decode_tx, video_remote_decode_worker_handle) =
+            video_call::start_remote_video_decode_worker(app_handle.clone());
 
         Self {
             swarm,
@@ -816,8 +828,12 @@ impl NetworkManager {
             video_next_seq: 0,
             video_force_next_keyframe: true,
             video_expected_inbound_seq: None,
-            video_vp8_encoder: None,
-            video_vp8_decoder: None,
+            video_encode_generation: 0,
+            video_encode_tx,
+            video_encode_event_rx,
+            video_encode_worker_handle,
+            video_remote_decode_tx,
+            video_remote_decode_worker_handle,
             video_capture_start_task: None,
             video_capture_session: None,
             video_capture_info: None,
@@ -1450,6 +1466,8 @@ impl NetworkManager {
 
 impl Drop for NetworkManager {
     fn drop(&mut self) {
+        self.video_encode_worker_handle.abort();
+        self.video_remote_decode_worker_handle.abort();
         self.shutdown_transfer_workers_gracefully(std::time::Duration::from_secs(5));
         self.shutdown_persistence_workers_gracefully(std::time::Duration::from_secs(5));
 

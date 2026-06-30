@@ -122,6 +122,9 @@ impl NetworkManager {
                 _ = video_call_tick.tick() => {
                     self.tick_video_call().await;
                 }
+                Some(event) = self.video_encode_event_rx.recv() => {
+                    self.handle_outbound_video_encode_event(event);
+                }
                 Some(event) = self.video_stream_event_rx.recv() => {
                     self.handle_video_stream_event(event).await;
                 }

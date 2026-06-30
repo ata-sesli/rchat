@@ -4,6 +4,7 @@ import {
   createLocalCameraToggleState,
   markLocalCameraToggleSettled,
   requestLocalCameraToggle,
+  shouldRenderLocalPreviewCanvas,
 } from "../src/lib/video/cameraToggle";
 
 describe("local camera toggle state", () => {
@@ -28,5 +29,14 @@ describe("local camera toggle state", () => {
 
     expect(second.command).toEqual({ enabled: false });
     expect(second.state.starting).toBe(false);
+  });
+
+  test("keeps the local preview canvas mounted while startup is pending", () => {
+    expect(
+      shouldRenderLocalPreviewCanvas({
+        cameraEnabled: true,
+        hasPreviewError: false,
+      }),
+    ).toBe(true);
   });
 });

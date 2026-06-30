@@ -38,6 +38,7 @@
     createLocalCameraToggleState,
     markLocalCameraToggleSettled,
     requestLocalCameraToggle,
+    shouldRenderLocalPreviewCanvas,
   } from "$lib/video/cameraToggle";
 
   // Types
@@ -1922,15 +1923,20 @@
 
       <div class="absolute bottom-2 right-2 w-28 h-20 rounded-lg border border-theme-base-700 bg-black/60 overflow-hidden flex items-center justify-center">
         {#if activeCallCameraEnabled}
-          {#if localCameraStarting}
-            <span class="text-[11px] text-theme-base-300 px-2 text-center">Starting…</span>
-          {:else if localPreviewError}
+          {#if localPreviewError}
             <span class="text-[11px] text-theme-base-300 px-2 text-center">{localPreviewError}</span>
-          {:else}
+          {/if}
+          {#if shouldRenderLocalPreviewCanvas({
+            cameraEnabled: activeCallCameraEnabled,
+            hasPreviewError: Boolean(localPreviewError),
+          })}
             <canvas
               bind:this={localPreviewCanvasEl}
               class="w-full h-full object-cover"
             ></canvas>
+            {#if localCameraStarting}
+              <span class="absolute inset-0 flex items-center justify-center text-[11px] text-theme-base-300 bg-black/50 px-2 text-center">Starting…</span>
+            {/if}
           {/if}
         {:else}
           <span class="text-[11px] text-theme-base-300">Camera off</span>

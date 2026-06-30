@@ -1,8 +1,9 @@
 use super::*;
 use crate::app_state::{CallKind, VoiceCallPhase};
 use crate::live::video::codec::{
-    should_force_video_keyframe, VideoAdaptationWindow, VideoProfile, VideoQualityChangeDecision,
-    VideoQualityMode, Vp8VideoDecoder, Vp8VideoEncoder,
+    should_force_video_keyframe, RgbaVideoFrame, VideoAdaptationWindow, VideoProfile,
+    VideoQualityChangeDecision, VideoQualityMode, Vp8EncodedPacket, Vp8VideoDecoder,
+    Vp8VideoEncoder,
 };
 use crate::live::video::protocol::{
     read_video_stream_header, read_video_stream_record, write_video_stream_header,
@@ -16,6 +17,9 @@ use serde::Serialize;
 
 const CALL_RING_TIMEOUT_SECS: u64 = 30;
 const VIDEO_STREAM_QUEUE_CAPACITY: usize = 8;
+const VIDEO_ENCODE_QUEUE_CAPACITY: usize = 2;
+const VIDEO_ENCODE_EVENT_QUEUE_CAPACITY: usize = 8;
+const VIDEO_REMOTE_DECODE_QUEUE_CAPACITY: usize = 4;
 const VIDEO_SUMMARY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,6 +69,294 @@ pub(super) struct VideoCaptureStartTask {
     handle: tokio::task::JoinHandle<Result<VideoCaptureSession, VideoCaptureError>>,
 }
 
+pub(super) struct OutboundVideoEncodeFrame {
+    call_id: String,
+    generation: u64,
+    timestamp_us: i64,
+    width: u32,
+    height: u32,
+    profile: VideoProfile,
+    data: Vec<u8>,
+    force_keyframe: bool,
+}
+
+pub(super) enum OutboundVideoEncodeTask {
+    Frame(OutboundVideoEncodeFrame),
+    Reset,
+}
+
+pub(super) struct OutboundVideoEncodeOutput {
+    call_id: String,
+    generation: u64,
+    timestamp_us: i64,
+    width: u32,
+    height: u32,
+    profile: VideoProfile,
+    packets: Vec<Vp8EncodedPacket>,
+    encode_micros: u64,
+}
+
+pub(super) enum OutboundVideoEncodeEvent {
+    Encoded(OutboundVideoEncodeOutput),
+    EncodeError {
+        call_id: String,
+        generation: u64,
+        error: String,
+    },
+}
+
+pub(super) enum RemoteVideoDecodeTask {
+    Frame {
+        peer: PeerId,
+        call_id: String,
+        frame: VideoStreamFrame,
+    },
+    Reset,
+}
+
+#[derive(Default)]
+struct OutboundVideoEncoderState {
+    encoder: Option<Vp8VideoEncoder>,
+    encoded_packet_count: u32,
+}
+
+impl OutboundVideoEncoderState {
+    fn reset(&mut self) {
+        self.encoder = None;
+        self.encoded_packet_count = 0;
+    }
+
+    fn encode_frame(
+        &mut self,
+        frame: OutboundVideoEncodeFrame,
+    ) -> Result<OutboundVideoEncodeOutput, String> {
+        let OutboundVideoEncodeFrame {
+            call_id,
+            generation,
+            timestamp_us,
+            width,
+            height,
+            profile,
+            data,
+            force_keyframe,
+        } = frame;
+
+        let needs_encoder = self
+            .encoder
+            .as_ref()
+            .map(|encoder| {
+                encoder.profile() != profile
+                    || encoder.width() != width
+                    || encoder.height() != height
+            })
+            .unwrap_or(true);
+        if needs_encoder {
+            self.encoder = Some(Vp8VideoEncoder::new_with_dimensions(
+                profile, width, height,
+            )?);
+            self.encoded_packet_count = 0;
+        }
+
+        let force_keyframe =
+            should_force_video_keyframe(force_keyframe, needs_encoder, self.encoded_packet_count);
+        let encode_started = std::time::Instant::now();
+        let packets = match self.encoder.as_mut() {
+            Some(encoder) => {
+                encoder.encode_i420(timestamp_us, width, height, &data, force_keyframe)
+            }
+            None => Err("VP8 encoder unavailable".to_string()),
+        }?;
+        let encode_micros = encode_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        self.encoded_packet_count = self
+            .encoded_packet_count
+            .wrapping_add(packets.len().try_into().unwrap_or(u32::MAX));
+
+        Ok(OutboundVideoEncodeOutput {
+            call_id,
+            generation,
+            timestamp_us,
+            width,
+            height,
+            profile,
+            packets,
+            encode_micros,
+        })
+    }
+}
+
+pub(super) fn start_outbound_video_encode_worker() -> (
+    tokio::sync::mpsc::Sender<OutboundVideoEncodeTask>,
+    tokio::sync::mpsc::Receiver<OutboundVideoEncodeEvent>,
+    tauri::async_runtime::JoinHandle<()>,
+) {
+    let (task_tx, mut task_rx) =
+        tokio::sync::mpsc::channel::<OutboundVideoEncodeTask>(VIDEO_ENCODE_QUEUE_CAPACITY);
+    let (event_tx, event_rx) =
+        tokio::sync::mpsc::channel::<OutboundVideoEncodeEvent>(VIDEO_ENCODE_EVENT_QUEUE_CAPACITY);
+    let handle = tauri::async_runtime::spawn(async move {
+        let mut state = OutboundVideoEncoderState::default();
+        while let Some(task) = task_rx.recv().await {
+            match task {
+                OutboundVideoEncodeTask::Reset => state.reset(),
+                OutboundVideoEncodeTask::Frame(frame) => {
+                    let call_id = frame.call_id.clone();
+                    let generation = frame.generation;
+                    let current_state = std::mem::take(&mut state);
+                    let result = tauri::async_runtime::spawn_blocking(move || {
+                        let mut state = current_state;
+                        let encoded = state.encode_frame(frame);
+                        (state, encoded)
+                    })
+                    .await;
+
+                    let event = match result {
+                        Ok((next_state, Ok(output))) => {
+                            state = next_state;
+                            OutboundVideoEncodeEvent::Encoded(output)
+                        }
+                        Ok((next_state, Err(error))) => {
+                            state = next_state;
+                            OutboundVideoEncodeEvent::EncodeError {
+                                call_id,
+                                generation,
+                                error,
+                            }
+                        }
+                        Err(error) => {
+                            state.reset();
+                            OutboundVideoEncodeEvent::EncodeError {
+                                call_id,
+                                generation,
+                                error: format!("VP8 encode worker failed: {}", error),
+                            }
+                        }
+                    };
+
+                    if event_tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    (task_tx, event_rx, handle)
+}
+
+#[derive(Default)]
+struct RemoteVideoDecoderState {
+    call_id: Option<String>,
+    decoder: Option<Vp8VideoDecoder>,
+}
+
+impl RemoteVideoDecoderState {
+    fn reset(&mut self) {
+        self.call_id = None;
+        self.decoder = None;
+    }
+
+    fn decode_frame(
+        &mut self,
+        call_id: &str,
+        frame: &VideoStreamFrame,
+    ) -> Result<Option<RgbaVideoFrame>, String> {
+        if self.call_id.as_deref() != Some(call_id) {
+            self.call_id = Some(call_id.to_string());
+            self.decoder = None;
+        }
+
+        if frame.chunk_type == VideoChunkType::Key {
+            self.decoder = Some(Vp8VideoDecoder::new()?);
+        } else if self.decoder.is_none() {
+            return Ok(None);
+        }
+
+        let decoded = match self.decoder.as_mut() {
+            Some(decoder) => decoder.decode_rgba(&frame.payload),
+            None => Err("VP8 decoder unavailable".to_string()),
+        };
+        match decoded {
+            Ok(frame) => Ok(Some(frame)),
+            Err(e) => {
+                self.decoder = None;
+                Err(e)
+            }
+        }
+    }
+}
+
+pub(super) fn start_remote_video_decode_worker(
+    app_handle: AppHandle,
+) -> (
+    tokio::sync::mpsc::Sender<RemoteVideoDecodeTask>,
+    tauri::async_runtime::JoinHandle<()>,
+) {
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<RemoteVideoDecodeTask>(VIDEO_REMOTE_DECODE_QUEUE_CAPACITY);
+    let handle = tauri::async_runtime::spawn(async move {
+        let mut state = RemoteVideoDecoderState::default();
+        while let Some(task) = rx.recv().await {
+            match task {
+                RemoteVideoDecodeTask::Reset => state.reset(),
+                RemoteVideoDecodeTask::Frame {
+                    peer,
+                    call_id,
+                    frame,
+                } => {
+                    let peer_id = peer.to_string();
+                    let seq = frame.seq;
+                    let timestamp = frame.timestamp_us;
+                    let kind = frame.chunk_type;
+                    let bytes = frame.payload.len();
+                    let call_id_for_log = call_id.clone();
+                    let peer_id_for_log = peer_id.clone();
+                    let current_state = std::mem::take(&mut state);
+                    let result = tauri::async_runtime::spawn_blocking(move || {
+                        let mut state = current_state;
+                        let decoded = state.decode_frame(&call_id, &frame).map(|frame| {
+                            frame.map(|decoded| VideoRemoteFrameEvent {
+                                call_id,
+                                peer_id,
+                                seq,
+                                timestamp,
+                                width: decoded.width,
+                                height: decoded.height,
+                                rgba: decoded.rgba,
+                            })
+                        });
+                        (state, decoded)
+                    })
+                    .await;
+
+                    match result {
+                        Ok((next_state, Ok(Some(event)))) => {
+                            state = next_state;
+                            let _ = app_handle.emit("video-call-remote-frame", event);
+                        }
+                        Ok((next_state, Ok(None))) => {
+                            state = next_state;
+                        }
+                        Ok((next_state, Err(e))) => {
+                            state = next_state;
+                            eprintln!(
+                                "[Video][Codec] inbound VP8 decode failed peer={} call_id={} seq={} kind={:?} bytes={} error={}",
+                                peer_id_for_log, call_id_for_log, seq, kind, bytes, e
+                            );
+                        }
+                        Err(e) => {
+                            state.reset();
+                            eprintln!(
+                                "[Video][Codec] inbound VP8 decode worker failed peer={} call_id={} seq={} error={}",
+                                peer_id_for_log, call_id_for_log, seq, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+    (tx, handle)
+}
+
 fn take_finished_video_capture_start(
     task: &mut Option<VideoCaptureStartTask>,
 ) -> Option<VideoCaptureStartTask> {
@@ -88,6 +380,14 @@ impl NetworkManager {
         self.video_last_summary_at = Some(std::time::Instant::now());
     }
 
+    fn reset_outbound_video_encoder(&mut self) {
+        self.video_encode_generation = self.video_encode_generation.wrapping_add(1);
+        self.video_force_next_keyframe = true;
+        let _ = self
+            .video_encode_tx
+            .try_send(OutboundVideoEncodeTask::Reset);
+    }
+
     pub(super) fn stop_video_media(&mut self) {
         if let Some(call) = self.active_call.as_ref() {
             if call.kind == CallKind::Video {
@@ -104,8 +404,10 @@ impl NetworkManager {
         self.video_next_seq = 0;
         self.video_force_next_keyframe = true;
         self.video_expected_inbound_seq = None;
-        self.video_vp8_encoder = None;
-        self.video_vp8_decoder = None;
+        self.reset_outbound_video_encoder();
+        let _ = self
+            .video_remote_decode_tx
+            .try_send(RemoteVideoDecodeTask::Reset);
         self.video_quality_controller =
             crate::live::video::codec::VideoQualityController::new(VideoQualityMode::Auto);
         self.reset_video_network_diagnostics();
@@ -118,8 +420,10 @@ impl NetworkManager {
         camera_enabled: bool,
     ) -> bool {
         self.reset_video_network_diagnostics();
-        self.video_force_next_keyframe = true;
-        self.video_vp8_decoder = None;
+        self.reset_outbound_video_encoder();
+        let _ = self
+            .video_remote_decode_tx
+            .try_send(RemoteVideoDecodeTask::Reset);
         let started = self.start_video_stream_writer(peer, call_id.clone());
         if started {
             self.queue_video_stream_record(VideoStreamRecord::CameraState(VideoCameraState {
@@ -302,7 +606,8 @@ impl NetworkManager {
                 .emit("video-call-local-preview-frame", event);
         }
         if let Some(frame) = frame {
-            self.encode_and_queue_video_i420_frame(
+            self.queue_outbound_video_encode_frame(
+                call_id,
                 frame.timestamp_us,
                 frame.width,
                 frame.height,
@@ -452,7 +757,7 @@ impl NetworkManager {
         self.video_stream_tx = Some(tx);
         self.video_stream_call_id = Some(call_id);
         self.video_stream_writer_handle = Some(handle);
-        self.video_force_next_keyframe = true;
+        self.reset_outbound_video_encoder();
         true
     }
 
@@ -499,62 +804,33 @@ impl NetworkManager {
         let _ = self.app_handle.emit("video-call-camera-state", event);
     }
 
-    fn decode_and_emit_remote_video_frame(
+    fn queue_remote_video_decode_frame(
         &mut self,
         peer: PeerId,
         call_id: String,
         frame: VideoStreamFrame,
     ) {
-        if frame.chunk_type == VideoChunkType::Key {
-            match Vp8VideoDecoder::new() {
-                Ok(decoder) => {
-                    self.video_vp8_decoder = Some(decoder);
-                }
-                Err(e) => {
-                    self.video_network_stats.local_decode_errors += 1;
-                    eprintln!(
-                        "[Video][Codec] Failed to initialize inbound VP8 decoder peer={} call_id={} seq={} error={}",
-                        peer, call_id, frame.seq, e
-                    );
-                    return;
-                }
+        match self
+            .video_remote_decode_tx
+            .try_send(RemoteVideoDecodeTask::Frame {
+                peer,
+                call_id,
+                frame,
+            }) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.video_network_stats.local_dropped_frames = self
+                    .video_network_stats
+                    .local_dropped_frames
+                    .saturating_add(1);
             }
-        } else if self.video_vp8_decoder.is_none() {
-            return;
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.video_network_stats.local_decode_errors = self
+                    .video_network_stats
+                    .local_decode_errors
+                    .saturating_add(1);
+            }
         }
-
-        let decoded = match self.video_vp8_decoder.as_mut() {
-            Some(decoder) => decoder.decode_rgba(&frame.payload),
-            None => Err("VP8 decoder unavailable".to_string()),
-        };
-        let decoded = match decoded {
-            Ok(decoded) => decoded,
-            Err(e) => {
-                self.video_network_stats.local_decode_errors += 1;
-                self.video_vp8_decoder = None;
-                eprintln!(
-                    "[Video][Codec] inbound VP8 decode failed peer={} call_id={} seq={} kind={:?} bytes={} error={}",
-                    peer,
-                    call_id,
-                    frame.seq,
-                    frame.chunk_type,
-                    frame.payload.len(),
-                    e
-                );
-                return;
-            }
-        };
-
-        let event = VideoRemoteFrameEvent {
-            call_id,
-            peer_id: peer.to_string(),
-            seq: frame.seq,
-            timestamp: frame.timestamp_us,
-            width: decoded.width,
-            height: decoded.height,
-            rgba: decoded.rgba,
-        };
-        let _ = self.app_handle.emit("video-call-remote-frame", event);
     }
 
     pub(super) async fn handle_start_video_call(&mut self, peer_chat_id: String) {
@@ -788,6 +1064,7 @@ impl NetworkManager {
         }));
         if !enabled {
             self.stop_video_capture();
+            self.reset_outbound_video_encoder();
         } else {
             self.ensure_video_capture_running(&updated).await;
             if self
@@ -861,11 +1138,12 @@ impl NetworkManager {
             let _ = self.start_video_stream_writer(call_snapshot.remote_peer_id, call_id.clone());
         }
 
-        self.encode_and_queue_video_i420_frame(timestamp_us, width, height, data);
+        self.queue_outbound_video_encode_frame(&call_id, timestamp_us, width, height, data);
     }
 
-    fn encode_and_queue_video_i420_frame(
+    fn queue_outbound_video_encode_frame(
         &mut self,
+        call_id: &str,
         timestamp_us: i64,
         width: u32,
         height: u32,
@@ -882,53 +1160,73 @@ impl NetworkManager {
             return;
         }
 
-        let needs_encoder = self
-            .video_vp8_encoder
-            .as_ref()
-            .map(|encoder| {
-                encoder.profile() != current_profile
-                    || encoder.width() != width
-                    || encoder.height() != height
-            })
-            .unwrap_or(true);
-        let force_keyframe = should_force_video_keyframe(
-            self.video_force_next_keyframe,
-            needs_encoder,
-            self.video_next_seq,
-        );
-        if needs_encoder {
-            match Vp8VideoEncoder::new_with_dimensions(current_profile, width, height) {
-                Ok(encoder) => self.video_vp8_encoder = Some(encoder),
-                Err(e) => {
-                    eprintln!("[Video][Codec] Failed to initialize VP8 encoder: {}", e);
-                    self.video_network_stats.encode_errors += 1;
-                    return;
-                }
+        let queued = self
+            .video_encode_tx
+            .try_send(OutboundVideoEncodeTask::Frame(OutboundVideoEncodeFrame {
+                call_id: call_id.to_string(),
+                generation: self.video_encode_generation,
+                timestamp_us,
+                width,
+                height,
+                profile: current_profile,
+                data,
+                force_keyframe: self.video_force_next_keyframe,
+            }));
+        match queued {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.video_network_stats.raw_frames_dropped += 1;
+                self.video_window_counters.raw_frames_dropped += 1;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.video_network_stats.encode_errors += 1;
             }
         }
+    }
 
-        let encode_started = std::time::Instant::now();
-        let packets = match self.video_vp8_encoder.as_mut() {
-            Some(encoder) => {
-                encoder.encode_i420(timestamp_us, width, height, &data, force_keyframe)
-            }
-            None => Err("VP8 encoder unavailable".to_string()),
-        };
-        let encode_micros = encode_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-        self.video_window_counters.encode_micros.push(encode_micros);
-
-        let packets = match packets {
-            Ok(packets) => packets,
-            Err(e) => {
-                eprintln!("[Video][Codec] VP8 encode failed: {}", e);
-                self.video_network_stats.encode_errors += 1;
+    pub(super) fn handle_outbound_video_encode_event(&mut self, event: OutboundVideoEncodeEvent) {
+        let output = match event {
+            OutboundVideoEncodeEvent::Encoded(output) => output,
+            OutboundVideoEncodeEvent::EncodeError {
+                call_id,
+                generation,
+                error,
+            } => {
+                if generation == self.video_encode_generation
+                    && self
+                        .active_call
+                        .as_ref()
+                        .map(|call| call.call_id == call_id && call.kind == CallKind::Video)
+                        .unwrap_or(false)
+                {
+                    eprintln!("[Video][Codec] VP8 encode failed: {}", error);
+                    self.video_network_stats.encode_errors += 1;
+                }
                 return;
             }
         };
+        if output.generation != self.video_encode_generation
+            || self.video_stream_call_id.as_deref() != Some(output.call_id.as_str())
+            || !self
+                .active_call
+                .as_ref()
+                .map(|call| {
+                    call.phase == ActiveCallPhase::Active
+                        && call.kind == CallKind::Video
+                        && call.call_id == output.call_id
+                        && call.camera_enabled
+                })
+                .unwrap_or(false)
+        {
+            return;
+        }
 
+        self.video_window_counters
+            .encode_micros
+            .push(output.encode_micros);
         let mut queued_keyframe = false;
         let mut dropped_video_frame = false;
-        for packet in packets {
+        for packet in output.packets {
             let packet_is_key = packet.is_key;
             let chunk_type = if packet.is_key {
                 self.video_network_stats.keyframes += 1;
@@ -940,11 +1238,11 @@ impl NetworkManager {
             let payload_len = packet.payload.len() as u64;
             let record = VideoStreamRecord::Frame(VideoStreamFrame {
                 seq: self.video_next_seq,
-                timestamp_us,
+                timestamp_us: output.timestamp_us,
                 chunk_type,
-                profile: current_profile,
-                width,
-                height,
+                profile: output.profile,
+                width: output.width,
+                height: output.height,
                 payload: packet.payload,
             });
             self.video_next_seq = self.video_next_seq.wrapping_add(1);
@@ -1059,8 +1357,7 @@ impl NetworkManager {
 
     fn apply_video_quality_change(&mut self, call_id: &str, change: VideoQualityChangeDecision) {
         self.video_network_stats.quality_changes += 1;
-        self.video_vp8_encoder = None;
-        self.video_force_next_keyframe = true;
+        self.reset_outbound_video_encoder();
         self.stop_video_capture();
         self.queue_video_stream_record(VideoStreamRecord::QualityChange(VideoQualityChange {
             profile: change.profile,
@@ -1112,7 +1409,7 @@ impl NetworkManager {
                     }
                     self.video_expected_inbound_seq = Some(frame.seq.wrapping_add(1));
 
-                    self.decode_and_emit_remote_video_frame(peer, call_id, frame);
+                    self.queue_remote_video_decode_frame(peer, call_id, frame);
                 }
                 VideoStreamRecord::ReceiverReport(report) => {
                     self.video_network_stats.receiver_received_frames = self
@@ -1402,6 +1699,40 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    fn synthetic_i420(width: usize, height: usize) -> Vec<u8> {
+        let y_len = width * height;
+        let uv_len = y_len / 4;
+        let mut data = vec![96u8; y_len + uv_len * 2];
+        data[y_len..].fill(128);
+        data
+    }
+
+    fn encoded_keyframe(seq: u32) -> VideoStreamFrame {
+        let width = 640;
+        let height = 360;
+        let mut encoder = Vp8VideoEncoder::new_with_dimensions(VideoProfile::P360, width, height)
+            .expect("encoder starts");
+        let packets = encoder
+            .encode_i420(
+                123,
+                width,
+                height,
+                &synthetic_i420(width as usize, height as usize),
+                true,
+            )
+            .expect("frame encodes");
+        let packet = packets.first().expect("packet");
+        VideoStreamFrame {
+            seq,
+            timestamp_us: 123,
+            chunk_type: VideoChunkType::Key,
+            profile: VideoProfile::P360,
+            width,
+            height,
+            payload: packet.payload.clone(),
+        }
+    }
+
     #[tokio::test]
     async fn pending_video_capture_start_is_not_awaited() {
         let handle = tokio::spawn(async {
@@ -1416,5 +1747,68 @@ mod tests {
 
         assert!(take_finished_video_capture_start(&mut task).is_none());
         assert!(task.is_some());
+    }
+
+    #[test]
+    fn remote_video_decoder_state_waits_for_keyframe_when_call_changes() {
+        let mut state = RemoteVideoDecoderState::default();
+        let decoded = state
+            .decode_frame("call-1", &encoded_keyframe(0))
+            .expect("keyframe decodes");
+        assert!(decoded.is_some());
+
+        let delta = VideoStreamFrame {
+            seq: 1,
+            timestamp_us: 456,
+            chunk_type: VideoChunkType::Delta,
+            profile: VideoProfile::P360,
+            width: 640,
+            height: 360,
+            payload: vec![1, 2, 3],
+        };
+
+        assert_eq!(
+            state
+                .decode_frame("call-2", &delta)
+                .expect("delta waits for keyframe"),
+            None
+        );
+    }
+
+    #[test]
+    fn outbound_video_encoder_state_forces_keyframe_after_reset() {
+        let mut state = OutboundVideoEncoderState::default();
+        let width = 640;
+        let height = 360;
+
+        let first = state
+            .encode_frame(OutboundVideoEncodeFrame {
+                call_id: "call-1".to_string(),
+                generation: 0,
+                timestamp_us: 1,
+                width,
+                height,
+                profile: VideoProfile::P360,
+                data: synthetic_i420(width as usize, height as usize),
+                force_keyframe: false,
+            })
+            .expect("first frame encodes");
+        assert!(first.packets.iter().any(|packet| packet.is_key));
+
+        state.reset();
+
+        let after_reset = state
+            .encode_frame(OutboundVideoEncodeFrame {
+                call_id: "call-1".to_string(),
+                generation: 0,
+                timestamp_us: 2,
+                width,
+                height,
+                profile: VideoProfile::P360,
+                data: synthetic_i420(width as usize, height as usize),
+                force_keyframe: false,
+            })
+            .expect("frame after reset encodes");
+        assert!(after_reset.packets.iter().any(|packet| packet.is_key));
     }
 }
