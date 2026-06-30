@@ -33,7 +33,7 @@ impl PlatformScreenCaptureSession {
         while let Some((sample, output_type)) = self.stream.try_next_typed() {
             let status = sample.frame_status();
             let pixel_buffer = if output_type == SCStreamOutputType::Screen
-                && is_convertible_sample_status(status)
+                && can_probe_macos_image_buffer(status)
             {
                 sample.image_buffer()
             } else {
@@ -136,7 +136,6 @@ enum MacosSampleSkipReason {
     Blank,
     Suspended,
     Stopped,
-    UnknownStatus,
     NoImageBuffer,
 }
 
@@ -150,6 +149,10 @@ struct MacosSampleDescriptor {
 
 fn is_convertible_sample_status(status: Option<SCFrameStatus>) -> bool {
     matches!(status, Some(SCFrameStatus::Complete))
+}
+
+fn can_probe_macos_image_buffer(status: Option<SCFrameStatus>) -> bool {
+    is_convertible_sample_status(status) || status.is_none()
 }
 
 #[cfg(test)]
@@ -171,6 +174,8 @@ fn classify_macos_sample(
         Some(SCFrameStatus::Complete) => {
             MacosSampleDecision::Skip(MacosSampleSkipReason::NoImageBuffer)
         }
+        None if has_image_buffer => MacosSampleDecision::Convert,
+        None => MacosSampleDecision::Skip(MacosSampleSkipReason::NoImageBuffer),
         Some(SCFrameStatus::Started) => MacosSampleDecision::Skip(MacosSampleSkipReason::Started),
         Some(SCFrameStatus::Idle) => MacosSampleDecision::Skip(MacosSampleSkipReason::Idle),
         Some(SCFrameStatus::Blank) => MacosSampleDecision::Skip(MacosSampleSkipReason::Blank),
@@ -178,7 +183,6 @@ fn classify_macos_sample(
             MacosSampleDecision::Skip(MacosSampleSkipReason::Suspended)
         }
         Some(SCFrameStatus::Stopped) => MacosSampleDecision::Skip(MacosSampleSkipReason::Stopped),
-        None => MacosSampleDecision::Skip(MacosSampleSkipReason::UnknownStatus),
     }
 }
 
@@ -331,9 +335,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_complete_screencapturekit_samples_are_convertible() {
+    fn complete_or_missing_status_screencapturekit_samples_can_carry_pixels() {
+        assert!(can_probe_macos_image_buffer(Some(SCFrameStatus::Complete)));
+        assert!(can_probe_macos_image_buffer(None));
+        assert!(!can_probe_macos_image_buffer(Some(SCFrameStatus::Started)));
+        assert!(!can_probe_macos_image_buffer(Some(SCFrameStatus::Idle)));
+        assert!(!can_probe_macos_image_buffer(Some(SCFrameStatus::Blank)));
+        assert!(!can_probe_macos_image_buffer(Some(SCFrameStatus::Suspended)));
+        assert!(!can_probe_macos_image_buffer(Some(SCFrameStatus::Stopped)));
+    }
+
+    #[test]
+    fn only_complete_present_status_is_convertible_without_fallback() {
         assert!(is_convertible_sample_status(Some(SCFrameStatus::Complete)));
-        assert!(!is_convertible_sample_status(None));
         assert!(!is_convertible_sample_status(Some(SCFrameStatus::Started)));
         assert!(!is_convertible_sample_status(Some(SCFrameStatus::Idle)));
         assert!(!is_convertible_sample_status(Some(SCFrameStatus::Blank)));
@@ -349,6 +363,14 @@ mod tests {
                 Some(SCFrameStatus::Complete),
                 true,
             ),
+            MacosSampleDecision::Convert
+        );
+    }
+
+    #[test]
+    fn classifies_unknown_status_screen_sample_with_image_as_convertible() {
+        assert_eq!(
+            classify_macos_sample(SCStreamOutputType::Screen, None, true),
             MacosSampleDecision::Convert
         );
     }
@@ -390,10 +412,6 @@ mod tests {
                 true,
             ),
             MacosSampleDecision::Skip(MacosSampleSkipReason::Stopped)
-        );
-        assert_eq!(
-            classify_macos_sample(SCStreamOutputType::Screen, None, true),
-            MacosSampleDecision::Skip(MacosSampleSkipReason::UnknownStatus)
         );
     }
 
@@ -450,7 +468,7 @@ mod tests {
             },
             MacosSampleDescriptor {
                 output_type: SCStreamOutputType::Screen,
-                status: Some(SCFrameStatus::Complete),
+                status: None,
                 has_image_buffer: true,
             },
         ];
