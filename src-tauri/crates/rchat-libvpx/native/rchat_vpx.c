@@ -18,6 +18,11 @@ struct RchatVpxEncoder {
     int64_t frame_index;
 };
 
+struct RchatVpxDecoder {
+    vpx_codec_ctx_t codec;
+    int initialized;
+};
+
 static size_t rchat_vpx_expected_i420_len(uint32_t width, uint32_t height) {
     size_t pixels = (size_t)width * (size_t)height;
     return pixels + pixels / 2;
@@ -208,6 +213,126 @@ int rchat_vpx_encoder_encode_i420(
 
 void rchat_vpx_packet_list_free(RchatVpxPacketList *packets) {
     rchat_vpx_packet_list_clear(packets);
+}
+
+int rchat_vpx_decoder_new(RchatVpxDecoder **out_decoder) {
+    if (out_decoder == NULL) {
+        return RCHAT_VPX_INVALID_ARGUMENT;
+    }
+    *out_decoder = NULL;
+
+    RchatVpxDecoder *decoder = (RchatVpxDecoder *)calloc(1, sizeof(RchatVpxDecoder));
+    if (decoder == NULL) {
+        return RCHAT_VPX_ALLOC_FAILED;
+    }
+
+    if (vpx_codec_dec_init(&decoder->codec, vpx_codec_vp8_dx(), NULL, 0) != VPX_CODEC_OK) {
+        free(decoder);
+        return RCHAT_VPX_DECODER_INIT_FAILED;
+    }
+
+    decoder->initialized = 1;
+    *out_decoder = decoder;
+    return RCHAT_VPX_OK;
+}
+
+void rchat_vpx_decoder_free(RchatVpxDecoder *decoder) {
+    if (decoder == NULL) {
+        return;
+    }
+    if (decoder->initialized) {
+        vpx_codec_destroy(&decoder->codec);
+    }
+    free(decoder);
+}
+
+static int rchat_vpx_copy_decoded_i420(vpx_image_t *image, RchatVpxDecodedFrame *out_frame) {
+    if (image == NULL || out_frame == NULL || image->fmt != VPX_IMG_FMT_I420) {
+        return RCHAT_VPX_DECODE_FAILED;
+    }
+
+    uint32_t width = image->d_w;
+    uint32_t height = image->d_h;
+    if (width == 0 || height == 0 || (width % 2) != 0 || (height % 2) != 0) {
+        return RCHAT_VPX_DECODE_FAILED;
+    }
+
+    size_t y_len = (size_t)width * (size_t)height;
+    size_t uv_width = (size_t)width / 2;
+    size_t uv_height = (size_t)height / 2;
+    size_t uv_len = uv_width * uv_height;
+    size_t len = y_len + uv_len * 2;
+    uint8_t *data = (uint8_t *)malloc(len);
+    if (data == NULL) {
+        return RCHAT_VPX_ALLOC_FAILED;
+    }
+
+    for (uint32_t row = 0; row < height; row++) {
+        memcpy(
+            data + (size_t)row * width,
+            image->planes[VPX_PLANE_Y] + row * image->stride[VPX_PLANE_Y],
+            width);
+    }
+
+    size_t u_offset = y_len;
+    size_t v_offset = y_len + uv_len;
+    for (uint32_t row = 0; row < height / 2; row++) {
+        memcpy(
+            data + u_offset + (size_t)row * uv_width,
+            image->planes[VPX_PLANE_U] + row * image->stride[VPX_PLANE_U],
+            uv_width);
+        memcpy(
+            data + v_offset + (size_t)row * uv_width,
+            image->planes[VPX_PLANE_V] + row * image->stride[VPX_PLANE_V],
+            uv_width);
+    }
+
+    out_frame->data = data;
+    out_frame->len = len;
+    out_frame->width = width;
+    out_frame->height = height;
+    return RCHAT_VPX_OK;
+}
+
+int rchat_vpx_decoder_decode_i420(
+    RchatVpxDecoder *decoder,
+    const uint8_t *data,
+    size_t data_len,
+    RchatVpxDecodedFrame *out_frame) {
+    if (out_frame == NULL) {
+        return RCHAT_VPX_INVALID_ARGUMENT;
+    }
+    out_frame->data = NULL;
+    out_frame->len = 0;
+    out_frame->width = 0;
+    out_frame->height = 0;
+
+    if (decoder == NULL || data == NULL || data_len == 0) {
+        return RCHAT_VPX_INVALID_ARGUMENT;
+    }
+
+    if (vpx_codec_decode(&decoder->codec, data, (unsigned int)data_len, NULL, 0) !=
+        VPX_CODEC_OK) {
+        return RCHAT_VPX_DECODE_FAILED;
+    }
+
+    vpx_codec_iter_t iter = NULL;
+    vpx_image_t *image = vpx_codec_get_frame(&decoder->codec, &iter);
+    if (image == NULL) {
+        return RCHAT_VPX_NO_DECODED_FRAME;
+    }
+    return rchat_vpx_copy_decoded_i420(image, out_frame);
+}
+
+void rchat_vpx_decoded_frame_free(RchatVpxDecodedFrame *frame) {
+    if (frame == NULL) {
+        return;
+    }
+    free(frame->data);
+    frame->data = NULL;
+    frame->len = 0;
+    frame->width = 0;
+    frame->height = 0;
 }
 
 int rchat_vpx_probe_vp8_decode(const uint8_t *data, size_t data_len) {

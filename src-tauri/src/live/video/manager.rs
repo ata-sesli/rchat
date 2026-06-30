@@ -2,12 +2,12 @@ use super::*;
 use crate::app_state::{CallKind, VoiceCallPhase};
 use crate::live::video::codec::{
     should_force_video_keyframe, VideoAdaptationWindow, VideoProfile, VideoQualityChangeDecision,
-    VideoQualityMode, Vp8VideoEncoder,
+    VideoQualityMode, Vp8VideoDecoder, Vp8VideoEncoder,
 };
 use crate::live::video::protocol::{
     read_video_stream_header, read_video_stream_record, write_video_stream_header,
-    write_video_stream_record, VideoCameraState, VideoChunkType, VideoFrameEvent,
-    VideoQualityChange, VideoReceiverReport, VideoStreamFrame, VideoStreamRecord,
+    write_video_stream_record, VideoCameraState, VideoChunkType, VideoQualityChange,
+    VideoReceiverReport, VideoStreamFrame, VideoStreamRecord,
 };
 use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
 use futures::AsyncWriteExt as _;
@@ -37,6 +37,17 @@ struct VideoCameraStateEvent {
 struct VideoLocalPreviewFrameEvent {
     call_id: String,
     timestamp_us: i64,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VideoRemoteFrameEvent {
+    call_id: String,
+    peer_id: String,
+    seq: u32,
+    timestamp: i64,
     width: u32,
     height: u32,
     rgba: Vec<u8>,
@@ -94,6 +105,7 @@ impl NetworkManager {
         self.video_force_next_keyframe = true;
         self.video_expected_inbound_seq = None;
         self.video_vp8_encoder = None;
+        self.video_vp8_decoder = None;
         self.video_quality_controller =
             crate::live::video::codec::VideoQualityController::new(VideoQualityMode::Auto);
         self.reset_video_network_diagnostics();
@@ -107,6 +119,7 @@ impl NetworkManager {
     ) -> bool {
         self.reset_video_network_diagnostics();
         self.video_force_next_keyframe = true;
+        self.video_vp8_decoder = None;
         let started = self.start_video_stream_writer(peer, call_id.clone());
         if started {
             self.queue_video_stream_record(VideoStreamRecord::CameraState(VideoCameraState {
@@ -484,6 +497,64 @@ impl NetworkManager {
             enabled,
         };
         let _ = self.app_handle.emit("video-call-camera-state", event);
+    }
+
+    fn decode_and_emit_remote_video_frame(
+        &mut self,
+        peer: PeerId,
+        call_id: String,
+        frame: VideoStreamFrame,
+    ) {
+        if frame.chunk_type == VideoChunkType::Key {
+            match Vp8VideoDecoder::new() {
+                Ok(decoder) => {
+                    self.video_vp8_decoder = Some(decoder);
+                }
+                Err(e) => {
+                    self.video_network_stats.local_decode_errors += 1;
+                    eprintln!(
+                        "[Video][Codec] Failed to initialize inbound VP8 decoder peer={} call_id={} seq={} error={}",
+                        peer, call_id, frame.seq, e
+                    );
+                    return;
+                }
+            }
+        } else if self.video_vp8_decoder.is_none() {
+            return;
+        }
+
+        let decoded = match self.video_vp8_decoder.as_mut() {
+            Some(decoder) => decoder.decode_rgba(&frame.payload),
+            None => Err("VP8 decoder unavailable".to_string()),
+        };
+        let decoded = match decoded {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                self.video_network_stats.local_decode_errors += 1;
+                self.video_vp8_decoder = None;
+                eprintln!(
+                    "[Video][Codec] inbound VP8 decode failed peer={} call_id={} seq={} kind={:?} bytes={} error={}",
+                    peer,
+                    call_id,
+                    frame.seq,
+                    frame.chunk_type,
+                    frame.payload.len(),
+                    e
+                );
+                return;
+            }
+        };
+
+        let event = VideoRemoteFrameEvent {
+            call_id,
+            peer_id: peer.to_string(),
+            seq: frame.seq,
+            timestamp: frame.timestamp_us,
+            width: decoded.width,
+            height: decoded.height,
+            rgba: decoded.rgba,
+        };
+        let _ = self.app_handle.emit("video-call-remote-frame", event);
     }
 
     pub(super) async fn handle_start_video_call(&mut self, peer_chat_id: String) {
@@ -1041,20 +1112,7 @@ impl NetworkManager {
                     }
                     self.video_expected_inbound_seq = Some(frame.seq.wrapping_add(1));
 
-                    let event = VideoFrameEvent {
-                        call_id,
-                        peer_id: peer.to_string(),
-                        seq: frame.seq,
-                        timestamp: frame.timestamp_us,
-                        mime: "video/webm;codecs=vp8".to_string(),
-                        codec: "vp8".to_string(),
-                        chunk_type: frame.chunk_type,
-                        profile: frame.profile,
-                        width: frame.width,
-                        height: frame.height,
-                        payload: frame.payload,
-                    };
-                    let _ = self.app_handle.emit("video-call-frame", event);
+                    self.decode_and_emit_remote_video_frame(peer, call_id, frame);
                 }
                 VideoStreamRecord::ReceiverReport(report) => {
                     self.video_network_stats.receiver_received_frames = self

@@ -67,6 +67,19 @@ pub struct Vp8Encoder {
 
 unsafe impl Send for Vp8Encoder {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedI420Frame {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
+pub struct Vp8Decoder {
+    raw: NonNull<RchatVpxDecoder>,
+}
+
+unsafe impl Send for Vp8Decoder {}
+
 impl Vp8Encoder {
     pub fn new(config: Vp8EncoderConfig) -> Result<Self, VpxError> {
         if expected_i420_len(config.width, config.height).is_none()
@@ -159,6 +172,59 @@ impl Vp8Encoder {
     }
 }
 
+impl Vp8Decoder {
+    pub fn new() -> Result<Self, VpxError> {
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe { rchat_vpx_decoder_new(&mut raw) };
+        if status != RCHAT_VPX_OK {
+            return Err(VpxError::from_status(status));
+        }
+
+        let raw =
+            NonNull::new(raw).ok_or_else(|| VpxError::message("libvpx returned null decoder"))?;
+        Ok(Self { raw })
+    }
+
+    pub fn decode(&mut self, data: &[u8]) -> Result<DecodedI420Frame, VpxError> {
+        if data.is_empty() {
+            return Err(VpxError::message("empty VP8 packet"));
+        }
+
+        let mut frame = RchatVpxDecodedFrame {
+            data: std::ptr::null_mut(),
+            len: 0,
+            width: 0,
+            height: 0,
+        };
+        let status = unsafe {
+            rchat_vpx_decoder_decode_i420(self.raw.as_ptr(), data.as_ptr(), data.len(), &mut frame)
+        };
+        if status != RCHAT_VPX_OK {
+            return Err(VpxError::from_status(status));
+        }
+
+        let _guard = DecodedFrameGuard(&mut frame);
+        let decoded = if frame.data.is_null() || frame.len == 0 {
+            Vec::new()
+        } else {
+            unsafe { slice::from_raw_parts(frame.data, frame.len).to_vec() }
+        };
+        Ok(DecodedI420Frame {
+            width: frame.width,
+            height: frame.height,
+            data: decoded,
+        })
+    }
+}
+
+impl Drop for Vp8Decoder {
+    fn drop(&mut self) {
+        unsafe {
+            rchat_vpx_decoder_free(self.raw.as_ptr());
+        }
+    }
+}
+
 impl Drop for Vp8Encoder {
     fn drop(&mut self) {
         unsafe {
@@ -173,6 +239,16 @@ impl Drop for PacketListGuard {
     fn drop(&mut self) {
         unsafe {
             rchat_vpx_packet_list_free(self.0);
+        }
+    }
+}
+
+struct DecodedFrameGuard(*mut RchatVpxDecodedFrame);
+
+impl Drop for DecodedFrameGuard {
+    fn drop(&mut self) {
+        unsafe {
+            rchat_vpx_decoded_frame_free(self.0);
         }
     }
 }
@@ -200,6 +276,11 @@ struct RchatVpxEncoder {
 }
 
 #[repr(C)]
+struct RchatVpxDecoder {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
 struct RchatVpxPacket {
     data: *mut u8,
     len: usize,
@@ -210,6 +291,14 @@ struct RchatVpxPacket {
 struct RchatVpxPacketList {
     packets: *mut RchatVpxPacket,
     len: usize,
+}
+
+#[repr(C)]
+struct RchatVpxDecodedFrame {
+    data: *mut u8,
+    len: usize,
+    width: u32,
+    height: u32,
 }
 
 const RCHAT_VPX_OK: i32 = 0;
@@ -238,6 +327,19 @@ extern "C" {
     ) -> i32;
 
     fn rchat_vpx_packet_list_free(packets: *mut RchatVpxPacketList);
+
+    fn rchat_vpx_decoder_new(out_decoder: *mut *mut RchatVpxDecoder) -> i32;
+
+    fn rchat_vpx_decoder_free(decoder: *mut RchatVpxDecoder);
+
+    fn rchat_vpx_decoder_decode_i420(
+        decoder: *mut RchatVpxDecoder,
+        data: *const u8,
+        data_len: usize,
+        out_frame: *mut RchatVpxDecodedFrame,
+    ) -> i32;
+
+    fn rchat_vpx_decoded_frame_free(frame: *mut RchatVpxDecodedFrame);
 
     fn rchat_vpx_probe_vp8_decode(data: *const u8, data_len: usize) -> i32;
 
@@ -297,6 +399,21 @@ mod tests {
         let packet = packets.first().expect("packet");
 
         probe_vp8_decode(&packet.payload).expect("packet decodes");
+    }
+
+    #[test]
+    fn decoder_outputs_i420_frames() {
+        let mut encoder = Vp8Encoder::new(config(640, 360, 650)).expect("encoder starts");
+        let data = synthetic_i420(640, 360);
+        let packets = encoder.encode_i420(&data, true).expect("frame encodes");
+        let packet = packets.first().expect("packet");
+        let mut decoder = Vp8Decoder::new().expect("decoder starts");
+
+        let frame = decoder.decode(&packet.payload).expect("packet decodes");
+
+        assert_eq!(frame.width, 640);
+        assert_eq!(frame.height, 360);
+        assert_eq!(frame.data.len(), expected_i420_len(640, 360).unwrap());
     }
 
     #[test]

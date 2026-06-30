@@ -10,21 +10,6 @@ pub enum VideoChunkType {
     Delta,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VideoFrameEvent {
-    pub call_id: String,
-    pub peer_id: String,
-    pub seq: u32,
-    pub timestamp: i64,
-    pub mime: String,
-    pub codec: String,
-    pub chunk_type: VideoChunkType,
-    pub profile: VideoProfile,
-    pub width: u32,
-    pub height: u32,
-    pub payload: Vec<u8>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoStreamFrame {
     pub seq: u32,

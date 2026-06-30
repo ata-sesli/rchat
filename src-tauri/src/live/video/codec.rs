@@ -1,4 +1,4 @@
-use rchat_libvpx::{EncodedPacket, Vp8Encoder, Vp8EncoderConfig};
+use rchat_libvpx::{EncodedPacket, Vp8Decoder, Vp8Encoder, Vp8EncoderConfig};
 use serde::{Deserialize, Serialize};
 
 pub const VIDEO_FPS: u32 = 30;
@@ -132,6 +132,17 @@ pub struct Vp8VideoEncoder {
     encoder: Vp8Encoder,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RgbaVideoFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+pub struct Vp8VideoDecoder {
+    decoder: Vp8Decoder,
+}
+
 impl Vp8VideoEncoder {
     pub fn new_with_dimensions(
         profile: VideoProfile,
@@ -203,6 +214,24 @@ impl Vp8VideoEncoder {
     }
 }
 
+impl Vp8VideoDecoder {
+    pub fn new() -> Result<Self, String> {
+        Ok(Self {
+            decoder: Vp8Decoder::new().map_err(|e| e.to_string())?,
+        })
+    }
+
+    pub fn decode_rgba(&mut self, payload: &[u8]) -> Result<RgbaVideoFrame, String> {
+        let decoded = self.decoder.decode(payload).map_err(|e| e.to_string())?;
+        let rgba = i420_to_rgba(&decoded.data, decoded.width, decoded.height)?;
+        Ok(RgbaVideoFrame {
+            width: decoded.width,
+            height: decoded.height,
+            rgba,
+        })
+    }
+}
+
 impl From<EncodedPacket> for Vp8EncodedPacket {
     fn from(packet: EncodedPacket) -> Self {
         Self {
@@ -210,6 +239,49 @@ impl From<EncodedPacket> for Vp8EncodedPacket {
             is_key: packet.is_key,
         }
     }
+}
+
+fn clamp_byte(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
+}
+
+pub fn i420_to_rgba(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let expected_len = rchat_libvpx::expected_i420_len(width, height)
+        .ok_or_else(|| "invalid I420 frame size".to_string())?;
+    if data.len() < expected_len {
+        return Err(format!(
+            "invalid I420 frame length: expected {}, got {}",
+            expected_len,
+            data.len()
+        ));
+    }
+
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    let y_len = width_usize * height_usize;
+    let uv_width = width_usize / 2;
+    let u_offset = y_len;
+    let v_offset = y_len + y_len / 4;
+    let mut rgba = Vec::with_capacity(width_usize * height_usize * 4);
+
+    for y in 0..height_usize {
+        for x in 0..width_usize {
+            let y_value = data[y * width_usize + x] as i32;
+            let uv_index = (y / 2) * uv_width + x / 2;
+            let u_value = data[u_offset + uv_index] as i32;
+            let v_value = data[v_offset + uv_index] as i32;
+
+            let c = y_value - 16;
+            let d = u_value - 128;
+            let e = v_value - 128;
+            let r = (298 * c + 409 * e + 128) >> 8;
+            let g = (298 * c - 100 * d - 208 * e + 128) >> 8;
+            let b = (298 * c + 516 * d + 128) >> 8;
+            rgba.extend_from_slice(&[clamp_byte(r), clamp_byte(g), clamp_byte(b), 255]);
+        }
+    }
+
+    Ok(rgba)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -400,6 +472,28 @@ mod tests {
         let packet = packets.first().expect("packet");
 
         rchat_libvpx::probe_vp8_decode(&packet.payload).expect("packet decodes");
+    }
+
+    #[test]
+    fn vp8_decoder_outputs_rgba_frames() {
+        let profile = VideoProfile::P360;
+        let (width, height) = profile_dimensions(profile);
+        let mut encoder =
+            Vp8VideoEncoder::new_with_dimensions(profile, width, height).expect("encoder starts");
+        let data = synthetic_i420(width as usize, height as usize);
+        let packets = encoder
+            .encode_i420(123, width, height, &data, true)
+            .expect("frame encodes");
+        let packet = packets.first().expect("packet");
+        let mut decoder = Vp8VideoDecoder::new().expect("decoder starts");
+
+        let frame = decoder
+            .decode_rgba(&packet.payload)
+            .expect("packet decodes");
+
+        assert_eq!(frame.width, width);
+        assert_eq!(frame.height, height);
+        assert_eq!(frame.rgba.len(), (width * height * 4) as usize);
     }
 
     #[test]

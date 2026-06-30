@@ -9,6 +9,7 @@ extern "C" {
 #endif
 
 typedef struct RchatVpxEncoder RchatVpxEncoder;
+typedef struct RchatVpxDecoder RchatVpxDecoder;
 
 typedef struct RchatVpxPacket {
     uint8_t *data;
@@ -20,6 +21,13 @@ typedef struct RchatVpxPacketList {
     RchatVpxPacket *packets;
     size_t len;
 } RchatVpxPacketList;
+
+typedef struct RchatVpxDecodedFrame {
+    uint8_t *data;
+    size_t len;
+    uint32_t width;
+    uint32_t height;
+} RchatVpxDecodedFrame;
 
 enum {
     RCHAT_VPX_OK = 0,
@@ -54,6 +62,18 @@ int rchat_vpx_encoder_encode_i420(
     RchatVpxPacketList *out_packets);
 
 void rchat_vpx_packet_list_free(RchatVpxPacketList *packets);
+
+int rchat_vpx_decoder_new(RchatVpxDecoder **out_decoder);
+
+void rchat_vpx_decoder_free(RchatVpxDecoder *decoder);
+
+int rchat_vpx_decoder_decode_i420(
+    RchatVpxDecoder *decoder,
+    const uint8_t *data,
+    size_t data_len,
+    RchatVpxDecodedFrame *out_frame);
+
+void rchat_vpx_decoded_frame_free(RchatVpxDecodedFrame *frame);
 
 int rchat_vpx_probe_vp8_decode(const uint8_t *data, size_t data_len);
 

@@ -568,6 +568,8 @@ pub struct NetworkManager {
     video_expected_inbound_seq: Option<u32>,
     // VP8 encoder for outbound camera frames.
     video_vp8_encoder: Option<crate::live::video::codec::Vp8VideoEncoder>,
+    // VP8 decoder for inbound camera frames.
+    video_vp8_decoder: Option<crate::live::video::codec::Vp8VideoDecoder>,
     // Pending native camera startup task; polled from the video tick without blocking the network loop.
     video_capture_start_task: Option<video_call::VideoCaptureStartTask>,
     // Native local camera capture for active video calls.
@@ -815,6 +817,7 @@ impl NetworkManager {
             video_force_next_keyframe: true,
             video_expected_inbound_seq: None,
             video_vp8_encoder: None,
+            video_vp8_decoder: None,
             video_capture_start_task: None,
             video_capture_session: None,
             video_capture_info: None,
