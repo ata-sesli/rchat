@@ -147,6 +147,7 @@ impl NetworkManager {
                 rendered_frames,
                 dropped_frames,
                 decode_errors,
+                window_seconds,
             } => {
                 self.handle_report_video_call_render_stats(
                     call_id,
@@ -154,6 +155,7 @@ impl NetworkManager {
                     rendered_frames,
                     dropped_frames,
                     decode_errors,
+                    window_seconds,
                 )
                 .await;
             }

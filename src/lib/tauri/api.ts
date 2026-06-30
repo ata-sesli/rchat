@@ -316,6 +316,7 @@ export type VideoRenderStats = {
   rendered_frames: number;
   dropped_frames: number;
   decode_errors: number;
+  window_seconds: number;
 };
 export type VideoCaptureDeviceInfo = {
   id: string;

@@ -410,6 +410,17 @@ fn should_restart_running_video_capture_for_profile_change(
     current_requested_profile.is_none()
 }
 
+fn should_keep_video_capture_warm_when_camera_disabled() -> bool {
+    cfg!(target_os = "macos")
+}
+
+fn receiver_report_window_seconds(window_seconds: Option<f64>) -> f64 {
+    match window_seconds {
+        Some(seconds) if seconds.is_finite() && seconds > 0.0 => seconds.clamp(1.0, 30.0),
+        _ => VIDEO_SUMMARY_INTERVAL.as_secs_f64(),
+    }
+}
+
 impl NetworkManager {
     pub(super) fn reset_video_network_diagnostics(&mut self) {
         self.video_network_stats.reset();
@@ -504,11 +515,14 @@ impl NetworkManager {
     }
 
     async fn ensure_video_capture_running(&mut self, call_snapshot: &ActiveCall) {
-        if call_snapshot.phase != ActiveCallPhase::Active
-            || call_snapshot.kind != CallKind::Video
-            || !call_snapshot.camera_enabled
-        {
+        if call_snapshot.phase != ActiveCallPhase::Active || call_snapshot.kind != CallKind::Video {
             self.stop_video_capture();
+            return;
+        }
+        if !call_snapshot.camera_enabled {
+            if !should_keep_video_capture_warm_when_camera_disabled() {
+                self.stop_video_capture();
+            }
             return;
         }
 
@@ -520,7 +534,9 @@ impl NetworkManager {
             .map(|call| call.call_id == call_snapshot.call_id && !call.camera_enabled)
             .unwrap_or(false)
         {
-            self.stop_video_capture();
+            if !should_keep_video_capture_warm_when_camera_disabled() {
+                self.stop_video_capture();
+            }
             return;
         }
 
@@ -1125,7 +1141,9 @@ impl NetworkManager {
             enabled,
         }));
         if !enabled {
-            self.stop_video_capture();
+            if !should_keep_video_capture_warm_when_camera_disabled() {
+                self.stop_video_capture();
+            }
             self.reset_outbound_video_encoder();
         } else {
             self.ensure_video_capture_running(&updated).await;
@@ -1338,6 +1356,7 @@ impl NetworkManager {
         rendered_frames: u64,
         dropped_frames: u64,
         decode_errors: u64,
+        window_seconds: Option<f64>,
     ) {
         let Some(call) = self.active_call.as_ref() else {
             return;
@@ -1364,9 +1383,10 @@ impl NetworkManager {
             dropped_frames,
             decode_errors,
         );
+        let window_seconds = receiver_report_window_seconds(window_seconds);
         if let Some(change) = self.video_receiver_preference_controller.evaluate_window(
             VideoReceiverPreferenceWindow {
-                seconds: VIDEO_SUMMARY_INTERVAL.as_secs_f64(),
+                seconds: window_seconds,
                 received_frames: report.received_frames,
                 rendered_frames: report.rendered_frames,
                 dropped_frames: report.dropped_frames,
@@ -1403,7 +1423,9 @@ impl NetworkManager {
             );
         }
         self.ensure_video_capture_running(&call_snapshot).await;
-        self.pump_native_video_capture(&call_snapshot.call_id);
+        if call_snapshot.camera_enabled {
+            self.pump_native_video_capture(&call_snapshot.call_id);
+        }
         if self
             .video_last_summary_at
             .map(|last| last.elapsed() >= VIDEO_SUMMARY_INTERVAL)
@@ -1895,6 +1917,28 @@ mod tests {
             None,
             VideoProfile::P720,
         ));
+    }
+
+    #[test]
+    fn macos_camera_toggle_off_keeps_capture_session_warm() {
+        if cfg!(target_os = "macos") {
+            assert!(should_keep_video_capture_warm_when_camera_disabled());
+        } else {
+            assert!(!should_keep_video_capture_warm_when_camera_disabled());
+        }
+    }
+
+    #[test]
+    fn render_stats_window_seconds_use_valid_actual_duration() {
+        assert_eq!(receiver_report_window_seconds(Some(4.75)), 4.75);
+        assert_eq!(
+            receiver_report_window_seconds(None),
+            VIDEO_SUMMARY_INTERVAL.as_secs_f64()
+        );
+        assert_eq!(
+            receiver_report_window_seconds(Some(0.0)),
+            VIDEO_SUMMARY_INTERVAL.as_secs_f64()
+        );
     }
 
     #[test]

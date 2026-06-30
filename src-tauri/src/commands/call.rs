@@ -12,6 +12,8 @@ pub struct VideoRenderStatsInput {
     pub rendered_frames: u64,
     pub dropped_frames: u64,
     pub decode_errors: u64,
+    #[serde(default)]
+    pub window_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -292,6 +294,7 @@ pub async fn report_video_call_render_stats(
             rendered_frames: stats.rendered_frames,
             dropped_frames: stats.dropped_frames,
             decode_errors: stats.decode_errors,
+            window_seconds: stats.window_seconds,
         })
         .await
         .map_err(|e| format!("Failed to report video render stats: {}", e))

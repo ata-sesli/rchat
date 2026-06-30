@@ -40,6 +40,10 @@
     requestLocalCameraToggle,
     shouldRenderLocalPreviewCanvas,
   } from "$lib/video/cameraToggle";
+  import {
+    buildVideoRenderStatsReport,
+    VIDEO_RENDER_STATS_REPORT_INTERVAL_MS,
+  } from "$lib/video/renderStats";
 
   // Types
   type Message = {
@@ -168,7 +172,9 @@
     dropped: 0,
     decodeErrors: 0,
   };
+  let videoRenderStatsWindowStartedAt = nowMs();
   let remoteVideoStateError: string | null = null;
+  let videoCallFullscreen = false;
 
   const REMOTE_REORDER_WINDOW = 6;
 
@@ -238,6 +244,9 @@
     callMatchesActivePeer &&
     voiceCallState.phase === "active" &&
     activeCallKind === "video";
+  $: if (!isVideoCallActiveInThisChat && videoCallFullscreen) {
+    videoCallFullscreen = false;
+  }
   $: broadcastMatchesActivePeer =
     broadcastState.phase !== "idle" &&
     matchesChatPeer(broadcastState.peer_id, activePeer);
@@ -309,6 +318,10 @@
     return "auto";
   }
 
+  function nowMs(): number {
+    return typeof performance !== "undefined" ? performance.now() : Date.now();
+  }
+
   function resetVideoRenderCounters() {
     remoteVideoReceivedFrames = 0;
     remoteVideoRenderedFrames = 0;
@@ -320,23 +333,26 @@
       dropped: 0,
       decodeErrors: 0,
     };
+    videoRenderStatsWindowStartedAt = nowMs();
   }
 
   function reportVideoRenderStats() {
     if (!activeCallId || !isVideoCallActiveInThisChat) return;
-    const stats = {
-      received_frames: remoteVideoReceivedFrames - lastReportedVideoStats.received,
-      rendered_frames: remoteVideoRenderedFrames - lastReportedVideoStats.rendered,
-      dropped_frames: remoteVideoDroppedFrames - lastReportedVideoStats.dropped,
-      decode_errors: remoteVideoDecodeErrors - lastReportedVideoStats.decodeErrors,
-    };
-    lastReportedVideoStats = {
-      received: remoteVideoReceivedFrames,
-      rendered: remoteVideoRenderedFrames,
-      dropped: remoteVideoDroppedFrames,
-      decodeErrors: remoteVideoDecodeErrors,
-    };
-    void api.reportVideoCallRenderStats(activeCallId, stats).catch((err) => {
+    const report = buildVideoRenderStatsReport(
+      {
+        received: remoteVideoReceivedFrames,
+        rendered: remoteVideoRenderedFrames,
+        dropped: remoteVideoDroppedFrames,
+        decodeErrors: remoteVideoDecodeErrors,
+      },
+      lastReportedVideoStats,
+      videoRenderStatsWindowStartedAt,
+      nowMs(),
+    );
+    if (!report) return;
+    lastReportedVideoStats = report.snapshot;
+    videoRenderStatsWindowStartedAt = report.windowStartedAtMs;
+    void api.reportVideoCallRenderStats(activeCallId, report.stats).catch((err) => {
       console.debug("Video render stats report skipped:", err);
     });
   }
@@ -416,6 +432,16 @@
         localCameraToggleState = markLocalCameraToggleSettled(localCameraToggleState);
       },
     );
+  }
+
+  function toggleVideoCallFullscreen() {
+    videoCallFullscreen = !videoCallFullscreen;
+  }
+
+  function handleVideoCallKeydown(event: KeyboardEvent) {
+    if (event.key === "Escape" && videoCallFullscreen) {
+      videoCallFullscreen = false;
+    }
   }
 
   function handleScreenBroadcastPreviewFrame(eventPayload: any) {
@@ -1635,7 +1661,10 @@
       if (!activeCallId || payload.call_id !== activeCallId) return;
       remoteCameraEnabled = Boolean(payload.enabled);
     });
-    videoRenderStatsTimer = setInterval(reportVideoRenderStats, 5000);
+    videoRenderStatsTimer = setInterval(
+      reportVideoRenderStats,
+      VIDEO_RENDER_STATS_REPORT_INTERVAL_MS,
+    );
   });
 
   onDestroy(() => {
@@ -1695,6 +1724,8 @@
     scrollToBottom();
   }
 </script>
+
+<svelte:window onkeydown={handleVideoCallKeydown} />
 
 <!-- Chat Header -->
 <div
@@ -1911,20 +1942,74 @@
 </div>
 
 {#if isVideoCallActiveInThisChat}
-  <div class="px-6 pt-3">
-    <div class="relative rounded-xl border border-theme-base-700 bg-theme-base-900/70 overflow-hidden h-36 flex items-center justify-center">
-      {#if remoteVideoStateError}
-        <div class="text-xs text-theme-base-300 px-3 text-center">{remoteVideoStateError}</div>
-      {:else if !remoteCameraEnabled}
-        <div class="text-xs text-theme-base-300 px-3 text-center">Remote camera off</div>
-      {:else}
-        <canvas bind:this={remoteVideoCanvasEl} class="w-full h-full object-cover"></canvas>
-      {/if}
+  <div class={videoCallFullscreen ? "fixed inset-0 z-50 bg-black" : "px-6 pt-3"}>
+    <div
+      class={videoCallFullscreen
+        ? "relative h-full min-h-0 w-full overflow-hidden bg-black"
+        : "relative overflow-hidden rounded-xl border border-theme-base-700 bg-theme-base-900/70 p-4"}
+    >
+      <button
+        onclick={toggleVideoCallFullscreen}
+        class="absolute right-4 top-4 z-20 flex h-10 w-10 items-center justify-center rounded-full bg-black/60 text-theme-base-100 transition-colors hover:bg-black/80"
+        title={videoCallFullscreen ? "Exit full screen" : "Enter full screen"}
+        aria-label={videoCallFullscreen ? "Exit full screen" : "Enter full screen"}
+      >
+        <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          {#if videoCallFullscreen}
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              stroke-width="2"
+              d="M9 4v5H4m11-5v5h5M9 20v-5H4m11 5v-5h5"
+            />
+          {:else}
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              stroke-width="2"
+              d="M4 9V4h5m11 5V4h-5M4 15v5h5m11-5v5h-5"
+            />
+          {/if}
+        </svg>
+      </button>
 
-      <div class="absolute bottom-2 right-2 w-28 h-20 rounded-lg border border-theme-base-700 bg-black/60 overflow-hidden flex items-center justify-center">
+      <div
+        class={videoCallFullscreen
+          ? "flex h-full w-full items-center justify-center px-5 py-16"
+          : "flex w-full items-center justify-center"}
+      >
+        <div
+          class={videoCallFullscreen
+            ? "relative flex aspect-square h-[82vmin] w-[82vmin] max-h-[calc(100vh-8rem)] max-w-[calc(100vw-2rem)] items-center justify-center overflow-hidden rounded-2xl bg-black shadow-2xl"
+            : "relative flex aspect-square w-full max-w-lg items-center justify-center overflow-hidden rounded-xl bg-black"}
+        >
+          {#if remoteVideoStateError}
+            <div class="px-4 text-center text-xs text-theme-base-300">
+              {remoteVideoStateError}
+            </div>
+          {:else if !remoteCameraEnabled}
+            <div class="px-4 text-center text-xs text-theme-base-300">
+              Remote camera off
+            </div>
+          {:else}
+            <canvas
+              bind:this={remoteVideoCanvasEl}
+              class="h-full w-full object-cover"
+            ></canvas>
+          {/if}
+        </div>
+      </div>
+
+      <div
+        class={videoCallFullscreen
+          ? "absolute bottom-6 right-6 z-20 flex aspect-square w-36 items-center justify-center overflow-hidden rounded-xl border border-white/20 bg-black/70 shadow-2xl"
+          : "absolute bottom-6 right-6 z-20 flex aspect-square w-28 items-center justify-center overflow-hidden rounded-lg border border-theme-base-700 bg-black/70 shadow-xl"}
+      >
         {#if activeCallCameraEnabled}
           {#if localPreviewError}
-            <span class="text-[11px] text-theme-base-300 px-2 text-center">{localPreviewError}</span>
+            <span class="px-2 text-center text-[11px] text-theme-base-300">
+              {localPreviewError}
+            </span>
           {/if}
           {#if shouldRenderLocalPreviewCanvas({
             cameraEnabled: activeCallCameraEnabled,
@@ -1932,10 +2017,12 @@
           })}
             <canvas
               bind:this={localPreviewCanvasEl}
-              class="w-full h-full object-cover"
+              class="h-full w-full object-cover"
             ></canvas>
             {#if localCameraStarting}
-              <span class="absolute inset-0 flex items-center justify-center text-[11px] text-theme-base-300 bg-black/50 px-2 text-center">Starting…</span>
+              <span class="absolute inset-0 flex items-center justify-center bg-black/50 px-2 text-center text-[11px] text-theme-base-300">
+                Starting…
+              </span>
             {/if}
           {/if}
         {:else}

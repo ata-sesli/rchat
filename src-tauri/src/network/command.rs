@@ -127,6 +127,7 @@ pub enum NetworkCommand {
         rendered_frames: u64,
         dropped_frames: u64,
         decode_errors: u64,
+        window_seconds: Option<f64>,
     },
     StartScreenBroadcast {
         peer_id: String,
