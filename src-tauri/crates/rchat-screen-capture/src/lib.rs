@@ -149,8 +149,8 @@ pub enum ScreenCaptureError {
     Backend(String),
 }
 
-pub fn screen_capture_support() -> ScreenCaptureSupport {
-    platform::screen_capture_support()
+pub async fn screen_capture_support() -> ScreenCaptureSupport {
+    platform::screen_capture_support().await
 }
 
 pub struct ScreenCaptureSession {
@@ -355,7 +355,9 @@ fn rgba_like_to_i420(
     let width_usize = width as usize;
     let height_usize = height as usize;
     if stride < width_usize * 4 || src.len() < stride * height_usize {
-        return Err(ScreenCaptureError::Conversion("RGBA/BGRA buffer too small".to_string()));
+        return Err(ScreenCaptureError::Conversion(
+            "RGBA/BGRA buffer too small".to_string(),
+        ));
     }
 
     let mut out = vec![0_u8; expected_i420_len(width, height)?];
@@ -421,7 +423,9 @@ fn nv12_to_i420(
         || y_plane.len() < y_stride * height_usize
         || uv_plane.len() < uv_stride * (height_usize / 2)
     {
-        return Err(ScreenCaptureError::Conversion("NV12 buffer too small".to_string()));
+        return Err(ScreenCaptureError::Conversion(
+            "NV12 buffer too small".to_string(),
+        ));
     }
 
     let mut out = vec![0_u8; expected_i420_len(width, height)?];
@@ -459,7 +463,9 @@ fn yuyv_to_i420(
     let width_usize = width as usize;
     let height_usize = height as usize;
     if stride < width_usize * 2 || src.len() < stride * height_usize {
-        return Err(ScreenCaptureError::Conversion("YUYV buffer too small".to_string()));
+        return Err(ScreenCaptureError::Conversion(
+            "YUYV buffer too small".to_string(),
+        ));
     }
 
     let mut out = vec![0_u8; expected_i420_len(width, height)?];
@@ -514,7 +520,9 @@ fn i420_copy(
         || u_plane.len() < u_stride * uv_height
         || v_plane.len() < v_stride * uv_height
     {
-        return Err(ScreenCaptureError::Conversion("I420 buffer too small".to_string()));
+        return Err(ScreenCaptureError::Conversion(
+            "I420 buffer too small".to_string(),
+        ));
     }
 
     let mut out = vec![0_u8; expected_i420_len(width, height)?];
@@ -544,7 +552,9 @@ fn i420_to_preview_rgba(
     let width_usize = width as usize;
     let height_usize = height as usize;
     if data.len() != expected_i420_len(width, height)? {
-        return Err(ScreenCaptureError::Conversion("I420 preview input length mismatch".to_string()));
+        return Err(ScreenCaptureError::Conversion(
+            "I420 preview input length mismatch".to_string(),
+        ));
     }
 
     let y_len = width_usize * height_usize;
@@ -582,10 +592,8 @@ fn preview_dimensions(width: u32, height: u32) -> (u32, u32) {
         return (width, height);
     }
     let preview_width = PREVIEW_MAX_WIDTH & !1;
-    let preview_height = (((height as f64) * (preview_width as f64 / width as f64)).round()
-        as u32)
-        .max(2)
-        & !1;
+    let preview_height =
+        (((height as f64) * (preview_width as f64 / width as f64)).round() as u32).max(2) & !1;
     (preview_width, preview_height)
 }
 

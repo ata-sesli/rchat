@@ -5,7 +5,7 @@ use crate::{
     ScreenCaptureSessionStats, ScreenCaptureSupport, PREVIEW_INTERVAL,
 };
 use screencapturekit::async_api::{AsyncSCContentSharingPicker, AsyncSCStream};
-use screencapturekit::cm::{CMSampleBufferExt, CMTime};
+use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt, CMTime, SCFrameStatus};
 use screencapturekit::content_sharing_picker::{
     SCContentSharingPickerConfiguration, SCContentSharingPickerMode, SCPickerOutcome,
 };
@@ -32,7 +32,8 @@ impl PlatformScreenCaptureSession {
         let mut latest = None;
         while let Some(sample) = self.stream.try_next() {
             match self.convert_sample(sample) {
-                Ok(frame) => latest = Some(frame),
+                Ok(Some(frame)) => latest = Some(frame),
+                Ok(None) => {}
                 Err(error) => {
                     self.stats.conversion_errors.fetch_add(1, Ordering::Relaxed);
                     eprintln!("[Screen][Capture] macOS frame conversion failed: {}", error);
@@ -47,24 +48,30 @@ impl PlatformScreenCaptureSession {
     }
 
     pub fn stats(&self) -> ScreenCaptureSessionStats {
-        self.stats
-            .snapshot(0, self.preview_slot.dropped())
+        self.stats.snapshot(0, self.preview_slot.dropped())
     }
 
     fn convert_sample(
         &mut self,
         sample: screencapturekit::cm::CMSampleBuffer,
-    ) -> Result<I420ScreenFrame, ScreenCaptureError> {
-        let pixel_buffer = sample
-            .image_buffer()
-            .ok_or_else(|| ScreenCaptureError::Conversion("sample has no image buffer".to_string()))?;
+    ) -> Result<Option<I420ScreenFrame>, ScreenCaptureError> {
+        if should_skip_sample_status(sample.frame_status()) {
+            return Ok(None);
+        }
+
+        let pixel_buffer = sample.image_buffer().ok_or_else(|| {
+            ScreenCaptureError::Conversion("sample has no image buffer".to_string())
+        })?;
         let guard = pixel_buffer
             .lock(CVPixelBufferLockFlags::READ_ONLY)
-            .map_err(|e| ScreenCaptureError::Conversion(format!("pixel buffer lock failed: {e:?}")))?;
+            .map_err(|e| {
+                ScreenCaptureError::Conversion(format!("pixel buffer lock failed: {e:?}"))
+            })?;
         let width = guard.width() as u32;
         let height = guard.height() as u32;
         let stride = guard.bytes_per_row();
-        let (out_width, out_height) = clamp_to_profile(width, height, crate::ScreenCaptureProfile::P720);
+        let (out_width, out_height) =
+            clamp_to_profile(width, height, crate::ScreenCaptureProfile::P720);
         let i420 = bgra_to_i420(guard.as_slice(), width, height, stride)?;
         let i420 = if out_width != width || out_height != height {
             scale_i420_nearest(&i420, width, height, out_width, out_height)?
@@ -93,13 +100,20 @@ impl PlatformScreenCaptureSession {
                 }
                 Err(error) => {
                     self.stats.conversion_errors.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[Screen][Capture] macOS preview conversion failed: {}", error);
+                    eprintln!(
+                        "[Screen][Capture] macOS preview conversion failed: {}",
+                        error
+                    );
                 }
             }
         }
 
-        Ok(frame)
+        Ok(Some(frame))
     }
+}
+
+fn should_skip_sample_status(status: Option<SCFrameStatus>) -> bool {
+    matches!(status, Some(status) if !status.has_content())
 }
 
 impl Drop for PlatformScreenCaptureSession {
@@ -108,7 +122,7 @@ impl Drop for PlatformScreenCaptureSession {
     }
 }
 
-pub fn screen_capture_support() -> ScreenCaptureSupport {
+pub async fn screen_capture_support() -> ScreenCaptureSupport {
     ScreenCaptureSupport {
         supported: true,
         reason: None,
@@ -181,4 +195,20 @@ pub async fn start_session(
         preview_slot: crate::LatestSlot::default(),
         last_preview_at: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skips_non_content_screencapturekit_samples() {
+        assert!(!should_skip_sample_status(None));
+        assert!(!should_skip_sample_status(Some(SCFrameStatus::Complete)));
+        assert!(!should_skip_sample_status(Some(SCFrameStatus::Started)));
+        assert!(should_skip_sample_status(Some(SCFrameStatus::Idle)));
+        assert!(should_skip_sample_status(Some(SCFrameStatus::Blank)));
+        assert!(should_skip_sample_status(Some(SCFrameStatus::Suspended)));
+        assert!(should_skip_sample_status(Some(SCFrameStatus::Stopped)));
+    }
 }

@@ -321,7 +321,7 @@ pub async fn get_video_capture_support() -> Result<VideoCaptureSupport, String> 
 
 #[tauri::command]
 pub async fn get_screen_capture_support() -> Result<ScreenCaptureSupport, String> {
-    let support = rchat_screen_capture::screen_capture_support();
+    let support = rchat_screen_capture::screen_capture_support().await;
     Ok(ScreenCaptureSupport {
         supported: support.supported,
         reason: support.reason,

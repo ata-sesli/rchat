@@ -25,7 +25,7 @@ impl PlatformScreenCaptureSession {
     }
 }
 
-pub fn screen_capture_support() -> ScreenCaptureSupport {
+pub async fn screen_capture_support() -> ScreenCaptureSupport {
     ScreenCaptureSupport {
         supported: false,
         reason: Some("native screen capture is supported only on macOS and Linux".to_string()),

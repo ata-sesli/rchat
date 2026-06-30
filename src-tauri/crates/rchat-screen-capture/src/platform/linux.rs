@@ -1,9 +1,9 @@
 use crate::{
-    bgra_to_i420, clamp_to_profile, i420_copy, i420_to_preview_rgba, nv12_to_i420,
-    now_timestamp_us, rgba_to_i420, scale_i420_nearest, yuyv_to_i420, CaptureStatsAtomic,
+    bgra_to_i420, clamp_to_profile, i420_copy, i420_to_preview_rgba, now_timestamp_us,
+    nv12_to_i420, rgba_to_i420, scale_i420_nearest, yuyv_to_i420, CaptureStatsAtomic,
     I420ScreenFrame, LatestSlot, PreviewFrame, ScreenCaptureBackend, ScreenCaptureConfig,
-    ScreenCaptureCursorMode, ScreenCaptureError, ScreenCaptureFormatInfo,
-    ScreenCaptureSessionInfo, ScreenCaptureSessionStats, ScreenCaptureSupport, PREVIEW_INTERVAL,
+    ScreenCaptureCursorMode, ScreenCaptureError, ScreenCaptureFormatInfo, ScreenCaptureSessionInfo,
+    ScreenCaptureSessionStats, ScreenCaptureSupport, PREVIEW_INTERVAL,
 };
 use ashpd::desktop::{
     screencast::{
@@ -58,11 +58,21 @@ impl Drop for PlatformScreenCaptureSession {
     }
 }
 
-pub fn screen_capture_support() -> ScreenCaptureSupport {
-    ScreenCaptureSupport {
-        supported: true,
-        reason: None,
-        backend: ScreenCaptureBackend::LinuxPortalPipeWire,
+pub async fn screen_capture_support() -> ScreenCaptureSupport {
+    match Screencast::new().await {
+        Ok(_) => ScreenCaptureSupport {
+            supported: true,
+            reason: None,
+            backend: ScreenCaptureBackend::LinuxPortalPipeWire,
+        },
+        Err(error) => ScreenCaptureSupport {
+            supported: false,
+            reason: Some(format!(
+                "Linux screen capture portal is unavailable: {}",
+                error
+            )),
+            backend: ScreenCaptureBackend::LinuxPortalPipeWire,
+        },
     }
 }
 
@@ -238,8 +248,7 @@ fn run_pipewire_capture(
             if id != pw::spa::param::ParamType::Format.as_raw() {
                 return;
             }
-            let Ok((media_type, media_subtype)) =
-                pw::spa::param::format_utils::parse_format(param)
+            let Ok((media_type, media_subtype)) = pw::spa::param::format_utils::parse_format(param)
             else {
                 return;
             };
@@ -274,9 +283,13 @@ fn run_pipewire_capture(
             }
             let end = offset.saturating_add(size).min(bytes.len());
             let frame_bytes = &bytes[offset..end];
-            match convert_pipewire_frame(frame_bytes, stride, &user_data.format, user_data.profile) {
+            match convert_pipewire_frame(frame_bytes, stride, &user_data.format, user_data.profile)
+            {
                 Ok(frame) => {
-                    user_data.stats.captured_frames.fetch_add(1, Ordering::Relaxed);
+                    user_data
+                        .stats
+                        .captured_frames
+                        .fetch_add(1, Ordering::Relaxed);
                     let should_preview = user_data
                         .last_preview_at
                         .map(|last| last.elapsed() >= PREVIEW_INTERVAL)
@@ -286,20 +299,35 @@ fn run_pipewire_capture(
                             Ok(mut preview) => {
                                 preview.timestamp_us = frame.timestamp_us;
                                 user_data.preview_slot.replace(preview);
-                                user_data.stats.preview_frames.fetch_add(1, Ordering::Relaxed);
+                                user_data
+                                    .stats
+                                    .preview_frames
+                                    .fetch_add(1, Ordering::Relaxed);
                                 user_data.last_preview_at = Some(Instant::now());
                             }
                             Err(error) => {
-                                user_data.stats.conversion_errors.fetch_add(1, Ordering::Relaxed);
-                                eprintln!("[Screen][Capture] PipeWire preview conversion failed: {}", error);
+                                user_data
+                                    .stats
+                                    .conversion_errors
+                                    .fetch_add(1, Ordering::Relaxed);
+                                eprintln!(
+                                    "[Screen][Capture] PipeWire preview conversion failed: {}",
+                                    error
+                                );
                             }
                         }
                     }
                     user_data.i420_slot.replace(frame);
                 }
                 Err(error) => {
-                    user_data.stats.conversion_errors.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[Screen][Capture] PipeWire frame conversion failed: {}", error);
+                    user_data
+                        .stats
+                        .conversion_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "[Screen][Capture] PipeWire frame conversion failed: {}",
+                        error
+                    );
                 }
             }
         })
@@ -343,7 +371,10 @@ fn run_pipewire_capture(
                 width: target_width,
                 height: target_height
             },
-            pw::spa::utils::Rectangle { width: 2, height: 2 },
+            pw::spa::utils::Rectangle {
+                width: 2,
+                height: 2
+            },
             pw::spa::utils::Rectangle {
                 width: target_width,
                 height: target_height
@@ -408,7 +439,9 @@ fn convert_pipewire_frame(
             let uv_stride = stride / 2;
             let uv_size = uv_stride * (height as usize / 2);
             if frame_bytes.len() < y_size + uv_size * 2 {
-                return Err(ScreenCaptureError::Conversion("PipeWire I420 frame too small".to_string()));
+                return Err(ScreenCaptureError::Conversion(
+                    "PipeWire I420 frame too small".to_string(),
+                ));
             }
             i420_copy(
                 &frame_bytes[..y_size],
@@ -424,7 +457,9 @@ fn convert_pipewire_frame(
         spa::param::video::VideoFormat::NV12 => {
             let y_size = stride * height as usize;
             if frame_bytes.len() < y_size {
-                return Err(ScreenCaptureError::Conversion("PipeWire NV12 frame too small".to_string()));
+                return Err(ScreenCaptureError::Conversion(
+                    "PipeWire NV12 frame too small".to_string(),
+                ));
             }
             nv12_to_i420(
                 &frame_bytes[..y_size],

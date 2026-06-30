@@ -180,6 +180,7 @@
   let videoRenderStatsWindowStartedAt = nowMs();
   let remoteVideoStateError: string | null = null;
   let videoCallFullscreen = false;
+  let screenBroadcastFullscreen = false;
 
   const REMOTE_REORDER_WINDOW = 6;
 
@@ -265,6 +266,9 @@
     isBroadcastActiveInThisChat && broadcastState.is_host;
   $: isBroadcastViewerInThisChat =
     isBroadcastActiveInThisChat && !broadcastState.is_host;
+  $: if (!isBroadcastActiveInThisChat && screenBroadcastFullscreen) {
+    screenBroadcastFullscreen = false;
+  }
   $: broadcastRingCountdownSec =
     broadcastState.ring_expires_at && broadcastState.phase !== "active"
       ? Math.max(0, broadcastState.ring_expires_at - callClockSec)
@@ -443,9 +447,16 @@
     videoCallFullscreen = !videoCallFullscreen;
   }
 
-  function handleVideoCallKeydown(event: KeyboardEvent) {
+  function toggleScreenBroadcastFullscreen() {
+    screenBroadcastFullscreen = !screenBroadcastFullscreen;
+  }
+
+  function handleLiveStageKeydown(event: KeyboardEvent) {
     if (event.key === "Escape" && videoCallFullscreen) {
       videoCallFullscreen = false;
+    }
+    if (event.key === "Escape" && screenBroadcastFullscreen) {
+      screenBroadcastFullscreen = false;
     }
   }
 
@@ -1719,7 +1730,7 @@
   }
 </script>
 
-<svelte:window onkeydown={handleVideoCallKeydown} />
+<svelte:window onkeydown={handleLiveStageKeydown} />
 
 <!-- Chat Header -->
 <div
@@ -2028,22 +2039,86 @@
 {/if}
 
 {#if isBroadcastActiveInThisChat}
-  <div class="px-6 pt-3">
-    <div class="relative rounded-xl border border-theme-base-700 bg-theme-base-900/70 overflow-hidden h-36 flex items-center justify-center">
-      {#if isBroadcastHostInThisChat}
-        {#if localPreviewError}
-          <div class="text-xs text-theme-base-300 px-3 text-center">
-            {localPreviewError}
-          </div>
-        {:else}
-          <canvas bind:this={localPreviewCanvasEl} class="w-full h-full object-cover"></canvas>
-        {/if}
-      {:else if remoteVideoStateError}
-        <div class="text-xs text-theme-base-300 px-3 text-center">
-          {remoteVideoStateError}
+  <div class={screenBroadcastFullscreen ? "fixed inset-0 z-50 bg-black" : "px-6 pt-3"}>
+    <div
+      class={screenBroadcastFullscreen
+        ? "relative h-full min-h-0 w-full overflow-hidden bg-black"
+        : "relative overflow-hidden rounded-xl border border-theme-base-700 bg-theme-base-900/70 p-4"}
+    >
+      <div class="absolute left-4 top-4 z-20 flex items-center gap-2 rounded-full bg-black/60 px-3 py-2 text-xs text-theme-base-100">
+        <span class="h-2 w-2 rounded-full bg-theme-success-400"></span>
+        <span>{isBroadcastHostInThisChat ? "You are sharing" : "Screen share"}</span>
+      </div>
+
+      <button
+        onclick={toggleScreenBroadcastFullscreen}
+        class="absolute right-4 top-4 z-20 flex h-10 w-10 items-center justify-center rounded-full bg-black/60 text-theme-base-100 transition-colors hover:bg-black/80"
+        title={screenBroadcastFullscreen ? "Exit full screen" : "Enter full screen"}
+        aria-label={screenBroadcastFullscreen ? "Exit full screen" : "Enter full screen"}
+      >
+        <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          {#if screenBroadcastFullscreen}
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              stroke-width="2"
+              d="M9 4v5H4m11-5v5h5M9 20v-5H4m11 5v-5h5"
+            />
+          {:else}
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              stroke-width="2"
+              d="M4 9V4h5m11 5V4h-5M4 15v5h5m11-5v5h-5"
+            />
+          {/if}
+        </svg>
+      </button>
+
+      <div
+        class={screenBroadcastFullscreen
+          ? "flex h-full w-full items-center justify-center px-5 py-16"
+          : "flex w-full items-center justify-center"}
+      >
+        <div
+          class={screenBroadcastFullscreen
+            ? "relative flex aspect-video h-auto w-full max-h-[calc(100vh-8rem)] max-w-[calc(100vw-2rem)] items-center justify-center overflow-hidden rounded-2xl bg-black shadow-2xl"
+            : "relative flex aspect-video w-full items-center justify-center overflow-hidden rounded-xl bg-black"}
+        >
+          {#if isBroadcastHostInThisChat}
+            {#if localPreviewError}
+              <div class="px-4 text-center text-xs text-theme-base-300">
+                {localPreviewError}
+              </div>
+            {:else}
+              <canvas
+                bind:this={localPreviewCanvasEl}
+                class="h-full w-full object-contain"
+              ></canvas>
+            {/if}
+          {:else if remoteVideoStateError}
+            <div class="px-4 text-center text-xs text-theme-base-300">
+              {remoteVideoStateError}
+            </div>
+          {:else}
+            <canvas
+              bind:this={remoteVideoCanvasEl}
+              class="h-full w-full object-contain"
+            ></canvas>
+          {/if}
         </div>
-      {:else}
-        <canvas bind:this={remoteVideoCanvasEl} class="w-full h-full object-cover"></canvas>
+      </div>
+
+      {#if screenBroadcastFullscreen && activeBroadcastSessionId}
+        <div class="absolute bottom-6 left-1/2 z-20 flex -translate-x-1/2 items-center gap-3 rounded-full bg-black/70 px-4 py-3 shadow-2xl">
+          <button
+            onclick={() => onEndScreenBroadcast(activeBroadcastSessionId)}
+            class="rounded-full bg-theme-error-500 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-theme-error-400"
+            title={isBroadcastHostInThisChat ? "Stop screen share" : "Leave screen share"}
+          >
+            {isBroadcastHostInThisChat ? "Stop sharing" : "Leave"}
+          </button>
+        </div>
       {/if}
     </div>
   </div>
