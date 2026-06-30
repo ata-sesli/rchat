@@ -7,6 +7,7 @@ import { isChatConnected, presencePeerKey } from "$lib/stores/presence";
 import {
   api,
   type BroadcastState,
+  type ScreenBroadcastProfile,
   type VoiceCallState,
 } from "$lib/tauri/api";
 
@@ -320,7 +321,8 @@ export const liveActions = {
     logLive("native video camera toggle requested", { call_id: callId, enabled });
     return api.setVideoCallCameraEnabled(callId, enabled);
   },
-  startScreenBroadcast: (peerId: string) => api.startScreenBroadcast(peerId),
+  startScreenBroadcast: (peerId: string, profile: ScreenBroadcastProfile) =>
+    api.startScreenBroadcast(peerId, profile),
   acceptScreenBroadcast: (sessionId: string) =>
     api.acceptScreenBroadcast(sessionId),
   rejectScreenBroadcast: (sessionId: string) =>

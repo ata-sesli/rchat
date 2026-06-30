@@ -76,6 +76,7 @@ struct ActiveBroadcast {
     ring_expires_at: Option<i64>,
     started_at: Option<i64>,
     is_host: bool,
+    profile: rchat_screen_capture::ScreenCaptureProfile,
 }
 
 #[derive(Debug, Default)]
@@ -186,11 +187,9 @@ impl VideoWindowCounters {
 #[derive(Debug, Default)]
 struct ScreenBroadcastStats {
     capture_start_failures: u64,
-    encoded_frames: u64,
-    keyframes: u64,
-    delta_frames: u64,
-    outbound_bytes: u64,
-    encode_errors: u64,
+    inbound_frames: u64,
+    inbound_bytes: u64,
+    stream_queue_drops: u64,
     outbound_failures: u64,
     inbound_failures: u64,
     rejected_responses: u64,
@@ -502,6 +501,34 @@ pub struct NetworkManager {
     active_call: Option<ActiveCall>,
     // Current DM broadcast runtime state (single broadcast session).
     active_broadcast: Option<ActiveBroadcast>,
+    // Screen broadcast stream task events returned to the network manager loop.
+    screen_broadcast_stream_event_rx:
+        tokio::sync::mpsc::Receiver<broadcast::ScreenBroadcastStreamEvent>,
+    // Screen broadcast stream task event sender cloned into accept/writer tasks.
+    screen_broadcast_stream_event_tx:
+        tokio::sync::mpsc::Sender<broadcast::ScreenBroadcastStreamEvent>,
+    // Current active outbound screen broadcast stream writer.
+    screen_broadcast_stream_tx:
+        Option<tokio::sync::mpsc::Sender<crate::live::broadcast::protocol::BroadcastStreamRecord>>,
+    // Session id currently owned by the outbound screen broadcast stream writer.
+    screen_broadcast_stream_session_id: Option<String>,
+    // Current active outbound screen broadcast stream writer task.
+    screen_broadcast_stream_writer_handle: Option<tauri::async_runtime::JoinHandle<()>>,
+    // Screen broadcast capture/encode worker events.
+    screen_broadcast_worker_event_rx:
+        tokio::sync::mpsc::Receiver<broadcast::ScreenBroadcastWorkerEvent>,
+    // Screen broadcast capture/encode worker event sender.
+    screen_broadcast_worker_event_tx:
+        tokio::sync::mpsc::Sender<broadcast::ScreenBroadcastWorkerEvent>,
+    // Current active screen broadcast capture/encode worker task.
+    screen_broadcast_worker_handle: Option<tauri::async_runtime::JoinHandle<()>>,
+    // Control channel for the active screen broadcast capture/encode worker.
+    screen_broadcast_worker_control_tx:
+        Option<tokio::sync::mpsc::Sender<broadcast::ScreenBroadcastWorkerCommand>>,
+    // Session id currently owned by the capture/encode worker.
+    screen_broadcast_worker_session_id: Option<String>,
+    // Last stats snapshot reported by the capture/encode worker.
+    screen_broadcast_worker_stats: broadcast::ScreenBroadcastWorkerStats,
     // Pending native screen-capture startup task; polled from the broadcast tick.
     screen_capture_start_task: Option<broadcast::ScreenCaptureStartTask>,
     // Native screen capture for the active host broadcast.
@@ -751,6 +778,18 @@ impl NetworkManager {
         } else {
             eprintln!("[Video] Video stream incoming receiver was already taken");
         }
+        let (screen_broadcast_stream_event_tx, screen_broadcast_stream_event_rx) =
+            tokio::sync::mpsc::channel(512);
+        if let Some(incoming) = swarm.behaviour_mut().broadcast_stream.take_incoming() {
+            broadcast::start_screen_broadcast_stream_accept_loop(
+                incoming,
+                screen_broadcast_stream_event_tx.clone(),
+            );
+        } else {
+            eprintln!("[Broadcast] Screen broadcast stream incoming receiver was already taken");
+        }
+        let (screen_broadcast_worker_event_tx, screen_broadcast_worker_event_rx) =
+            tokio::sync::mpsc::channel(512);
         let (video_encode_tx, video_encode_event_rx, video_encode_worker_handle) =
             video_call::start_outbound_video_encode_worker();
 
@@ -799,6 +838,17 @@ impl NetworkManager {
             persistence_worker_handles,
             active_call: None,
             active_broadcast: None,
+            screen_broadcast_stream_event_rx,
+            screen_broadcast_stream_event_tx,
+            screen_broadcast_stream_tx: None,
+            screen_broadcast_stream_session_id: None,
+            screen_broadcast_stream_writer_handle: None,
+            screen_broadcast_worker_event_rx,
+            screen_broadcast_worker_event_tx,
+            screen_broadcast_worker_handle: None,
+            screen_broadcast_worker_control_tx: None,
+            screen_broadcast_worker_session_id: None,
+            screen_broadcast_worker_stats: broadcast::ScreenBroadcastWorkerStats::default(),
             screen_capture_start_task: None,
             screen_capture_session: None,
             screen_capture_info: None,

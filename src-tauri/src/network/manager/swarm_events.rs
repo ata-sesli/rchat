@@ -19,6 +19,7 @@ impl NetworkManager {
                 }
                 RChatBehaviourEvent::VoiceCall(()) => {}
                 RChatBehaviourEvent::VideoCall(()) => {}
+                RChatBehaviourEvent::BroadcastStream(()) => {}
                 RChatBehaviourEvent::Broadcast(event) => {
                     self.handle_broadcast_frame_event(event).await;
                 }

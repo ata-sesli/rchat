@@ -351,13 +351,16 @@ fn video_capture_device_info(
 #[tauri::command]
 pub async fn start_screen_broadcast(
     peer_id: String,
+    profile: String,
     state: State<'_, NetworkState>,
 ) -> Result<(), String> {
     ensure_dm_connected(&peer_id, &state, "Screen broadcast").await?;
+    let profile = rchat_screen_capture::ScreenCaptureProfile::from_label(&profile)
+        .ok_or_else(|| format!("Unsupported screen broadcast profile: {}", profile))?;
 
     let sender = state.sender.lock().await;
     sender
-        .send(NetworkCommand::StartScreenBroadcast { peer_id })
+        .send(NetworkCommand::StartScreenBroadcast { peer_id, profile })
         .await
         .map_err(|e| format!("Failed to start screen broadcast: {}", e))
 }
@@ -396,32 +399,6 @@ pub async fn end_screen_broadcast(
         .send(NetworkCommand::EndScreenBroadcast { session_id })
         .await
         .map_err(|e| format!("Failed to end screen broadcast: {}", e))
-}
-
-#[tauri::command]
-pub async fn send_screen_broadcast_chunk(
-    session_id: String,
-    seq: u32,
-    timestamp: i64,
-    mime: String,
-    codec: String,
-    chunk_type: String,
-    payload: Vec<u8>,
-    state: State<'_, NetworkState>,
-) -> Result<(), String> {
-    let sender = state.sender.lock().await;
-    sender
-        .send(NetworkCommand::SendScreenBroadcastChunk {
-            session_id,
-            seq,
-            timestamp,
-            mime,
-            codec,
-            chunk_type,
-            payload,
-        })
-        .await
-        .map_err(|e| format!("Failed to send screen broadcast chunk: {}", e))
 }
 
 #[tauri::command]

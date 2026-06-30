@@ -16,6 +16,7 @@
     sendActiveChatMessage,
     setActiveChat,
   } from "$lib/stores";
+  import type { ScreenBroadcastProfile } from "$lib/screenBroadcast/profile";
 
   let messageInput = "";
   let showAttachments = false;
@@ -60,9 +61,9 @@
         console.error("Failed to start video call:", e);
       }
     }}
-    onStartScreenBroadcast={async () => {
+    onStartScreenBroadcast={async (profile: ScreenBroadcastProfile) => {
       try {
-        await liveActions.startScreenBroadcast(activePeer);
+        await liveActions.startScreenBroadcast(activePeer, profile);
       } catch (e) {
         console.error("Failed to start screen broadcast:", e);
       }

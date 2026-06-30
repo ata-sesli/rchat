@@ -131,6 +131,12 @@ impl NetworkManager {
                 _ = broadcast_tick.tick() => {
                     self.tick_broadcast().await;
                 }
+                Some(event) = self.screen_broadcast_worker_event_rx.recv() => {
+                    self.handle_screen_broadcast_worker_event(event).await;
+                }
+                Some(event) = self.screen_broadcast_stream_event_rx.recv() => {
+                    self.handle_screen_broadcast_stream_event(event).await;
+                }
                 _ = mdns_reconcile_interval.tick() => {
                     self.reconcile_mdns_runtime();
                 }

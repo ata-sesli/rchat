@@ -1,56 +1,82 @@
 use super::*;
 use crate::app_state::{BroadcastPhase, CallKind};
 use crate::live::broadcast::protocol::{
-    BroadcastChunkType, BroadcastFrameEvent, BroadcastFrameRequest, BroadcastFrameResponse,
+    read_broadcast_stream_header, read_broadcast_stream_record, write_broadcast_stream_header,
+    write_broadcast_stream_record, BroadcastChunkType, BroadcastFrameEvent, BroadcastFrameRequest,
+    BroadcastFrameResponse, BroadcastStreamFrame, BroadcastStreamRecord,
 };
 use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
+use futures::io::AsyncWriteExt;
+use futures::StreamExt;
 use libp2p::request_response;
 use serde::Serialize;
 use std::time::{Duration, Instant};
 
 const BROADCAST_RING_TIMEOUT_SECS: u64 = 30;
-const SCREEN_BROADCAST_FPS: u32 = 15;
-const SCREEN_BROADCAST_BITRATE_KBPS: u32 = 1_500;
 const SCREEN_BROADCAST_ENCODER_THREADS: u32 = 4;
 const SCREEN_BROADCAST_ENCODER_CPU_USED: i32 = 8;
-const SCREEN_BROADCAST_KEYFRAME_INTERVAL_FRAMES: u32 = 30;
-const SCREEN_BROADCAST_PROFILE: &str = "720p15";
 const SCREEN_BROADCAST_MIME: &str = "video/webm;codecs=vp8";
 const SCREEN_BROADCAST_CODEC: &str = "vp8";
 const SCREEN_BROADCAST_SUMMARY_INTERVAL: Duration = Duration::from_secs(5);
+const SCREEN_BROADCAST_STREAM_QUEUE_CAPACITY: usize = 256;
 
+#[allow(dead_code)]
 pub(super) struct ScreenCaptureStartTask {
-    session_id: String,
-    result_rx: tokio::sync::oneshot::Receiver<
+    pub(super) session_id: String,
+    pub(super) result_rx: tokio::sync::oneshot::Receiver<
         Result<
             rchat_screen_capture::ScreenCaptureSession,
             rchat_screen_capture::ScreenCaptureError,
         >,
     >,
-    handle: tauri::async_runtime::JoinHandle<()>,
+    pub(super) handle: tauri::async_runtime::JoinHandle<()>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_broadcast_keyframe_scheduler_forces_next_frame_once() {
+        let mut scheduler = ScreenBroadcastKeyframeScheduler::new(60);
+
+        assert!(scheduler.should_force(0));
+        assert!(!scheduler.should_force(1));
+
+        scheduler.force_next();
+
+        assert!(scheduler.should_force(2));
+        assert!(!scheduler.should_force(3));
+    }
 }
 
 pub(super) struct ScreenBroadcastVp8Encoder {
     width: u32,
     height: u32,
+    profile: rchat_screen_capture::ScreenCaptureProfile,
     encoder: rchat_libvpx::Vp8Encoder,
 }
 
 impl ScreenBroadcastVp8Encoder {
-    fn new(width: u32, height: u32) -> Result<Self, String> {
+    fn new(
+        width: u32,
+        height: u32,
+        profile: rchat_screen_capture::ScreenCaptureProfile,
+    ) -> Result<Self, String> {
         let encoder = rchat_libvpx::Vp8Encoder::new(rchat_libvpx::Vp8EncoderConfig {
             width,
             height,
-            bitrate_kbps: SCREEN_BROADCAST_BITRATE_KBPS,
-            fps: SCREEN_BROADCAST_FPS,
+            bitrate_kbps: profile.bitrate_kbps(),
+            fps: profile.fps(),
             threads: SCREEN_BROADCAST_ENCODER_THREADS,
-            keyframe_interval: SCREEN_BROADCAST_KEYFRAME_INTERVAL_FRAMES,
+            keyframe_interval: profile.keyframe_interval_frames(),
             cpu_used: SCREEN_BROADCAST_ENCODER_CPU_USED,
         })
         .map_err(|e| e.to_string())?;
         Ok(Self {
             width,
             height,
+            profile,
             encoder,
         })
     }
@@ -63,7 +89,7 @@ impl ScreenBroadcastVp8Encoder {
         force_keyframe: bool,
     ) -> Result<Vec<rchat_libvpx::EncodedPacket>, String> {
         if width != self.width || height != self.height {
-            *self = Self::new(width, height)?;
+            *self = Self::new(width, height, self.profile)?;
         }
         let expected_len = rchat_libvpx::expected_i420_len(width, height)
             .ok_or_else(|| "invalid screen frame size".to_string())?;
@@ -95,20 +121,381 @@ struct ScreenBroadcastCaptureErrorEvent {
     message: String,
 }
 
-impl NetworkManager {
-    fn parse_broadcast_chunk_type(value: &str) -> BroadcastChunkType {
-        if value.eq_ignore_ascii_case("key") {
-            BroadcastChunkType::Key
-        } else {
-            BroadcastChunkType::Delta
+#[derive(Debug)]
+pub(super) enum ScreenBroadcastStreamEvent {
+    InboundRecord {
+        peer: PeerId,
+        session_id: String,
+        record: BroadcastStreamRecord,
+    },
+    InboundFailure {
+        peer: PeerId,
+        session_id: Option<String>,
+        error: String,
+    },
+    OutboundFailure {
+        peer: PeerId,
+        session_id: String,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct ScreenBroadcastWorkerStats {
+    started_at: Option<Instant>,
+    capture_stats: rchat_screen_capture::ScreenCaptureSessionStats,
+    encoded_frames: u64,
+    keyframes: u64,
+    delta_frames: u64,
+    outbound_bytes: u64,
+    encode_errors: u64,
+    skipped_frames: u64,
+    worker_event_drops: u64,
+    encode_micros: Vec<u64>,
+}
+
+impl ScreenBroadcastWorkerStats {
+    fn capture_fps(&self) -> f64 {
+        let Some(started_at) = self.started_at else {
+            return 0.0;
+        };
+        let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+        self.capture_stats.captured_frames as f64 / elapsed
+    }
+
+    fn encode_fps(&self) -> f64 {
+        let Some(started_at) = self.started_at else {
+            return 0.0;
+        };
+        let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+        self.encoded_frames as f64 / elapsed
+    }
+
+    fn actual_kbps(&self) -> f64 {
+        let Some(started_at) = self.started_at else {
+            return 0.0;
+        };
+        let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+        self.outbound_bytes as f64 * 8.0 / elapsed / 1000.0
+    }
+
+    fn encode_p95_ms(&self) -> f64 {
+        if self.encode_micros.is_empty() {
+            return 0.0;
+        }
+        let mut values = self.encode_micros.clone();
+        values.sort_unstable();
+        let index = ((values.len() - 1) as f64 * 0.95).round() as usize;
+        values[index] as f64 / 1000.0
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum ScreenBroadcastWorkerEvent {
+    Started {
+        session_id: String,
+        info: rchat_screen_capture::ScreenCaptureSessionInfo,
+    },
+    EncodedFrame {
+        session_id: String,
+        frame: BroadcastStreamFrame,
+        encode_micros: u64,
+    },
+    Stats {
+        session_id: String,
+        info: rchat_screen_capture::ScreenCaptureSessionInfo,
+        stats: ScreenBroadcastWorkerStats,
+    },
+    Failure {
+        session_id: String,
+        error: String,
+    },
+}
+
+#[derive(Debug)]
+pub(super) enum ScreenBroadcastWorkerCommand {
+    ForceKeyframe,
+}
+
+#[derive(Debug)]
+struct ScreenBroadcastKeyframeScheduler {
+    interval_frames: u32,
+    force_next: bool,
+}
+
+impl ScreenBroadcastKeyframeScheduler {
+    fn new(interval_frames: u32) -> Self {
+        Self {
+            interval_frames: interval_frames.max(1),
+            force_next: true,
         }
     }
 
+    fn force_next(&mut self) {
+        self.force_next = true;
+    }
+
+    fn should_force(&mut self, seq: u32) -> bool {
+        let force_keyframe = self.force_next || seq == 0 || seq % self.interval_frames.max(1) == 0;
+        if force_keyframe {
+            self.force_next = false;
+        }
+        force_keyframe
+    }
+}
+
+fn start_screen_broadcast_worker(
+    session_id: String,
+    profile: rchat_screen_capture::ScreenCaptureProfile,
+    app_handle: AppHandle,
+    event_tx: tokio::sync::mpsc::Sender<ScreenBroadcastWorkerEvent>,
+    mut control_rx: tokio::sync::mpsc::Receiver<ScreenBroadcastWorkerCommand>,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        let config = rchat_screen_capture::ScreenCaptureConfig::default_for_profile(profile);
+        let mut capture_session =
+            match rchat_screen_capture::ScreenCaptureSession::start(config).await {
+                Ok(session) => session,
+                Err(error) => {
+                    let _ = event_tx
+                        .send(ScreenBroadcastWorkerEvent::Failure {
+                            session_id,
+                            error: error.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+        let info = capture_session.info().clone();
+        let _ = event_tx
+            .send(ScreenBroadcastWorkerEvent::Started {
+                session_id: session_id.clone(),
+                info: info.clone(),
+            })
+            .await;
+
+        let cadence_ms = (1000 / profile.fps().max(1) as u64).max(1);
+        let mut cadence = tokio::time::interval(Duration::from_millis(cadence_ms));
+        cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_stats_at = Instant::now();
+        let mut stats = ScreenBroadcastWorkerStats {
+            started_at: Some(Instant::now()),
+            ..ScreenBroadcastWorkerStats::default()
+        };
+        let mut encoder: Option<ScreenBroadcastVp8Encoder> = None;
+        let mut seq = 0_u32;
+        let mut keyframes =
+            ScreenBroadcastKeyframeScheduler::new(profile.keyframe_interval_frames());
+
+        loop {
+            cadence.tick().await;
+            while let Ok(ScreenBroadcastWorkerCommand::ForceKeyframe) = control_rx.try_recv() {
+                keyframes.force_next();
+            }
+
+            while let Some(preview) = capture_session.try_recv_latest_preview() {
+                let _ = app_handle.emit(
+                    "screen-broadcast-local-preview-frame",
+                    ScreenBroadcastLocalPreviewFrameEvent {
+                        session_id: session_id.clone(),
+                        timestamp_us: preview.timestamp_us,
+                        width: preview.width,
+                        height: preview.height,
+                        rgba: preview.rgba,
+                    },
+                );
+            }
+
+            let mut latest_frame = None;
+            while let Some(frame) = capture_session.try_recv_latest_i420() {
+                latest_frame = Some(frame);
+            }
+
+            let Some(frame) = latest_frame else {
+                stats.skipped_frames = stats.skipped_frames.saturating_add(1);
+                stats.capture_stats = capture_session.stats();
+                maybe_emit_worker_stats(&event_tx, &session_id, &info, &stats, &mut last_stats_at);
+                continue;
+            };
+
+            let force_keyframe = keyframes.should_force(seq);
+            if encoder.is_none() {
+                match ScreenBroadcastVp8Encoder::new(frame.width, frame.height, profile) {
+                    Ok(new_encoder) => {
+                        encoder = Some(new_encoder);
+                    }
+                    Err(error) => {
+                        stats.encode_errors = stats.encode_errors.saturating_add(1);
+                        eprintln!("[Broadcast][Screen] VP8 encoder init failed: {}", error);
+                        continue;
+                    }
+                }
+            }
+
+            let encode_started = Instant::now();
+            let packets = match encoder
+                .as_mut()
+                .expect("encoder was initialized")
+                .encode_i420(frame.width, frame.height, &frame.data, force_keyframe)
+            {
+                Ok(packets) => packets,
+                Err(error) => {
+                    stats.encode_errors = stats.encode_errors.saturating_add(1);
+                    eprintln!("[Broadcast][Screen] VP8 encode failed: {}", error);
+                    continue;
+                }
+            };
+            let encode_micros = encode_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
+            stats.encode_micros.push(encode_micros);
+
+            for packet in packets {
+                if packet.payload.is_empty() {
+                    continue;
+                }
+                let chunk_type = if packet.is_key {
+                    stats.keyframes = stats.keyframes.saturating_add(1);
+                    BroadcastChunkType::Key
+                } else {
+                    stats.delta_frames = stats.delta_frames.saturating_add(1);
+                    BroadcastChunkType::Delta
+                };
+                let payload_len = packet.payload.len() as u64;
+                let stream_frame = BroadcastStreamFrame {
+                    seq,
+                    timestamp_us: frame.timestamp_us,
+                    chunk_type,
+                    profile,
+                    width: frame.width,
+                    height: frame.height,
+                    payload: packet.payload,
+                };
+                seq = seq.wrapping_add(1);
+                stats.encoded_frames = stats.encoded_frames.saturating_add(1);
+                stats.outbound_bytes = stats.outbound_bytes.saturating_add(payload_len);
+
+                match event_tx.try_send(ScreenBroadcastWorkerEvent::EncodedFrame {
+                    session_id: session_id.clone(),
+                    frame: stream_frame,
+                    encode_micros,
+                }) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        stats.worker_event_drops = stats.worker_event_drops.saturating_add(1);
+                        keyframes.force_next();
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                }
+            }
+
+            stats.capture_stats = capture_session.stats();
+            maybe_emit_worker_stats(&event_tx, &session_id, &info, &stats, &mut last_stats_at);
+        }
+    })
+}
+
+fn maybe_emit_worker_stats(
+    event_tx: &tokio::sync::mpsc::Sender<ScreenBroadcastWorkerEvent>,
+    session_id: &str,
+    info: &rchat_screen_capture::ScreenCaptureSessionInfo,
+    stats: &ScreenBroadcastWorkerStats,
+    last_stats_at: &mut Instant,
+) {
+    if last_stats_at.elapsed() < Duration::from_secs(1) {
+        return;
+    }
+    *last_stats_at = Instant::now();
+    let _ = event_tx.try_send(ScreenBroadcastWorkerEvent::Stats {
+        session_id: session_id.to_string(),
+        info: info.clone(),
+        stats: stats.clone(),
+    });
+}
+
+pub(super) fn start_screen_broadcast_stream_accept_loop(
+    incoming: crate::network::voice_stream::IncomingStreams,
+    event_tx: tokio::sync::mpsc::Sender<ScreenBroadcastStreamEvent>,
+) {
+    tauri::async_runtime::spawn(async move {
+        futures::pin_mut!(incoming);
+        while let Some((peer, mut stream)) = incoming.next().await {
+            let event_tx = event_tx.clone();
+            tauri::async_runtime::spawn(async move {
+                eprintln!("[Broadcast][Stream] inbound stream accepted peer={}", peer);
+                let session_id = match read_broadcast_stream_header(&mut stream).await {
+                    Ok(session_id) => session_id,
+                    Err(error) => {
+                        let _ = event_tx
+                            .send(ScreenBroadcastStreamEvent::InboundFailure {
+                                peer,
+                                session_id: None,
+                                error: error.to_string(),
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                eprintln!(
+                    "[Broadcast][Stream] inbound header read peer={} session_id={}",
+                    peer, session_id
+                );
+
+                let mut first_frame_read = false;
+                loop {
+                    match read_broadcast_stream_record(&mut stream).await {
+                        Ok(record) => {
+                            let BroadcastStreamRecord::Frame(frame) = &record;
+                            if !first_frame_read {
+                                eprintln!(
+                                    "[Broadcast][Stream] inbound first frame read peer={} session_id={} seq={} bytes={} kind={:?} profile={}",
+                                    peer,
+                                    session_id,
+                                    frame.seq,
+                                    frame.payload.len(),
+                                    frame.chunk_type,
+                                    frame.profile.label()
+                                );
+                                first_frame_read = true;
+                            }
+                            if event_tx
+                                .send(ScreenBroadcastStreamEvent::InboundRecord {
+                                    peer,
+                                    session_id: session_id.clone(),
+                                    record,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return,
+                        Err(error) => {
+                            let _ = event_tx
+                                .send(ScreenBroadcastStreamEvent::InboundFailure {
+                                    peer,
+                                    session_id: Some(session_id.clone()),
+                                    error: error.to_string(),
+                                })
+                                .await;
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+impl NetworkManager {
     fn broadcast_session_id_from_signal(request: &DirectMessageRequest) -> String {
         request
             .text_content
             .clone()
-            .filter(|v| !v.trim().is_empty())
+            .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| request.id.clone())
     }
 
@@ -169,6 +556,7 @@ impl NetworkManager {
         self.screen_broadcast_next_seq = 0;
         self.screen_broadcast_force_next_keyframe = true;
         self.screen_broadcast_last_summary_at = None;
+        self.screen_broadcast_worker_stats = ScreenBroadcastWorkerStats::default();
         self.screen_capture_last_stats = rchat_screen_capture::ScreenCaptureSessionStats::default();
     }
 
@@ -179,6 +567,16 @@ impl NetworkManager {
         }
         if let Some(session) = self.screen_capture_session.take() {
             self.screen_capture_last_stats = session.stats();
+        }
+        if let Some(handle) = self.screen_broadcast_worker_handle.take() {
+            handle.abort();
+        }
+        self.screen_broadcast_worker_session_id = None;
+        self.screen_broadcast_worker_control_tx = None;
+        self.screen_broadcast_stream_tx = None;
+        self.screen_broadcast_stream_session_id = None;
+        if let Some(handle) = self.screen_broadcast_stream_writer_handle.take() {
+            handle.abort();
         }
         self.screen_capture_info = None;
         self.screen_capture_started_at = None;
@@ -195,13 +593,6 @@ impl NetworkManager {
         })
     }
 
-    fn screen_capture_stats_snapshot(&self) -> rchat_screen_capture::ScreenCaptureSessionStats {
-        self.screen_capture_session
-            .as_ref()
-            .map(|session| session.stats())
-            .unwrap_or(self.screen_capture_last_stats.clone())
-    }
-
     fn log_screen_broadcast_summary(&self, label: &str) {
         let Some(session) = self.active_broadcast.as_ref() else {
             return;
@@ -210,26 +601,11 @@ impl NetworkManager {
             return;
         }
 
-        let capture_stats = self.screen_capture_stats_snapshot();
-        let info = self
-            .screen_capture_session
-            .as_ref()
-            .map(|session| session.info())
-            .or(self.screen_capture_info.as_ref());
-        let elapsed_secs = self
-            .screen_capture_started_at
-            .map(|started| started.elapsed().as_secs_f64().max(0.001))
-            .unwrap_or(0.0);
-        let captured_fps = if elapsed_secs > 0.0 {
-            capture_stats.captured_frames as f64 / elapsed_secs
-        } else {
-            0.0
-        };
-        let actual_kbps = if elapsed_secs > 0.0 {
-            self.screen_broadcast_stats.outbound_bytes as f64 * 8.0 / elapsed_secs / 1000.0
-        } else {
-            0.0
-        };
+        let info = self.screen_capture_info.as_ref().or_else(|| {
+            self.screen_capture_session
+                .as_ref()
+                .map(|session| session.info())
+        });
         let (backend, source, actual_width, actual_height, actual_fps, format) =
             if let Some(info) = info {
                 (
@@ -243,31 +619,36 @@ impl NetworkManager {
             } else {
                 ("unknown", "unknown", 0, 0, 0, "unknown")
             };
-
+        let stats = &self.screen_broadcast_worker_stats;
         println!(
-            "[Broadcast][Screen][{}] peer={}, backend={}, source='{}', profile={}, actual_width={}, actual_height={}, actual_fps={}, format={}, target_kbps={}, actual_kbps={:.1}, captured_frames={}, captured_fps={:.1}, capture_drops={}, preview_drops={}, conversion_errors={}, preview_frames={}, encoded_frames={}, keyframes={}, delta_frames={}, outbound_bytes={}, encode_errors={}, outbound_failures={}, inbound_failures={}, rejected_responses={}",
+            "[Broadcast][Screen][{}] peer={}, backend={}, source='{}', profile={}, actual_width={}, actual_height={}, actual_fps={}, format={}, target_kbps={}, actual_kbps={:.1}, captured_frames={}, captured_fps={:.1}, encode_fps={:.1}, encode_p95_ms={:.1}, capture_drops={}, preview_drops={}, conversion_errors={}, preview_frames={}, skipped_frames={}, encoded_frames={}, keyframes={}, delta_frames={}, outbound_bytes={}, encode_errors={}, worker_event_drops={}, stream_queue_drops={}, outbound_failures={}, inbound_failures={}, rejected_responses={}",
             label,
             session.remote_peer_id,
             backend,
             source,
-            SCREEN_BROADCAST_PROFILE,
+            session.profile.label(),
             actual_width,
             actual_height,
             actual_fps,
             format,
-            SCREEN_BROADCAST_BITRATE_KBPS,
-            actual_kbps,
-            capture_stats.captured_frames,
-            captured_fps,
-            capture_stats.dropped_i420_frames,
-            capture_stats.dropped_preview_frames,
-            capture_stats.conversion_errors,
-            capture_stats.preview_frames,
-            self.screen_broadcast_stats.encoded_frames,
-            self.screen_broadcast_stats.keyframes,
-            self.screen_broadcast_stats.delta_frames,
-            self.screen_broadcast_stats.outbound_bytes,
-            self.screen_broadcast_stats.encode_errors,
+            session.profile.bitrate_kbps(),
+            stats.actual_kbps(),
+            stats.capture_stats.captured_frames,
+            stats.capture_fps(),
+            stats.encode_fps(),
+            stats.encode_p95_ms(),
+            stats.capture_stats.dropped_i420_frames,
+            stats.capture_stats.dropped_preview_frames,
+            stats.capture_stats.conversion_errors,
+            stats.capture_stats.preview_frames,
+            stats.skipped_frames,
+            stats.encoded_frames,
+            stats.keyframes,
+            stats.delta_frames,
+            stats.outbound_bytes,
+            stats.encode_errors,
+            stats.worker_event_drops,
+            self.screen_broadcast_stats.stream_queue_drops,
             self.screen_broadcast_stats.outbound_failures,
             self.screen_broadcast_stats.inbound_failures,
             self.screen_broadcast_stats.rejected_responses,
@@ -298,7 +679,7 @@ impl NetworkManager {
             "screen-broadcast-capture-error",
             ScreenBroadcastCaptureErrorEvent {
                 session_id: session.session_id.clone(),
-                message: message.clone(),
+                message,
             },
         );
         self.send_broadcast_signal(
@@ -310,200 +691,220 @@ impl NetworkManager {
             .await;
     }
 
-    async fn poll_screen_capture_start_task(&mut self, session: &ActiveBroadcast) -> bool {
-        let Some(mut task) = self.screen_capture_start_task.take() else {
-            return true;
-        };
-
-        if task.session_id != session.session_id {
-            task.handle.abort();
-            return false;
-        }
-
-        match task.result_rx.try_recv() {
-            Ok(Ok(capture_session)) => {
-                let info = capture_session.info().clone();
-                println!(
-                    "[Broadcast][Screen] capture started session={} backend={} source='{}' format={} {}x{}@{}",
-                    session.session_id,
-                    info.backend.label(),
-                    info.source_label,
-                    info.format.format,
-                    info.format.width,
-                    info.format.height,
-                    info.format.fps
-                );
-                self.screen_capture_info = Some(info);
-                self.screen_capture_started_at = Some(Instant::now());
-                self.screen_capture_session = Some(capture_session);
-                true
-            }
-            Ok(Err(error)) => {
-                self.screen_broadcast_stats.capture_start_failures = self
-                    .screen_broadcast_stats
-                    .capture_start_failures
-                    .saturating_add(1);
-                self.fail_active_screen_capture(session, error.to_string())
-                    .await;
-                false
-            }
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                self.screen_capture_start_task = Some(task);
-                false
-            }
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                self.screen_broadcast_stats.capture_start_failures = self
-                    .screen_broadcast_stats
-                    .capture_start_failures
-                    .saturating_add(1);
-                self.fail_active_screen_capture(session, "screen capture task failed".to_string())
-                    .await;
-                false
-            }
-        }
-    }
-
-    async fn ensure_screen_capture_running(&mut self, session: &ActiveBroadcast) -> bool {
-        if self.screen_capture_session.is_some() {
+    fn start_screen_broadcast_stream_writer(&mut self, peer: PeerId, session_id: String) -> bool {
+        if self.screen_broadcast_stream_tx.is_some()
+            && self.screen_broadcast_stream_session_id.as_deref() == Some(session_id.as_str())
+        {
             return true;
         }
-        if self.screen_capture_start_task.is_some() {
-            return self.poll_screen_capture_start_task(session).await;
-        }
 
-        let session_id = session.session_id.clone();
-        println!(
-            "[Broadcast][Screen] starting native capture session={} peer={}",
-            session.session_id, session.remote_peer_id
-        );
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let handle = tauri::async_runtime::spawn(async move {
-            let result = rchat_screen_capture::ScreenCaptureSession::start(
-                rchat_screen_capture::ScreenCaptureConfig::default(),
-            )
-            .await;
-            let _ = result_tx.send(result);
-        });
-        self.screen_capture_start_task = Some(ScreenCaptureStartTask {
-            session_id,
-            result_rx,
-            handle,
-        });
-        false
-    }
-
-    fn emit_screen_broadcast_preview(&mut self, session_id: &str) {
-        let Some(capture_session) = self.screen_capture_session.as_mut() else {
-            return;
-        };
-        while let Some(preview) = capture_session.try_recv_latest_preview() {
-            let _ = self.app_handle.emit(
-                "screen-broadcast-local-preview-frame",
-                ScreenBroadcastLocalPreviewFrameEvent {
-                    session_id: session_id.to_string(),
-                    timestamp_us: preview.timestamp_us,
-                    width: preview.width,
-                    height: preview.height,
-                    rgba: preview.rgba,
-                },
+        let Some(connection_id) = self.voice_quic_connection_id(&peer) else {
+            eprintln!(
+                "[Broadcast][QUIC] No QUIC connection id available for screen stream: peer={}",
+                peer
             );
+            return false;
+        };
+
+        self.screen_broadcast_stream_tx = None;
+        self.screen_broadcast_stream_session_id = None;
+        if let Some(handle) = self.screen_broadcast_stream_writer_handle.take() {
+            handle.abort();
         }
-    }
 
-    fn encode_and_send_screen_frame(
-        &mut self,
-        session: &ActiveBroadcast,
-        frame: rchat_screen_capture::I420ScreenFrame,
-    ) {
-        let force_keyframe = self.screen_broadcast_force_next_keyframe
-            || self.screen_broadcast_next_seq == 0
-            || self.screen_broadcast_next_seq % SCREEN_BROADCAST_KEYFRAME_INTERVAL_FRAMES == 0;
+        eprintln!(
+            "[Broadcast][Stream] selected outbound QUIC connection peer={} session_id={} connection_id={:?}",
+            peer, session_id, connection_id
+        );
 
-        if self.screen_broadcast_vp8_encoder.is_none() {
-            match ScreenBroadcastVp8Encoder::new(frame.width, frame.height) {
-                Ok(encoder) => {
-                    self.screen_broadcast_vp8_encoder = Some(encoder);
-                    self.screen_broadcast_force_next_keyframe = true;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BroadcastStreamRecord>(
+            SCREEN_BROADCAST_STREAM_QUEUE_CAPACITY,
+        );
+        let stream_rx = match self
+            .swarm
+            .behaviour_mut()
+            .broadcast_stream
+            .open_stream_on_connection(peer, connection_id)
+        {
+            Ok(stream_rx) => stream_rx,
+            Err(error) => {
+                eprintln!(
+                    "[Broadcast][QUIC] Failed to queue screen stream on {} for {}: {}",
+                    connection_id, peer, error
+                );
+                return false;
+            }
+        };
+        let event_tx = self.screen_broadcast_stream_event_tx.clone();
+        let writer_session_id = session_id.clone();
+        let handle = tauri::async_runtime::spawn(async move {
+            let mut stream = match tokio::time::timeout(Duration::from_secs(5), stream_rx).await {
+                Ok(Ok(Ok(stream))) => {
+                    eprintln!(
+                            "[Broadcast][Stream] outbound stream opened peer={} session_id={} connection_id={:?}",
+                            peer, writer_session_id, connection_id
+                        );
+                    stream
                 }
-                Err(error) => {
-                    self.screen_broadcast_stats.encode_errors =
-                        self.screen_broadcast_stats.encode_errors.saturating_add(1);
-                    eprintln!("[Broadcast][Screen] VP8 encoder init failed: {}", error);
+                Ok(Ok(Err(error))) => {
+                    let _ = event_tx
+                        .send(ScreenBroadcastStreamEvent::OutboundFailure {
+                            peer,
+                            session_id: writer_session_id.clone(),
+                            error: error.to_string(),
+                        })
+                        .await;
                     return;
                 }
-            }
-        }
+                Ok(Err(_)) => {
+                    let _ = event_tx
+                        .send(ScreenBroadcastStreamEvent::OutboundFailure {
+                            peer,
+                            session_id: writer_session_id.clone(),
+                            error: "stream open canceled".to_string(),
+                        })
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    let _ = event_tx
+                        .send(ScreenBroadcastStreamEvent::OutboundFailure {
+                            peer,
+                            session_id: writer_session_id.clone(),
+                            error: format!("stream open timed out: {}", error),
+                        })
+                        .await;
+                    return;
+                }
+            };
 
-        let packets = match self
-            .screen_broadcast_vp8_encoder
-            .as_mut()
-            .expect("encoder was initialized")
-            .encode_i420(frame.width, frame.height, &frame.data, force_keyframe)
-        {
-            Ok(packets) => packets,
-            Err(error) => {
-                self.screen_broadcast_stats.encode_errors =
-                    self.screen_broadcast_stats.encode_errors.saturating_add(1);
-                self.screen_broadcast_force_next_keyframe = true;
-                eprintln!("[Broadcast][Screen] VP8 encode failed: {}", error);
+            if let Err(error) = write_broadcast_stream_header(&mut stream, &writer_session_id).await
+            {
+                let _ = event_tx
+                    .send(ScreenBroadcastStreamEvent::OutboundFailure {
+                        peer,
+                        session_id: writer_session_id.clone(),
+                        error: error.to_string(),
+                    })
+                    .await;
                 return;
             }
-        };
-
-        for packet in packets {
-            if packet.payload.is_empty() {
-                continue;
-            }
-            let seq = self.screen_broadcast_next_seq;
-            self.screen_broadcast_next_seq = self.screen_broadcast_next_seq.wrapping_add(1);
-            self.screen_broadcast_stats.encoded_frames =
-                self.screen_broadcast_stats.encoded_frames.saturating_add(1);
-            self.screen_broadcast_stats.outbound_bytes = self
-                .screen_broadcast_stats
-                .outbound_bytes
-                .saturating_add(packet.payload.len() as u64);
-            let chunk_type = if packet.is_key {
-                self.screen_broadcast_stats.keyframes =
-                    self.screen_broadcast_stats.keyframes.saturating_add(1);
-                BroadcastChunkType::Key
-            } else {
-                self.screen_broadcast_stats.delta_frames =
-                    self.screen_broadcast_stats.delta_frames.saturating_add(1);
-                BroadcastChunkType::Delta
-            };
-            self.screen_broadcast_force_next_keyframe = false;
-
-            self.swarm.behaviour_mut().broadcast.send_request(
-                &session.remote_peer_id,
-                BroadcastFrameRequest {
-                    session_id: session.session_id.clone(),
-                    seq,
-                    timestamp: frame.timestamp_us,
-                    mime: SCREEN_BROADCAST_MIME.to_string(),
-                    codec: SCREEN_BROADCAST_CODEC.to_string(),
-                    profile: SCREEN_BROADCAST_PROFILE.to_string(),
-                    width: frame.width,
-                    height: frame.height,
-                    chunk_type,
-                    payload: packet.payload,
-                },
+            eprintln!(
+                "[Broadcast][Stream] outbound header written peer={} session_id={} connection_id={:?}",
+                peer, writer_session_id, connection_id
             );
+
+            let mut first_frame_written = false;
+            while let Some(record) = rx.recv().await {
+                let frame_log = match &record {
+                    BroadcastStreamRecord::Frame(frame) => Some((
+                        frame.seq,
+                        frame.payload.len(),
+                        frame.chunk_type,
+                        frame.profile,
+                    )),
+                };
+                if let Err(error) = write_broadcast_stream_record(&mut stream, &record).await {
+                    let _ = event_tx
+                        .send(ScreenBroadcastStreamEvent::OutboundFailure {
+                            peer,
+                            session_id: writer_session_id.clone(),
+                            error: error.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+                if let Some((seq, bytes, chunk_type, profile)) = frame_log {
+                    if !first_frame_written {
+                        eprintln!(
+                            "[Broadcast][Stream] outbound first frame written peer={} session_id={} seq={} bytes={} kind={:?} profile={} connection_id={:?}",
+                            peer,
+                            writer_session_id,
+                            seq,
+                            bytes,
+                            chunk_type,
+                            profile.label(),
+                            connection_id
+                        );
+                        first_frame_written = true;
+                    }
+                }
+            }
+
+            let _ = stream.close().await;
+        });
+
+        self.screen_broadcast_stream_tx = Some(tx);
+        self.screen_broadcast_stream_session_id = Some(session_id);
+        self.screen_broadcast_stream_writer_handle = Some(handle);
+        true
+    }
+
+    fn queue_screen_broadcast_stream_record(&mut self, record: BroadcastStreamRecord) -> bool {
+        let Some(tx) = self.screen_broadcast_stream_tx.as_ref() else {
+            return false;
+        };
+        match tx.try_send(record) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.screen_broadcast_stats.stream_queue_drops = self
+                    .screen_broadcast_stats
+                    .stream_queue_drops
+                    .saturating_add(1);
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.screen_broadcast_stats.outbound_failures = self
+                    .screen_broadcast_stats
+                    .outbound_failures
+                    .saturating_add(1);
+                self.screen_broadcast_stream_tx = None;
+                self.screen_broadcast_stream_session_id = None;
+                false
+            }
         }
     }
 
-    async fn pump_screen_broadcast_capture(&mut self, session: &ActiveBroadcast) {
-        self.emit_screen_broadcast_preview(&session.session_id);
-        let Some(capture_session) = self.screen_capture_session.as_mut() else {
+    fn request_screen_broadcast_worker_keyframe(&mut self) {
+        let Some(tx) = self.screen_broadcast_worker_control_tx.as_ref() else {
             return;
         };
+        match tx.try_send(ScreenBroadcastWorkerCommand::ForceKeyframe) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.screen_broadcast_worker_control_tx = None;
+            }
+        }
+    }
 
-        let mut latest = None;
-        while let Some(frame) = capture_session.try_recv_latest_i420() {
-            latest = Some(frame);
+    fn ensure_screen_broadcast_worker(&mut self, session: &ActiveBroadcast) {
+        if self.screen_broadcast_worker_handle.is_some()
+            && self.screen_broadcast_worker_session_id.as_deref()
+                == Some(session.session_id.as_str())
+        {
+            return;
         }
-        if let Some(frame) = latest {
-            self.encode_and_send_screen_frame(session, frame);
+        if let Some(handle) = self.screen_broadcast_worker_handle.take() {
+            handle.abort();
         }
+        self.screen_broadcast_worker_control_tx = None;
+        self.screen_broadcast_worker_session_id = Some(session.session_id.clone());
+        self.screen_broadcast_worker_stats = ScreenBroadcastWorkerStats::default();
+        eprintln!(
+            "[Broadcast][Screen] starting capture worker session={} peer={} profile={}",
+            session.session_id,
+            session.remote_peer_id,
+            session.profile.label()
+        );
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(16);
+        self.screen_broadcast_worker_control_tx = Some(control_tx);
+        self.screen_broadcast_worker_handle = Some(start_screen_broadcast_worker(
+            session.session_id.clone(),
+            session.profile,
+            self.app_handle.clone(),
+            self.screen_broadcast_worker_event_tx.clone(),
+            control_rx,
+        ));
     }
 
     fn broadcast_conflict_reason(&self, peer_chat_id: &str) -> Option<String> {
@@ -525,7 +926,11 @@ impl NetworkManager {
         }
     }
 
-    pub(super) async fn handle_start_screen_broadcast(&mut self, peer_chat_id: String) {
+    pub(super) async fn handle_start_screen_broadcast(
+        &mut self,
+        peer_chat_id: String,
+        profile: rchat_screen_capture::ScreenCaptureProfile,
+    ) {
         if self.active_broadcast.is_some() {
             self.push_idle_broadcast_state(Some("busy".to_string()))
                 .await;
@@ -576,6 +981,7 @@ impl NetworkManager {
             ring_expires_at: Some(now + BROADCAST_RING_TIMEOUT_SECS as i64),
             started_at: None,
             is_host: true,
+            profile,
         };
 
         let offer = DirectMessageRequest {
@@ -666,49 +1072,6 @@ impl NetworkManager {
             .await;
     }
 
-    pub(super) async fn handle_send_screen_broadcast_chunk(
-        &mut self,
-        session_id: String,
-        seq: u32,
-        timestamp: i64,
-        mime: String,
-        codec: String,
-        chunk_type: String,
-        payload: Vec<u8>,
-    ) {
-        let Some(session_snapshot) = self.active_broadcast.as_ref().cloned() else {
-            return;
-        };
-        if session_snapshot.session_id != session_id
-            || session_snapshot.phase != ActiveBroadcastPhase::Active
-            || !session_snapshot.is_host
-        {
-            return;
-        }
-
-        if !self.swarm.is_connected(&session_snapshot.remote_peer_id) {
-            self.transition_broadcast_to_idle(Some("disconnected".to_string()))
-                .await;
-            return;
-        }
-
-        self.swarm.behaviour_mut().broadcast.send_request(
-            &session_snapshot.remote_peer_id,
-            BroadcastFrameRequest {
-                session_id,
-                seq,
-                timestamp,
-                mime,
-                codec,
-                profile: "legacy".to_string(),
-                width: 640,
-                height: 360,
-                chunk_type: Self::parse_broadcast_chunk_type(&chunk_type),
-                payload,
-            },
-        );
-    }
-
     pub(super) async fn handle_broadcast_signal(
         &mut self,
         peer: PeerId,
@@ -732,12 +1095,9 @@ impl NetworkManager {
                     return Ok(());
                 }
 
-                if self.active_broadcast.is_some() {
-                    self.send_broadcast_signal(peer, DirectMessageKind::BroadcastBusy, &request.id);
-                    return Ok(());
-                }
-
-                if self.broadcast_conflict_reason(&incoming_chat_id).is_some() {
+                if self.active_broadcast.is_some()
+                    || self.broadcast_conflict_reason(&incoming_chat_id).is_some()
+                {
                     self.send_broadcast_signal(peer, DirectMessageKind::BroadcastBusy, &request.id);
                     return Ok(());
                 }
@@ -755,6 +1115,7 @@ impl NetworkManager {
                     ring_expires_at: Some(now + BROADCAST_RING_TIMEOUT_SECS as i64),
                     started_at: None,
                     is_host: false,
+                    profile: rchat_screen_capture::ScreenCaptureProfile::default(),
                 };
                 self.push_active_broadcast_state(&session, BroadcastPhase::IncomingRinging, None)
                     .await;
@@ -823,20 +1184,255 @@ impl NetworkManager {
                     self.send_broadcast_signal(peer, DirectMessageKind::BroadcastEnd, &session_id);
                     self.transition_broadcast_to_idle(Some("ring_timeout".to_string()))
                         .await;
+                    return;
                 }
             }
         }
 
         let Some(session) = self.active_host_broadcast_snapshot() else {
-            if self.screen_capture_session.is_some() || self.screen_capture_start_task.is_some() {
+            if self.screen_broadcast_worker_handle.is_some()
+                || self.screen_broadcast_stream_tx.is_some()
+                || self.screen_capture_session.is_some()
+                || self.screen_capture_start_task.is_some()
+            {
                 self.stop_screen_broadcast_media("final");
             }
             return;
         };
 
-        if self.ensure_screen_capture_running(&session).await {
-            self.pump_screen_broadcast_capture(&session).await;
-            self.maybe_log_screen_broadcast_summary();
+        if !self.peer_has_quic_path(&session.remote_peer_id) {
+            self.transition_broadcast_to_idle(Some("quic_path_lost".to_string()))
+                .await;
+            return;
+        }
+
+        if self.screen_broadcast_stream_tx.is_none()
+            || self.screen_broadcast_stream_session_id.as_deref()
+                != Some(session.session_id.as_str())
+        {
+            let _ = self.start_screen_broadcast_stream_writer(
+                session.remote_peer_id,
+                session.session_id.clone(),
+            );
+        }
+        self.ensure_screen_broadcast_worker(&session);
+        self.maybe_log_screen_broadcast_summary();
+    }
+
+    pub(super) async fn handle_screen_broadcast_worker_event(
+        &mut self,
+        event: ScreenBroadcastWorkerEvent,
+    ) {
+        match event {
+            ScreenBroadcastWorkerEvent::Started { session_id, info } => {
+                if self
+                    .active_broadcast
+                    .as_ref()
+                    .map(|session| {
+                        session.session_id == session_id
+                            && session.phase == ActiveBroadcastPhase::Active
+                            && session.is_host
+                    })
+                    .unwrap_or(false)
+                {
+                    eprintln!(
+                        "[Broadcast][Screen] capture started session={} backend={} source='{}' format={} {}x{}@{}",
+                        session_id,
+                        info.backend.label(),
+                        info.source_label,
+                        info.format.format,
+                        info.format.width,
+                        info.format.height,
+                        info.format.fps
+                    );
+                    self.screen_capture_info = Some(info);
+                    self.screen_capture_started_at = Some(Instant::now());
+                    self.screen_broadcast_worker_stats.started_at = Some(Instant::now());
+                }
+            }
+            ScreenBroadcastWorkerEvent::EncodedFrame {
+                session_id,
+                frame,
+                encode_micros,
+            } => {
+                if !self
+                    .active_broadcast
+                    .as_ref()
+                    .map(|session| {
+                        session.session_id == session_id
+                            && session.phase == ActiveBroadcastPhase::Active
+                            && session.is_host
+                    })
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                self.screen_broadcast_worker_stats.encoded_frames = self
+                    .screen_broadcast_worker_stats
+                    .encoded_frames
+                    .saturating_add(1);
+                self.screen_broadcast_worker_stats.outbound_bytes = self
+                    .screen_broadcast_worker_stats
+                    .outbound_bytes
+                    .saturating_add(frame.payload.len() as u64);
+                self.screen_broadcast_worker_stats
+                    .encode_micros
+                    .push(encode_micros);
+                match frame.chunk_type {
+                    BroadcastChunkType::Key => {
+                        self.screen_broadcast_worker_stats.keyframes = self
+                            .screen_broadcast_worker_stats
+                            .keyframes
+                            .saturating_add(1);
+                    }
+                    BroadcastChunkType::Delta => {
+                        self.screen_broadcast_worker_stats.delta_frames = self
+                            .screen_broadcast_worker_stats
+                            .delta_frames
+                            .saturating_add(1);
+                    }
+                }
+                let queued =
+                    self.queue_screen_broadcast_stream_record(BroadcastStreamRecord::Frame(frame));
+                if !queued {
+                    self.request_screen_broadcast_worker_keyframe();
+                }
+            }
+            ScreenBroadcastWorkerEvent::Stats {
+                session_id,
+                info,
+                stats,
+            } => {
+                if self
+                    .active_broadcast
+                    .as_ref()
+                    .map(|session| session.session_id == session_id && session.is_host)
+                    .unwrap_or(false)
+                {
+                    self.screen_capture_info = Some(info);
+                    self.screen_broadcast_worker_stats = stats;
+                }
+            }
+            ScreenBroadcastWorkerEvent::Failure { session_id, error } => {
+                let Some(session) = self.active_broadcast.as_ref().cloned() else {
+                    return;
+                };
+                if session.session_id == session_id && session.is_host {
+                    self.screen_broadcast_stats.capture_start_failures = self
+                        .screen_broadcast_stats
+                        .capture_start_failures
+                        .saturating_add(1);
+                    self.fail_active_screen_capture(&session, error).await;
+                }
+            }
+        }
+    }
+
+    pub(super) async fn handle_screen_broadcast_stream_event(
+        &mut self,
+        event: ScreenBroadcastStreamEvent,
+    ) {
+        match event {
+            ScreenBroadcastStreamEvent::InboundRecord {
+                peer,
+                session_id,
+                record,
+            } => match record {
+                BroadcastStreamRecord::Frame(frame) => {
+                    if !self
+                        .active_broadcast
+                        .as_ref()
+                        .map(|session| {
+                            session.phase == ActiveBroadcastPhase::Active
+                                && session.session_id == session_id
+                                && session.remote_peer_id == peer
+                                && !session.is_host
+                        })
+                        .unwrap_or(false)
+                    {
+                        return;
+                    }
+                    self.screen_broadcast_stats.inbound_frames =
+                        self.screen_broadcast_stats.inbound_frames.saturating_add(1);
+                    self.screen_broadcast_stats.inbound_bytes = self
+                        .screen_broadcast_stats
+                        .inbound_bytes
+                        .saturating_add(frame.payload.len() as u64);
+                    let event = BroadcastFrameEvent {
+                        session_id,
+                        peer_id: peer.to_string(),
+                        seq: frame.seq,
+                        timestamp: frame.timestamp_us,
+                        mime: SCREEN_BROADCAST_MIME.to_string(),
+                        codec: SCREEN_BROADCAST_CODEC.to_string(),
+                        profile: frame.profile.label().to_string(),
+                        width: frame.width,
+                        height: frame.height,
+                        chunk_type: frame.chunk_type,
+                        payload: frame.payload,
+                    };
+                    let _ = self.app_handle.emit("broadcast-frame", event);
+                }
+            },
+            ScreenBroadcastStreamEvent::InboundFailure {
+                peer,
+                session_id,
+                error,
+            } => {
+                eprintln!(
+                    "[Broadcast][Stream] inbound failure from {}: {}",
+                    peer, error
+                );
+                self.screen_broadcast_stats.inbound_failures = self
+                    .screen_broadcast_stats
+                    .inbound_failures
+                    .saturating_add(1);
+                if self
+                    .active_broadcast
+                    .as_ref()
+                    .map(|session| {
+                        session.phase == ActiveBroadcastPhase::Active
+                            && session.remote_peer_id == peer
+                            && session_id.as_deref() == Some(session.session_id.as_str())
+                    })
+                    .unwrap_or(false)
+                {
+                    self.transition_broadcast_to_idle(Some("stream_failure".to_string()))
+                        .await;
+                }
+            }
+            ScreenBroadcastStreamEvent::OutboundFailure {
+                peer,
+                session_id,
+                error,
+            } => {
+                eprintln!(
+                    "[Broadcast][Stream] outbound failure to {}: {}",
+                    peer, error
+                );
+                self.screen_broadcast_stats.outbound_failures = self
+                    .screen_broadcast_stats
+                    .outbound_failures
+                    .saturating_add(1);
+                if self.screen_broadcast_stream_session_id.as_deref() == Some(session_id.as_str()) {
+                    self.screen_broadcast_stream_tx = None;
+                    self.screen_broadcast_stream_session_id = None;
+                    self.screen_broadcast_stream_writer_handle = None;
+                }
+                if self
+                    .active_broadcast
+                    .as_ref()
+                    .map(|session| {
+                        session.phase == ActiveBroadcastPhase::Active
+                            && session.remote_peer_id == peer
+                            && session.session_id == session_id
+                    })
+                    .unwrap_or(false)
+                {
+                    self.transition_broadcast_to_idle(Some("stream_failure".to_string()))
+                        .await;
+                }
+            }
         }
     }
 
@@ -896,19 +1492,6 @@ impl NetworkManager {
                             .screen_broadcast_stats
                             .rejected_responses
                             .saturating_add(1);
-                        let should_end = self
-                            .active_broadcast
-                            .as_ref()
-                            .map(|session| {
-                                session.phase == ActiveBroadcastPhase::Active
-                                    && session.remote_peer_id == peer
-                                    && session.is_host
-                            })
-                            .unwrap_or(false);
-                        if should_end {
-                            self.transition_broadcast_to_idle(Some("stream_rejected".to_string()))
-                                .await;
-                        }
                     }
                 }
             },
@@ -918,21 +1501,9 @@ impl NetworkManager {
                     .outbound_failures
                     .saturating_add(1);
                 eprintln!(
-                    "[Broadcast] Outbound frame failure to {}: {:?}",
+                    "[Broadcast] Legacy outbound frame failure to {}: {:?}",
                     peer, error
                 );
-                let should_end = self
-                    .active_broadcast
-                    .as_ref()
-                    .map(|session| {
-                        session.phase == ActiveBroadcastPhase::Active
-                            && session.remote_peer_id == peer
-                    })
-                    .unwrap_or(false);
-                if should_end {
-                    self.transition_broadcast_to_idle(Some("stream_failure".to_string()))
-                        .await;
-                }
             }
             Event::InboundFailure { peer, error, .. } => {
                 self.screen_broadcast_stats.inbound_failures = self
@@ -940,21 +1511,9 @@ impl NetworkManager {
                     .inbound_failures
                     .saturating_add(1);
                 eprintln!(
-                    "[Broadcast] Inbound frame failure from {}: {:?}",
+                    "[Broadcast] Legacy inbound frame failure from {}: {:?}",
                     peer, error
                 );
-                let should_end = self
-                    .active_broadcast
-                    .as_ref()
-                    .map(|session| {
-                        session.phase == ActiveBroadcastPhase::Active
-                            && session.remote_peer_id == peer
-                    })
-                    .unwrap_or(false);
-                if should_end {
-                    self.transition_broadcast_to_idle(Some("stream_failure".to_string()))
-                        .await;
-                }
             }
             Event::ResponseSent { .. } => {}
         }

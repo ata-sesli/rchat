@@ -104,7 +104,6 @@ export const COMMANDS = {
   acceptScreenBroadcast: "accept_screen_broadcast",
   rejectScreenBroadcast: "reject_screen_broadcast",
   endScreenBroadcast: "end_screen_broadcast",
-  sendScreenBroadcastChunk: "send_screen_broadcast_chunk",
   getBroadcastState: "get_broadcast_state",
   getConnectedChatIds: "get_connected_chat_ids",
 } as const;
@@ -335,6 +334,7 @@ export type ScreenCaptureSupport = {
   reason?: string | null;
   backend: string;
 };
+export type ScreenBroadcastProfile = "480p15" | "480p30" | "720p15" | "720p30";
 export type BroadcastPhase =
   | "idle"
   | "outgoing_ringing"
@@ -680,7 +680,10 @@ type CommandSpec = {
     result: ScreenCaptureSupport;
   };
   [COMMANDS.getVoiceCallState]: { args?: undefined; result: VoiceCallState };
-  [COMMANDS.startScreenBroadcast]: { args: { peer_id: string }; result: void };
+  [COMMANDS.startScreenBroadcast]: {
+    args: { peer_id: string; profile: ScreenBroadcastProfile };
+    result: void;
+  };
   [COMMANDS.acceptScreenBroadcast]: {
     args: { session_id: string };
     result: void;
@@ -691,18 +694,6 @@ type CommandSpec = {
   };
   [COMMANDS.endScreenBroadcast]: {
     args: { session_id: string };
-    result: void;
-  };
-  [COMMANDS.sendScreenBroadcastChunk]: {
-    args: {
-      session_id: string;
-      seq: number;
-      timestamp: number;
-      mime: string;
-      codec: string;
-      chunk_type: BroadcastChunkType;
-      payload: Uint8Array;
-    };
     result: void;
   };
   [COMMANDS.getBroadcastState]: { args?: undefined; result: BroadcastState };
@@ -1028,32 +1019,14 @@ export const api = {
   getVideoCaptureDevices: () => invokeCommand(COMMANDS.getVideoCaptureDevices),
   getScreenCaptureSupport: () => invokeCommand(COMMANDS.getScreenCaptureSupport),
   getVoiceCallState: () => invokeCommand(COMMANDS.getVoiceCallState),
-  startScreenBroadcast: (peerId: string) =>
-    invokeCommand(COMMANDS.startScreenBroadcast, { peer_id: peerId }),
+  startScreenBroadcast: (peerId: string, profile: ScreenBroadcastProfile) =>
+    invokeCommand(COMMANDS.startScreenBroadcast, { peer_id: peerId, profile }),
   acceptScreenBroadcast: (sessionId: string) =>
     invokeCommand(COMMANDS.acceptScreenBroadcast, { session_id: sessionId }),
   rejectScreenBroadcast: (sessionId: string) =>
     invokeCommand(COMMANDS.rejectScreenBroadcast, { session_id: sessionId }),
   endScreenBroadcast: (sessionId: string) =>
     invokeCommand(COMMANDS.endScreenBroadcast, { session_id: sessionId }),
-  sendScreenBroadcastChunk: (
-    sessionId: string,
-    seq: number,
-    timestamp: number,
-    mime: string,
-    codec: string,
-    chunkType: BroadcastChunkType,
-    payload: Uint8Array,
-  ) =>
-    invokeCommand(COMMANDS.sendScreenBroadcastChunk, {
-      session_id: sessionId,
-      seq,
-      timestamp,
-      mime,
-      codec,
-      chunk_type: chunkType,
-      payload,
-    }),
   getBroadcastState: () => invokeCommand(COMMANDS.getBroadcastState),
   getConnectedChatIds: () => invokeCommand(COMMANDS.getConnectedChatIds),
 };

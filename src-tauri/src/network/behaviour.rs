@@ -29,6 +29,8 @@ pub struct RChatBehaviour {
     // Dedicated video-call media transport
     pub video_call: crate::network::voice_stream::Behaviour,
     // Dedicated DM screen-broadcast media transport
+    pub broadcast_stream: crate::network::voice_stream::Behaviour,
+    // Dedicated DM screen-broadcast media transport
     pub broadcast: request_response::cbor::Behaviour<BroadcastFrameRequest, BroadcastFrameResponse>,
 
     // Circuit Relay Client - for NAT traversal via public relays
@@ -83,10 +85,15 @@ impl RChatBehaviour {
             crate::live::video::video::VIDEO_PROTOCOL,
         ));
 
-        // 6d. Request-Response (Broadcast Frames)
+        // 6d. Stream protocol (Screen Broadcast Frames)
+        let broadcast_stream = crate::network::voice_stream::Behaviour::new(
+            libp2p::StreamProtocol::new(crate::live::broadcast::broadcast::BROADCAST_PROTOCOL),
+        );
+
+        // 6e. Request-Response (legacy Broadcast Frames)
         let broadcast = request_response::cbor::Behaviour::new(
             [(
-                libp2p::StreamProtocol::new(crate::live::broadcast::broadcast::BROADCAST_PROTOCOL),
+                libp2p::StreamProtocol::new("/rchat/broadcast/screen/request-response/1.0.0"),
                 request_response::ProtocolSupport::Full,
             )],
             request_response::Config::default(),
@@ -103,6 +110,7 @@ impl RChatBehaviour {
             direct_message,
             voice_call,
             video_call,
+            broadcast_stream,
             broadcast,
             relay_client,
             dcutr,

@@ -70,8 +70,7 @@ impl PlatformScreenCaptureSession {
         let width = guard.width() as u32;
         let height = guard.height() as u32;
         let stride = guard.bytes_per_row();
-        let (out_width, out_height) =
-            clamp_to_profile(width, height, crate::ScreenCaptureProfile::P720);
+        let (out_width, out_height) = clamp_to_profile(width, height, self.info_profile());
         let i420 = bgra_to_i420(guard.as_slice(), width, height, stride)?;
         let i420 = if out_width != width || out_height != height {
             scale_i420_nearest(&i420, width, height, out_width, out_height)?
@@ -109,6 +108,11 @@ impl PlatformScreenCaptureSession {
         }
 
         Ok(Some(frame))
+    }
+
+    fn info_profile(&self) -> crate::ScreenCaptureProfile {
+        crate::ScreenCaptureProfile::from_label(&self.info.requested_profile)
+            .unwrap_or_default()
     }
 }
 

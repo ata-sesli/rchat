@@ -47,6 +47,14 @@
     buildVideoRenderStatsReport,
     VIDEO_RENDER_STATS_REPORT_INTERVAL_MS,
   } from "$lib/video/renderStats";
+  import {
+    buildScreenBroadcastProfile,
+    DEFAULT_SCREEN_BROADCAST_FPS,
+    DEFAULT_SCREEN_BROADCAST_RESOLUTION,
+    type ScreenBroadcastFps,
+    type ScreenBroadcastProfile,
+    type ScreenBroadcastResolution,
+  } from "$lib/screenBroadcast/profile";
 
   // Types
   type Message = {
@@ -104,7 +112,7 @@
   export let screenBroadcastViewerUnsupportedReason: string | null = null;
   export let onStartVoiceCall = () => {};
   export let onStartVideoCall = () => {};
-  export let onStartScreenBroadcast = () => {};
+  export let onStartScreenBroadcast = (_profile: ScreenBroadcastProfile) => {};
   export let onEndVoiceCall = (_callId: string) => {};
   export let onEndVideoCall = (_callId: string) => {};
   export let onEndScreenBroadcast = (_sessionId: string) => {};
@@ -181,8 +189,16 @@
   let remoteVideoStateError: string | null = null;
   let videoCallFullscreen = false;
   let screenBroadcastFullscreen = false;
+  let screenBroadcastResolution: ScreenBroadcastResolution =
+    DEFAULT_SCREEN_BROADCAST_RESOLUTION;
+  let screenBroadcastFps: ScreenBroadcastFps = DEFAULT_SCREEN_BROADCAST_FPS;
 
   const REMOTE_REORDER_WINDOW = 6;
+  const screenBroadcastResolutionOptions: ScreenBroadcastResolution[] = [
+    "480p",
+    "720p",
+  ];
+  const screenBroadcastFpsOptions: ScreenBroadcastFps[] = [15, 30];
 
   type IncomingFrame = {
     call_id: string;
@@ -279,6 +295,10 @@
     videoCallSupported;
   $: canPressScreenBroadcastButton =
     canStartScreenBroadcast && screenBroadcastSupported;
+  $: selectedScreenBroadcastProfile = buildScreenBroadcastProfile(
+    screenBroadcastResolution,
+    screenBroadcastFps,
+  );
 
   function logVideoCapture(message: string, data?: Record<string, unknown>) {
     const details = data
@@ -1928,8 +1948,38 @@
           </svg>
         </button>
       {:else}
+        <div class="flex items-center gap-1 rounded-lg border border-theme-base-700 bg-theme-base-900 p-1">
+          {#each screenBroadcastResolutionOptions as resolution}
+            <button
+              onclick={() => (screenBroadcastResolution = resolution)}
+              class={screenBroadcastResolution === resolution
+                ? "rounded-md bg-theme-primary-500 px-2 py-1 text-[11px] font-medium text-white"
+                : "rounded-md px-2 py-1 text-[11px] text-theme-base-300 hover:bg-theme-base-800 hover:text-white"}
+              disabled={!canPressScreenBroadcastButton}
+              title={`${resolution} screen share`}
+              aria-label={`${resolution} screen share`}
+            >
+              {resolution}
+            </button>
+          {/each}
+        </div>
+        <div class="flex items-center gap-1 rounded-lg border border-theme-base-700 bg-theme-base-900 p-1">
+          {#each screenBroadcastFpsOptions as fps}
+            <button
+              onclick={() => (screenBroadcastFps = fps)}
+              class={screenBroadcastFps === fps
+                ? "rounded-md bg-theme-primary-500 px-2 py-1 text-[11px] font-medium text-white"
+                : "rounded-md px-2 py-1 text-[11px] text-theme-base-300 hover:bg-theme-base-800 hover:text-white"}
+              disabled={!canPressScreenBroadcastButton}
+              title={`${fps} fps screen share`}
+              aria-label={`${fps} fps screen share`}
+            >
+              {fps}
+            </button>
+          {/each}
+        </div>
         <button
-          onclick={onStartScreenBroadcast}
+          onclick={() => onStartScreenBroadcast(selectedScreenBroadcastProfile)}
           class="p-2 rounded-lg border border-theme-base-700 text-theme-base-300 hover:text-white hover:bg-theme-base-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           disabled={!canPressScreenBroadcastButton}
           title={canPressScreenBroadcastButton

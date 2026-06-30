@@ -2,36 +2,68 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const SCREEN_CAPTURE_FPS: u32 = 15;
 pub const PREVIEW_MAX_WIDTH: u32 = 320;
 pub const PREVIEW_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenCaptureProfile {
-    P720,
+    P480F15,
+    P480F30,
+    P720F15,
+    P720F30,
 }
 
 impl ScreenCaptureProfile {
     pub fn dimensions(self) -> (u32, u32) {
         match self {
-            Self::P720 => (1280, 720),
+            Self::P480F15 | Self::P480F30 => (854, 480),
+            Self::P720F15 | Self::P720F30 => (1280, 720),
         }
     }
 
     pub fn fps(self) -> u32 {
-        SCREEN_CAPTURE_FPS
+        match self {
+            Self::P480F15 | Self::P720F15 => 15,
+            Self::P480F30 | Self::P720F30 => 30,
+        }
+    }
+
+    pub fn bitrate_kbps(self) -> u32 {
+        match self {
+            Self::P480F15 => 800,
+            Self::P480F30 => 1_200,
+            Self::P720F15 => 1_500,
+            Self::P720F30 => 2_500,
+        }
+    }
+
+    pub fn keyframe_interval_frames(self) -> u32 {
+        self.fps() * 2
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::P720 => "720p15",
+            Self::P480F15 => "480p15",
+            Self::P480F30 => "480p30",
+            Self::P720F15 => "720p15",
+            Self::P720F30 => "720p30",
+        }
+    }
+
+    pub fn from_label(value: &str) -> Option<Self> {
+        match value {
+            "480p15" => Some(Self::P480F15),
+            "480p30" => Some(Self::P480F30),
+            "720p15" => Some(Self::P720F15),
+            "720p30" => Some(Self::P720F30),
+            _ => None,
         }
     }
 }
 
 impl Default for ScreenCaptureProfile {
     fn default() -> Self {
-        Self::P720
+        Self::P720F15
     }
 }
 
@@ -51,6 +83,7 @@ impl Default for ScreenCaptureCursorMode {
 pub enum ScreenCaptureBackend {
     MacosScreenCaptureKit,
     LinuxPortalPipeWire,
+    LinuxX11,
     Unsupported,
 }
 
@@ -59,6 +92,7 @@ impl ScreenCaptureBackend {
         match self {
             Self::MacosScreenCaptureKit => "screencapturekit",
             Self::LinuxPortalPipeWire => "portal-pipewire",
+            Self::LinuxX11 => "x11",
             Self::Unsupported => "unsupported",
         }
     }
@@ -151,6 +185,26 @@ pub enum ScreenCaptureError {
 
 pub async fn screen_capture_support() -> ScreenCaptureSupport {
     platform::screen_capture_support().await
+}
+
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn select_linux_capture_backend_for_env(
+    xdg_session_type: Option<&str>,
+    display: Option<&str>,
+    wayland_display: Option<&str>,
+) -> ScreenCaptureBackend {
+    if xdg_session_type
+        .map(|value| value.eq_ignore_ascii_case("x11"))
+        .unwrap_or(false)
+    {
+        return ScreenCaptureBackend::LinuxX11;
+    }
+    if display.map(|value| !value.is_empty()).unwrap_or(false)
+        && !wayland_display.map(|value| !value.is_empty()).unwrap_or(false)
+    {
+        return ScreenCaptureBackend::LinuxX11;
+    }
+    ScreenCaptureBackend::LinuxPortalPipeWire
 }
 
 pub struct ScreenCaptureSession {
@@ -641,10 +695,87 @@ mod tests {
     #[test]
     fn default_config_is_720p15_picker_with_embedded_cursor() {
         let config = ScreenCaptureConfig::default();
-        assert_eq!(config.profile, ScreenCaptureProfile::P720);
+        assert_eq!(config.profile, ScreenCaptureProfile::P720F15);
         assert_eq!(config.profile.dimensions(), (1280, 720));
         assert_eq!(config.profile.fps(), 15);
+        assert_eq!(config.profile.label(), "720p15");
         assert_eq!(config.cursor_mode, ScreenCaptureCursorMode::Embedded);
+    }
+
+    #[test]
+    fn screen_capture_profiles_expose_dimensions_fps_labels_and_bitrates() {
+        let cases = [
+            (
+                ScreenCaptureProfile::P480F15,
+                (854, 480),
+                15,
+                "480p15",
+                800,
+            ),
+            (
+                ScreenCaptureProfile::P480F30,
+                (854, 480),
+                30,
+                "480p30",
+                1_200,
+            ),
+            (
+                ScreenCaptureProfile::P720F15,
+                (1280, 720),
+                15,
+                "720p15",
+                1_500,
+            ),
+            (
+                ScreenCaptureProfile::P720F30,
+                (1280, 720),
+                30,
+                "720p30",
+                2_500,
+            ),
+        ];
+
+        for (profile, dimensions, fps, label, bitrate) in cases {
+            assert_eq!(profile.dimensions(), dimensions);
+            assert_eq!(profile.fps(), fps);
+            assert_eq!(profile.label(), label);
+            assert_eq!(profile.bitrate_kbps(), bitrate);
+            assert_eq!(ScreenCaptureProfile::from_label(label), Some(profile));
+        }
+        assert_eq!(ScreenCaptureProfile::from_label("720p"), None);
+        assert_eq!(ScreenCaptureProfile::from_label("360p15"), None);
+    }
+
+    #[test]
+    fn clamp_to_profile_preserves_aspect_ratio_for_480p_and_720p() {
+        assert_eq!(
+            clamp_to_profile(1920, 1080, ScreenCaptureProfile::P720F15),
+            (1280, 720)
+        );
+        assert_eq!(
+            clamp_to_profile(1920, 1080, ScreenCaptureProfile::P480F15),
+            (852, 480)
+        );
+        assert_eq!(
+            clamp_to_profile(640, 480, ScreenCaptureProfile::P480F30),
+            (640, 480)
+        );
+    }
+
+    #[test]
+    fn linux_capture_backend_selection_prefers_x11_for_x11_sessions() {
+        assert_eq!(
+            select_linux_capture_backend_for_env(Some("x11"), Some(":0"), None),
+            ScreenCaptureBackend::LinuxX11
+        );
+        assert_eq!(
+            select_linux_capture_backend_for_env(None, Some(":0"), None),
+            ScreenCaptureBackend::LinuxX11
+        );
+        assert_eq!(
+            select_linux_capture_backend_for_env(Some("wayland"), Some(":0"), Some("wayland-0")),
+            ScreenCaptureBackend::LinuxPortalPipeWire
+        );
     }
 
     #[test]

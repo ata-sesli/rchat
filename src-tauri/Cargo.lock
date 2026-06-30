@@ -6233,9 +6233,7 @@ dependencies = [
  "tauri-plugin-fs",
  "tauri-plugin-single-instance",
  "tempfile",
- "thiserror 2.0.17",
  "tokio",
- "tracing",
  "tracing-subscriber",
  "x25519-dalek",
  "zeroconf",
@@ -6263,10 +6261,11 @@ version = "0.1.0"
 dependencies = [
  "apple-metal",
  "ashpd",
+ "libc",
  "pipewire",
  "screencapturekit",
  "thiserror 2.0.17",
- "tokio",
+ "x11rb",
 ]
 
 [[package]]

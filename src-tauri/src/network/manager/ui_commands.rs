@@ -159,8 +159,8 @@ impl NetworkManager {
                 )
                 .await;
             }
-            NetworkCommand::StartScreenBroadcast { peer_id } => {
-                self.handle_start_screen_broadcast(peer_id).await;
+            NetworkCommand::StartScreenBroadcast { peer_id, profile } => {
+                self.handle_start_screen_broadcast(peer_id, profile).await;
             }
             NetworkCommand::AcceptScreenBroadcast { session_id } => {
                 self.handle_accept_screen_broadcast(session_id).await;
@@ -170,20 +170,6 @@ impl NetworkManager {
             }
             NetworkCommand::EndScreenBroadcast { session_id } => {
                 self.handle_end_screen_broadcast(session_id).await;
-            }
-            NetworkCommand::SendScreenBroadcastChunk {
-                session_id,
-                seq,
-                timestamp,
-                mime,
-                codec,
-                chunk_type,
-                payload,
-            } => {
-                self.handle_send_screen_broadcast_chunk(
-                    session_id, seq, timestamp, mime, codec, chunk_type, payload,
-                )
-                .await;
             }
         }
     }

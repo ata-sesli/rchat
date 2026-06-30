@@ -131,6 +131,7 @@ pub enum NetworkCommand {
     },
     StartScreenBroadcast {
         peer_id: String,
+        profile: rchat_screen_capture::ScreenCaptureProfile,
     },
     AcceptScreenBroadcast {
         session_id: String,
@@ -140,14 +141,5 @@ pub enum NetworkCommand {
     },
     EndScreenBroadcast {
         session_id: String,
-    },
-    SendScreenBroadcastChunk {
-        session_id: String,
-        seq: u32,
-        timestamp: i64,
-        mime: String,
-        codec: String,
-        chunk_type: String,
-        payload: Vec<u8>,
     },
 }
