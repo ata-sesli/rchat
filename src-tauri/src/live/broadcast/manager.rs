@@ -48,6 +48,24 @@ mod tests {
         assert!(scheduler.should_force(2));
         assert!(!scheduler.should_force(3));
     }
+
+    #[test]
+    fn screen_broadcast_worker_takes_only_one_capture_frame_per_tick() {
+        let mut calls = 0_u32;
+        let frame = take_screen_broadcast_frame_for_tick(|| {
+            calls += 1;
+            Some(rchat_screen_capture::I420ScreenFrame {
+                timestamp_us: i64::from(calls),
+                width: 2,
+                height: 2,
+                data: vec![0; 6],
+            })
+        })
+        .expect("first frame should be selected");
+
+        assert_eq!(calls, 1);
+        assert_eq!(frame.timestamp_us, 1);
+    }
 }
 
 pub(super) struct ScreenBroadcastVp8Encoder {
@@ -244,6 +262,15 @@ impl ScreenBroadcastKeyframeScheduler {
     }
 }
 
+fn take_screen_broadcast_frame_for_tick<F>(
+    mut try_recv_latest_i420: F,
+) -> Option<rchat_screen_capture::I420ScreenFrame>
+where
+    F: FnMut() -> Option<rchat_screen_capture::I420ScreenFrame>,
+{
+    try_recv_latest_i420()
+}
+
 fn start_screen_broadcast_worker(
     session_id: String,
     profile: rchat_screen_capture::ScreenCaptureProfile,
@@ -307,12 +334,9 @@ fn start_screen_broadcast_worker(
                 );
             }
 
-            let mut latest_frame = None;
-            while let Some(frame) = capture_session.try_recv_latest_i420() {
-                latest_frame = Some(frame);
-            }
-
-            let Some(frame) = latest_frame else {
+            let Some(frame) =
+                take_screen_broadcast_frame_for_tick(|| capture_session.try_recv_latest_i420())
+            else {
                 stats.skipped_frames = stats.skipped_frames.saturating_add(1);
                 stats.capture_stats = capture_session.stats();
                 maybe_emit_worker_stats(&event_tx, &session_id, &info, &stats, &mut last_stats_at);
