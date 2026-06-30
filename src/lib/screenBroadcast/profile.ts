@@ -12,3 +12,15 @@ export function buildScreenBroadcastProfile(
 ): ScreenBroadcastProfile {
   return `${resolution}${fps}` as ScreenBroadcastProfile;
 }
+
+export function normalizeScreenBroadcastProfile(value: unknown): ScreenBroadcastProfile {
+  if (
+    value === "480p15" ||
+    value === "480p30" ||
+    value === "720p15" ||
+    value === "720p30"
+  ) {
+    return value;
+  }
+  return DEFAULT_SCREEN_BROADCAST_PROFILE;
+}

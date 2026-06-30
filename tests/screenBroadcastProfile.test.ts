@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   DEFAULT_SCREEN_BROADCAST_PROFILE,
   buildScreenBroadcastProfile,
+  normalizeScreenBroadcastProfile,
 } from "../src/lib/screenBroadcast/profile";
 
 describe("screen broadcast profile selection", () => {
@@ -13,5 +14,11 @@ describe("screen broadcast profile selection", () => {
   test("combines resolution and fps into the backend profile label", () => {
     expect(buildScreenBroadcastProfile("480p", 30)).toBe("480p30");
     expect(buildScreenBroadcastProfile("720p", 15)).toBe("720p15");
+  });
+
+  test("normalizes incoming screen broadcast profile labels without camera fallback", () => {
+    expect(normalizeScreenBroadcastProfile("720p15")).toBe("720p15");
+    expect(normalizeScreenBroadcastProfile("720p30")).toBe("720p30");
+    expect(normalizeScreenBroadcastProfile("unknown")).toBe("720p15");
   });
 });

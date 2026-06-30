@@ -51,6 +51,7 @@
     buildScreenBroadcastProfile,
     DEFAULT_SCREEN_BROADCAST_FPS,
     DEFAULT_SCREEN_BROADCAST_RESOLUTION,
+    normalizeScreenBroadcastProfile,
     type ScreenBroadcastFps,
     type ScreenBroadcastProfile,
     type ScreenBroadcastResolution,
@@ -207,7 +208,7 @@
     mime: string;
     codec: string;
     chunk_type: VideoChunkType;
-    profile: VideoProfile;
+    profile: VideoProfile | ScreenBroadcastProfile;
     width: number;
     height: number;
     payload: Uint8Array;
@@ -915,7 +916,7 @@
       mime: eventPayload.mime,
       codec: eventPayload.codec,
       chunk_type: eventPayload.chunk_type as BroadcastChunkType,
-      profile: eventPayload.profile,
+      profile: normalizeScreenBroadcastProfile(eventPayload.profile),
       width: eventPayload.width,
       height: eventPayload.height,
       payload: eventPayload.payload,

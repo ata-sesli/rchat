@@ -19,6 +19,7 @@ const SCREEN_BROADCAST_MIME: &str = "video/webm;codecs=vp8";
 const SCREEN_BROADCAST_CODEC: &str = "vp8";
 const SCREEN_BROADCAST_SUMMARY_INTERVAL: Duration = Duration::from_secs(5);
 const SCREEN_BROADCAST_STREAM_QUEUE_CAPACITY: usize = 256;
+const SCREEN_BROADCAST_STARTUP_KEYFRAMES: u32 = 3;
 
 #[allow(dead_code)]
 pub(super) struct ScreenCaptureStartTask {
@@ -38,7 +39,7 @@ mod tests {
 
     #[test]
     fn screen_broadcast_keyframe_scheduler_forces_next_frame_once() {
-        let mut scheduler = ScreenBroadcastKeyframeScheduler::new(60);
+        let mut scheduler = ScreenBroadcastKeyframeScheduler::with_startup_burst(60, 1);
 
         assert!(scheduler.should_force(0));
         assert!(!scheduler.should_force(1));
@@ -47,6 +48,32 @@ mod tests {
 
         assert!(scheduler.should_force(2));
         assert!(!scheduler.should_force(3));
+    }
+
+    #[test]
+    fn screen_broadcast_keyframe_scheduler_forces_startup_burst() {
+        let mut scheduler = ScreenBroadcastKeyframeScheduler::with_startup_burst(30, 3);
+
+        assert!(scheduler.should_force(0));
+        assert!(scheduler.should_force(1));
+        assert!(scheduler.should_force(2));
+        assert!(!scheduler.should_force(3));
+    }
+
+    #[test]
+    fn screen_broadcast_keyframe_interval_is_one_nominal_second() {
+        assert_eq!(
+            screen_broadcast_forced_keyframe_interval(
+                rchat_screen_capture::ScreenCaptureProfile::P720F15,
+            ),
+            15,
+        );
+        assert_eq!(
+            screen_broadcast_forced_keyframe_interval(
+                rchat_screen_capture::ScreenCaptureProfile::P720F30,
+            ),
+            30,
+        );
     }
 
     #[test]
@@ -239,13 +266,15 @@ pub(super) enum ScreenBroadcastWorkerCommand {
 struct ScreenBroadcastKeyframeScheduler {
     interval_frames: u32,
     force_next: bool,
+    startup_keyframes_remaining: u32,
 }
 
 impl ScreenBroadcastKeyframeScheduler {
-    fn new(interval_frames: u32) -> Self {
+    fn with_startup_burst(interval_frames: u32, startup_keyframes: u32) -> Self {
         Self {
             interval_frames: interval_frames.max(1),
             force_next: true,
+            startup_keyframes_remaining: startup_keyframes.max(1),
         }
     }
 
@@ -254,12 +283,22 @@ impl ScreenBroadcastKeyframeScheduler {
     }
 
     fn should_force(&mut self, seq: u32) -> bool {
-        let force_keyframe = self.force_next || seq == 0 || seq % self.interval_frames.max(1) == 0;
+        let force_keyframe = self.force_next
+            || seq == 0
+            || self.startup_keyframes_remaining > 0
+            || seq % self.interval_frames.max(1) == 0;
         if force_keyframe {
             self.force_next = false;
+            self.startup_keyframes_remaining = self.startup_keyframes_remaining.saturating_sub(1);
         }
         force_keyframe
     }
+}
+
+fn screen_broadcast_forced_keyframe_interval(
+    profile: rchat_screen_capture::ScreenCaptureProfile,
+) -> u32 {
+    profile.fps().max(1)
 }
 
 fn take_screen_broadcast_frame_for_tick<F>(
@@ -312,8 +351,10 @@ fn start_screen_broadcast_worker(
         };
         let mut encoder: Option<ScreenBroadcastVp8Encoder> = None;
         let mut seq = 0_u32;
-        let mut keyframes =
-            ScreenBroadcastKeyframeScheduler::new(profile.keyframe_interval_frames());
+        let mut keyframes = ScreenBroadcastKeyframeScheduler::with_startup_burst(
+            screen_broadcast_forced_keyframe_interval(profile),
+            SCREEN_BROADCAST_STARTUP_KEYFRAMES,
+        );
 
         loop {
             cadence.tick().await;
