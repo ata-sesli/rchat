@@ -22,6 +22,22 @@ const VIDEO_ENCODE_EVENT_QUEUE_CAPACITY: usize = 8;
 const VIDEO_REMOTE_DECODE_QUEUE_CAPACITY: usize = 4;
 const VIDEO_SUMMARY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 const VIDEO_RECEIVER_REQUEST_REASON: &str = "receiver_request";
+const INBOUND_VIDEO_DECODE_MODE_ENV: &str = "RCHAT_INBOUND_VIDEO_DECODE";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundVideoDecodeMode {
+    Native,
+    WebCodecs,
+}
+
+impl InboundVideoDecodeMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::WebCodecs => "webcodecs",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct VideoQualityEvent {
@@ -56,6 +72,21 @@ struct VideoRemoteFrameEvent {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VideoEncodedRemoteFrameEvent {
+    call_id: String,
+    peer_id: String,
+    seq: u32,
+    timestamp: i64,
+    mime: String,
+    codec: String,
+    chunk_type: VideoChunkType,
+    profile: String,
+    width: u32,
+    height: u32,
+    payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -383,6 +414,21 @@ fn effective_video_profile(
     local_profile.min(remote_requested_profile)
 }
 
+fn inbound_video_decode_mode_from_value(value: Option<&str>) -> InboundVideoDecodeMode {
+    match value.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if matches!(value.as_str(), "web" | "webcodec" | "webcodecs") => {
+            InboundVideoDecodeMode::WebCodecs
+        }
+        _ => InboundVideoDecodeMode::Native,
+    }
+}
+
+fn inbound_video_decode_mode() -> InboundVideoDecodeMode {
+    inbound_video_decode_mode_from_value(
+        std::env::var(INBOUND_VIDEO_DECODE_MODE_ENV).ok().as_deref(),
+    )
+}
+
 fn build_video_receiver_report(
     pending_inbound_frames: &mut u64,
     frontend_received_frames: u64,
@@ -494,6 +540,11 @@ impl NetworkManager {
             .try_send(RemoteVideoDecodeTask::Reset);
         let started = self.start_video_stream_writer(peer, call_id.clone());
         if started {
+            eprintln!(
+                "[Video][Capture] inbound decode mode={} env={}",
+                inbound_video_decode_mode().label(),
+                INBOUND_VIDEO_DECODE_MODE_ENV
+            );
             self.queue_video_stream_record(VideoStreamRecord::CameraState(VideoCameraState {
                 enabled: camera_enabled,
             }));
@@ -892,6 +943,33 @@ impl NetworkManager {
         call_id: String,
         frame: VideoStreamFrame,
     ) {
+        if inbound_video_decode_mode() == InboundVideoDecodeMode::WebCodecs {
+            let event = VideoEncodedRemoteFrameEvent {
+                call_id,
+                peer_id: peer.to_string(),
+                seq: frame.seq,
+                timestamp: frame.timestamp_us,
+                mime: "video/webm;codecs=vp8".to_string(),
+                codec: "vp8".to_string(),
+                chunk_type: frame.chunk_type,
+                profile: frame.profile.label().to_string(),
+                width: frame.width,
+                height: frame.height,
+                payload: frame.payload,
+            };
+            if self
+                .app_handle
+                .emit("video-call-encoded-remote-frame", event)
+                .is_err()
+            {
+                self.video_network_stats.local_decode_errors = self
+                    .video_network_stats
+                    .local_decode_errors
+                    .saturating_add(1);
+            }
+            return;
+        }
+
         match self
             .video_remote_decode_tx
             .try_send(RemoteVideoDecodeTask::Frame {
@@ -1690,7 +1768,7 @@ impl NetworkManager {
                 })
                 .unwrap_or(("none", "none", "none", "none", "none".to_string()));
         eprintln!(
-            "[Video][Network][{}] peer={}, quic_connections={}, tcp_connections={}, profile={}, local_profile={}, remote_requested_profile={}, effective_profile={}, target_kbps={}, actual_kbps={:.1}, encoded_actual={}, capture_backend={}, capture_device='{}', capture_requested_profile={}, capture_actual={}, capture_format={}, captured_frames={}, captured_fps={:.1}, capture_dropped_i420={}, capture_dropped_preview={}, capture_conversion_errors={}, capture_preview_frames={}, capture_start_failures={}, submitted_frames={}, raw_frames_dropped={}, encoded_frames={}, keyframes={}, delta_frames={}, inbound_frames={}, inbound_seq_gaps={}, inbound_out_of_order_frames={}, outbound_failures={}, inbound_failures={}, encode_errors={}, encoded_queue_drops={}, local_rendered_frames={}, local_dropped_frames={}, local_decode_errors={}, receiver_received_frames={}, receiver_rendered_frames={}, receiver_dropped_frames={}, receiver_decode_errors={}, quality_changes={}, outbound_bytes={}, inbound_bytes={}, avg_out_bytes={:.1}, avg_in_bytes={:.1}, encode_p95_ms={:.1}",
+            "[Video][Network][{}] peer={}, quic_connections={}, tcp_connections={}, profile={}, local_profile={}, remote_requested_profile={}, effective_profile={}, inbound_decode_mode={}, target_kbps={}, actual_kbps={:.1}, encoded_actual={}, capture_backend={}, capture_device='{}', capture_requested_profile={}, capture_actual={}, capture_format={}, captured_frames={}, captured_fps={:.1}, capture_dropped_i420={}, capture_dropped_preview={}, capture_conversion_errors={}, capture_preview_frames={}, capture_start_failures={}, submitted_frames={}, raw_frames_dropped={}, encoded_frames={}, keyframes={}, delta_frames={}, inbound_frames={}, inbound_seq_gaps={}, inbound_out_of_order_frames={}, outbound_failures={}, inbound_failures={}, encode_errors={}, encoded_queue_drops={}, local_rendered_frames={}, local_dropped_frames={}, local_decode_errors={}, receiver_received_frames={}, receiver_rendered_frames={}, receiver_dropped_frames={}, receiver_decode_errors={}, quality_changes={}, outbound_bytes={}, inbound_bytes={}, avg_out_bytes={:.1}, avg_in_bytes={:.1}, encode_p95_ms={:.1}",
             label,
             peer_id,
             quic_count,
@@ -1699,6 +1777,7 @@ impl NetworkManager {
             local_profile.label(),
             remote_requested_profile.label(),
             effective_profile.label(),
+            inbound_video_decode_mode().label(),
             effective_profile.bitrate_kbps(),
             actual_kbps,
             encoded_actual,
@@ -1943,6 +2022,34 @@ mod tests {
         assert_eq!(
             receiver_report_window_seconds(Some(0.0)),
             VIDEO_SUMMARY_INTERVAL.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn inbound_video_decode_mode_defaults_to_native() {
+        assert_eq!(
+            inbound_video_decode_mode_from_value(None),
+            InboundVideoDecodeMode::Native
+        );
+        assert_eq!(
+            inbound_video_decode_mode_from_value(Some("")),
+            InboundVideoDecodeMode::Native
+        );
+    }
+
+    #[test]
+    fn inbound_video_decode_mode_accepts_webcodecs_opt_in() {
+        assert_eq!(
+            inbound_video_decode_mode_from_value(Some("webcodecs")),
+            InboundVideoDecodeMode::WebCodecs
+        );
+        assert_eq!(
+            inbound_video_decode_mode_from_value(Some("WEB")),
+            InboundVideoDecodeMode::WebCodecs
+        );
+        assert_eq!(
+            inbound_video_decode_mode_from_value(Some("native")),
+            InboundVideoDecodeMode::Native
         );
     }
 

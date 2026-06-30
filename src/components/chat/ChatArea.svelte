@@ -135,6 +135,7 @@
   let callClockSec = 0;
   let callClockTimer: ReturnType<typeof setInterval> | null = null;
   let videoFrameUnlisten: (() => void) | null = null;
+  let encodedVideoFrameUnlisten: (() => void) | null = null;
   let broadcastFrameUnlisten: (() => void) | null = null;
   let localPreviewFrameUnlisten: (() => void) | null = null;
   let screenPreviewFrameUnlisten: (() => void) | null = null;
@@ -929,6 +930,20 @@
     );
   }
 
+  function enqueueIncomingVideoCallFrame(eventPayload: any) {
+    void enqueueRemoteVideoReceiveTask(
+      remoteReceiveQueue,
+      () => handleIncomingVideoFrame(eventPayload),
+      (error) => {
+        console.error("Remote video receive task failed:", error);
+        logVideoCapture("remote video receive task failed", {
+          call_id: activeRemoteSessionId() || "none",
+          error: describeError(error),
+        });
+      },
+    );
+  }
+
   async function setVideoQualityMode(mode: VideoQualityMode) {
     videoQualityMode = mode;
     if (!activeCallId || !isVideoCallActiveInThisChat) return;
@@ -1616,7 +1631,7 @@
       video_call_supported: videoCallSupported,
       screen_broadcast_supported: screenBroadcastSupported,
       outbound_video_capture: "native",
-      inbound_video_decode: "native",
+      inbound_video_decode: "native_or_webcodecs_test",
       outbound_screen_capture: "native",
     });
     if (!canUseRecorderApi()) {
@@ -1626,6 +1641,12 @@
     videoFrameUnlisten = await listen("video-call-remote-frame", (event: any) => {
       handleRemoteDecodedFrame(event.payload);
     });
+    encodedVideoFrameUnlisten = await listen(
+      "video-call-encoded-remote-frame",
+      (event: any) => {
+        enqueueIncomingVideoCallFrame(event.payload);
+      },
+    );
     broadcastFrameUnlisten = await listen("broadcast-frame", (event: any) => {
       enqueueIncomingBroadcastFrame(event.payload);
     });
@@ -1684,6 +1705,10 @@
     if (videoFrameUnlisten) {
       videoFrameUnlisten();
       videoFrameUnlisten = null;
+    }
+    if (encodedVideoFrameUnlisten) {
+      encodedVideoFrameUnlisten();
+      encodedVideoFrameUnlisten = null;
     }
     if (broadcastFrameUnlisten) {
       broadcastFrameUnlisten();
