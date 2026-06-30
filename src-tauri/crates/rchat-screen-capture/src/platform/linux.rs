@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::{randr, shm, xfixes, xproto};
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shm::ConnectionExt as _;
