@@ -256,12 +256,14 @@ pub struct Vp8VideoEncoder {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct RgbaVideoFrame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
 }
 
+#[allow(dead_code)]
 pub struct Vp8VideoDecoder {
     decoder: Vp8Decoder,
 }
@@ -337,6 +339,7 @@ impl Vp8VideoEncoder {
     }
 }
 
+#[allow(dead_code)]
 impl Vp8VideoDecoder {
     pub fn new() -> Result<Self, String> {
         Ok(Self {
@@ -364,10 +367,12 @@ impl From<EncodedPacket> for Vp8EncodedPacket {
     }
 }
 
+#[allow(dead_code)]
 fn clamp_byte(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
 
+#[allow(dead_code)]
 pub fn i420_to_rgba(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
     let expected_len = rchat_libvpx::expected_i420_len(width, height)
         .ok_or_else(|| "invalid I420 frame size".to_string())?;

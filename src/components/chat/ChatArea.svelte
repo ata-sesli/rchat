@@ -137,7 +137,6 @@
   let discardWhenStopping = false;
   let callClockSec = 0;
   let callClockTimer: ReturnType<typeof setInterval> | null = null;
-  let videoFrameUnlisten: (() => void) | null = null;
   let encodedVideoFrameUnlisten: (() => void) | null = null;
   let broadcastFrameUnlisten: (() => void) | null = null;
   let localPreviewFrameUnlisten: (() => void) | null = null;
@@ -563,59 +562,6 @@
       remoteVideoCanvasCtx = remoteVideoCanvasEl.getContext("2d");
     }
     return remoteVideoCanvasCtx;
-  }
-
-  function handleRemoteDecodedFrame(eventPayload: any) {
-    if (!eventPayload || !activeCallId || eventPayload.call_id !== activeCallId) {
-      return;
-    }
-    if (!isVideoCallActiveInThisChat) {
-      return;
-    }
-
-    remoteVideoReceivedFrames += 1;
-
-    const payload = normalizeBinaryPayload(eventPayload.rgba);
-    const width = Number(eventPayload.width || 0);
-    const height = Number(eventPayload.height || 0);
-    if (!payload || width <= 0 || height <= 0 || payload.length !== width * height * 4) {
-      remoteVideoDroppedFrames += 1;
-      remoteVideoStateError = "Remote video frame was invalid.";
-      logVideoCapture("remote native frame invalid", {
-        call_id: activeCallId,
-        seq: eventPayload.seq ?? "none",
-        width,
-        height,
-        bytes: payload?.byteLength ?? 0,
-      });
-      return;
-    }
-
-    const ctx = ensureRemoteCanvasContext();
-    if (!ctx || !remoteVideoCanvasEl) {
-      remoteVideoDroppedFrames += 1;
-      return;
-    }
-    if (remoteVideoCanvasEl.width !== width || remoteVideoCanvasEl.height !== height) {
-      remoteVideoCanvasEl.width = width;
-      remoteVideoCanvasEl.height = height;
-    }
-
-    try {
-      const image = new ImageData(new Uint8ClampedArray(payload), width, height);
-      ctx.putImageData(image, 0, 0);
-      remoteVideoRenderedFrames += 1;
-      remoteVideoStateError = null;
-    } catch (e) {
-      console.error("Failed to render native remote video frame:", e);
-      logVideoCapture("remote native render failed", {
-        call_id: activeCallId,
-        seq: eventPayload.seq ?? "none",
-        error: describeError(e),
-      });
-      remoteVideoDecodeErrors += 1;
-      remoteVideoStateError = "Remote video render failed.";
-    }
   }
 
   function renderDecodedFrame(videoFrame: any) {
@@ -1661,16 +1607,13 @@
       video_call_supported: videoCallSupported,
       screen_broadcast_supported: screenBroadcastSupported,
       outbound_video_capture: "native",
-      inbound_video_decode: "native_or_webcodecs_test",
+      inbound_video_decode: "webcodecs",
       outbound_screen_capture: "native",
     });
     if (!canUseRecorderApi()) {
       recorderDisabledReason = "Recording is not supported on this device.";
     }
     void cleanupStaleTempRecordings();
-    videoFrameUnlisten = await listen("video-call-remote-frame", (event: any) => {
-      handleRemoteDecodedFrame(event.payload);
-    });
     encodedVideoFrameUnlisten = await listen(
       "video-call-encoded-remote-frame",
       (event: any) => {
@@ -1732,10 +1675,6 @@
     clearRecordedPreviewUrl();
     void cleanupTempRecording();
     resetRemoteVideoDecodeState();
-    if (videoFrameUnlisten) {
-      videoFrameUnlisten();
-      videoFrameUnlisten = null;
-    }
     if (encodedVideoFrameUnlisten) {
       encodedVideoFrameUnlisten();
       encodedVideoFrameUnlisten = null;

@@ -59,8 +59,58 @@ use crate::commands::peer_profile::{
 use crate::storage::config::ConfigManager;
 use tauri::{Emitter, Manager};
 
+#[cfg(target_os = "linux")]
+const GST_PLUGIN_FEATURE_RANK_ENV: &str = "GST_PLUGIN_FEATURE_RANK";
+#[cfg(any(target_os = "linux", test))]
+const LINUX_WEBKITGTK_WEB_CODECS_VP8_GST_RANK: &str =
+    "vavp8renderD129alphadecodebin:NONE,vp8alphadecodebin:NONE,varenderD129vp8dec:NONE,msdkvp8dec:NONE,vp8dec:1000";
+#[cfg(any(target_os = "linux", test))]
+const LINUX_WEBKITGTK_WEB_CODECS_VP8_GST_FEATURES: &[&str] = &[
+    "vavp8renderD129alphadecodebin",
+    "vp8alphadecodebin",
+    "varenderD129vp8dec",
+    "msdkvp8dec",
+    "vp8dec",
+];
+
+#[cfg(any(target_os = "linux", test))]
+fn gst_plugin_feature_name(rank_entry: &str) -> &str {
+    rank_entry
+        .split_once(':')
+        .map(|(feature, _rank)| feature.trim())
+        .unwrap_or_else(|| rank_entry.trim())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_webcodecs_gst_plugin_feature_rank(current_rank: Option<&str>) -> String {
+    let mut entries: Vec<&str> = current_rank
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter(|entry| {
+            !LINUX_WEBKITGTK_WEB_CODECS_VP8_GST_FEATURES.contains(&gst_plugin_feature_name(entry))
+        })
+        .collect();
+    entries.push(LINUX_WEBKITGTK_WEB_CODECS_VP8_GST_RANK);
+
+    entries.join(",")
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_webcodecs_gstreamer_rank() {
+    let current_rank = std::env::var(GST_PLUGIN_FEATURE_RANK_ENV).ok();
+    let rank = linux_webcodecs_gst_plugin_feature_rank(current_rank.as_deref());
+    std::env::set_var(GST_PLUGIN_FEATURE_RANK_ENV, rank);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_linux_webcodecs_gstreamer_rank() {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    configure_linux_webcodecs_gstreamer_rank();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Bring existing window to front when a second instance is invoked.
@@ -220,4 +270,37 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_webcodecs_gst_rank_is_applied_without_decode_flag() {
+        assert_eq!(
+            linux_webcodecs_gst_plugin_feature_rank(None),
+            "vavp8renderD129alphadecodebin:NONE,vp8alphadecodebin:NONE,varenderD129vp8dec:NONE,msdkvp8dec:NONE,vp8dec:1000"
+        );
+    }
+
+    #[test]
+    fn linux_webcodecs_gst_rank_preserves_unrelated_existing_entries() {
+        assert_eq!(
+            linux_webcodecs_gst_plugin_feature_rank(Some(
+                "openh264dec:300,vp8dec:256,varenderD129vp8dec:265"
+            )),
+            "openh264dec:300,vavp8renderD129alphadecodebin:NONE,vp8alphadecodebin:NONE,varenderD129vp8dec:NONE,msdkvp8dec:NONE,vp8dec:1000"
+        );
+    }
+
+    #[test]
+    fn linux_webcodecs_gst_rank_replaces_conflicting_vp8_entries() {
+        assert_eq!(
+            linux_webcodecs_gst_plugin_feature_rank(Some(
+                "vp8dec:256,vavp8renderD129alphadecodebin:265,vp8alphadecodebin:264,msdkvp8dec:128"
+            )),
+            "vavp8renderD129alphadecodebin:NONE,vp8alphadecodebin:NONE,varenderD129vp8dec:NONE,msdkvp8dec:NONE,vp8dec:1000"
+        );
+    }
 }
