@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { describe, expect, mock, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { get } from "svelte/store";
 
 function deferred() {
@@ -74,5 +75,15 @@ describe("app session startup", () => {
     await expect(staleLockedRefresh).resolves.toBe(true);
     expect(get(appSession).authPhase).toBe("unlocked");
     expect(get(appSession).appReady).toBe(true);
+  });
+});
+
+describe("layout stylesheet boundaries", () => {
+  test("keeps global layout CSS out of the Svelte layout style query", () => {
+    const layout = readFileSync("src/routes/+layout.svelte", "utf8");
+    const appCss = readFileSync("src/app.css", "utf8");
+
+    expect(layout).not.toContain("<style>");
+    expect(appCss).toContain("body.is-dragging");
   });
 });

@@ -739,30 +739,3 @@
 {/if}
 
 <svelte:body class:is-dragging={isDragging} />
-
-<style>
-  :global(body) {
-    margin: 0;
-    padding: 0;
-    overflow: hidden;
-  }
-  :global(body.is-dragging) {
-    user-select: none;
-    -webkit-user-select: none;
-    cursor: grabbing !important;
-  }
-  :global(body.is-dragging *) {
-    user-select: none;
-    -webkit-user-select: none;
-    cursor: grabbing !important;
-  }
-  :global(html) {
-    overflow: hidden;
-  }
-  :global([id^="peer-item-"]) {
-    will-change: transform;
-    user-select: none;
-    -webkit-user-select: none;
-    cursor: grabbing !important;
-  }
-</style>

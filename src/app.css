@@ -1,2 +1,31 @@
 @import "tailwindcss";
 @import "./theme.css";
+
+body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+html {
+  overflow: hidden;
+}
+
+body.is-dragging {
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: grabbing !important;
+}
+
+body.is-dragging * {
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: grabbing !important;
+}
+
+[id^="peer-item-"] {
+  will-change: transform;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: grabbing !important;
+}

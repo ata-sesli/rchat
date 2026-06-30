@@ -411,7 +411,11 @@ fn should_restart_running_video_capture_for_profile_change(
 }
 
 fn should_keep_video_capture_warm_when_camera_disabled() -> bool {
-    cfg!(target_os = "macos")
+    should_keep_video_capture_warm_when_camera_disabled_for_target(std::env::consts::OS)
+}
+
+fn should_keep_video_capture_warm_when_camera_disabled_for_target(target_os: &str) -> bool {
+    matches!(target_os, "linux" | "macos" | "windows")
 }
 
 fn receiver_report_window_seconds(window_seconds: Option<f64>) -> f64 {
@@ -1920,12 +1924,13 @@ mod tests {
     }
 
     #[test]
-    fn macos_camera_toggle_off_keeps_capture_session_warm() {
-        if cfg!(target_os = "macos") {
-            assert!(should_keep_video_capture_warm_when_camera_disabled());
-        } else {
-            assert!(!should_keep_video_capture_warm_when_camera_disabled());
-        }
+    fn camera_toggle_off_keeps_capture_session_warm_on_current_desktop() {
+        assert!(should_keep_video_capture_warm_when_camera_disabled());
+    }
+
+    #[test]
+    fn linux_camera_toggle_off_keeps_capture_session_warm() {
+        assert!(should_keep_video_capture_warm_when_camera_disabled_for_target("linux"));
     }
 
     #[test]
