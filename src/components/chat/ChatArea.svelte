@@ -44,6 +44,12 @@
     shouldRenderLocalPreviewCanvas,
   } from "$lib/video/cameraToggle";
   import {
+    clearCanvasAndResetContext,
+    createCanvasContextCache,
+    getCachedCanvasContext,
+    isCurrentRemoteDecodeCallback,
+  } from "$lib/video/canvasContext";
+  import {
     buildVideoRenderStatsReport,
     VIDEO_RENDER_STATS_REPORT_INTERVAL_MS,
   } from "$lib/video/renderStats";
@@ -154,16 +160,25 @@
   let screenCaptureErrorUnlisten: (() => void) | null = null;
   let localPreviewCanvasEl: HTMLCanvasElement | null = null;
   let localPreviewCanvasCtx: CanvasRenderingContext2D | null = null;
+  let localPreviewCanvasCtxCache = createCanvasContextCache<
+    HTMLCanvasElement,
+    CanvasRenderingContext2D
+  >();
   let localPreviewError: string | null = null;
   let localCameraToggleState = createLocalCameraToggleState();
   $: localCameraStarting = localCameraToggleState.starting;
   let remoteVideoCanvasEl: HTMLCanvasElement | null = null;
   let remoteVideoCanvasCtx: CanvasRenderingContext2D | null = null;
+  let remoteVideoCanvasCtxCache = createCanvasContextCache<
+    HTMLCanvasElement,
+    CanvasRenderingContext2D
+  >();
   let remoteVideoDecoder: any | null = null;
   let remoteVideoDecoderCodec: string | null = null;
   let remoteVideoDecoderWidth: number | null = null;
   let remoteVideoDecoderHeight: number | null = null;
   let remoteVideoDecoderConfigIndex: number | null = null;
+  let remoteDecodeGeneration = 0;
   let remoteExpectedSeq: number | null = null;
   let remotePendingFrames = new Map<number, IncomingFrame>();
   let remoteReceiveState = createRemoteVideoReceiveState();
@@ -399,17 +414,28 @@
     return null;
   }
 
+  function ensureLocalPreviewCanvasContext(): CanvasRenderingContext2D | null {
+    localPreviewCanvasCtx = getCachedCanvasContext(
+      localPreviewCanvasCtxCache,
+      localPreviewCanvasEl,
+    );
+    return localPreviewCanvasCtx;
+  }
+
+  function clearLocalPreviewCanvasContext() {
+    clearCanvasAndResetContext(localPreviewCanvasCtxCache, localPreviewCanvasEl);
+    localPreviewCanvasCtx = null;
+  }
+
+  function clearRemoteVideoCanvasContext() {
+    clearCanvasAndResetContext(remoteVideoCanvasCtxCache, remoteVideoCanvasEl);
+    remoteVideoCanvasCtx = null;
+  }
+
   function clearLocalPreview() {
     localPreviewError = null;
     localCameraToggleState = markLocalCameraToggleSettled(localCameraToggleState);
-    if (localPreviewCanvasCtx && localPreviewCanvasEl) {
-      localPreviewCanvasCtx.clearRect(
-        0,
-        0,
-        localPreviewCanvasEl.width,
-        localPreviewCanvasEl.height,
-      );
-    }
+    clearLocalPreviewCanvasContext();
   }
 
   function handleLocalPreviewFrame(eventPayload: any) {
@@ -426,15 +452,14 @@
       return;
     }
     if (!localPreviewCanvasEl) return;
-    localPreviewCanvasCtx =
-      localPreviewCanvasCtx || localPreviewCanvasEl.getContext("2d");
-    if (!localPreviewCanvasCtx) return;
+    const ctx = ensureLocalPreviewCanvasContext();
+    if (!ctx) return;
     if (localPreviewCanvasEl.width !== width || localPreviewCanvasEl.height !== height) {
       localPreviewCanvasEl.width = width;
       localPreviewCanvasEl.height = height;
     }
     const image = new ImageData(new Uint8ClampedArray(payload), width, height);
-    localPreviewCanvasCtx.putImageData(image, 0, 0);
+    ctx.putImageData(image, 0, 0);
     localCameraToggleState = markLocalCameraToggleSettled(localCameraToggleState);
     localPreviewError = null;
   }
@@ -497,15 +522,14 @@
       return;
     }
     if (!localPreviewCanvasEl) return;
-    localPreviewCanvasCtx =
-      localPreviewCanvasCtx || localPreviewCanvasEl.getContext("2d");
-    if (!localPreviewCanvasCtx) return;
+    const ctx = ensureLocalPreviewCanvasContext();
+    if (!ctx) return;
     if (localPreviewCanvasEl.width !== width || localPreviewCanvasEl.height !== height) {
       localPreviewCanvasEl.width = width;
       localPreviewCanvasEl.height = height;
     }
     const image = new ImageData(new Uint8ClampedArray(payload), width, height);
-    localPreviewCanvasCtx.putImageData(image, 0, 0);
+    ctx.putImageData(image, 0, 0);
     localPreviewError = null;
   }
 
@@ -551,6 +575,7 @@
   }
 
   function resetRemoteVideoDecodeState() {
+    remoteDecodeGeneration += 1;
     remotePendingFrames.clear();
     remoteExpectedSeq = null;
     remoteReceiveState = createRemoteVideoReceiveState();
@@ -558,14 +583,7 @@
     resetRemoteVideoDecoderConfigAttempts(remoteDecoderConfigRetryState);
     remoteLastSubmittedFrame = null;
     closeRemoteVideoDecoder();
-    if (remoteVideoCanvasCtx && remoteVideoCanvasEl) {
-      remoteVideoCanvasCtx.clearRect(
-        0,
-        0,
-        remoteVideoCanvasEl.width,
-        remoteVideoCanvasEl.height,
-      );
-    }
+    clearRemoteVideoCanvasContext();
   }
 
   function waitForRemoteKeyframeAfterDecoderFailure() {
@@ -589,10 +607,10 @@
   }
 
   function ensureRemoteCanvasContext(): CanvasRenderingContext2D | null {
-    if (!remoteVideoCanvasEl) return null;
-    if (!remoteVideoCanvasCtx) {
-      remoteVideoCanvasCtx = remoteVideoCanvasEl.getContext("2d");
-    }
+    remoteVideoCanvasCtx = getCachedCanvasContext(
+      remoteVideoCanvasCtxCache,
+      remoteVideoCanvasEl,
+    );
     return remoteVideoCanvasCtx;
   }
 
@@ -688,9 +706,38 @@
           }
         }
 
+        const decoderGeneration = remoteDecodeGeneration;
+        const decoderSessionId = frame.call_id || null;
         const decoder = new decoderCtor({
-          output: (decodedFrame: any) => renderDecodedFrame(decodedFrame),
+          output: (decodedFrame: any) => {
+            if (
+              !isCurrentRemoteDecodeCallback(
+                decoderGeneration,
+                remoteDecodeGeneration,
+                decoderSessionId,
+                activeRemoteSessionId(),
+              )
+            ) {
+              try {
+                decodedFrame.close();
+              } catch {
+                // no-op
+              }
+              return;
+            }
+            renderDecodedFrame(decodedFrame);
+          },
           error: (err: unknown) => {
+            if (
+              !isCurrentRemoteDecodeCallback(
+                decoderGeneration,
+                remoteDecodeGeneration,
+                decoderSessionId,
+                activeRemoteSessionId(),
+              )
+            ) {
+              return;
+            }
             console.error("Remote video decoder error:", err);
             logVideoCapture("remote decoder callback error", {
               call_id: activeRemoteSessionId() || "none",
