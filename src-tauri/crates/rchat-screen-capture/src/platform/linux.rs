@@ -1,9 +1,10 @@
 use crate::{
-    bgra_to_i420, clamp_to_profile, i420_copy, i420_to_preview_rgba, now_timestamp_us,
-    nv12_to_i420, rgba_to_i420, scale_i420_nearest, yuyv_to_i420, CaptureStatsAtomic,
-    I420ScreenFrame, LatestSlot, PreviewFrame, ScreenCaptureBackend, ScreenCaptureConfig,
-    ScreenCaptureCursorMode, ScreenCaptureError, ScreenCaptureFormatInfo, ScreenCaptureSessionInfo,
-    ScreenCaptureSessionStats, ScreenCaptureSupport, PREVIEW_INTERVAL,
+    bgra_to_i420, bgra_to_i420_scaled_nearest, clamp_to_profile, i420_copy,
+    i420_to_preview_rgba, now_timestamp_us, nv12_to_i420, rgba_to_i420, scale_i420_nearest,
+    yuyv_to_i420, CaptureStatsAtomic, I420ScreenFrame, LatestSlot, PreviewFrame,
+    ScreenCaptureBackend, ScreenCaptureConfig, ScreenCaptureCursorMode, ScreenCaptureError,
+    ScreenCaptureFormatInfo, ScreenCaptureSessionInfo, ScreenCaptureSessionStats,
+    ScreenCaptureSupport, PREVIEW_INTERVAL,
 };
 use ashpd::desktop::{
     screencast::{
@@ -26,6 +27,8 @@ use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
+
+const X11_CURSOR_REFRESH_INTERVAL: Duration = Duration::from_millis(66);
 
 pub struct PlatformScreenCaptureSession {
     info: ScreenCaptureSessionInfo,
@@ -366,8 +369,8 @@ impl X11ShmSegment {
         })
     }
 
-    fn bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
     }
 }
 
@@ -385,6 +388,41 @@ struct X11Capturer {
     area: X11CaptureArea,
     shm: Option<X11ShmSegment>,
     cursor_mode: ScreenCaptureCursorMode,
+    xfixes_available: bool,
+    cached_cursor: Option<CachedX11Cursor>,
+    last_cursor_refresh_at: Option<Instant>,
+}
+
+enum X11RawFrame<'a> {
+    Borrowed(&'a mut [u8]),
+    Owned(Vec<u8>),
+}
+
+impl X11RawFrame<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(data) => data,
+            Self::Owned(data) => data,
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Borrowed(data) => data,
+            Self::Owned(data) => data,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedX11Cursor {
+    x: i16,
+    y: i16,
+    xhot: u16,
+    yhot: u16,
+    width: u16,
+    height: u16,
+    cursor_image: Vec<u32>,
 }
 
 impl X11Capturer {
@@ -404,11 +442,19 @@ impl X11Capturer {
         } else {
             None
         };
+        let xfixes_available = conn
+            .extension_information(xfixes::X11_EXTENSION_NAME)
+            .ok()
+            .flatten()
+            .is_some();
         Ok(Self {
             conn,
             area,
             shm,
             cursor_mode,
+            xfixes_available,
+            cached_cursor: None,
+            last_cursor_refresh_at: None,
         })
     }
 
@@ -416,38 +462,48 @@ impl X11Capturer {
         &mut self,
         profile: crate::ScreenCaptureProfile,
     ) -> Result<I420ScreenFrame, ScreenCaptureError> {
-        let width = self.area.width as u32;
-        let height = self.area.height as u32;
+        let src_width = self.area.width as u32;
+        let src_height = self.area.height as u32;
         let stride = x11_stride(self.area.width, self.area.bits_per_pixel);
+        let (target_width, target_height) = profile.dimensions();
+        let (dst_width, dst_height) = if src_width > target_width || src_height > target_height {
+            clamp_to_profile(src_width, src_height, profile)
+        } else {
+            (src_width & !1, src_height & !1)
+        };
+
+        if self.cursor_mode == ScreenCaptureCursorMode::Embedded {
+            self.refresh_cursor_cache_if_needed(Instant::now());
+        }
+        let cached_cursor = self.cached_cursor.clone();
+        let area = self.area;
+        let bits_per_pixel = self.area.bits_per_pixel;
+        let bit_order = self.area.bit_order;
         let mut data = self.capture_raw_frame()?;
         if self.cursor_mode == ScreenCaptureCursorMode::Embedded {
-            self.overlay_cursor(&mut data, stride);
+            if let Some(cursor) = cached_cursor.as_ref() {
+                overlay_x11_cursor(area, data.as_mut_slice(), stride, cursor);
+            }
         }
-        let i420 = x11_zpixmap_to_i420(
-            &data,
-            width,
-            height,
+        let data = x11_zpixmap_to_i420_scaled_nearest(
+            data.as_slice(),
+            src_width,
+            src_height,
             stride,
-            self.area.bits_per_pixel,
-            self.area.bit_order,
+            dst_width,
+            dst_height,
+            bits_per_pixel,
+            bit_order,
         )?;
-        let (target_width, target_height) = profile.dimensions();
-        let (width, height, data) = if width > target_width || height > target_height {
-            let (out_width, out_height) = clamp_to_profile(width, height, profile);
-            let data = scale_i420_nearest(&i420, width, height, out_width, out_height)?;
-            (out_width, out_height, data)
-        } else {
-            (width & !1, height & !1, i420)
-        };
         Ok(I420ScreenFrame {
             timestamp_us: now_timestamp_us(),
-            width,
-            height,
+            width: dst_width,
+            height: dst_height,
             data,
         })
     }
 
-    fn capture_raw_frame(&mut self) -> Result<Vec<u8>, ScreenCaptureError> {
+    fn capture_raw_frame(&mut self) -> Result<X11RawFrame<'_>, ScreenCaptureError> {
         if let Some(shm) = self.shm.as_ref() {
             let result = match self.conn.shm_get_image(
                 self.area.root,
@@ -464,7 +520,12 @@ impl X11Capturer {
                 Err(error) => Err(error.to_string()),
             };
             match result {
-                Ok(_) => return Ok(shm.bytes().to_vec()),
+                Ok(_) => {
+                    let shm = self.shm.as_mut().ok_or_else(|| {
+                        ScreenCaptureError::Backend("X11 SHM segment disappeared".to_string())
+                    })?;
+                    return Ok(X11RawFrame::Borrowed(shm.bytes_mut()));
+                }
                 Err(error) => {
                     eprintln!(
                         "[Screen][Capture] X11 SHM get_image failed, falling back to GetImage: {}",
@@ -489,63 +550,87 @@ impl X11Capturer {
             .map_err(|e| ScreenCaptureError::Backend(e.to_string()))?
             .reply()
             .map_err(|e| ScreenCaptureError::Backend(e.to_string()))?;
-        Ok(reply.data)
+        Ok(X11RawFrame::Owned(reply.data))
     }
 
-    fn overlay_cursor(&self, raw: &mut [u8], stride: usize) {
-        if self.area.bits_per_pixel != 32 {
-            return;
-        }
-        if self
-            .conn
-            .extension_information(xfixes::X11_EXTENSION_NAME)
-            .ok()
-            .flatten()
-            .is_none()
-        {
+    fn refresh_cursor_cache_if_needed(&mut self, now: Instant) {
+        if !self.xfixes_available || !should_refresh_x11_cursor(self.last_cursor_refresh_at, now) {
             return;
         }
         let reply = match self.conn.xfixes_get_cursor_image() {
             Ok(cookie) => match cookie.reply() {
                 Ok(reply) => reply,
-                Err(_) => return,
+                Err(_) => {
+                    self.last_cursor_refresh_at = Some(now);
+                    return;
+                }
             },
-            Err(_) => return,
+            Err(_) => {
+                self.last_cursor_refresh_at = Some(now);
+                return;
+            }
         };
-        let cursor_left = reply.x.saturating_sub(reply.xhot as i16);
-        let cursor_top = reply.y.saturating_sub(reply.yhot as i16);
-        let capture_left = self.area.x;
-        let capture_top = self.area.y;
-        let capture_right = capture_left.saturating_add(self.area.width as i16);
-        let capture_bottom = capture_top.saturating_add(self.area.height as i16);
+        self.cached_cursor = Some(CachedX11Cursor {
+            x: reply.x,
+            y: reply.y,
+            xhot: reply.xhot,
+            yhot: reply.yhot,
+            width: reply.width,
+            height: reply.height,
+            cursor_image: reply.cursor_image,
+        });
+        self.last_cursor_refresh_at = Some(now);
+    }
+}
 
-        for cy in 0..reply.height as i16 {
-            let py = cursor_top.saturating_add(cy);
-            if py < capture_top || py >= capture_bottom {
+fn should_refresh_x11_cursor(last_refresh_at: Option<Instant>, now: Instant) -> bool {
+    last_refresh_at
+        .map(|last| now.saturating_duration_since(last) >= X11_CURSOR_REFRESH_INTERVAL)
+        .unwrap_or(true)
+}
+
+fn overlay_x11_cursor(
+    area: X11CaptureArea,
+    raw: &mut [u8],
+    stride: usize,
+    cursor: &CachedX11Cursor,
+) {
+    if area.bits_per_pixel != 32 {
+        return;
+    }
+    let cursor_left = cursor.x.saturating_sub(cursor.xhot as i16);
+    let cursor_top = cursor.y.saturating_sub(cursor.yhot as i16);
+    let capture_left = area.x;
+    let capture_top = area.y;
+    let capture_right = capture_left.saturating_add(area.width as i16);
+    let capture_bottom = capture_top.saturating_add(area.height as i16);
+
+    for cy in 0..cursor.height as i16 {
+        let py = cursor_top.saturating_add(cy);
+        if py < capture_top || py >= capture_bottom {
+            continue;
+        }
+        for cx in 0..cursor.width as i16 {
+            let px = cursor_left.saturating_add(cx);
+            if px < capture_left || px >= capture_right {
                 continue;
             }
-            for cx in 0..reply.width as i16 {
-                let px = cursor_left.saturating_add(cx);
-                if px < capture_left || px >= capture_right {
-                    continue;
-                }
-                let cursor_index = (cy as usize * reply.width as usize) + cx as usize;
-                let argb = reply.cursor_image.get(cursor_index).copied().unwrap_or(0);
-                let alpha = ((argb >> 24) & 0xff) as u8;
-                if alpha == 0 {
-                    continue;
-                }
-                let src_r = ((argb >> 16) & 0xff) as u8;
-                let src_g = ((argb >> 8) & 0xff) as u8;
-                let src_b = (argb & 0xff) as u8;
-                let dst_x = (px - capture_left) as usize;
-                let dst_y = (py - capture_top) as usize;
-                let offset = dst_y * stride + dst_x * 4;
-                if offset + 2 >= raw.len() {
-                    continue;
-                }
-                blend_bgrx_pixel(&mut raw[offset..offset + 4], src_r, src_g, src_b, alpha);
+            let cursor_index = (cy as usize * cursor.width as usize) + cx as usize;
+            let argb = cursor.cursor_image.get(cursor_index).copied().unwrap_or(0);
+            let alpha = ((argb >> 24) & 0xff) as u8;
+            if alpha == 0 {
+                continue;
             }
+            let src_r = ((argb >> 16) & 0xff) as u8;
+            let src_g = ((argb >> 8) & 0xff) as u8;
+            let src_b = (argb & 0xff) as u8;
+            let dst_x = (px - capture_left) as usize;
+            let dst_y = (py - capture_top) as usize;
+            let offset = dst_y * stride + dst_x * 4;
+            if offset + 2 >= raw.len() {
+                continue;
+            }
+            blend_bgrx_pixel(&mut raw[offset..offset + 4], src_r, src_g, src_b, alpha);
         }
     }
 }
@@ -634,6 +719,30 @@ fn x11_zpixmap_to_i420(
     }
 }
 
+fn x11_zpixmap_to_i420_scaled_nearest(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    src_stride: usize,
+    dst_width: u32,
+    dst_height: u32,
+    bits_per_pixel: u8,
+    bit_order: xproto::ImageOrder,
+) -> Result<Vec<u8>, ScreenCaptureError> {
+    match bits_per_pixel {
+        32 => bgra_to_i420_scaled_nearest(
+            src, src_width, src_height, src_stride, dst_width, dst_height,
+        ),
+        24 => x11_rgb24_to_i420_scaled_nearest(
+            src, src_width, src_height, src_stride, dst_width, dst_height, bit_order,
+        ),
+        other => Err(ScreenCaptureError::UnsupportedFormat(format!(
+            "unsupported X11 bits-per-pixel: {}",
+            other
+        ))),
+    }
+}
+
 fn x11_rgb24_to_i420(
     src: &[u8],
     width: u32,
@@ -664,6 +773,90 @@ fn x11_rgb24_to_i420(
         }
     }
     bgra_to_i420(&bgra, width, height, width as usize * 4)
+}
+
+fn x11_rgb24_to_i420_scaled_nearest(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    src_stride: usize,
+    dst_width: u32,
+    dst_height: u32,
+    bit_order: xproto::ImageOrder,
+) -> Result<Vec<u8>, ScreenCaptureError> {
+    crate::validate_even_dimensions(src_width, src_height)?;
+    crate::validate_even_dimensions(dst_width, dst_height)?;
+    let src_width_usize = src_width as usize;
+    let src_height_usize = src_height as usize;
+    let dst_width_usize = dst_width as usize;
+    let dst_height_usize = dst_height as usize;
+    if src_stride < src_width_usize * 3 || src.len() < src_stride * src_height_usize {
+        return Err(ScreenCaptureError::Conversion(
+            "X11 RGB24 buffer too small".to_string(),
+        ));
+    }
+
+    let mut out = vec![0_u8; crate::expected_i420_len(dst_width, dst_height)?];
+    let dst_y_len = dst_width_usize * dst_height_usize;
+    let dst_uv_width = dst_width_usize / 2;
+    let u_offset = dst_y_len;
+    let v_offset = dst_y_len + dst_y_len / 4;
+
+    for y in 0..dst_height_usize {
+        let sy = y * src_height_usize / dst_height_usize;
+        for x in 0..dst_width_usize {
+            let sx = x * src_width_usize / dst_width_usize;
+            let (r, g, b) = x11_rgb24_pixel_rgb(src, src_stride, sx, sy, bit_order);
+            out[y * dst_width_usize + x] = crate::rgb_to_y(r, g, b);
+        }
+    }
+
+    let src_uv_width = src_width_usize / 2;
+    let src_uv_height = src_height_usize / 2;
+    let dst_uv_height = dst_height_usize / 2;
+    for y in 0..dst_uv_height {
+        let sy = y * src_uv_height / dst_uv_height;
+        for x in 0..dst_uv_width {
+            let sx = x * src_uv_width / dst_uv_width;
+            let src_x = sx * 2;
+            let src_y = sy * 2;
+            let mut r_sum = 0_u16;
+            let mut g_sum = 0_u16;
+            let mut b_sum = 0_u16;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let (r, g, b) =
+                        x11_rgb24_pixel_rgb(src, src_stride, src_x + dx, src_y + dy, bit_order);
+                    r_sum += r as u16;
+                    g_sum += g as u16;
+                    b_sum += b as u16;
+                }
+            }
+            let r = (r_sum / 4) as u8;
+            let g = (g_sum / 4) as u8;
+            let b = (b_sum / 4) as u8;
+            let uv_index = y * dst_uv_width + x;
+            out[u_offset + uv_index] = crate::rgb_to_u(r, g, b);
+            out[v_offset + uv_index] = crate::rgb_to_v(r, g, b);
+        }
+    }
+
+    Ok(out)
+}
+
+fn x11_rgb24_pixel_rgb(
+    src: &[u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    bit_order: xproto::ImageOrder,
+) -> (u8, u8, u8) {
+    let offset = y * stride + x * 3;
+    if bit_order == xproto::ImageOrder::LSB_FIRST {
+        (src[offset + 2], src[offset + 1], src[offset])
+    } else {
+        (src[offset], src[offset + 1], src[offset + 2])
+    }
 }
 
 fn blend_bgrx_pixel(pixel: &mut [u8], src_r: u8, src_g: u8, src_b: u8, alpha: u8) {
@@ -1051,5 +1244,101 @@ fn default_stride(format: spa::param::video::VideoFormat, width: u32) -> usize {
         }
         spa::param::video::VideoFormat::YUY2 => width as usize * 2,
         _ => width as usize * 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rgb24_pattern(width: u32, height: u32, bit_order: xproto::ImageOrder) -> Vec<u8> {
+        (0..width as usize * height as usize)
+            .flat_map(|i| {
+                let x = (i % width as usize) as u8;
+                let y = (i / width as usize) as u8;
+                let r = x.wrapping_mul(17).wrapping_add(y);
+                let g = y.wrapping_mul(23).wrapping_add(x);
+                let b = x.wrapping_mul(3) ^ y.wrapping_mul(5);
+                if bit_order == xproto::ImageOrder::LSB_FIRST {
+                    [b, g, r]
+                } else {
+                    [r, g, b]
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn x11_rgb24_to_i420_scaled_nearest_lsb_matches_rgb24_convert_then_scale() {
+        let src = rgb24_pattern(4, 4, xproto::ImageOrder::LSB_FIRST);
+        let converted =
+            x11_rgb24_to_i420(&src, 4, 4, 12, xproto::ImageOrder::LSB_FIRST).unwrap();
+        let expected = scale_i420_nearest(&converted, 4, 4, 2, 2).unwrap();
+
+        let out = x11_rgb24_to_i420_scaled_nearest(
+            &src,
+            4,
+            4,
+            12,
+            2,
+            2,
+            xproto::ImageOrder::LSB_FIRST,
+        )
+        .unwrap();
+
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn x11_rgb24_to_i420_scaled_nearest_msb_matches_rgb24_convert_then_scale() {
+        let src = rgb24_pattern(4, 4, xproto::ImageOrder::MSB_FIRST);
+        let converted =
+            x11_rgb24_to_i420(&src, 4, 4, 12, xproto::ImageOrder::MSB_FIRST).unwrap();
+        let expected = scale_i420_nearest(&converted, 4, 4, 2, 2).unwrap();
+
+        let out = x11_rgb24_to_i420_scaled_nearest(
+            &src,
+            4,
+            4,
+            12,
+            2,
+            2,
+            xproto::ImageOrder::MSB_FIRST,
+        )
+        .unwrap();
+
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn x11_zpixmap_scaled_rejects_unsupported_bits_per_pixel() {
+        let src = vec![0_u8; 4 * 4 * 2];
+
+        assert!(x11_zpixmap_to_i420_scaled_nearest(
+            &src,
+            4,
+            4,
+            8,
+            2,
+            2,
+            16,
+            xproto::ImageOrder::LSB_FIRST,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn x11_cursor_refresh_decision_reuses_recent_cache() {
+        let now = Instant::now();
+
+        assert!(should_refresh_x11_cursor(None, now));
+        assert!(!should_refresh_x11_cursor(
+            Some(now - Duration::from_millis(65)),
+            now
+        ));
+        assert!(should_refresh_x11_cursor(
+            Some(now - Duration::from_millis(66)),
+            now
+        ));
     }
 }

@@ -418,6 +418,26 @@ fn bgra_to_i420(
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn bgra_to_i420_scaled_nearest(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    src_stride: usize,
+    dst_width: u32,
+    dst_height: u32,
+) -> Result<Vec<u8>, ScreenCaptureError> {
+    rgba_like_to_i420_scaled_nearest(
+        src,
+        src_width,
+        src_height,
+        src_stride,
+        dst_width,
+        dst_height,
+        RgbaLayout::Bgra,
+    )
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn rgba_to_i420(
     src: &[u8],
     width: u32,
@@ -494,6 +514,89 @@ fn rgba_like_to_i420(
     }
 
     Ok(out)
+}
+
+fn rgba_like_to_i420_scaled_nearest(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    src_stride: usize,
+    dst_width: u32,
+    dst_height: u32,
+    layout: RgbaLayout,
+) -> Result<Vec<u8>, ScreenCaptureError> {
+    validate_even_dimensions(src_width, src_height)?;
+    validate_even_dimensions(dst_width, dst_height)?;
+    let src_width_usize = src_width as usize;
+    let src_height_usize = src_height as usize;
+    let dst_width_usize = dst_width as usize;
+    let dst_height_usize = dst_height as usize;
+    if src_stride < src_width_usize * 4 || src.len() < src_stride * src_height_usize {
+        return Err(ScreenCaptureError::Conversion(
+            "RGBA/BGRA buffer too small".to_string(),
+        ));
+    }
+
+    let mut out = vec![0_u8; expected_i420_len(dst_width, dst_height)?];
+    let dst_y_len = dst_width_usize * dst_height_usize;
+    let dst_uv_width = dst_width_usize / 2;
+    let u_offset = dst_y_len;
+    let v_offset = dst_y_len + dst_y_len / 4;
+
+    for y in 0..dst_height_usize {
+        let sy = y * src_height_usize / dst_height_usize;
+        for x in 0..dst_width_usize {
+            let sx = x * src_width_usize / dst_width_usize;
+            let (r, g, b) = rgba_like_pixel_rgb(src, src_stride, sx, sy, layout);
+            out[y * dst_width_usize + x] = rgb_to_y(r, g, b);
+        }
+    }
+
+    let src_uv_width = src_width_usize / 2;
+    let src_uv_height = src_height_usize / 2;
+    let dst_uv_height = dst_height_usize / 2;
+    for y in 0..dst_uv_height {
+        let sy = y * src_uv_height / dst_uv_height;
+        for x in 0..dst_uv_width {
+            let sx = x * src_uv_width / dst_uv_width;
+            let src_x = sx * 2;
+            let src_y = sy * 2;
+            let mut r_sum = 0_u16;
+            let mut g_sum = 0_u16;
+            let mut b_sum = 0_u16;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let (r, g, b) =
+                        rgba_like_pixel_rgb(src, src_stride, src_x + dx, src_y + dy, layout);
+                    r_sum += r as u16;
+                    g_sum += g as u16;
+                    b_sum += b as u16;
+                }
+            }
+            let r = (r_sum / 4) as u8;
+            let g = (g_sum / 4) as u8;
+            let b = (b_sum / 4) as u8;
+            let uv_index = y * dst_uv_width + x;
+            out[u_offset + uv_index] = rgb_to_u(r, g, b);
+            out[v_offset + uv_index] = rgb_to_v(r, g, b);
+        }
+    }
+
+    Ok(out)
+}
+
+fn rgba_like_pixel_rgb(
+    src: &[u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    layout: RgbaLayout,
+) -> (u8, u8, u8) {
+    let px = &src[y * stride + x * 4..][..4];
+    match layout {
+        RgbaLayout::Rgba => (px[0], px[1], px[2]),
+        RgbaLayout::Bgra => (px[2], px[1], px[0]),
+    }
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -856,6 +959,63 @@ mod tests {
         let bgra_out = bgra_to_i420(&bgra, 2, 2, 8).unwrap();
         assert_eq!(rgba_out, bgra_out);
         assert_eq!(rgba_out.len(), 6);
+    }
+
+    #[test]
+    fn bgra_to_i420_scaled_nearest_matches_convert_then_scale_4x4_to_2x2() {
+        let bgra: Vec<u8> = (0..4 * 4)
+            .flat_map(|i| {
+                let value = i as u8;
+                [value, value.wrapping_mul(3), value.wrapping_mul(5), 255]
+            })
+            .collect();
+        let converted = bgra_to_i420(&bgra, 4, 4, 16).unwrap();
+        let expected = scale_i420_nearest(&converted, 4, 4, 2, 2).unwrap();
+
+        let out = bgra_to_i420_scaled_nearest(&bgra, 4, 4, 16, 2, 2).unwrap();
+
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn bgra_to_i420_scaled_nearest_matches_convert_then_scale_1920x1080_to_1280x720() {
+        let src_width = 1920;
+        let src_height = 1080;
+        let dst_width = 1280;
+        let dst_height = 720;
+        let stride = src_width as usize * 4;
+        let bgra: Vec<u8> = (0..src_width as usize * src_height as usize)
+            .flat_map(|i| {
+                let x = (i % src_width as usize) as u8;
+                let y = (i / src_width as usize) as u8;
+                [x.wrapping_mul(3), y.wrapping_mul(5), x ^ y, 255]
+            })
+            .collect();
+        let converted = bgra_to_i420(&bgra, src_width, src_height, stride).unwrap();
+        let expected =
+            scale_i420_nearest(&converted, src_width, src_height, dst_width, dst_height).unwrap();
+
+        let out = bgra_to_i420_scaled_nearest(
+            &bgra, src_width, src_height, stride, dst_width, dst_height,
+        )
+        .unwrap();
+
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn bgra_to_i420_scaled_nearest_rejects_odd_destination_dimensions() {
+        let bgra = vec![0_u8; 4 * 4 * 4];
+
+        assert!(bgra_to_i420_scaled_nearest(&bgra, 4, 4, 16, 3, 2).is_err());
+        assert!(bgra_to_i420_scaled_nearest(&bgra, 4, 4, 16, 2, 3).is_err());
+    }
+
+    #[test]
+    fn bgra_to_i420_scaled_nearest_rejects_short_source_buffer() {
+        let bgra = vec![0_u8; 4 * 4 * 4 - 1];
+
+        assert!(bgra_to_i420_scaled_nearest(&bgra, 4, 4, 16, 2, 2).is_err());
     }
 
     #[test]
