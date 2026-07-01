@@ -471,8 +471,9 @@ impl X11Capturer {
         } else {
             (src_width & !1, src_height & !1)
         };
+        let cursor_enabled = self.cursor_mode == ScreenCaptureCursorMode::Embedded;
 
-        if self.cursor_mode == ScreenCaptureCursorMode::Embedded {
+        if cursor_enabled {
             self.refresh_cursor_cache_if_needed(Instant::now());
         }
         let cached_cursor = self.cached_cursor.clone();
@@ -480,7 +481,7 @@ impl X11Capturer {
         let bits_per_pixel = self.area.bits_per_pixel;
         let bit_order = self.area.bit_order;
         let mut data = self.capture_raw_frame()?;
-        if self.cursor_mode == ScreenCaptureCursorMode::Embedded {
+        if cursor_enabled {
             if let Some(cursor) = cached_cursor.as_ref() {
                 overlay_x11_cursor(area, data.as_mut_slice(), stride, cursor);
             }
