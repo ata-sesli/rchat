@@ -355,50 +355,15 @@ async fn send_stored_media(
         sender_alias: None,
     };
 
-    // Enqueue the network command before storing the message so a closed
-    // command channel cannot leave a phantom `delivered` message behind.
-    if !matches!(chat_kind, ChatKind::SelfChat) {
+    if is_temporary {
         if matches!(chat_kind, ChatKind::TemporaryGroup) {
             temporary::validate_temp_group_session(net_state, &canonical_chat_id).await?;
         }
-        let tx = net_state.sender.lock().await;
-        match chat_kind {
-            ChatKind::Direct | ChatKind::TemporaryDirect => {
-                let target_peer_id = direct::resolve_peer_id_for_chat(&canonical_chat_id)
-                    .unwrap_or_else(|| canonical_chat_id.clone());
-                tx.send(NetworkCommand::SendDirectMedia {
-                    kind: media.direct_type,
-                    target_peer_id,
-                    file_hash: media.file_hash.clone(),
-                    file_name: media.direct_file_name.clone(),
-                    msg_id: msg_id.clone(),
-                    timestamp,
-                })
-                .await
-                .map_err(|error| anyhow!("network command channel is closed: {error}"))?;
-            }
-            ChatKind::Group | ChatKind::TemporaryGroup => {
-                let envelope = GroupMessageEnvelope {
-                    id: msg_id.clone(),
-                    group_id: canonical_chat_id.clone(),
-                    sender_id: "Me".to_string(),
-                    sender_alias: None,
-                    timestamp,
-                    content_type: media.group_type,
-                    text_content: media.text_content.clone(),
-                    file_hash: Some(media.file_hash.clone()),
-                    protocol_version: None,
-                    signed_record_id: None,
-                };
-                tx.send(NetworkCommand::PublishGroup { envelope })
-                    .await
-                    .map_err(|error| anyhow!("network command channel is closed: {error}"))?;
-            }
-            ChatKind::SelfChat | ChatKind::Archived => {}
-        }
-    }
-
-    if is_temporary {
+        // In-memory sends enqueue before storing so a closed command channel
+        // cannot leave a phantom `delivered` message that retrying would
+        // duplicate.
+        dispatch_stored_media(net_state, chat_kind, &canonical_chat_id, &media, &msg_id, timestamp)
+            .await?;
         let mut temp_state = net_state.temporary_state.lock().await;
         temp_state
             .messages
@@ -406,6 +371,8 @@ async fn send_stored_media(
             .or_default()
             .push(message);
     } else {
+        // Durable sends persist before dispatch so a late database failure
+        // cannot deliver a message that is missing from local history.
         let resolved_peer_id = direct::resolve_peer_id_for_chat(&canonical_chat_id)
             .unwrap_or_else(|| canonical_chat_id.clone());
         let conn = app_state
@@ -418,6 +385,8 @@ async fn send_stored_media(
             ensure_group_chat_rows(&conn, &canonical_chat_id)?;
         }
         storage::db::insert_message(&conn, &message)?;
+        dispatch_stored_media(net_state, chat_kind, &canonical_chat_id, &media, &msg_id, timestamp)
+            .await?;
     }
 
     Ok(SentMediaResult {
@@ -425,6 +394,59 @@ async fn send_stored_media(
         file_hash: media.file_hash,
         file_name: media.file_name,
     })
+}
+
+/// Dispatch the network command for a stored media message.
+///
+/// Used by `send_stored_media` either before (temporary) or after (durable)
+/// persisting the message, depending on which failure mode matters more for
+/// that chat kind.
+async fn dispatch_stored_media(
+    net_state: &NetworkState,
+    chat_kind: ChatKind,
+    canonical_chat_id: &str,
+    media: &StoredMedia,
+    msg_id: &str,
+    timestamp: i64,
+) -> Result<()> {
+    if matches!(chat_kind, ChatKind::SelfChat) {
+        return Ok(());
+    }
+    let tx = net_state.sender.lock().await;
+    match chat_kind {
+        ChatKind::Direct | ChatKind::TemporaryDirect => {
+            let target_peer_id = direct::resolve_peer_id_for_chat(canonical_chat_id)
+                .unwrap_or_else(|| canonical_chat_id.to_string());
+            tx.send(NetworkCommand::SendDirectMedia {
+                kind: media.direct_type.clone(),
+                target_peer_id,
+                file_hash: media.file_hash.clone(),
+                file_name: media.direct_file_name.clone(),
+                msg_id: msg_id.to_string(),
+                timestamp,
+            })
+            .await
+            .map_err(|error| anyhow!("network command channel is closed: {error}"))
+        }
+        ChatKind::Group | ChatKind::TemporaryGroup => {
+            let envelope = GroupMessageEnvelope {
+                id: msg_id.to_string(),
+                group_id: canonical_chat_id.to_string(),
+                sender_id: "Me".to_string(),
+                sender_alias: None,
+                timestamp,
+                content_type: media.group_type,
+                text_content: media.text_content.clone(),
+                file_hash: Some(media.file_hash.clone()),
+                protocol_version: None,
+                signed_record_id: None,
+            };
+            tx.send(NetworkCommand::PublishGroup { envelope })
+                .await
+                .map_err(|error| anyhow!("network command channel is closed: {error}"))
+        }
+        ChatKind::SelfChat | ChatKind::Archived => Ok(()),
+    }
 }
 
 fn ensure_group_chat_rows(conn: &rusqlite::Connection, chat_id: &str) -> Result<()> {
@@ -768,6 +790,81 @@ mod tests {
         assert!(
             messages.is_empty(),
             "failed media send must not leave a phantom delivered message"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_direct_media_persists_before_dispatch() {
+        use crate::network::command::NetworkCommand;
+
+        let (_temp, app_state) = crate::testing::test_app_state().await;
+        let (net_state, mut rx) = crate::testing::test_network_state();
+        let chat_id = "12D3KooWLk1GoEB3MbHbRLHTxXrvNGSxC2UALaCuKAgKuYXkXazU";
+        let canonical = crate::chat_identity::build_local_chat_id("peer", chat_id);
+        let image_path = std::env::temp_dir().join("rchat-media-durable.png");
+        std::fs::write(&image_path, b"fake png bytes").expect("write image");
+
+        let result = send_file_from_path(
+            &app_state,
+            &net_state,
+            chat_id,
+            MediaKind::Image,
+            &image_path,
+        )
+        .await
+        .expect("send media");
+        let _ = std::fs::remove_file(&image_path);
+
+        let conn = app_state.db_conn.lock().expect("db");
+        let messages = storage::db::get_messages(&conn, &canonical).expect("history");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, result.msg_id);
+        assert_eq!(messages[0].content_type, "image");
+        assert_eq!(messages[0].status, "pending");
+        drop(conn);
+
+        match rx.recv().await.expect("command") {
+            NetworkCommand::SendDirectMedia {
+                target_peer_id,
+                file_hash,
+                msg_id,
+                ..
+            } => {
+                assert_eq!(target_peer_id, chat_id);
+                assert_eq!(file_hash, result.file_hash);
+                assert_eq!(msg_id, result.msg_id);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_direct_media_persistence_failure_prevents_dispatch() {
+        let (_temp, app_state) = crate::testing::test_app_state().await;
+        {
+            let conn = app_state.db_conn.lock().expect("db");
+            conn.execute("DROP TABLE messages", [])
+                .expect("drop messages table");
+        }
+        let (net_state, mut rx) = crate::testing::test_network_state();
+        let chat_id = "12D3KooWLk1GoEB3MbHbRLHTxXrvNGSxC2UALaCuKAgKuYXkXazU";
+        let image_path = std::env::temp_dir().join("rchat-media-durable-fail.png");
+        std::fs::write(&image_path, b"fake png bytes").expect("write image");
+
+        let result = send_file_from_path(
+            &app_state,
+            &net_state,
+            chat_id,
+            MediaKind::Image,
+            &image_path,
+        )
+        .await;
+        let _ = std::fs::remove_file(&image_path);
+
+        assert!(result.is_err(), "persistence failure must fail the send");
+        assert!(
+            rx.try_recv().is_err(),
+            "no media command may be dispatched when durable persistence fails"
         );
     }
 
