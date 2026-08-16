@@ -45,6 +45,13 @@ rchat-libvpx = { path = "../rchat-libvpx" }
 rchat-screen-capture = { path = "../rchat-screen-capture" }
 rchat-video-capture = { path = "../rchat-video-capture" }
 rubato = { version = "2.0.0", default-features = false }
+tempfile = { version = "3.23.0", optional = true }
+
+[features]
+# Shared test-support helpers (`testing` module) used by rchat-core and
+# downstream crate tests. Kept behind a feature so the helpers and their
+# dependencies never ship in the release binary.
+test-utils = ["dep:tempfile"]
 
 [dev-dependencies]
 tempfile = "3.23.0"

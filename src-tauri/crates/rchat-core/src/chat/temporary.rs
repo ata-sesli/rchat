@@ -2,7 +2,11 @@ use crate::app_state::{
     ActiveTemporaryInvite, AppState, NetworkState, TemporaryChatKind, TemporaryChatSession,
     TemporaryInvitePayload,
 };
-use crate::network::command::NetworkCommand;
+use crate::network::{
+    command::NetworkCommand,
+    gossip::{GroupContentType, GroupMessageEnvelope},
+};
+use crate::storage::db::Message;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
@@ -256,6 +260,117 @@ pub async fn redeem_temporary_invite(
         expires_at,
         peer_id: Some(payload.inviter_peer_id),
     })
+}
+
+/// Load the in-memory history of a temporary-group chat.
+///
+/// Temporary-group messages live only in `temporary_state` until the session
+/// expires or is archived, so this reads them straight from there.
+pub async fn get_temporary_group_history(
+    net_state: &NetworkState,
+    chat_id: &str,
+) -> Result<Vec<Message>> {
+    ensure_temp_group_chat_id(chat_id)?;
+    let temp_state = net_state.temporary_state.lock().await;
+    Ok(temp_state
+        .messages
+        .get(chat_id)
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Send a text message through the temporary-group path.
+///
+/// The message is appended to the in-memory temporary session history and then
+/// published on the temporary-group gossip topic, mirroring how the web client
+/// routes `TemporaryGroup` text messages.
+pub async fn send_temporary_group_text(
+    app_state: &AppState,
+    net_state: &NetworkState,
+    chat_id: &str,
+    message: &str,
+) -> Result<String> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err(anyhow!("message is empty"));
+    }
+    ensure_temp_group_chat_id(chat_id)?;
+
+    let my_alias = {
+        let mgr = app_state.config_manager.lock().await;
+        mgr.load().await?.user.profile.alias
+    };
+    let timestamp = now_unix_secs() as i64;
+    let msg_id = format!("{}-{}", timestamp, rand::random::<u32>());
+    let outgoing = Message {
+        id: msg_id.clone(),
+        chat_id: chat_id.to_string(),
+        peer_id: "Me".to_string(),
+        timestamp,
+        content_type: "text".to_string(),
+        text_content: Some(message.to_string()),
+        file_hash: None,
+        status: "delivered".to_string(),
+        content_metadata: None,
+        sender_alias: my_alias.clone(),
+    };
+
+    {
+        let mut temp_state = net_state.temporary_state.lock().await;
+        temp_state
+            .messages
+            .entry(chat_id.to_string())
+            .or_default()
+            .push(outgoing);
+    }
+
+    let envelope = GroupMessageEnvelope {
+        id: msg_id.clone(),
+        group_id: chat_id.to_string(),
+        sender_id: "Me".to_string(),
+        sender_alias: my_alias,
+        timestamp,
+        content_type: GroupContentType::Text,
+        text_content: Some(message.to_string()),
+        file_hash: None,
+        protocol_version: None,
+        signed_record_id: None,
+    };
+    let tx = net_state.sender.lock().await;
+    tx.send(NetworkCommand::PublishGroup { envelope })
+        .await
+        .map_err(|error| anyhow!("network command channel is closed: {error}"))?;
+
+    Ok(msg_id)
+}
+
+/// Mark incoming temporary-group messages as read in the in-memory session.
+///
+/// Returns the ids of the messages whose status changed. Own messages are
+/// skipped, matching how temporary-direct chats are marked read.
+pub async fn mark_temporary_group_messages_read(
+    net_state: &NetworkState,
+    chat_id: &str,
+) -> Result<Vec<String>> {
+    ensure_temp_group_chat_id(chat_id)?;
+    let mut temp_state = net_state.temporary_state.lock().await;
+    let messages = temp_state.messages.entry(chat_id.to_string()).or_default();
+    let mut ids = Vec::new();
+    for message in messages {
+        if message.peer_id != "Me" && message.status != "read" {
+            message.status = "read".to_string();
+            ids.push(message.id.clone());
+        }
+    }
+    Ok(ids)
+}
+
+fn ensure_temp_group_chat_id(chat_id: &str) -> Result<()> {
+    if crate::chat_kind::is_temp_group_chat_id(chat_id) {
+        Ok(())
+    } else {
+        Err(anyhow!("Not a temporary group chat id: {chat_id}"))
+    }
 }
 
 fn now_unix_secs() -> u64 {
@@ -522,4 +637,158 @@ mod tests {
         );
         assert!(extract_temporary_payload_token("rchat://temp/").is_err());
     }
+
+    #[tokio::test]
+    async fn temporary_group_text_round_trips_through_temp_state_and_publish() {
+        let (_temp, app_state) = test_app_state().await;
+        let (net_state, mut rx) = test_network_state();
+        let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+
+        let msg_id =
+            send_temporary_group_text(&app_state, &net_state, &chat_id, "  hello group  ")
+                .await
+                .expect("send");
+
+        let messages = net_state
+            .temporary_state
+            .lock()
+            .await
+            .messages
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, msg_id);
+        assert_eq!(messages[0].peer_id, "Me");
+        assert_eq!(messages[0].text_content.as_deref(), Some("hello group"));
+        assert_eq!(messages[0].status, "delivered");
+
+        match rx.recv().await.expect("command") {
+            NetworkCommand::PublishGroup { envelope } => {
+                assert_eq!(envelope.id, msg_id);
+                assert_eq!(envelope.group_id, chat_id);
+                assert_eq!(envelope.sender_id, "Me");
+                assert_eq!(envelope.content_type, GroupContentType::Text);
+                assert_eq!(envelope.text_content.as_deref(), Some("hello group"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn temporary_group_text_rejects_empty_and_non_group_ids() {
+        let (_temp, app_state) = test_app_state().await;
+        let (net_state, _rx) = test_network_state();
+
+        assert!(send_temporary_group_text(&app_state, &net_state, "peer-1", "hello")
+            .await
+            .expect_err("not a temp group")
+            .to_string()
+            .contains("Not a temporary group chat id"));
+        assert!(send_temporary_group_text(
+            &app_state,
+            &net_state,
+            &crate::chat_kind::generate_temp_group_chat_id(),
+            "   "
+        )
+        .await
+        .expect_err("empty message")
+        .to_string()
+        .contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn temporary_group_history_returns_stored_messages() {
+        let (_temp, _app_state) = test_app_state().await;
+        let (net_state, _rx) = test_network_state();
+        let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            temp_state.messages.insert(
+                chat_id.clone(),
+                vec![
+                    temp_group_message(&chat_id, "m1", "first"),
+                    temp_group_message(&chat_id, "m2", "second"),
+                ],
+            );
+        }
+
+        let history = get_temporary_group_history(&net_state, &chat_id)
+            .await
+            .expect("history");
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].text_content.as_deref(), Some("first"));
+        assert_eq!(history[1].text_content.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn temporary_group_history_rejects_non_group_ids() {
+        let (net_state, _rx) = test_network_state();
+
+        assert!(get_temporary_group_history(&net_state, "peer-1")
+            .await
+            .expect_err("not a temp group")
+            .to_string()
+            .contains("Not a temporary group chat id"));
+    }
+
+    #[tokio::test]
+    async fn temporary_group_mark_read_only_marks_incoming_messages() {
+        let (_temp, _app_state) = test_app_state().await;
+        let (net_state, _rx) = test_network_state();
+        let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            temp_state.messages.insert(
+                chat_id.clone(),
+                vec![
+                    temp_group_message(&chat_id, "m1", "from peer"),
+                    temp_group_message(&chat_id, "m2", "from me"),
+                ],
+            );
+            temp_state
+                .messages
+                .get_mut(&chat_id)
+                .expect("messages")
+                .iter_mut()
+                .for_each(|message| {
+                    if message.id == "m2" {
+                        message.peer_id = "Me".to_string();
+                    }
+                });
+        }
+
+        let marked = mark_temporary_group_messages_read(&net_state, &chat_id)
+            .await
+            .expect("mark read");
+
+        assert_eq!(marked, vec!["m1"]);
+        let messages = net_state
+            .temporary_state
+            .lock()
+            .await
+            .messages
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(messages[0].status, "read");
+        assert_eq!(messages[1].status, "pending");
+    }
+
+    fn temp_group_message(chat_id: &str, id: &str, text: &str) -> Message {
+        Message {
+            id: id.to_string(),
+            chat_id: chat_id.to_string(),
+            peer_id: REMOTE_PEER_ID.to_string(),
+            timestamp: 1_700_000_000,
+            content_type: "text".to_string(),
+            text_content: Some(text.to_string()),
+            file_hash: None,
+            status: "pending".to_string(),
+            content_metadata: None,
+            sender_alias: None,
+        }
+    }
+
 }

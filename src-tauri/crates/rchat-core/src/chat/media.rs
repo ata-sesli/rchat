@@ -264,8 +264,26 @@ pub async fn retry_direct_attachment_fetch(
             Ok(())
         }
         ChatKind::SelfChat => Err(anyhow!("self chat attachments are already local")),
-        ChatKind::Group | ChatKind::TemporaryGroup => {
-            Err(anyhow!("group attachment retry is not supported in rchat-tui yet"))
+        ChatKind::Group => Err(anyhow!(
+            "durable group attachment retry is not supported in rchat-tui yet"
+        )),
+        ChatKind::TemporaryGroup => {
+            let target_peer_id = {
+                let temp_state = net_state.temporary_state.lock().await;
+                temp_state
+                    .chats
+                    .get(&canonical_chat_id)
+                    .and_then(|session| session.peer_id.clone())
+                    .ok_or_else(|| anyhow!("temporary group peer is not connected yet"))?
+            };
+            let tx = net_state.sender.lock().await;
+            tx.send(NetworkCommand::RequestDirectFileMetadata {
+                target_peer_id,
+                file_hash: file_hash.to_string(),
+            })
+            .await
+            .map_err(|error| anyhow!("network command channel is closed: {error}"))?;
+            Ok(())
         }
         ChatKind::Archived => Err(anyhow!("archived chats are read-only")),
     }
@@ -630,6 +648,68 @@ mod tests {
         let target = temp.path().join("saved.txt");
         save_attachment_to_path(&app_state, &file_hash, &target).expect("saved");
         assert_eq!(std::fs::read(target).expect("saved bytes"), b"hello attachment");
+    }
+
+    #[tokio::test]
+    async fn temporary_group_media_send_stores_in_temp_state_and_publishes() {
+        use crate::app_state::{TemporaryChatKind, TemporaryChatSession};
+        use crate::network::command::NetworkCommand;
+        use crate::network::gossip::GroupContentType;
+
+        let (_temp, app_state) = crate::testing::test_app_state().await;
+        let (net_state, mut rx) = crate::testing::test_network_state();
+        let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            temp_state.chats.insert(
+                chat_id.clone(),
+                TemporaryChatSession {
+                    chat_id: chat_id.clone(),
+                    name: "Design Crew".to_string(),
+                    kind: TemporaryChatKind::Group,
+                    expires_at: 1_700_000_000 + 120,
+                    peer_id: Some("12D3KooWAKrRudfV7S7XK418Jg4c8SvCkcnjwjhoATAQ1J6NAw86".to_string()),
+                    archived: false,
+                },
+            );
+        }
+        let image_path = std::env::temp_dir().join("rchat-media-test.png");
+        std::fs::write(&image_path, b"fake png bytes").expect("write image");
+
+        let result = send_file_from_path(
+            &app_state,
+            &net_state,
+            &chat_id,
+            MediaKind::Image,
+            &image_path,
+        )
+        .await
+        .expect("send media");
+        let _ = std::fs::remove_file(&image_path);
+
+        let messages = net_state
+            .temporary_state
+            .lock()
+            .await
+            .messages
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, result.msg_id);
+        assert_eq!(messages[0].content_type, "image");
+        assert_eq!(messages[0].file_hash.as_deref(), Some(result.file_hash.as_str()));
+        assert_eq!(messages[0].status, "delivered");
+
+        match rx.recv().await.expect("command") {
+            NetworkCommand::PublishGroup { envelope } => {
+                assert_eq!(envelope.group_id, chat_id);
+                assert_eq!(envelope.sender_id, "Me");
+                assert_eq!(envelope.content_type, GroupContentType::Image);
+                assert_eq!(envelope.file_hash.as_deref(), Some(result.file_hash.as_str()));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[tokio::test]

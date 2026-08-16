@@ -1337,6 +1337,220 @@ mod tests {
             Some("video active peer-1 muted camera off | Actions: Video ends".to_string())
         );
     }
+
+    const REMOTE_PEER_ID: &str =
+        "12D3KooWAKrRudfV7S7XK418Jg4c8SvCkcnjwjhoATAQ1J6NAw86";
+
+    async fn temp_group_tui_state(
+        chat_id: &str,
+        messages: Vec<rchat_core::storage::db::Message>,
+    ) -> (
+        tempfile::TempDir,
+        rchat_core::AppState,
+        rchat_core::NetworkState,
+        tokio::sync::mpsc::Receiver<NetworkCommand>,
+        UiState,
+    ) {
+        let (temp, app_state) = rchat_core::testing::test_app_state().await;
+        let (network_state, rx) = rchat_core::testing::test_network_state();
+        {
+            let mut temp_state = network_state.temporary_state.lock().await;
+            temp_state.chats.insert(
+                chat_id.to_string(),
+                rchat_core::app_state::TemporaryChatSession {
+                    chat_id: chat_id.to_string(),
+                    name: "Design Crew".to_string(),
+                    kind: rchat_core::app_state::TemporaryChatKind::Group,
+                    expires_at: 1_700_000_000 + 120,
+                    peer_id: Some(REMOTE_PEER_ID.to_string()),
+                    archived: false,
+                },
+            );
+            if !messages.is_empty() {
+                temp_state.messages.insert(chat_id.to_string(), messages);
+            }
+        }
+        let mut state = UiState::new(ProtocolType::Kitty, TuiEventSink::channel(4).0);
+        state.app.replace_chats(vec![TuiChat {
+            id: chat_id.to_string(),
+            name: "Design Crew".to_string(),
+            latest_timestamp: 1_700_000_000,
+            unread_count: 0,
+        }]);
+        (temp, app_state, network_state, rx, state)
+    }
+
+    fn temp_group_db_message(
+        chat_id: &str,
+        id: &str,
+        text: &str,
+    ) -> rchat_core::storage::db::Message {
+        rchat_core::storage::db::Message {
+            id: id.to_string(),
+            chat_id: chat_id.to_string(),
+            peer_id: REMOTE_PEER_ID.to_string(),
+            timestamp: 1_700_000_000,
+            content_type: "text".to_string(),
+            text_content: Some(text.to_string()),
+            file_hash: None,
+            status: "delivered".to_string(),
+            content_metadata: None,
+            sender_alias: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn temporary_group_activation_loads_history_and_removes_placeholder() {
+        let chat_id = rchat_core::chat_kind::generate_temp_group_chat_id();
+        let (_temp, app_state, network_state, _rx, mut state) = temp_group_tui_state(
+            &chat_id,
+            vec![
+                temp_group_db_message(&chat_id, "m1", "first"),
+                temp_group_db_message(&chat_id, "m2", "second"),
+            ],
+        )
+        .await;
+
+        open_chat_list_item(&app_state, &network_state, &mut state, &chat_id)
+            .await
+            .expect("open temporary group");
+
+        assert_eq!(state.app.active_chat_id.as_deref(), Some(chat_id.as_str()));
+        assert_eq!(state.app.messages.len(), 2);
+        assert_eq!(state.app.messages[0].text, "first");
+        assert_eq!(state.app.messages[1].text, "second");
+        assert!(!state.app.status.contains("not implemented"));
+
+        let stored = network_state
+            .temporary_state
+            .lock()
+            .await
+            .messages
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(stored.len(), 2);
+        assert!(stored.iter().all(|message| message.status == "read"));
+    }
+
+    #[tokio::test]
+    async fn temporary_group_composer_routes_through_group_send_path() {
+        let chat_id = rchat_core::chat_kind::generate_temp_group_chat_id();
+        let (_temp, app_state, network_state, mut rx, mut state) =
+            temp_group_tui_state(&chat_id, vec![]).await;
+        open_chat_list_item(&app_state, &network_state, &mut state, &chat_id)
+            .await
+            .expect("open temporary group");
+        state.app.composer = "hello group".to_string();
+
+        send_composer(&app_state, &network_state, &mut state)
+            .await
+            .expect("send composer");
+
+        let messages = network_state
+            .temporary_state
+            .lock()
+            .await
+            .messages
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].peer_id, "Me");
+        assert_eq!(messages[0].text_content.as_deref(), Some("hello group"));
+        assert_eq!(messages[0].status, "delivered");
+
+        match rx.recv().await.expect("command") {
+            NetworkCommand::PublishGroup { envelope } => {
+                assert_eq!(envelope.group_id, chat_id);
+                assert_eq!(envelope.sender_id, "Me");
+                assert_eq!(
+                    envelope.content_type,
+                    rchat_core::network::gossip::GroupContentType::Text
+                );
+                assert_eq!(envelope.text_content.as_deref(), Some("hello group"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        assert!(state.app.composer.is_empty());
+        assert_eq!(state.app.messages.len(), 1);
+        assert_eq!(state.app.messages[0].text, "hello group");
+        assert_eq!(state.app.messages[0].status, "delivered");
+        assert_eq!(state.app.status, "message sent");
+    }
+
+    #[tokio::test]
+    async fn temporary_group_media_send_via_tui_path() {
+        let chat_id = rchat_core::chat_kind::generate_temp_group_chat_id();
+        let (_temp, app_state, network_state, mut rx, mut state) =
+            temp_group_tui_state(&chat_id, vec![]).await;
+        open_chat_list_item(&app_state, &network_state, &mut state, &chat_id)
+            .await
+            .expect("open temporary group");
+        let image_path = std::env::temp_dir().join("rchat-tui-media-test.png");
+        std::fs::write(&image_path, b"fake png bytes").expect("write image");
+
+        send_attachment_from_path(
+            &app_state,
+            &network_state,
+            &mut state,
+            chat_media::MediaKind::Image,
+            image_path.to_str().expect("utf8 path"),
+        )
+        .await
+        .expect("send media");
+        let _ = std::fs::remove_file(&image_path);
+
+        let messages = network_state
+            .temporary_state
+            .lock()
+            .await
+            .messages
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content_type, "image");
+        assert!(messages[0].file_hash.is_some());
+
+        match rx.recv().await.expect("command") {
+            NetworkCommand::PublishGroup { envelope } => {
+                assert_eq!(
+                    envelope.content_type,
+                    rchat_core::network::gossip::GroupContentType::Image
+                );
+                assert!(envelope.file_hash.is_some());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert_eq!(state.app.status, "sent image");
+    }
+
+    #[tokio::test]
+    async fn temporary_group_send_failure_retains_composer_draft() {
+        let chat_id = rchat_core::chat_kind::generate_temp_group_chat_id();
+        let (_temp, app_state, network_state, rx, mut state) =
+            temp_group_tui_state(&chat_id, vec![]).await;
+        open_chat_list_item(&app_state, &network_state, &mut state, &chat_id)
+            .await
+            .expect("open temporary group");
+        drop(rx);
+        state.app.composer = "important draft".to_string();
+
+        send_composer(&app_state, &network_state, &mut state)
+            .await
+            .expect("send composer returns");
+
+        assert_eq!(state.app.composer, "important draft");
+        assert_eq!(state.app.status, "send failed");
+        assert!(state.app.last_error.is_some());
+        assert!(state
+            .app
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("channel")));
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -2065,7 +2279,11 @@ async fn open_direct_chat(
     state: &mut UiState,
     chat_id: &str,
 ) -> Result<()> {
-    let history = direct::get_direct_history(app_state, network_state, chat_id).await?;
+    let history = if chat_kind::is_temp_group_chat_id(chat_id) {
+        temporary::get_temporary_group_history(network_state, chat_id).await?
+    } else {
+        direct::get_direct_history(app_state, network_state, chat_id).await?
+    };
     state.app.select_chat_with_history(chat_id, history);
     direct::mark_direct_messages_read(app_state, network_state, chat_id).await?;
     Ok(())
@@ -2077,11 +2295,15 @@ async fn open_chat_list_item(
     state: &mut UiState,
     chat_id: &str,
 ) -> Result<()> {
+    if chat_kind::is_temp_group_chat_id(chat_id) {
+        return open_direct_chat(app_state, network_state, state, chat_id).await;
+    }
     if is_group_chat_list_item(chat_id) {
         state.app.active_chat_id = Some(chat_id.to_string());
         state.app.messages.clear();
         state.app.history_scroll_offset = 0;
-        state.app.status = "group chat history is not implemented in rchat-tui yet".to_string();
+        state.app.status = "durable group chat history is not implemented in rchat-tui yet"
+            .to_string();
         return Ok(());
     }
 
@@ -2127,7 +2349,18 @@ async fn send_composer(
     let Some(draft) = state.app.prepare_composer_send() else {
         return Ok(());
     };
-    match direct::send_direct_text(app_state, network_state, &draft.chat_id, &draft.text).await {
+    let result = if chat_kind::is_temp_group_chat_id(&draft.chat_id) {
+        temporary::send_temporary_group_text(
+            app_state,
+            network_state,
+            &draft.chat_id,
+            &draft.text,
+        )
+        .await
+    } else {
+        direct::send_direct_text(app_state, network_state, &draft.chat_id, &draft.text).await
+    };
+    match result {
         Ok(msg_id) => {
             state
                 .app
@@ -2148,7 +2381,7 @@ fn active_chat_id(state: &UiState) -> Result<String> {
         .active_chat_id
         .clone()
         .or_else(|| state.app.selected_chat_id().map(ToOwned::to_owned))
-        .ok_or_else(|| anyhow!("select a direct chat first"))
+        .ok_or_else(|| anyhow!("select a chat first"))
 }
 
 async fn send_attachment_from_path(
@@ -4848,7 +5081,7 @@ async fn execute_palette_command(
             let chat_id = chat_id
                 .or_else(|| state.app.active_chat_id.clone())
                 .or_else(|| state.app.selected_chat_id().map(ToOwned::to_owned))
-                .ok_or_else(|| anyhow!("select a direct chat first"))?;
+                .ok_or_else(|| anyhow!("select a chat first"))?;
             open_chat_details(app_state, network_state, state, &chat_id).await
         }
         Ok(PaletteCommand::Connect { peer_id }) => {

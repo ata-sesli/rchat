@@ -198,12 +198,18 @@ pub async fn mark_direct_messages_read(
     let chat_kind = chat_kind::parse_chat_kind(&resolved_chat_id);
     if !matches!(
         chat_kind,
-        ChatKind::SelfChat | ChatKind::Direct | ChatKind::TemporaryDirect
+        ChatKind::SelfChat
+            | ChatKind::Direct
+            | ChatKind::TemporaryDirect
+            | ChatKind::TemporaryGroup
     ) {
         return Ok(Vec::new());
     }
 
-    let marked_ids = if matches!(chat_kind, ChatKind::TemporaryDirect) {
+    let marked_ids = if matches!(
+        chat_kind,
+        ChatKind::TemporaryDirect | ChatKind::TemporaryGroup
+    ) {
         let mut temp_state = net_state.temporary_state.lock().await;
         let messages = temp_state
             .messages

@@ -1,6 +1,7 @@
 use rchat_core::{
     chat::media::MediaKind,
     chat_identity::extract_peer_id_from_chat_id,
+    chat_kind::{self, ChatKind},
     events::LocalPeerEvent,
     storage::config::{ConnectivityMode, ConnectivitySettings},
     storage::db::{ChatFileRow, Message},
@@ -1958,6 +1959,11 @@ pub fn presence_key(chat_id: &str) -> String {
 fn outgoing_status(chat_id: &str) -> &'static str {
     if chat_id == "Me" {
         "read"
+    } else if matches!(
+        chat_kind::parse_chat_kind(chat_id),
+        ChatKind::Group | ChatKind::TemporaryGroup
+    ) {
+        "delivered"
     } else {
         "pending"
     }

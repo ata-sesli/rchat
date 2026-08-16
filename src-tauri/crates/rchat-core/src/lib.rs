@@ -9,5 +9,7 @@ pub mod oauth;
 pub mod runtime;
 pub mod settings;
 pub mod storage;
+#[cfg(any(feature = "test-utils", test))]
+pub mod testing;
 
 pub use app_state::{AppState, NetworkState};
