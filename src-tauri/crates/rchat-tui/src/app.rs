@@ -1361,7 +1361,7 @@ mod tests {
                     chat_id: chat_id.to_string(),
                     name: "Design Crew".to_string(),
                     kind: rchat_core::app_state::TemporaryChatKind::Group,
-                    expires_at: 1_700_000_000 + 120,
+                    expires_at: now_unix_secs() + 3600,
                     peer_id: Some(REMOTE_PEER_ID.to_string()),
                     archived: false,
                 },
@@ -1378,6 +1378,13 @@ mod tests {
             unread_count: 0,
         }]);
         (temp, app_state, network_state, rx, state)
+    }
+
+    fn now_unix_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0)
     }
 
     fn temp_group_db_message(
@@ -1550,6 +1557,19 @@ mod tests {
             .last_error
             .as_deref()
             .is_some_and(|error| error.contains("channel")));
+
+        let messages = network_state
+            .temporary_state
+            .lock()
+            .await
+            .messages
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            messages.is_empty(),
+            "failed send must not leave a phantom delivered message"
+        );
     }
 }
 

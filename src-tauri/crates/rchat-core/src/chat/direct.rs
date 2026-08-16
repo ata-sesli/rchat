@@ -210,6 +210,10 @@ pub async fn mark_direct_messages_read(
         chat_kind,
         ChatKind::TemporaryDirect | ChatKind::TemporaryGroup
     ) {
+        if matches!(chat_kind, ChatKind::TemporaryGroup) {
+            crate::chat::temporary::validate_temp_group_session(net_state, &resolved_chat_id)
+                .await?;
+        }
         let mut temp_state = net_state.temporary_state.lock().await;
         let messages = temp_state
             .messages

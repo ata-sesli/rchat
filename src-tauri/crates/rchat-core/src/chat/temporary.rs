@@ -265,12 +265,14 @@ pub async fn redeem_temporary_invite(
 /// Load the in-memory history of a temporary-group chat.
 ///
 /// Temporary-group messages live only in `temporary_state` until the session
-/// expires or is archived, so this reads them straight from there.
+/// expires or is archived, so this reads them straight from there. The
+/// session itself must still be resolvable, active, and unarchived so stale
+/// chat ids cannot materialize phantom history entries.
 pub async fn get_temporary_group_history(
     net_state: &NetworkState,
     chat_id: &str,
 ) -> Result<Vec<Message>> {
-    ensure_temp_group_chat_id(chat_id)?;
+    validate_temp_group_session(net_state, chat_id).await?;
     let temp_state = net_state.temporary_state.lock().await;
     Ok(temp_state
         .messages
@@ -281,9 +283,11 @@ pub async fn get_temporary_group_history(
 
 /// Send a text message through the temporary-group path.
 ///
-/// The message is appended to the in-memory temporary session history and then
-/// published on the temporary-group gossip topic, mirroring how the web client
-/// routes `TemporaryGroup` text messages.
+/// The message is published on the temporary-group gossip topic and then
+/// appended to the in-memory temporary session history, mirroring how the
+/// web client routes `TemporaryGroup` text messages. Enqueuing first ensures
+/// a closed command channel fails the send without leaving a phantom
+/// `delivered` message behind.
 pub async fn send_temporary_group_text(
     app_state: &AppState,
     net_state: &NetworkState,
@@ -294,7 +298,7 @@ pub async fn send_temporary_group_text(
     if message.is_empty() {
         return Err(anyhow!("message is empty"));
     }
-    ensure_temp_group_chat_id(chat_id)?;
+    validate_temp_group_session(net_state, chat_id).await?;
 
     let my_alias = {
         let mgr = app_state.config_manager.lock().await;
@@ -314,16 +318,6 @@ pub async fn send_temporary_group_text(
         content_metadata: None,
         sender_alias: my_alias.clone(),
     };
-
-    {
-        let mut temp_state = net_state.temporary_state.lock().await;
-        temp_state
-            .messages
-            .entry(chat_id.to_string())
-            .or_default()
-            .push(outgoing);
-    }
-
     let envelope = GroupMessageEnvelope {
         id: msg_id.clone(),
         group_id: chat_id.to_string(),
@@ -336,10 +330,22 @@ pub async fn send_temporary_group_text(
         protocol_version: None,
         signed_record_id: None,
     };
+
+    // Enqueue the publish before storing the message so a closed command
+    // channel cannot leave a phantom `delivered` message behind; retrying
+    // would otherwise duplicate it.
     let tx = net_state.sender.lock().await;
     tx.send(NetworkCommand::PublishGroup { envelope })
         .await
         .map_err(|error| anyhow!("network command channel is closed: {error}"))?;
+    drop(tx);
+
+    let mut temp_state = net_state.temporary_state.lock().await;
+    temp_state
+        .messages
+        .entry(chat_id.to_string())
+        .or_default()
+        .push(outgoing);
 
     Ok(msg_id)
 }
@@ -352,7 +358,7 @@ pub async fn mark_temporary_group_messages_read(
     net_state: &NetworkState,
     chat_id: &str,
 ) -> Result<Vec<String>> {
-    ensure_temp_group_chat_id(chat_id)?;
+    validate_temp_group_session(net_state, chat_id).await?;
     let mut temp_state = net_state.temporary_state.lock().await;
     let messages = temp_state.messages.entry(chat_id.to_string()).or_default();
     let mut ids = Vec::new();
@@ -371,6 +377,35 @@ fn ensure_temp_group_chat_id(chat_id: &str) -> Result<()> {
     } else {
         Err(anyhow!("Not a temporary group chat id: {chat_id}"))
     }
+}
+
+/// Resolve a temporary-group session and validate it is usable.
+///
+/// Rejects chat ids that are not temporary groups, and sessions that are
+/// missing, of the wrong kind, archived, or expired. Callers use this before
+/// sending, loading history, or marking read so a dead session can never
+/// create in-memory history entries or publish to a gossip topic.
+pub(crate) async fn validate_temp_group_session(
+    net_state: &NetworkState,
+    chat_id: &str,
+) -> Result<TemporaryChatSession> {
+    ensure_temp_group_chat_id(chat_id)?;
+    let temp_state = net_state.temporary_state.lock().await;
+    let session = temp_state
+        .chats
+        .get(chat_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("Temporary group chat not found: {chat_id}"))?;
+    if !matches!(session.kind, TemporaryChatKind::Group) {
+        return Err(anyhow!("Not a temporary group chat id: {chat_id}"));
+    }
+    if session.archived {
+        return Err(anyhow!("Temporary group chat is archived: {chat_id}"));
+    }
+    if session.expires_at <= now_unix_secs() {
+        return Err(anyhow!("Temporary group chat has expired: {chat_id}"));
+    }
+    Ok(session)
 }
 
 fn now_unix_secs() -> u64 {
@@ -643,6 +678,7 @@ mod tests {
         let (_temp, app_state) = test_app_state().await;
         let (net_state, mut rx) = test_network_state();
         let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+        insert_temp_group_session(&net_state, &chat_id, now_unix_secs() + 3600, false).await;
 
         let msg_id =
             send_temporary_group_text(&app_state, &net_state, &chat_id, "  hello group  ")
@@ -702,6 +738,7 @@ mod tests {
         let (_temp, _app_state) = test_app_state().await;
         let (net_state, _rx) = test_network_state();
         let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+        insert_temp_group_session(&net_state, &chat_id, now_unix_secs() + 3600, false).await;
         {
             let mut temp_state = net_state.temporary_state.lock().await;
             temp_state.messages.insert(
@@ -738,6 +775,7 @@ mod tests {
         let (_temp, _app_state) = test_app_state().await;
         let (net_state, _rx) = test_network_state();
         let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+        insert_temp_group_session(&net_state, &chat_id, now_unix_secs() + 3600, false).await;
         {
             let mut temp_state = net_state.temporary_state.lock().await;
             temp_state.messages.insert(
@@ -774,6 +812,95 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(messages[0].status, "read");
         assert_eq!(messages[1].status, "pending");
+    }
+
+    async fn insert_temp_group_session(
+        net_state: &NetworkState,
+        chat_id: &str,
+        expires_at: u64,
+        archived: bool,
+    ) {
+        let mut temp_state = net_state.temporary_state.lock().await;
+        temp_state.chats.insert(
+            chat_id.to_string(),
+            TemporaryChatSession {
+                chat_id: chat_id.to_string(),
+                name: "Design Crew".to_string(),
+                kind: TemporaryChatKind::Group,
+                expires_at,
+                peer_id: Some(REMOTE_PEER_ID.to_string()),
+                archived,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn temporary_group_text_send_failure_leaves_history_unchanged() {
+        let (_temp, app_state) = test_app_state().await;
+        let (net_state, rx) = test_network_state();
+        let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+        insert_temp_group_session(&net_state, &chat_id, now_unix_secs() + 3600, false).await;
+        drop(rx);
+
+        let result = send_temporary_group_text(&app_state, &net_state, &chat_id, "hello").await;
+        assert!(result.is_err());
+
+        let messages = net_state
+            .temporary_state
+            .lock()
+            .await
+            .messages
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            messages.is_empty(),
+            "failed send must not leave a phantom delivered message"
+        );
+    }
+
+    #[tokio::test]
+    async fn temporary_group_operations_reject_missing_archived_and_expired_sessions() {
+        let (_temp, app_state) = test_app_state().await;
+        let (net_state, _rx) = test_network_state();
+        let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+
+        assert!(send_temporary_group_text(&app_state, &net_state, &chat_id, "hello")
+            .await
+            .expect_err("missing session")
+            .to_string()
+            .contains("not found"));
+        assert!(get_temporary_group_history(&net_state, &chat_id)
+            .await
+            .expect_err("missing session")
+            .to_string()
+            .contains("not found"));
+        assert!(mark_temporary_group_messages_read(&net_state, &chat_id)
+            .await
+            .expect_err("missing session")
+            .to_string()
+            .contains("not found"));
+
+        insert_temp_group_session(&net_state, &chat_id, now_unix_secs() + 3600, true).await;
+        assert!(send_temporary_group_text(&app_state, &net_state, &chat_id, "hello")
+            .await
+            .expect_err("archived session")
+            .to_string()
+            .contains("archived"));
+
+        let expired_id = crate::chat_kind::generate_temp_group_chat_id();
+        insert_temp_group_session(
+            &net_state,
+            &expired_id,
+            now_unix_secs().saturating_sub(60),
+            false,
+        )
+        .await;
+        assert!(send_temporary_group_text(&app_state, &net_state, &expired_id, "hello")
+            .await
+            .expect_err("expired session")
+            .to_string()
+            .contains("expired"));
     }
 
     fn temp_group_message(chat_id: &str, id: &str, text: &str) -> Message {

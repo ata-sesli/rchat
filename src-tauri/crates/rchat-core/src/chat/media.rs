@@ -1,6 +1,6 @@
 use crate::{
     app_state::{AppState, NetworkState},
-    chat::{direct, group},
+    chat::{direct, group, temporary},
     chat_kind::{self, ChatKind},
     network::{
         command::{DirectMediaKind, NetworkCommand},
@@ -268,14 +268,11 @@ pub async fn retry_direct_attachment_fetch(
             "durable group attachment retry is not supported in rchat-tui yet"
         )),
         ChatKind::TemporaryGroup => {
-            let target_peer_id = {
-                let temp_state = net_state.temporary_state.lock().await;
-                temp_state
-                    .chats
-                    .get(&canonical_chat_id)
-                    .and_then(|session| session.peer_id.clone())
-                    .ok_or_else(|| anyhow!("temporary group peer is not connected yet"))?
-            };
+            let session =
+                temporary::validate_temp_group_session(net_state, &canonical_chat_id).await?;
+            let target_peer_id = session
+                .peer_id
+                .ok_or_else(|| anyhow!("temporary group peer is not connected yet"))?;
             let tx = net_state.sender.lock().await;
             tx.send(NetworkCommand::RequestDirectFileMetadata {
                 target_peer_id,
@@ -358,29 +355,12 @@ async fn send_stored_media(
         sender_alias: None,
     };
 
-    if is_temporary {
-        let mut temp_state = net_state.temporary_state.lock().await;
-        temp_state
-            .messages
-            .entry(db_chat_id.clone())
-            .or_default()
-            .push(message);
-    } else {
-        let resolved_peer_id = direct::resolve_peer_id_for_chat(&canonical_chat_id)
-            .unwrap_or_else(|| canonical_chat_id.clone());
-        let conn = app_state
-            .db_conn
-            .lock()
-            .map_err(|error| anyhow!("database lock failed: {error}"))?;
-        if matches!(chat_kind, ChatKind::Direct) {
-            direct::ensure_direct_chat_rows(&conn, &canonical_chat_id, &resolved_peer_id)?;
-        } else if matches!(chat_kind, ChatKind::Group | ChatKind::TemporaryGroup) {
-            ensure_group_chat_rows(&conn, &canonical_chat_id)?;
-        }
-        storage::db::insert_message(&conn, &message)?;
-    }
-
+    // Enqueue the network command before storing the message so a closed
+    // command channel cannot leave a phantom `delivered` message behind.
     if !matches!(chat_kind, ChatKind::SelfChat) {
+        if matches!(chat_kind, ChatKind::TemporaryGroup) {
+            temporary::validate_temp_group_session(net_state, &canonical_chat_id).await?;
+        }
         let tx = net_state.sender.lock().await;
         match chat_kind {
             ChatKind::Direct | ChatKind::TemporaryDirect => {
@@ -416,6 +396,28 @@ async fn send_stored_media(
             }
             ChatKind::SelfChat | ChatKind::Archived => {}
         }
+    }
+
+    if is_temporary {
+        let mut temp_state = net_state.temporary_state.lock().await;
+        temp_state
+            .messages
+            .entry(db_chat_id.clone())
+            .or_default()
+            .push(message);
+    } else {
+        let resolved_peer_id = direct::resolve_peer_id_for_chat(&canonical_chat_id)
+            .unwrap_or_else(|| canonical_chat_id.clone());
+        let conn = app_state
+            .db_conn
+            .lock()
+            .map_err(|error| anyhow!("database lock failed: {error}"))?;
+        if matches!(chat_kind, ChatKind::Direct) {
+            direct::ensure_direct_chat_rows(&conn, &canonical_chat_id, &resolved_peer_id)?;
+        } else if matches!(chat_kind, ChatKind::Group | ChatKind::TemporaryGroup) {
+            ensure_group_chat_rows(&conn, &canonical_chat_id)?;
+        }
+        storage::db::insert_message(&conn, &message)?;
     }
 
     Ok(SentMediaResult {
@@ -608,6 +610,13 @@ pub fn detect_audio_mime_from_bytes(data: &[u8]) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    fn now_unix_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0)
+    }
+
     #[test]
     fn audio_mime_accepts_supported_extensions() {
         assert_eq!(detect_audio_mime(Path::new("clip.mp3")), Some("audio/mpeg"));
@@ -667,7 +676,7 @@ mod tests {
                     chat_id: chat_id.clone(),
                     name: "Design Crew".to_string(),
                     kind: TemporaryChatKind::Group,
-                    expires_at: 1_700_000_000 + 120,
+                    expires_at: now_unix_secs() + 3600,
                     peer_id: Some("12D3KooWAKrRudfV7S7XK418Jg4c8SvCkcnjwjhoATAQ1J6NAw86".to_string()),
                     archived: false,
                 },
@@ -710,6 +719,56 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn temporary_group_media_send_failure_leaves_history_unchanged() {
+        use crate::app_state::{TemporaryChatKind, TemporaryChatSession};
+
+        let (_temp, app_state) = crate::testing::test_app_state().await;
+        let (net_state, rx) = crate::testing::test_network_state();
+        let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            temp_state.chats.insert(
+                chat_id.clone(),
+                TemporaryChatSession {
+                    chat_id: chat_id.clone(),
+                    name: "Design Crew".to_string(),
+                    kind: TemporaryChatKind::Group,
+                    expires_at: now_unix_secs() + 3600,
+                    peer_id: Some("12D3KooWAKrRudfV7S7XK418Jg4c8SvCkcnjwjhoATAQ1J6NAw86".to_string()),
+                    archived: false,
+                },
+            );
+        }
+        drop(rx);
+        let image_path = std::env::temp_dir().join("rchat-media-test.png");
+        std::fs::write(&image_path, b"fake png bytes").expect("write image");
+
+        let result = send_file_from_path(
+            &app_state,
+            &net_state,
+            &chat_id,
+            MediaKind::Image,
+            &image_path,
+        )
+        .await;
+        let _ = std::fs::remove_file(&image_path);
+        assert!(result.is_err());
+
+        let messages = net_state
+            .temporary_state
+            .lock()
+            .await
+            .messages
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            messages.is_empty(),
+            "failed media send must not leave a phantom delivered message"
+        );
     }
 
     #[tokio::test]
