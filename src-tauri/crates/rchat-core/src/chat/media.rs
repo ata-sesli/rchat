@@ -372,19 +372,24 @@ async fn send_stored_media(
             .push(message);
     } else {
         // Durable sends persist before dispatch so a late database failure
-        // cannot deliver a message that is missing from local history.
-        let resolved_peer_id = direct::resolve_peer_id_for_chat(&canonical_chat_id)
-            .unwrap_or_else(|| canonical_chat_id.clone());
-        let conn = app_state
-            .db_conn
-            .lock()
-            .map_err(|error| anyhow!("database lock failed: {error}"))?;
-        if matches!(chat_kind, ChatKind::Direct) {
-            direct::ensure_direct_chat_rows(&conn, &canonical_chat_id, &resolved_peer_id)?;
-        } else if matches!(chat_kind, ChatKind::Group | ChatKind::TemporaryGroup) {
-            ensure_group_chat_rows(&conn, &canonical_chat_id)?;
+        // cannot deliver a message that is missing from local history. The
+        // database lock is scoped so it is released before awaiting dispatch;
+        // otherwise a full command channel could deadlock while its consumer
+        // waits on the database.
+        {
+            let resolved_peer_id = direct::resolve_peer_id_for_chat(&canonical_chat_id)
+                .unwrap_or_else(|| canonical_chat_id.clone());
+            let conn = app_state
+                .db_conn
+                .lock()
+                .map_err(|error| anyhow!("database lock failed: {error}"))?;
+            if matches!(chat_kind, ChatKind::Direct) {
+                direct::ensure_direct_chat_rows(&conn, &canonical_chat_id, &resolved_peer_id)?;
+            } else if matches!(chat_kind, ChatKind::Group | ChatKind::TemporaryGroup) {
+                ensure_group_chat_rows(&conn, &canonical_chat_id)?;
+            }
+            storage::db::insert_message(&conn, &message)?;
         }
-        storage::db::insert_message(&conn, &message)?;
         dispatch_stored_media(net_state, chat_kind, &canonical_chat_id, &media, &msg_id, timestamp)
             .await?;
     }
