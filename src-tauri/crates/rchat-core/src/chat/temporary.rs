@@ -331,11 +331,11 @@ pub async fn get_temporary_group_history(
 
 /// Send a text message through the temporary-group path.
 ///
-/// The message is published on the temporary-group gossip topic and then
-/// appended to the in-memory temporary session history, mirroring how the
-/// web client routes `TemporaryGroup` text messages. Enqueuing first ensures
-/// a closed command channel fails the send without leaving a phantom
-/// `delivered` message behind.
+/// The message is reserved in the in-memory history under the lock and before
+/// any network dispatch: an archiving session is rejected up front, so the
+/// reservation check can never happen after the remote peer already received
+/// the message. If the publish then fails (closed command channel), the
+/// pending message is rolled back so retrying cannot duplicate it.
 pub async fn send_temporary_group_text(
     app_state: &AppState,
     net_state: &NetworkState,
@@ -379,35 +379,39 @@ pub async fn send_temporary_group_text(
         signed_record_id: None,
     };
 
-    // Enqueue the publish before storing the message so a closed command
-    // channel cannot leave a phantom `delivered` message behind; retrying
-    // would otherwise duplicate it.
-    let tx = net_state.sender.lock().await;
-    tx.send(NetworkCommand::PublishGroup { envelope })
-        .await
-        .map_err(|error| anyhow!("network command channel is closed: {error}"))?;
-    drop(tx);
-
-    // Re-check the reservation under the lock: if an archive reserved the
-    // session between validation and now, the snapshot would not include this
-    // message, so it must not be appended (the message is already on the
-    // gossip topic, but the archived copy stays consistent).
-    let mut temp_state = net_state.temporary_state.lock().await;
-    let reserved = temp_state
-        .chats
-        .get(chat_id)
-        .map(|session| session.archived)
-        .unwrap_or(true);
-    if reserved {
-        return Err(anyhow!(
-            "Temporary group chat is being archived: {chat_id}"
-        ));
+    // Reserve a slot in the live history UNDER THE LOCK and before any
+    // network dispatch: a reserved (archiving) session is rejected here, so
+    // the reservation check can never happen after the remote peer has
+    // already received the message. If the publish fails below, the pending
+    // message is rolled back so a closed command channel cannot leave a
+    // phantom `delivered` message behind.
+    {
+        let mut temp_state = net_state.temporary_state.lock().await;
+        let reserved = temp_state
+            .chats
+            .get(chat_id)
+            .map(|session| session.archived)
+            .unwrap_or(true);
+        if reserved {
+            return Err(anyhow!(
+                "Temporary group chat is being archived: {chat_id}"
+            ));
+        }
+        temp_state
+            .messages
+            .entry(chat_id.to_string())
+            .or_default()
+            .push(outgoing.clone());
     }
-    temp_state
-        .messages
-        .entry(chat_id.to_string())
-        .or_default()
-        .push(outgoing);
+
+    let tx = net_state.sender.lock().await;
+    if let Err(error) = tx.send(NetworkCommand::PublishGroup { envelope }).await {
+        let mut temp_state = net_state.temporary_state.lock().await;
+        if let Some(messages) = temp_state.messages.get_mut(chat_id) {
+            messages.retain(|message| message.id != msg_id);
+        }
+        return Err(anyhow!("network command channel is closed: {error}"));
+    }
 
     Ok(msg_id)
 }
@@ -487,17 +491,19 @@ pub async fn temporary_group_remote_members(
 
 /// Leave a temporary-group session locally.
 ///
-/// Records a remove tombstone for the local peer, clears the active invite if
-/// it points at this chat, and tells the network manager to end the temporary
-/// session. The manager broadcasts the updated membership log to the other
-/// members and then removes the session; leaving is group-scoped, so shared
-/// libp2p connections to the other members are never closed.
+/// Records a signed remove tombstone for the local peer, clears the active
+/// invite if it points at this chat, and tells the network manager to end the
+/// temporary session. The manager broadcasts the updated membership state to
+/// the other members and then removes the session; leaving is group-scoped, so
+/// shared libp2p connections to the other members are never closed.
 pub async fn leave_temporary_group(
+    app_state: &AppState,
     net_state: &NetworkState,
     chat_id: &str,
 ) -> Result<()> {
     validate_temp_group_session(net_state, chat_id).await?;
 
+    let signer = crate::chat::group::load_or_create_local_keypair(app_state).await?;
     let local_peer_id = net_state.local_peer_id.lock().await.clone();
     {
         let mut temp_state = net_state.temporary_state.lock().await;
@@ -510,6 +516,7 @@ pub async fn leave_temporary_group(
                 local,
                 TemporaryMembershipOpKind::Remove,
                 local,
+                Some(&signer),
             );
         }
         if temp_state
@@ -525,6 +532,7 @@ pub async fn leave_temporary_group(
     let tx = net_state.sender.lock().await;
     tx.send(NetworkCommand::EndTemporarySession {
         chat_id: chat_id.to_string(),
+        farewell_winners: None,
     })
     .await
     .map_err(|error| anyhow!("network command channel is closed: {error}"))?;
@@ -555,10 +563,17 @@ pub async fn archive_temporary_chat(
     let now = now_unix_secs() as i64;
     let archive_chat_id = format!("archived:{}:{}", chat_id, now);
 
+    let local_peer_id = net_state.local_peer_id.lock().await.clone();
+    let signer = crate::chat::group::load_or_create_local_keypair(app_state).await?;
+
     // Reserve the session under the lock, reject duplicate archive attempts,
-    // and snapshot it. Writes to a reserved session are rejected by the send
-    // and receive paths, so the snapshot stays authoritative.
-    let (session, messages) = {
+    // snapshot it, and issue a signed remove tombstone for the local peer.
+    // The tombstone becomes the farewell roster broadcast after the archive
+    // commits, so remaining peers drop the archiving member even though the
+    // shared libp2p connections stay open. Incoming messages are buffered in
+    // the live history until the transaction resolves (kept on failure,
+    // discarded together with the session on success).
+    let (session, messages, farewell_winners) = {
         let mut temp_state = net_state.temporary_state.lock().await;
         let messages = temp_state
             .messages
@@ -577,10 +592,18 @@ pub async fn archive_temporary_chat(
             return Err(anyhow!("No temporary messages to archive"));
         }
         session.archived = true;
-        (session.clone(), messages)
+        if let Some(local) = local_peer_id.as_deref() {
+            session.issue_membership_op(
+                local,
+                TemporaryMembershipOpKind::Remove,
+                local,
+                Some(&signer),
+            );
+        }
+        let farewell_winners = session.membership_winners();
+        (session.clone(), messages, farewell_winners)
     };
 
-    let local_peer_id = net_state.local_peer_id.lock().await.clone();
     // Resolve the roster so the local identity is stored exactly once: the
     // literal "Me" row plus every remote member (never the local peer id).
     let remote_members = session.remote_members(local_peer_id.as_deref());
@@ -663,18 +686,21 @@ pub async fn archive_temporary_chat(
     }
 
     // The archive is durable; only now remove the live session and messages.
-    // The reservation guarantees no writes happened since the snapshot, so
-    // nothing is discarded.
+    // Messages buffered while persistence ran are discarded with the session;
+    // the farewell broadcast (queued below) tells the remaining peers we left.
     {
         let mut temp_state = net_state.temporary_state.lock().await;
         temp_state.chats.remove(chat_id);
         temp_state.messages.remove(chat_id);
     }
 
+    // Carry the farewell winners in the command so the handler can broadcast
+    // the roster without reading the (now removed) session.
     let tx = net_state.sender.lock().await;
     let _ = tx
         .send(NetworkCommand::EndTemporarySession {
             chat_id: chat_id.to_string(),
+            farewell_winners: Some(farewell_winners),
         })
         .await;
 
@@ -1302,15 +1328,24 @@ mod tests {
 
     #[tokio::test]
     async fn leave_temporary_group_records_tombstone_without_dropping_connections() {
-        let (_temp, _app_state) = test_app_state().await;
+        let (_temp, app_state) = test_app_state().await;
         let (net_state, mut rx) = test_network_state();
+        // The local peer id in the live session must match the config keypair
+        // that signs the leave tombstone, exactly as in production.
+        let keypair = crate::chat::group::load_or_create_local_keypair(&app_state)
+            .await
+            .expect("keypair");
+        let local_peer_id = libp2p::PeerId::from_public_key(&keypair.public()).to_string();
+        *net_state.local_peer_id.lock().await = Some(local_peer_id.clone());
         let chat_id = crate::chat_kind::generate_temp_group_chat_id();
         insert_temp_group_session(&net_state, &chat_id, now_unix_secs() + 3600, false).await;
 
-        leave_temporary_group(&net_state, &chat_id).await.expect("leave");
+        leave_temporary_group(&app_state, &net_state, &chat_id)
+            .await
+            .expect("leave");
 
         // The session is retained for the manager to clean up, but now carries
-        // a remove tombstone for the local peer so the exit propagates
+        // a signed remove tombstone for the local peer so the exit propagates
         // group-wide instead of closing shared transport connections.
         let session = net_state
             .temporary_state
@@ -1320,10 +1355,19 @@ mod tests {
             .get(&chat_id)
             .cloned()
             .expect("session retained for manager cleanup");
-        assert!(session.membership_winners().iter().any(|op| {
-            op.op == TemporaryMembershipOpKind::Remove && op.target == LOCAL_PEER_ID
-        }));
-        assert!(!session.is_member(LOCAL_PEER_ID));
+        let tombstone = session
+            .membership_winners()
+            .iter()
+            .find(|op| {
+                op.op == TemporaryMembershipOpKind::Remove && op.target == local_peer_id
+            })
+            .cloned()
+            .expect("remove tombstone recorded");
+        assert!(
+            tombstone.verify(),
+            "the leave tombstone must be signed so it propagates"
+        );
+        assert!(!session.is_member(&local_peer_id));
 
         let mut commands = Vec::new();
         while let Ok(command) = rx.try_recv() {
@@ -1344,7 +1388,14 @@ mod tests {
     #[tokio::test]
     async fn archive_temporary_group_preserves_complete_member_roster() {
         let (_temp, app_state) = crate::testing::test_app_state().await;
-        let (net_state, _rx) = test_network_state();
+        let (net_state, mut rx) = test_network_state();
+        // Align the local peer id with the config keypair (as in production)
+        // so the farewell tombstone is signed by the identity it claims.
+        let keypair = crate::chat::group::load_or_create_local_keypair(&app_state)
+            .await
+            .expect("keypair");
+        let local_peer_id = libp2p::PeerId::from_public_key(&keypair.public()).to_string();
+        *net_state.local_peer_id.lock().await = Some(local_peer_id.clone());
         let chat_id = crate::chat_kind::generate_temp_group_chat_id();
         {
             let mut temp_state = net_state.temporary_state.lock().await;
@@ -1357,7 +1408,7 @@ mod tests {
                     expires_at: now_unix_secs() + 3600,
                     peer_id: Some(REMOTE_PEER_ID.to_string()),
                     members: vec![
-                        LOCAL_PEER_ID.to_string(),
+                        local_peer_id.clone(),
                         REMOTE_PEER_ID.to_string(),
                         THIRD_MEMBER_ID.to_string(),
                     ],
@@ -1388,6 +1439,27 @@ mod tests {
             .get(&chat_id)
             .is_none());
 
+        // The farewell command must carry the signed remove tombstone for the
+        // local peer so remaining members drop the archiving member even
+        // though the shared libp2p connections stay open.
+        let farewell = loop {
+            match rx.try_recv() {
+                Ok(NetworkCommand::EndTemporarySession {
+                    farewell_winners: Some(winners),
+                    ..
+                }) => break winners,
+                Ok(_) => continue,
+                Err(_) => panic!("no farewell EndTemporarySession command queued"),
+            }
+        };
+        let tombstone = farewell
+            .iter()
+            .find(|op| {
+                op.op == TemporaryMembershipOpKind::Remove && op.target == local_peer_id
+            })
+            .expect("farewell must include the local remove tombstone");
+        assert!(tombstone.verify(), "farewell tombstone must be signed");
+
         let conn = app_state.db_conn.lock().expect("db");
         let mut members: Vec<String> = conn
             .prepare("SELECT peer_id FROM chat_peers WHERE chat_id = ?1")
@@ -1404,7 +1476,7 @@ mod tests {
         expected.push("Me".to_string());
         expected.sort();
         assert_eq!(members, expected);
-        assert!(!members.contains(&LOCAL_PEER_ID.to_string()));
+        assert!(!members.contains(&local_peer_id));
 
         let archived_messages = crate::storage::db::get_messages(&conn, &archived.chat_id)
             .expect("archived history");
@@ -1580,9 +1652,28 @@ mod tests {
         assert!(!leaked, "rollback must leave no partial archive rows");
     }
 
+    fn signed_op(
+        keypair: &libp2p::identity::Keypair,
+        counter: u64,
+        op: TemporaryMembershipOpKind,
+        target: &str,
+    ) -> TemporaryMembershipOp {
+        let mut op = TemporaryMembershipOp {
+            actor: libp2p::PeerId::from_public_key(&keypair.public()).to_string(),
+            counter,
+            op,
+            target: target.to_string(),
+            public_key_b64: String::new(),
+            signature_b64: String::new(),
+        };
+        assert!(op.sign(keypair), "test op must sign");
+        op
+    }
+
     #[test]
     fn temporary_group_roster_removals_converge_with_membership_ops() {
-        let a_peer = REMOTE_PEER_ID.to_string();
+        let a_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let a_peer = libp2p::PeerId::from_public_key(&a_keypair.public()).to_string();
         let b_peer = THIRD_MEMBER_ID.to_string();
         let new_session = || TemporaryChatSession {
             chat_id: "temp-group:550e8400-e29b-41d4-a716-446655440000".to_string(),
@@ -1595,46 +1686,37 @@ mod tests {
             next_member_op_counter: 0,
             archived: false,
         };
-        let stale_add = TemporaryMembershipOp {
-            actor: a_peer.clone(),
-            counter: 1,
-            op: TemporaryMembershipOpKind::Add,
-            target: b_peer.clone(),
-        };
-        let removal = TemporaryMembershipOp {
-            actor: a_peer.clone(),
-            counter: 2,
-            op: TemporaryMembershipOpKind::Remove,
-            target: b_peer.clone(),
-        };
+        let stale_add = signed_op(&a_keypair, 1, TemporaryMembershipOpKind::Add, &b_peer);
+        let removal = signed_op(&a_keypair, 2, TemporaryMembershipOpKind::Remove, &b_peer);
 
         // A adds B, then removes B with a later op.
         let mut session_a = new_session();
-        assert!(session_a.apply_membership_ops(&[stale_add.clone()], &a_peer));
+        assert!(session_a.apply_membership_ops(&[stale_add.clone()]));
         assert!(session_a.is_member(&b_peer));
-        assert!(session_a.apply_membership_ops(&[removal.clone()], &a_peer));
+        assert!(session_a.apply_membership_ops(&[removal.clone()]));
         assert!(!session_a.is_member(&b_peer));
 
         // A stale handshake re-announcing B (union-only merging would
         // resurrect them) must be rejected because the remove is newer.
-        assert!(!session_a.apply_membership_ops(&[stale_add.clone()], &a_peer));
+        assert!(!session_a.apply_membership_ops(&[stale_add.clone()]));
         assert!(!session_a.is_member(&b_peer));
 
         // A peer that only ever saw the stale add converges when it learns the
         // removal, and its reply cannot resurrect B on A either: merging the
         // winner snapshot is last-writer-wins per target.
         let mut session_b = new_session();
-        assert!(session_b.apply_membership_ops(&[stale_add.clone()], &a_peer));
+        assert!(session_b.apply_membership_ops(&[stale_add.clone()]));
         assert!(session_b.is_member(&b_peer));
-        assert!(session_b.apply_membership_ops(&[removal], &a_peer));
+        assert!(session_b.apply_membership_ops(&[removal]));
         assert!(!session_b.is_member(&b_peer));
-        assert!(!session_a.apply_membership_ops(&session_b.membership_winners(), &a_peer));
+        assert!(!session_a.apply_membership_ops(&session_b.membership_winners()));
         assert!(!session_a.is_member(&b_peer));
     }
 
     #[test]
-    fn temporary_group_ops_are_bound_to_authenticated_sender() {
-        let a_peer = REMOTE_PEER_ID.to_string();
+    fn temporary_group_ops_require_valid_signatures() {
+        let a_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let a_peer = libp2p::PeerId::from_public_key(&a_keypair.public()).to_string();
         let mut session = TemporaryChatSession {
             chat_id: "temp-group:550e8400-e29b-41d4-a716-446655440000".to_string(),
             name: "Design Crew".to_string(),
@@ -1646,56 +1728,166 @@ mod tests {
             next_member_op_counter: 0,
             archived: false,
         };
-        // A handshake from `a_peer` that tries to forge an op as the local
-        // peer (a different actor) must be rejected outright, even with a huge
-        // counter that would otherwise win forever.
-        let forged = TemporaryMembershipOp {
-            actor: LOCAL_PEER_ID.to_string(),
-            counter: u64::MAX,
-            op: TemporaryMembershipOpKind::Remove,
-            target: LOCAL_PEER_ID.to_string(),
-        };
-        assert!(
-            !session.apply_membership_ops(&[forged], &a_peer),
-            "ops must be bound to the authenticated sender"
-        );
-        assert!(session.is_member(LOCAL_PEER_ID));
-        assert!(session.membership_winners().is_empty());
 
-        // The same op from its real actor is accepted and wins by Lamport
-        // ordering without any wall-clock involvement.
-        let own_remove = TemporaryMembershipOp {
+        // An unsigned op cannot be applied at all.
+        let unsigned = TemporaryMembershipOp {
             actor: a_peer.clone(),
             counter: 1,
             op: TemporaryMembershipOpKind::Remove,
             target: LOCAL_PEER_ID.to_string(),
+            public_key_b64: String::new(),
+            signature_b64: String::new(),
         };
-        assert!(session.apply_membership_ops(&[own_remove.clone()], &a_peer));
+        assert!(!session.apply_membership_ops(&[unsigned]));
+        assert!(session.is_member(LOCAL_PEER_ID));
+        assert!(session.membership_winners().is_empty());
+
+        // An op claiming to be the local peer but signed by a different key
+        // fails verification (its embedded public key derives to a different
+        // peer id), even with a huge counter that would otherwise win forever.
+        let mut forged = TemporaryMembershipOp {
+            actor: LOCAL_PEER_ID.to_string(),
+            counter: u64::MAX,
+            op: TemporaryMembershipOpKind::Remove,
+            target: LOCAL_PEER_ID.to_string(),
+            public_key_b64: String::new(),
+            signature_b64: String::new(),
+        };
+        assert!(
+            !forged.sign(&a_keypair),
+            "signing with a non-matching keypair must fail"
+        );
+        assert!(!session.apply_membership_ops(&[forged]));
+        assert!(session.is_member(LOCAL_PEER_ID));
+
+        // The same op from its real actor is accepted and wins by Lamport
+        // ordering without any wall-clock involvement.
+        let own_remove = signed_op(&a_keypair, 1, TemporaryMembershipOpKind::Remove, LOCAL_PEER_ID);
+        assert!(session.apply_membership_ops(&[own_remove.clone()]));
         assert!(!session.is_member(LOCAL_PEER_ID));
 
         // A later op for the same target from a different actor beats an
         // earlier one by (counter, actor) comparison — no wall clocks.
         let mut re_add = session.clone();
-        let c_peer = libp2p::identity::Keypair::generate_ed25519()
-            .public()
-            .to_peer_id()
-            .to_string();
-        let add_from_c = TemporaryMembershipOp {
-            actor: c_peer.clone(),
-            counter: 7,
-            op: TemporaryMembershipOpKind::Add,
-            target: LOCAL_PEER_ID.to_string(),
-        };
-        assert!(re_add.apply_membership_ops(&[add_from_c.clone()], &c_peer));
+        let c_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let add_from_c = signed_op(&c_keypair, 7, TemporaryMembershipOpKind::Add, LOCAL_PEER_ID);
+        assert!(re_add.apply_membership_ops(&[add_from_c.clone()]));
         assert!(re_add.is_member(LOCAL_PEER_ID));
         // And a replay of the older op cannot beat it.
-        assert!(!re_add.apply_membership_ops(&[own_remove], &a_peer));
+        assert!(!re_add.apply_membership_ops(&[own_remove]));
         assert!(re_add.is_member(LOCAL_PEER_ID));
     }
 
     #[test]
+    fn temporary_group_forwarded_winners_converge_transitively() {
+        // A signs its operations; B forwards A's winner snapshot to C. C must
+        // accept A's ops even though the immediate sender is B, because the
+        // signatures bind the ops to A, not to whoever delivered them.
+        let a_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let a_peer = libp2p::PeerId::from_public_key(&a_keypair.public()).to_string();
+        let b_peer = THIRD_MEMBER_ID.to_string();
+        let mut a_session = TemporaryChatSession {
+            chat_id: "temp-group:550e8400-e29b-41d4-a716-446655440000".to_string(),
+            name: "Design Crew".to_string(),
+            kind: TemporaryChatKind::Group,
+            expires_at: now_unix_secs() + 3600,
+            peer_id: Some(a_peer.clone()),
+            members: vec![LOCAL_PEER_ID.to_string(), a_peer.clone()],
+            member_op_winners: HashMap::new(),
+            next_member_op_counter: 0,
+            archived: false,
+        };
+        // A removes B and re-adds C in its own session.
+        a_session.apply_membership_ops(&[signed_op(
+            &a_keypair,
+            1,
+            TemporaryMembershipOpKind::Add,
+            &b_peer,
+        )]);
+        a_session.apply_membership_ops(&[signed_op(
+            &a_keypair,
+            2,
+            TemporaryMembershipOpKind::Remove,
+            &b_peer,
+        )]);
+        assert!(!a_session.is_member(&b_peer));
+        let forwarded = a_session.membership_winners();
+        assert!(!forwarded.is_empty());
+
+        // C (a fresh peer) applies the snapshot forwarded by B: every op is
+        // verified against A's embedded public key, so the roster converges
+        // without A ever talking to C directly.
+        let mut c_session = TemporaryChatSession {
+            chat_id: "temp-group:550e8400-e29b-41d4-a716-446655440000".to_string(),
+            name: "Design Crew".to_string(),
+            kind: TemporaryChatKind::Group,
+            expires_at: now_unix_secs() + 3600,
+            peer_id: Some(a_peer.clone()),
+            members: vec![a_peer.clone(), b_peer.clone()],
+            member_op_winners: HashMap::new(),
+            next_member_op_counter: 0,
+            archived: false,
+        };
+        assert!(c_session.apply_membership_ops(&forwarded));
+        assert!(
+            !c_session.is_member(&b_peer),
+            "forwarded removals must converge transitively"
+        );
+    }
+
+    #[test]
+    fn temporary_group_lamport_receive_rule_advances_local_clock() {
+        let a_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let a_peer = libp2p::PeerId::from_public_key(&a_keypair.public()).to_string();
+        let b_peer = THIRD_MEMBER_ID.to_string();
+        let mut session = TemporaryChatSession {
+            chat_id: "temp-group:550e8400-e29b-41d4-a716-446655440000".to_string(),
+            name: "Design Crew".to_string(),
+            kind: TemporaryChatKind::Group,
+            expires_at: now_unix_secs() + 3600,
+            peer_id: Some(a_peer.clone()),
+            members: vec![LOCAL_PEER_ID.to_string(), a_peer.clone(), b_peer.clone()],
+            member_op_winners: HashMap::new(),
+            next_member_op_counter: 0,
+            archived: false,
+        };
+
+        // A high-counter remote remove arrives: the local clock must advance
+        // past it (Lamport receive rule).
+        let remote_remove = signed_op(
+            &a_keypair,
+            1_000,
+            TemporaryMembershipOpKind::Remove,
+            &b_peer,
+        );
+        assert!(session.apply_membership_ops(&[remote_remove.clone()]));
+        assert!(!session.is_member(&b_peer));
+
+        // The reconnecting peer B re-joins: the local add issued now must
+        // carry a counter beyond the received remove, so it wins and B is
+        // back on the roster. Without the Lamport rule the add would lose.
+        let local_keypair = libp2p::identity::Keypair::generate_ed25519();
+        assert!(session.issue_membership_op(
+            &libp2p::PeerId::from_public_key(&local_keypair.public()).to_string(),
+            TemporaryMembershipOpKind::Add,
+            &b_peer,
+            Some(&local_keypair),
+        ));
+        assert!(session.is_member(&b_peer));
+        let winner = session
+            .member_op_winners
+            .get(&b_peer)
+            .expect("winner recorded");
+        assert!(
+            winner.counter > remote_remove.counter,
+            "causally-later local op must supersede the remote remove"
+        );
+    }
+
+    #[test]
     fn temporary_group_winners_snapshot_survives_op_churn_without_trimming() {
-        let a_peer = REMOTE_PEER_ID.to_string();
+        let a_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let a_peer = libp2p::PeerId::from_public_key(&a_keypair.public()).to_string();
         let mut session = TemporaryChatSession {
             chat_id: "temp-group:550e8400-e29b-41d4-a716-446655440000".to_string(),
             name: "Design Crew".to_string(),
@@ -1713,20 +1905,20 @@ mod tests {
         // trimmed) so a fresh peer can reconstruct the roster.
         let mut last_remove = None;
         for round in 0..(crate::app_state::TEMP_GROUP_MAX_MEMBERSHIP_OPS + 100) {
-            let add = TemporaryMembershipOp {
-                actor: a_peer.clone(),
-                counter: (round * 2) as u64 + 1,
-                op: TemporaryMembershipOpKind::Add,
-                target: LOCAL_PEER_ID.to_string(),
-            };
-            let remove = TemporaryMembershipOp {
-                actor: a_peer.clone(),
-                counter: (round * 2) as u64 + 2,
-                op: TemporaryMembershipOpKind::Remove,
-                target: LOCAL_PEER_ID.to_string(),
-            };
-            session.apply_membership_ops(&[add], &a_peer);
-            session.apply_membership_ops(&[remove.clone()], &a_peer);
+            let add = signed_op(
+                &a_keypair,
+                (round * 2) as u64 + 1,
+                TemporaryMembershipOpKind::Add,
+                LOCAL_PEER_ID,
+            );
+            let remove = signed_op(
+                &a_keypair,
+                (round * 2) as u64 + 2,
+                TemporaryMembershipOpKind::Remove,
+                LOCAL_PEER_ID,
+            );
+            session.apply_membership_ops(&[add]);
+            session.apply_membership_ops(&[remove.clone()]);
             last_remove = Some(remove);
         }
 
@@ -1754,21 +1946,17 @@ mod tests {
             next_member_op_counter: 0,
             archived: false,
         };
-        assert!(fresh.apply_membership_ops(&winners, &a_peer));
+        assert!(fresh.apply_membership_ops(&winners));
         assert!(!fresh.is_member(LOCAL_PEER_ID));
-        let stale_add = TemporaryMembershipOp {
-            actor: a_peer.clone(),
-            counter: 1,
-            op: TemporaryMembershipOpKind::Add,
-            target: LOCAL_PEER_ID.to_string(),
-        };
-        assert!(!fresh.apply_membership_ops(&[stale_add], &a_peer));
+        let stale_add = signed_op(&a_keypair, 1, TemporaryMembershipOpKind::Add, LOCAL_PEER_ID);
+        assert!(!fresh.apply_membership_ops(&[stale_add]));
         assert!(!fresh.is_member(LOCAL_PEER_ID));
     }
 
     #[test]
     fn temporary_group_winners_missing_from_detects_stale_snapshots() {
-        let a_peer = REMOTE_PEER_ID.to_string();
+        let a_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let a_peer = libp2p::PeerId::from_public_key(&a_keypair.public()).to_string();
         let b_peer = THIRD_MEMBER_ID.to_string();
         let mut session = TemporaryChatSession {
             chat_id: "temp-group:550e8400-e29b-41d4-a716-446655440000".to_string(),
@@ -1781,23 +1969,18 @@ mod tests {
             next_member_op_counter: 0,
             archived: false,
         };
-        let add_b = TemporaryMembershipOp {
-            actor: a_peer.clone(),
-            counter: 1,
-            op: TemporaryMembershipOpKind::Add,
-            target: b_peer.clone(),
-        };
-        session.apply_membership_ops(&[add_b.clone()], &a_peer);
+        let add_b = signed_op(&a_keypair, 1, TemporaryMembershipOpKind::Add, &b_peer);
+        session.apply_membership_ops(&[add_b.clone()]);
 
         // The sender's snapshot lacks B entirely: our winner is missing.
         assert!(session.winners_missing_from(&[]));
         // The sender holds a stale add for B: our winner is newer.
-        assert!(session.winners_missing_from(&[TemporaryMembershipOp {
-            actor: a_peer.clone(),
-            counter: 0,
-            op: TemporaryMembershipOpKind::Add,
-            target: b_peer.clone(),
-        }]));
+        assert!(session.winners_missing_from(&[signed_op(
+            &a_keypair,
+            0,
+            TemporaryMembershipOpKind::Add,
+            &b_peer,
+        )]));
         // The sender is fully up to date: nothing missing.
         assert!(!session.winners_missing_from(&session.membership_winners()));
     }
@@ -1823,6 +2006,7 @@ mod tests {
             REMOTE_PEER_ID,
             TemporaryMembershipOpKind::Add,
             "not-a-peer-id",
+            None,
         ));
 
         // Fill up to the cap with valid peer ids.

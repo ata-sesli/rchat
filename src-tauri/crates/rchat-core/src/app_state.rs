@@ -1,6 +1,7 @@
 use crate::network::command::NetworkCommand;
 use crate::storage::config::ConfigManager;
 use crate::storage::db::Message;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -76,13 +77,13 @@ pub const TEMP_GROUP_MAX_MEMBERSHIP_OPS: usize = 256;
 
 /// A single ordered membership operation for a temporary group.
 ///
-/// Ops are bound to the actor that issued them (a libp2p peer id) and carry a
-/// Lamport-style counter that is strictly increasing per actor. The winner for
-/// a target is the op with the greatest `(counter, actor)` pair, compared
-/// lexicographically — a deterministic total order with no wall-clock skew —
-/// so a removal issued later than an add wins regardless of arrival order and
-/// rosters converge group-wide instead of union-only merging resurrecting
-/// removed members.
+/// Ops are bound to the actor that issued them (a libp2p peer id), carry a
+/// Lamport-style counter that is strictly increasing per actor, and are signed
+/// by the actor's keypair. The winner for a target is the op with the greatest
+/// `(counter, actor)` pair, compared lexicographically — a deterministic total
+/// order with no wall-clock skew — so a removal issued later than an add wins
+/// regardless of arrival order and rosters converge group-wide instead of
+/// union-only merging resurrecting removed members.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TemporaryMembershipOpKind {
@@ -96,6 +97,80 @@ pub struct TemporaryMembershipOp {
     pub counter: u64,
     pub op: TemporaryMembershipOpKind,
     pub target: String,
+    /// Base64 protobuf public key of the actor, used to verify `signature_b64`.
+    #[serde(default)]
+    pub public_key_b64: String,
+    /// Base64 signature by the actor over the canonical serialization of
+    /// `(actor, counter, op, target)`. Signed ops are self-authenticating, so
+    /// they can be forwarded by any member and verified on receipt.
+    #[serde(default)]
+    pub signature_b64: String,
+}
+
+/// The fields a membership op signs, serialized canonically so `sign` and
+/// `verify` always agree on the exact bytes.
+#[derive(Debug, serde::Serialize)]
+struct TemporaryMembershipOpSigningPayload<'a> {
+    actor: &'a str,
+    counter: u64,
+    op: &'a TemporaryMembershipOpKind,
+    target: &'a str,
+}
+
+impl TemporaryMembershipOp {
+    /// Sign this operation with `keypair`, embedding the actor's public key so
+    /// receivers can verify it without prior knowledge of the actor. Returns
+    /// `false` when the actor does not match the keypair or signing fails.
+    pub fn sign(&mut self, keypair: &libp2p::identity::Keypair) -> bool {
+        if libp2p::PeerId::from_public_key(&keypair.public()).to_string() != self.actor {
+            return false;
+        }
+        let Ok(canonical) = serde_json::to_vec(&TemporaryMembershipOpSigningPayload {
+            actor: &self.actor,
+            counter: self.counter,
+            op: &self.op,
+            target: &self.target,
+        }) else {
+            return false;
+        };
+        let Ok(signature) = keypair.sign(&canonical) else {
+            return false;
+        };
+        self.public_key_b64 = BASE64.encode(keypair.public().encode_protobuf());
+        self.signature_b64 = BASE64.encode(signature);
+        true
+    }
+
+    /// Verify the signature over this operation. The embedded public key must
+    /// derive exactly to `actor`, and the signature must match the canonical
+    /// serialization of the op fields. Unsigned (legacy) ops fail verification.
+    pub fn verify(&self) -> bool {
+        if self.public_key_b64.is_empty() || self.signature_b64.is_empty() {
+            return false;
+        }
+        let Ok(public_key_bytes) = BASE64.decode(&self.public_key_b64) else {
+            return false;
+        };
+        let Ok(signature) = BASE64.decode(&self.signature_b64) else {
+            return false;
+        };
+        let Ok(public_key) = libp2p::identity::PublicKey::try_decode_protobuf(&public_key_bytes)
+        else {
+            return false;
+        };
+        if libp2p::PeerId::from_public_key(&public_key).to_string() != self.actor {
+            return false;
+        }
+        let Ok(canonical) = serde_json::to_vec(&TemporaryMembershipOpSigningPayload {
+            actor: &self.actor,
+            counter: self.counter,
+            op: &self.op,
+            target: &self.target,
+        }) else {
+            return false;
+        };
+        public_key.verify(&canonical, &signature)
+    }
 }
 
 fn is_valid_temp_group_member(peer_id: &str) -> bool {
@@ -147,43 +222,49 @@ impl TemporaryChatSession {
     /// Issue a membership operation on behalf of `actor` (the local peer) and
     /// apply it locally. The counter is a strictly increasing Lamport counter
     /// for that actor, so locally issued ops always win over any earlier op
-    /// from the same actor. Returns `true` when the roster changed.
+    /// from the same actor. When a `signer` keypair is provided (and matches
+    /// `actor`), the op is signed so it can be forwarded by any member and
+    /// verified on receipt. Returns `true` when the roster changed.
     pub fn issue_membership_op(
         &mut self,
         actor: &str,
         op: TemporaryMembershipOpKind,
         target: &str,
+        signer: Option<&libp2p::identity::Keypair>,
     ) -> bool {
         if !is_valid_temp_group_member(actor) || !is_valid_temp_group_member(target) {
             return false;
         }
         self.next_member_op_counter += 1;
-        self.apply_membership_op(TemporaryMembershipOp {
+        let mut op = TemporaryMembershipOp {
             actor: actor.to_string(),
             counter: self.next_member_op_counter,
             op,
             target: target.to_string(),
-        })
+            public_key_b64: String::new(),
+            signature_b64: String::new(),
+        };
+        if let Some(keypair) = signer {
+            op.sign(keypair);
+        }
+        self.apply_membership_op(op)
     }
 
-    /// Apply membership ops received from `authenticated_sender`.
+    /// Apply membership ops received from a handshake or broadcast.
     ///
-    /// Every op must be bound to the peer that actually sent it: ops whose
-    /// `actor` does not match `authenticated_sender` are rejected outright, so
-    /// a participant cannot forge operations as another member or inflate
-    /// counters under someone else's identity. The winner for a target is the
-    /// op with the greatest `(counter, actor)` pair, so stale adds cannot
-    /// resurrect a member that a newer remove already evicted. Returns `true`
-    /// when the roster changed.
-    pub fn apply_membership_ops(
-        &mut self,
-        ops: &[TemporaryMembershipOp],
-        authenticated_sender: &str,
-    ) -> bool {
+    /// Every op must be self-authenticating: only ops whose signature verifies
+    /// against the embedded public key (which must derive exactly to the op's
+    /// actor) are accepted. Because verification binds the op to its real
+    /// author rather than the peer that delivered it, verified ops can be
+    /// forwarded by any member and still converge transitively (A → B → C),
+    /// while a participant still cannot forge operations as another member.
+    /// The winner for a target is the op with the greatest `(counter, actor)`
+    /// pair, so stale adds cannot resurrect a member that a newer remove
+    /// already evicted. Returns `true` when the roster changed.
+    pub fn apply_membership_ops(&mut self, ops: &[TemporaryMembershipOp]) -> bool {
         let mut changed = false;
         for op in ops {
-            // Bind every received operation to its authenticated sender.
-            if op.actor != authenticated_sender {
+            if !op.verify() {
                 continue;
             }
             changed |= self.apply_membership_op(op.clone());
@@ -209,6 +290,10 @@ impl TemporaryChatSession {
             // their authoritative winner.
             return false;
         }
+        // Lamport receive rule: advance the local clock past any accepted
+        // remote operation, so a causally-later local operation issued from
+        // this point supersedes it.
+        self.next_member_op_counter = self.next_member_op_counter.max(op.counter);
         self.member_op_winners.insert(op.target.clone(), op.clone());
         match op.op {
             TemporaryMembershipOpKind::Add => self.add_member(&op.target),

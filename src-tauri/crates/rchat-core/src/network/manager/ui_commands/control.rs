@@ -42,12 +42,21 @@ impl NetworkManager {
         }
     }
 
-    pub(super) async fn end_temporary_session(&mut self, chat_id: &str) {
-        // Group-scoped exit: broadcast our membership log (including any
-        // remove tombstones issued by leave) so remaining members drop us,
-        // without ever closing the peer's shared libp2p connections.
+    pub(super) async fn end_temporary_session(
+        &mut self,
+        chat_id: &str,
+        farewell_winners: Option<Vec<crate::app_state::TemporaryMembershipOp>>,
+    ) {
+        // Group-scoped exit: broadcast the farewell roster (including any
+        // remove tombstones issued by leave or archive) so remaining members
+        // drop us, without ever closing the peer's shared libp2p connections.
+        // The archive path passes the winners explicitly because it removes
+        // the session before queueing this command; the leave path leaves the
+        // session in place and reads the current roster from it.
         let network_state = self.network_state.clone();
-        let is_group = {
+        let is_group = if farewell_winners.is_some() {
+            true
+        } else {
             let temp_state = network_state.temporary_state.lock().await;
             temp_state
                 .chats
@@ -61,7 +70,10 @@ impl NetworkManager {
                 .unwrap_or(false)
         };
         if is_group {
-            self.broadcast_temp_group_roster(chat_id, None).await;
+            match farewell_winners {
+                Some(winners) => self.broadcast_temp_group_winners(chat_id, winners, None).await,
+                None => self.broadcast_temp_group_roster(chat_id, None).await,
+            }
         }
         {
             let mut temp_state = network_state.temporary_state.lock().await;

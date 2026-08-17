@@ -364,17 +364,45 @@ async fn send_stored_media(
         if matches!(chat_kind, ChatKind::TemporaryGroup) {
             temporary::validate_temp_group_session(net_state, &canonical_chat_id).await?;
         }
-        // In-memory sends enqueue before storing so a closed command channel
-        // cannot leave a phantom `delivered` message that retrying would
-        // duplicate.
-        dispatch_stored_media(net_state, chat_kind, &canonical_chat_id, &media, &msg_id, timestamp)
-            .await?;
-        let mut temp_state = net_state.temporary_state.lock().await;
-        temp_state
-            .messages
-            .entry(db_chat_id.clone())
-            .or_default()
-            .push(message);
+        // Reserve a slot in the live history UNDER THE LOCK and before any
+        // network dispatch: an archiving session is rejected here (before the
+        // remote peer can receive the media), and if the dispatch fails the
+        // pending message is rolled back so a closed command channel cannot
+        // leave a phantom `delivered` message that retrying would duplicate.
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            let session_ok = temp_state
+                .chats
+                .get(&canonical_chat_id)
+                .map(|session| !session.archived)
+                .unwrap_or(false);
+            if !session_ok {
+                return Err(anyhow!(
+                    "Temporary chat is being archived: {chat_id}"
+                ));
+            }
+            temp_state
+                .messages
+                .entry(db_chat_id.clone())
+                .or_default()
+                .push(message.clone());
+        }
+        if let Err(error) = dispatch_stored_media(
+            net_state,
+            chat_kind,
+            &canonical_chat_id,
+            &media,
+            &msg_id,
+            timestamp,
+        )
+        .await
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            if let Some(messages) = temp_state.messages.get_mut(&db_chat_id) {
+                messages.retain(|stored| stored.id != msg_id);
+            }
+            return Err(error);
+        }
     } else {
         // Durable sends persist before dispatch so a late database failure
         // cannot deliver a message that is missing from local history. The

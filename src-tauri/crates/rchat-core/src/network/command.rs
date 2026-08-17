@@ -35,6 +35,12 @@ pub enum NetworkCommand {
     },
     EndTemporarySession {
         chat_id: String,
+        /// Signed membership winners to broadcast as the farewell roster.
+        /// `None` for the plain leave path (the session still exists, so the
+        /// handler reads the roster from it); `Some` for the archive path,
+        /// where the caller removes the session and the handler must not
+        /// depend on state that no longer exists.
+        farewell_winners: Option<Vec<crate::app_state::TemporaryMembershipOp>>,
     },
     SubscribeGroup {
         group_id: String,

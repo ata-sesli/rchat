@@ -268,9 +268,13 @@ impl NetworkManager {
                 if let Some(chat_id) = self.remove_temporary_by_peer_id(&peer_id_str) {
                     // Update the in-memory session roster so presence is
                     // derived from the member set: the dropped peer leaves the
-                    // roster via a remove tombstone (so the removal converges
-                    // group-wide), and the group only ends when the last
-                    // member disconnects.
+                    // roster via a remove tombstone signed by the local peer
+                    // (so the removal converges group-wide), and the group
+                    // only ends when the last member disconnects.
+                    let signer =
+                        crate::chat::group::load_or_create_local_keypair(&self.app_state)
+                            .await
+                            .ok();
                     {
                         let network_state = &self.network_state;
                         let mut temp_state = network_state.temporary_state.lock().await;
@@ -280,6 +284,7 @@ impl NetworkManager {
                                     &self.swarm.local_peer_id().to_string(),
                                     crate::app_state::TemporaryMembershipOpKind::Remove,
                                     &peer_id_str,
+                                    signer.as_ref(),
                                 );
                             }
                         }
