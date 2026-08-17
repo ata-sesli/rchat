@@ -594,10 +594,10 @@ impl NetworkManager {
         let Some(handshake_text) = request.text_content.clone() else {
             return;
         };
-        let (chat_id, announced_members) = match serde_json::from_str::<
+        let (chat_id, announced_ops) = match serde_json::from_str::<
             crate::network::gossip::TemporaryHandshakePayload,
         >(&handshake_text) {
-            Ok(payload) => (payload.chat_id, payload.members),
+            Ok(payload) => (payload.chat_id, payload.ops),
             // Older peers send a bare chat id; treat it as a roster-less join.
             Err(_) => (handshake_text, Vec::new()),
         };
@@ -617,25 +617,22 @@ impl NetworkManager {
             let mut temp_state = network_state.temporary_state.lock().await;
             if let Some(session) = temp_state.chats.get_mut(&chat_id) {
                 if is_group {
-                    let mut sender_known: std::collections::HashSet<String> =
-                        announced_members.iter().cloned().collect();
-                    sender_known.insert(peer_id_str.clone());
-                    for member in announced_members {
-                        if session.add_member(&member) {
-                            roster_changed = true;
-                        }
+                    // Merge the sender's ordered membership ops (adds and
+                    // remove tombstones). Last-writer-wins per target keeps
+                    // removals convergent even when peers hold stale rosters.
+                    roster_changed = session.apply_membership_ops(&announced_ops);
+                    // The sender itself is a member by virtue of dialing us;
+                    // record it with a fresh add op so it is part of the log.
+                    if !session.is_member(&peer_id_str) {
+                        roster_changed |= session.issue_membership_op(
+                            &self.swarm.local_peer_id().to_string(),
+                            crate::app_state::TemporaryMembershipOpKind::Add,
+                            &peer_id_str,
+                        );
                     }
-                    if session.add_member(&peer_id_str) {
-                        roster_changed = true;
-                    }
-                    // Tell the sender about members they haven't announced yet
-                    // (e.g. peers that joined while they were away), but only
-                    // when that is actually new information so handshakes do
-                    // not ping-pong forever.
-                    respond_to_sender = session
-                        .members
-                        .iter()
-                        .any(|member| !sender_known.contains(member));
+                    // Bring the sender up to date when its op log is stale
+                    // (e.g. it reconnected after other members joined).
+                    respond_to_sender = session.has_ops_missing_from(&announced_ops);
                 }
                 if !is_group {
                     session.peer_id = Some(peer_id_str.clone());
@@ -663,24 +660,28 @@ impl NetworkManager {
                         .unwrap_or(120),
                     peer_id: Some(peer_id_str.clone()),
                     members: Vec::new(),
+                    member_ops: Vec::new(),
+                    member_op_winners: std::collections::HashMap::new(),
+                    next_member_op_seq: 0,
                     archived: false,
                 };
                 if is_group {
-                    // Seed the roster with the local peer plus everything the
-                    // sender announced, then the sender itself.
+                    // Seed the local peer, apply the sender's ops, then record
+                    // the sender itself.
                     session.add_member(&self.swarm.local_peer_id().to_string());
-                    for member in announced_members {
-                        session.add_member(&member);
-                    }
-                    session.add_member(&peer_id_str);
-                    roster_changed = true;
+                    roster_changed = session.apply_membership_ops(&announced_ops);
+                    roster_changed |= session.issue_membership_op(
+                        &self.swarm.local_peer_id().to_string(),
+                        crate::app_state::TemporaryMembershipOpKind::Add,
+                        &peer_id_str,
+                    );
                     respond_to_sender = true;
                 }
                 temp_state.chats.insert(chat_id.clone(), session);
             }
         }
 
-        // Respond with our roster so the sender learns about the other
+        // Respond with our op log so the sender learns about the other
         // members of the group, and push roster growth to every other
         // connected member so join/leave/disconnect membership stays
         // consistent group-wide. Both are gated on new information so the
@@ -700,22 +701,22 @@ impl NetworkManager {
         ));
     }
 
-    /// Send a `TempHandshake` to `peer` carrying the current member roster of
-    /// `chat_id` so both sides converge on the same member set.
+    /// Send a `TempHandshake` to `peer` carrying the current membership-op
+    /// log of `chat_id` so both sides converge on the same member set.
     pub(crate) async fn send_temp_handshake_to(&mut self, peer: &PeerId, chat_id: &str) {
         use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
-        let members = {
+        let ops = {
             let network_state = &self.network_state;
             let temp_state = network_state.temporary_state.lock().await;
             temp_state
                 .chats
                 .get(chat_id)
-                .map(|session| session.members.clone())
+                .map(|session| session.member_ops.clone())
                 .unwrap_or_default()
         };
         let payload = crate::network::gossip::TemporaryHandshakePayload {
             chat_id: chat_id.to_string(),
-            members,
+            ops,
         };
         let text_content =
             serde_json::to_string(&payload).unwrap_or_else(|_| chat_id.to_string());

@@ -1364,6 +1364,9 @@ mod tests {
                     expires_at: now_unix_secs() + 3600,
                     peer_id: Some(REMOTE_PEER_ID.to_string()),
                     members: Vec::new(),
+                    member_ops: Vec::new(),
+                    member_op_winners: std::collections::HashMap::new(),
+                    next_member_op_seq: 0,
                     archived: false,
                 },
             );

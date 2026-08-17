@@ -641,6 +641,7 @@ pub fn detect_audio_mime_from_bytes(data: &[u8]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn now_unix_secs() -> u64 {
         std::time::SystemTime::now()
@@ -711,6 +712,9 @@ mod tests {
                     expires_at: now_unix_secs() + 3600,
                     peer_id: Some("12D3KooWAKrRudfV7S7XK418Jg4c8SvCkcnjwjhoATAQ1J6NAw86".to_string()),
                     members: Vec::new(),
+                    member_ops: Vec::new(),
+                    member_op_winners: HashMap::new(),
+                    next_member_op_seq: 0,
                     archived: false,
                 },
             );
@@ -772,6 +776,9 @@ mod tests {
                     expires_at: now_unix_secs() + 3600,
                     peer_id: Some("12D3KooWAKrRudfV7S7XK418Jg4c8SvCkcnjwjhoATAQ1J6NAw86".to_string()),
                     members: Vec::new(),
+                    member_ops: Vec::new(),
+                    member_op_winners: HashMap::new(),
+                    next_member_op_seq: 0,
                     archived: false,
                 },
             );

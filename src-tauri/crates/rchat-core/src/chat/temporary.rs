@@ -1,6 +1,6 @@
 use crate::app_state::{
     ActiveTemporaryInvite, AppState, NetworkState, TemporaryChatKind, TemporaryChatSession,
-    TemporaryInvitePayload,
+    TemporaryInvitePayload, TemporaryMembershipOpKind,
 };
 use crate::network::{
     command::NetworkCommand,
@@ -10,6 +10,7 @@ use crate::storage::db::Message;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 
 pub const TEMP_INVITE_SCHEME_PREFIX: &str = "rchat://temp/";
@@ -121,6 +122,9 @@ pub async fn create_temporary_invite(
                 expires_at,
                 peer_id: None,
                 members: local_membership,
+                member_ops: Vec::new(),
+                member_op_winners: HashMap::new(),
+                next_member_op_seq: 0,
                 archived: false,
             },
         );
@@ -266,6 +270,9 @@ pub async fn redeem_temporary_invite(
             expires_at,
             peer_id: Some(payload.inviter_peer_id.clone()),
             members: seeded_members.clone(),
+            member_ops: Vec::new(),
+            member_op_winners: HashMap::new(),
+            next_member_op_seq: 0,
             archived: false,
         });
     entry.name = resolved_name.clone();
@@ -468,25 +475,31 @@ pub async fn temporary_group_remote_members(
 
 /// Leave a temporary-group session locally.
 ///
-/// Removes the session (and its in-memory history), clears the active invite
-/// if it points at this chat, tells the network manager to end the temporary
-/// session (unsubscribe + drop routing), and drops the connections to every
-/// remote member so their own membership updates consistently.
+/// Records a remove tombstone for the local peer, clears the active invite if
+/// it points at this chat, and tells the network manager to end the temporary
+/// session. The manager broadcasts the updated membership log to the other
+/// members and then removes the session; leaving is group-scoped, so shared
+/// libp2p connections to the other members are never closed.
 pub async fn leave_temporary_group(
     net_state: &NetworkState,
     chat_id: &str,
 ) -> Result<()> {
     validate_temp_group_session(net_state, chat_id).await?;
 
-    let remote_members = {
-        let local_peer_id = net_state.local_peer_id.lock().await.clone();
+    let local_peer_id = net_state.local_peer_id.lock().await.clone();
+    {
         let mut temp_state = net_state.temporary_state.lock().await;
         let session = temp_state
             .chats
-            .get(chat_id)
-            .cloned()
+            .get_mut(chat_id)
             .ok_or_else(|| anyhow!("Temporary group chat not found: {chat_id}"))?;
-        let remote = session.remote_members(local_peer_id.as_deref());
+        if let Some(local) = local_peer_id.as_deref() {
+            session.issue_membership_op(
+                local,
+                TemporaryMembershipOpKind::Remove,
+                local,
+            );
+        }
         if temp_state
             .active_invite
             .as_ref()
@@ -495,10 +508,7 @@ pub async fn leave_temporary_group(
         {
             temp_state.active_invite = None;
         }
-        temp_state.chats.remove(chat_id);
-        temp_state.messages.remove(chat_id);
-        remote
-    };
+    }
 
     let tx = net_state.sender.lock().await;
     tx.send(NetworkCommand::EndTemporarySession {
@@ -506,18 +516,16 @@ pub async fn leave_temporary_group(
     })
     .await
     .map_err(|error| anyhow!("network command channel is closed: {error}"))?;
-    for member in remote_members {
-        let _ = tx
-            .send(NetworkCommand::DropConnection { peer_id: member })
-            .await;
-    }
     Ok(())
 }
 
 /// Archive a temporary chat (direct or group) into the durable database.
 ///
-/// Preserves the complete member roster of temporary-group sessions as chat
-/// members so the archive is a faithful copy of the conversation.
+/// Persists the archive inside one transaction first and only removes the
+/// live in-memory session after the commit succeeds, so a write failure rolls
+/// back and preserves the conversation. The complete member roster of group
+/// sessions is preserved as chat members, with the resolved local peer id
+/// excluded so the archive never stores duplicate local identities.
 pub async fn archive_temporary_chat(
     app_state: &AppState,
     net_state: &NetworkState,
@@ -530,8 +538,10 @@ pub async fn archive_temporary_chat(
     let now = now_unix_secs() as i64;
     let archive_chat_id = format!("archived:{}:{}", chat_id, now);
 
+    // Snapshot the live session without touching it yet; the archive only
+    // removes it after the transaction commits.
     let (session, messages) = {
-        let mut temp_state = net_state.temporary_state.lock().await;
+        let temp_state = net_state.temporary_state.lock().await;
         let Some(session) = temp_state.chats.get(chat_id).cloned() else {
             return Err(anyhow!("Temporary chat not found"));
         };
@@ -543,36 +553,40 @@ pub async fn archive_temporary_chat(
         if messages.is_empty() {
             return Err(anyhow!("No temporary messages to archive"));
         }
-        temp_state.chats.remove(chat_id);
-        temp_state.messages.remove(chat_id);
         (session, messages)
     };
 
+    let local_peer_id = net_state.local_peer_id.lock().await.clone();
+    // Resolve the roster so the local identity is stored exactly once: the
+    // literal "Me" row plus every remote member (never the local peer id).
+    let remote_members = session.remote_members(local_peer_id.as_deref());
+
     {
-        let conn = app_state
+        let mut conn = app_state
             .db_conn
             .lock()
             .map_err(|error| anyhow!("database lock failed: {error}"))?;
+        let tx = conn
+            .transaction()
+            .map_err(|error| anyhow!("failed to begin archive transaction: {error}"))?;
 
-        if conn
+        if tx
             .query_row("SELECT 1 FROM envelopes WHERE id = 'archived'", [], |_| Ok(()))
             .is_err()
         {
-            crate::storage::db::create_envelope(&conn, "archived", "Archived", None)?;
+            crate::storage::db::create_envelope(&tx, "archived", "Archived", None)?;
         }
 
         let archived_is_group = matches!(session.kind, TemporaryChatKind::Group);
-        crate::storage::db::create_chat(&conn, &archive_chat_id, &session.name, archived_is_group)?;
-        let _ = crate::storage::db::add_chat_member(&conn, &archive_chat_id, "Me", "member");
-        // Preserve the complete member roster of group sessions.
-        for member in &session.members {
-            if member == "Me" {
-                continue;
+        crate::storage::db::create_chat(&tx, &archive_chat_id, &session.name, archived_is_group)?;
+        let _ = crate::storage::db::add_chat_member(&tx, &archive_chat_id, "Me", "member");
+        // Preserve the complete member roster of group sessions, excluding
+        // the resolved local peer id (already represented by "Me").
+        for member in &remote_members {
+            if !crate::storage::db::is_peer(&tx, member) {
+                let _ = crate::storage::db::add_peer(&tx, member, None, None, "archived");
             }
-            if !crate::storage::db::is_peer(&conn, member) {
-                let _ = crate::storage::db::add_peer(&conn, member, None, None, "archived");
-            }
-            let _ = crate::storage::db::add_chat_member(&conn, &archive_chat_id, member, "member");
+            let _ = crate::storage::db::add_chat_member(&tx, &archive_chat_id, member, "member");
         }
 
         for (idx, mut msg) in messages.into_iter().enumerate() {
@@ -580,12 +594,12 @@ pub async fn archive_temporary_chat(
             msg.chat_id = archive_chat_id.clone();
             msg.status = "read".to_string();
 
-            if msg.peer_id != "Me" && !crate::storage::db::is_peer(&conn, &msg.peer_id) {
-                let _ = crate::storage::db::add_peer(&conn, &msg.peer_id, None, None, "archived");
+            if msg.peer_id != "Me" && !crate::storage::db::is_peer(&tx, &msg.peer_id) {
+                let _ = crate::storage::db::add_peer(&tx, &msg.peer_id, None, None, "archived");
             }
 
             if let Some(file_hash) = &msg.file_hash {
-                let file_exists: bool = conn
+                let file_exists: bool = tx
                     .query_row(
                         "SELECT 1 FROM files WHERE file_hash = ?1",
                         [file_hash],
@@ -602,10 +616,20 @@ pub async fn archive_temporary_chat(
                 }
             }
 
-            crate::storage::db::insert_message(&conn, &msg)?;
+            crate::storage::db::insert_message(&tx, &msg)?;
         }
 
-        crate::storage::db::assign_chat_to_envelope(&conn, &archive_chat_id, Some("archived"))?;
+        crate::storage::db::assign_chat_to_envelope(&tx, &archive_chat_id, Some("archived"))?;
+        tx.commit()
+            .map_err(|error| anyhow!("failed to commit archive transaction: {error}"))?;
+    }
+
+    // The archive is durable; only now remove the live session. On any write
+    // failure above, the transaction rolled back and the session survived.
+    {
+        let mut temp_state = net_state.temporary_state.lock().await;
+        temp_state.chats.remove(chat_id);
+        temp_state.messages.remove(chat_id);
     }
 
     let tx = net_state.sender.lock().await;
@@ -709,7 +733,8 @@ async fn resolve_current_public_address(net_state: &NetworkState) -> Result<Stri
 mod tests {
     use super::*;
     use crate::app_state::{
-        BroadcastState, ChatConnectionRuntime, TemporaryRuntimeState, VoiceCallState,
+        BroadcastState, ChatConnectionRuntime, TemporaryMembershipOp, TemporaryRuntimeState,
+        VoiceCallState,
     };
     use crate::storage::config::{ConfigManager, ConnectivitySettings};
     use std::collections::{HashMap, HashSet};
@@ -1053,6 +1078,9 @@ mod tests {
                     REMOTE_PEER_ID.to_string(),
                     "12D3KooWHT5qT2qfE9L4q9v4mD4VqQwZgTnNqYp9rXm7kQjY3bWx1".to_string(),
                 ],
+                member_ops: Vec::new(),
+                member_op_winners: HashMap::new(),
+                next_member_op_seq: 0,
                 archived,
             },
         );
@@ -1142,7 +1170,7 @@ mod tests {
         }
     }
 
-    const THIRD_MEMBER_ID: &str = "12D3KooWHT5qT2qfE9L4q9v4mD4VqQwZgTnNqYp9rXm7kQjY3bWx1";
+    const THIRD_MEMBER_ID: &str = "12D3KooWS2ErH2fC6AB7jZ8V8vmu6jgoP711oD5QV3vA4MbGV3RM";
 
     #[tokio::test]
     async fn temporary_group_remote_members_excludes_local_without_duplicates() {
@@ -1158,6 +1186,9 @@ mod tests {
                 expires_at: now_unix_secs() + 3600,
                 peer_id: Some(REMOTE_PEER_ID.to_string()),
                 members: vec![LOCAL_PEER_ID.to_string()],
+                member_ops: Vec::new(),
+                member_op_winners: HashMap::new(),
+                next_member_op_seq: 0,
                 archived: false,
             };
             // Add remote members twice: the roster must dedupe.
@@ -1190,6 +1221,9 @@ mod tests {
             expires_at: now_unix_secs() + 3600,
             peer_id: Some(REMOTE_PEER_ID.to_string()),
             members: vec![LOCAL_PEER_ID.to_string(), REMOTE_PEER_ID.to_string()],
+            member_ops: Vec::new(),
+            member_op_winners: HashMap::new(),
+            next_member_op_seq: 0,
             archived: false,
         };
 
@@ -1231,7 +1265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leave_temporary_group_removes_session_and_drops_member_connections() {
+    async fn leave_temporary_group_records_tombstone_without_dropping_connections() {
         let (_temp, _app_state) = test_app_state().await;
         let (net_state, mut rx) = test_network_state();
         let chat_id = crate::chat_kind::generate_temp_group_chat_id();
@@ -1239,20 +1273,21 @@ mod tests {
 
         leave_temporary_group(&net_state, &chat_id).await.expect("leave");
 
-        assert!(net_state
+        // The session is retained for the manager to clean up, but now carries
+        // a remove tombstone for the local peer so the exit propagates
+        // group-wide instead of closing shared transport connections.
+        let session = net_state
             .temporary_state
             .lock()
             .await
             .chats
             .get(&chat_id)
-            .is_none());
-        assert!(net_state
-            .temporary_state
-            .lock()
-            .await
-            .messages
-            .get(&chat_id)
-            .is_none());
+            .cloned()
+            .expect("session retained for manager cleanup");
+        assert!(session.member_ops.iter().any(|op| {
+            op.op == TemporaryMembershipOpKind::Remove && op.target == LOCAL_PEER_ID
+        }));
+        assert!(!session.is_member(LOCAL_PEER_ID));
 
         let mut commands = Vec::new();
         while let Ok(command) = rx.try_recv() {
@@ -1262,17 +1297,12 @@ mod tests {
             commands.first(),
             Some(NetworkCommand::EndTemporarySession { .. })
         ));
-        let drops: Vec<&String> = commands
-            .iter()
-            .filter_map(|command| match command {
-                NetworkCommand::DropConnection { peer_id } => Some(peer_id),
-                _ => None,
-            })
-            .collect();
-        // One drop per remote member (the local peer is not a target).
-        assert_eq!(drops.len(), 2);
-        assert!(drops.iter().any(|peer| *peer == REMOTE_PEER_ID));
-        assert!(drops.iter().any(|peer| *peer == THIRD_MEMBER_ID));
+        assert!(
+            commands
+                .iter()
+                .all(|command| !matches!(command, NetworkCommand::DropConnection { .. })),
+            "leaving a group must not drop the peer's shared libp2p connections"
+        );
     }
 
     #[tokio::test]
@@ -1295,6 +1325,9 @@ mod tests {
                         REMOTE_PEER_ID.to_string(),
                         THIRD_MEMBER_ID.to_string(),
                     ],
+                    member_ops: Vec::new(),
+                    member_op_winners: HashMap::new(),
+                    next_member_op_seq: 0,
                     archived: false,
                 },
             );
@@ -1330,16 +1363,168 @@ mod tests {
             .expect("rows");
         members.sort();
 
-        let mut expected = vec![LOCAL_PEER_ID.to_string(), REMOTE_PEER_ID.to_string()];
-        expected.push(THIRD_MEMBER_ID.to_string());
+        // The archive stores the literal "Me" plus every remote member; the
+        // resolved local peer id is excluded so identities are not duplicated.
+        let mut expected = vec![REMOTE_PEER_ID.to_string(), THIRD_MEMBER_ID.to_string()];
         expected.push("Me".to_string());
         expected.sort();
         assert_eq!(members, expected);
+        assert!(!members.contains(&LOCAL_PEER_ID.to_string()));
 
         let archived_messages = crate::storage::db::get_messages(&conn, &archived.chat_id)
             .expect("archived history");
         assert_eq!(archived_messages.len(), 2);
         assert!(archived_messages.iter().all(|message| message.status == "read"));
+    }
+
+    #[tokio::test]
+    async fn archive_failure_preserves_live_session() {
+        let (_temp, app_state) = crate::testing::test_app_state().await;
+        let (net_state, _rx) = test_network_state();
+        let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            temp_state.chats.insert(
+                chat_id.clone(),
+                TemporaryChatSession {
+                    chat_id: chat_id.clone(),
+                    name: "Design Crew".to_string(),
+                    kind: TemporaryChatKind::Group,
+                    expires_at: now_unix_secs() + 3600,
+                    peer_id: Some(REMOTE_PEER_ID.to_string()),
+                    members: vec![LOCAL_PEER_ID.to_string(), REMOTE_PEER_ID.to_string()],
+                    member_ops: Vec::new(),
+                    member_op_winners: HashMap::new(),
+                    next_member_op_seq: 0,
+                    archived: false,
+                },
+            );
+            temp_state.messages.insert(
+                chat_id.clone(),
+                vec![
+                    temp_group_message(&chat_id, "m1", "hello"),
+                    temp_group_message(&chat_id, "m2", "world"),
+                ],
+            );
+        }
+        // Break the database so the archive transaction fails mid-write.
+        {
+            let conn = app_state.db_conn.lock().expect("db");
+            conn.execute("DROP TABLE messages", [])
+                .expect("drop messages table");
+        }
+
+        let result = archive_temporary_chat(&app_state, &net_state, &chat_id).await;
+
+        assert!(result.is_err(), "archive must fail when persistence fails");
+        let temp_state = net_state.temporary_state.lock().await;
+        assert!(
+            temp_state.chats.contains_key(&chat_id),
+            "rollback must preserve the live session"
+        );
+        assert_eq!(
+            temp_state.messages.get(&chat_id).map(|messages| messages.len()),
+            Some(2),
+            "rollback must preserve the live history"
+        );
+    }
+
+    #[test]
+    fn temporary_group_roster_removals_converge_with_membership_ops() {
+        let a_peer = REMOTE_PEER_ID.to_string();
+        let b_peer = THIRD_MEMBER_ID.to_string();
+        let new_session = || TemporaryChatSession {
+            chat_id: "temp-group:550e8400-e29b-41d4-a716-446655440000".to_string(),
+            name: "Design Crew".to_string(),
+            kind: TemporaryChatKind::Group,
+            expires_at: now_unix_secs() + 3600,
+            peer_id: Some(a_peer.clone()),
+            members: vec![LOCAL_PEER_ID.to_string(), a_peer.clone()],
+            member_ops: Vec::new(),
+            member_op_winners: HashMap::new(),
+            next_member_op_seq: 0,
+            archived: false,
+        };
+        let stale_add = TemporaryMembershipOp {
+            issuer: a_peer.clone(),
+            seq: 1,
+            op: TemporaryMembershipOpKind::Add,
+            target: b_peer.clone(),
+        };
+        let removal = TemporaryMembershipOp {
+            issuer: a_peer.clone(),
+            seq: 2,
+            op: TemporaryMembershipOpKind::Remove,
+            target: b_peer.clone(),
+        };
+
+        // A adds B, then removes B with a later op.
+        let mut session_a = new_session();
+        assert!(session_a.apply_membership_ops(&[stale_add.clone()]));
+        assert!(session_a.is_member(&b_peer));
+        assert!(session_a.apply_membership_ops(&[removal.clone()]));
+        assert!(!session_a.is_member(&b_peer));
+
+        // A stale handshake re-announcing B (union-only merging would
+        // resurrect them) must be rejected because the remove is newer.
+        assert!(!session_a.apply_membership_ops(&[stale_add.clone()]));
+        assert!(!session_a.is_member(&b_peer));
+
+        // A peer that only ever saw the stale add converges when it learns the
+        // removal, and its reply cannot resurrect B on A either.
+        let mut session_b = new_session();
+        assert!(session_b.apply_membership_ops(&[stale_add.clone()]));
+        assert!(session_b.is_member(&b_peer));
+        assert!(session_b.apply_membership_ops(&[removal]));
+        assert!(!session_b.is_member(&b_peer));
+        assert!(!session_a.apply_membership_ops(&session_b.member_ops));
+        assert!(!session_a.is_member(&b_peer));
+    }
+
+    #[test]
+    fn temporary_group_members_reject_invalid_entries_and_enforce_cap() {
+        let mut session = TemporaryChatSession {
+            chat_id: "temp-group:550e8400-e29b-41d4-a716-446655440000".to_string(),
+            name: "Design Crew".to_string(),
+            kind: TemporaryChatKind::Group,
+            expires_at: now_unix_secs() + 3600,
+            peer_id: Some(REMOTE_PEER_ID.to_string()),
+            members: vec![LOCAL_PEER_ID.to_string()],
+            member_ops: Vec::new(),
+            member_op_winners: HashMap::new(),
+            next_member_op_seq: 0,
+            archived: false,
+        };
+
+        // Invalid entries are rejected outright.
+        assert!(!session.add_member("not-a-peer-id"));
+        assert!(!session.add_member(""));
+        assert!(!session.issue_membership_op(
+            REMOTE_PEER_ID,
+            TemporaryMembershipOpKind::Add,
+            "not-a-peer-id",
+        ));
+
+        // Fill up to the cap with valid peer ids.
+        while session.members.len() < crate::app_state::TEMP_GROUP_MAX_MEMBERS {
+            let peer = libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id()
+                .to_string();
+            assert!(session.add_member(&peer));
+        }
+        let extra = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_string();
+        assert!(
+            !session.add_member(&extra),
+            "roster must be bounded at the member cap"
+        );
+        assert_eq!(
+            session.members.len(),
+            crate::app_state::TEMP_GROUP_MAX_MEMBERS
+        );
     }
 
 }

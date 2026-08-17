@@ -47,8 +47,54 @@ pub struct TemporaryChatSession {
     /// peer id. Empty for temporary direct chats.
     #[serde(default)]
     pub members: Vec<String>,
+    /// Ordered, bounded membership-op log used to converge rosters across
+    /// peers (adds and remove tombstones).
+    #[serde(default)]
+    pub member_ops: Vec<TemporaryMembershipOp>,
+    /// Per-target winner of the membership-op merge: target -> (seq, issuer).
+    #[serde(default)]
+    pub member_op_winners: HashMap<String, (u64, String)>,
+    /// Next local membership-op sequence number (strictly increasing).
+    #[serde(default)]
+    pub next_member_op_seq: u64,
     #[serde(default)]
     pub archived: bool,
+}
+
+/// Hard cap on the number of members a temporary group tracks. Handshake-
+/// provided entries are validated and bounded so a participant cannot inflate
+/// rosters, handshake payloads, routing fan-out, or archived peer rows.
+pub const TEMP_GROUP_MAX_MEMBERS: usize = 64;
+
+/// Upper bound on the propagated membership-op log of a temporary-group
+/// session. Old ops may be trimmed from the log, but the per-target winner
+/// map keeps the applied state authoritative.
+pub const TEMP_GROUP_MAX_MEMBERSHIP_OPS: usize = 256;
+
+/// A single ordered membership operation for a temporary group.
+///
+/// Ops carry a wall-clock sequence number that is strictly increasing per
+/// issuer, so a removal issued later than an add wins regardless of arrival
+/// order. Merging is last-writer-wins per target (ties broken by issuer id),
+/// which makes rosters converge group-wide instead of union-only merging
+/// resurrecting removed members.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporaryMembershipOpKind {
+    Add,
+    Remove,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct TemporaryMembershipOp {
+    pub issuer: String,
+    pub seq: u64,
+    pub op: TemporaryMembershipOpKind,
+    pub target: String,
+}
+
+fn is_valid_temp_group_member(peer_id: &str) -> bool {
+    peer_id == "Me" || peer_id.parse::<libp2p::PeerId>().is_ok()
 }
 
 impl TemporaryChatSession {
@@ -57,9 +103,16 @@ impl TemporaryChatSession {
         self.members.iter().any(|member| member == peer_id)
     }
 
-    /// Add a member to the roster. Returns `true` when the roster changed.
+    /// Add a member to the roster. Rejects invalid peer ids and enforces the
+    /// roster cap. Returns `true` when the roster changed.
     pub fn add_member(&mut self, peer_id: &str) -> bool {
+        if !is_valid_temp_group_member(peer_id) {
+            return false;
+        }
         if self.is_member(peer_id) {
+            return false;
+        }
+        if self.members.len() >= TEMP_GROUP_MAX_MEMBERS {
             return false;
         }
         self.members.push(peer_id.to_string());
@@ -84,6 +137,79 @@ impl TemporaryChatSession {
             })
             .cloned()
             .collect()
+    }
+
+    /// Issue a membership operation on behalf of `issuer` and apply it
+    /// locally. Returns `true` when the roster changed.
+    pub fn issue_membership_op(
+        &mut self,
+        issuer: &str,
+        op: TemporaryMembershipOpKind,
+        target: &str,
+    ) -> bool {
+        if !is_valid_temp_group_member(issuer) || !is_valid_temp_group_member(target) {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let seq = now.max(self.next_member_op_seq + 1);
+        self.next_member_op_seq = seq;
+        self.apply_membership_op(TemporaryMembershipOp {
+            issuer: issuer.to_string(),
+            seq,
+            op,
+            target: target.to_string(),
+        })
+    }
+
+    /// Apply incoming membership ops (from a handshake or broadcast). Ops are
+    /// last-writer-wins per target by `(seq, issuer)`, so stale adds cannot
+    /// resurrect a member that a newer remove already evicted. Returns `true`
+    /// when the roster changed.
+    pub fn apply_membership_ops(&mut self, ops: &[TemporaryMembershipOp]) -> bool {
+        let mut changed = false;
+        for op in ops {
+            changed |= self.apply_membership_op(op.clone());
+        }
+        changed
+    }
+
+    fn apply_membership_op(&mut self, op: TemporaryMembershipOp) -> bool {
+        if !is_valid_temp_group_member(&op.issuer) || !is_valid_temp_group_member(&op.target) {
+            return false;
+        }
+        let winner = self
+            .member_op_winners
+            .entry(op.target.clone())
+            .or_insert((0, String::new()));
+        if op.seq < winner.0 || (op.seq == winner.0 && op.issuer <= winner.1) {
+            return false;
+        }
+        winner.0 = op.seq;
+        winner.1 = op.issuer.clone();
+        let changed = match op.op {
+            TemporaryMembershipOpKind::Add => self.add_member(&op.target),
+            TemporaryMembershipOpKind::Remove => self.remove_member(&op.target),
+        };
+        self.member_ops.push(op);
+        if self.member_ops.len() > TEMP_GROUP_MAX_MEMBERSHIP_OPS {
+            self.member_ops
+                .drain(0..self.member_ops.len() - TEMP_GROUP_MAX_MEMBERSHIP_OPS);
+        }
+        changed
+    }
+
+    /// Whether this session knows a membership op the `other` ops do not
+    /// (compared by issuer + sequence). Drives the handshake response so a
+    /// reconnecting member with a stale log is brought up to date.
+    pub fn has_ops_missing_from(&self, other: &[TemporaryMembershipOp]) -> bool {
+        self.member_ops.iter().any(|op| {
+            !other
+                .iter()
+                .any(|candidate| candidate.issuer == op.issuer && candidate.seq == op.seq)
+        })
     }
 }
 

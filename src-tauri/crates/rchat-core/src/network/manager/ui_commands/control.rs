@@ -42,7 +42,32 @@ impl NetworkManager {
         }
     }
 
-    pub(super) fn end_temporary_session(&mut self, chat_id: &str) {
+    pub(super) async fn end_temporary_session(&mut self, chat_id: &str) {
+        // Group-scoped exit: broadcast our membership log (including any
+        // remove tombstones issued by leave) so remaining members drop us,
+        // without ever closing the peer's shared libp2p connections.
+        let network_state = self.network_state.clone();
+        let is_group = {
+            let temp_state = network_state.temporary_state.lock().await;
+            temp_state
+                .chats
+                .get(chat_id)
+                .map(|session| {
+                    matches!(
+                        session.kind,
+                        crate::app_state::TemporaryChatKind::Group
+                    )
+                })
+                .unwrap_or(false)
+        };
+        if is_group {
+            self.broadcast_temp_group_roster(chat_id, None).await;
+        }
+        {
+            let mut temp_state = network_state.temporary_state.lock().await;
+            temp_state.chats.remove(chat_id);
+            temp_state.messages.remove(chat_id);
+        }
         self.remove_temporary_by_chat_id(chat_id);
         self.remove_punch_target(chat_id);
         self.unsubscribe_group(chat_id);

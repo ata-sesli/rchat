@@ -33,7 +33,7 @@ impl NetworkManager {
                 self.register_temporary_session(&chat_id, &peer_id, &multiaddr, is_group);
             }
             NetworkCommand::EndTemporarySession { chat_id } => {
-                self.end_temporary_session(&chat_id);
+                self.end_temporary_session(&chat_id).await;
             }
             NetworkCommand::SubscribeGroup { group_id } => self.subscribe_group(&group_id),
             NetworkCommand::UnsubscribeGroup { group_id } => self.unsubscribe_group(&group_id),
