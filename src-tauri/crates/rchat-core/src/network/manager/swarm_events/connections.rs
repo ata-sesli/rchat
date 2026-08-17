@@ -121,33 +121,7 @@ impl NetworkManager {
         }
 
         if let Some(chat_id) = self.temp_chat_by_peer_id.get(&peer_id_str).cloned() {
-            use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
-            let handshake = DirectMessageRequest {
-                id: format!(
-                    "temp-handshake-{}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs()
-                ),
-                sender_id: self.swarm.local_peer_id().to_string(),
-                msg_type: DirectMessageKind::TempHandshake,
-                text_content: Some(chat_id.clone()),
-                file_hash: None,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64,
-                chunk_hash: None,
-                chunk_data: None,
-                chunk_list: None,
-                sender_alias: None,
-            };
-
-            self.swarm
-                .behaviour_mut()
-                .direct_message
-                .send_request(&peer_id, handshake);
+            self.send_temp_handshake_to(&peer_id, &chat_id).await;
 
             self.emit(CoreEvent::TemporaryChatConnected(
                 crate::events::TemporaryChatConnectedEvent {
@@ -292,6 +266,23 @@ impl NetworkManager {
                 self.unmark_connected_chat_id(&peer_id_str).await;
                 self.note_chat_connection_closed(&peer_id_str).await;
                 if let Some(chat_id) = self.remove_temporary_by_peer_id(&peer_id_str) {
+                    // Update the in-memory session roster so presence is
+                    // derived from the member set: the dropped peer leaves the
+                    // roster, and the group only ends when the last member
+                    // disconnects.
+                    {
+                        let network_state = &self.network_state;
+                        let mut temp_state = network_state.temporary_state.lock().await;
+                        if let Some(session) = temp_state.chats.get_mut(&chat_id) {
+                            session.remove_member(&peer_id_str);
+                        }
+                    }
+                    if self.has_connected_temp_members(&chat_id) {
+                        // Other members remain connected; keep the session
+                        // alive and push the updated roster to them.
+                        self.broadcast_temp_group_roster(&chat_id, None).await;
+                        return;
+                    }
                     self.unmark_connected_chat_id(&chat_id).await;
                     self.note_chat_connection_closed(&chat_id).await;
                     self.emit(CoreEvent::TemporaryChatEnded(

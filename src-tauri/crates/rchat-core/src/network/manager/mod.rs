@@ -504,8 +504,8 @@ pub struct NetworkManager {
     peer_id_by_github: HashMap<String, String>,
     // Reverse lookup cache: PeerId string -> GitHub username
     github_by_peer_id: HashMap<String, String>,
-    // Temporary chat routing cache: temp chat id -> peer id
-    temp_peer_by_chat_id: HashMap<String, String>,
+    // Temporary chat routing cache: temp chat id -> connected member peer ids
+    temp_peer_by_chat_id: HashMap<String, HashSet<String>>,
     // Reverse temporary routing cache: peer id -> temp chat id
     temp_chat_by_peer_id: HashMap<String, String>,
     // Connection transport capability registry per peer.
@@ -1241,8 +1241,12 @@ impl NetworkManager {
         context: &str,
     ) -> Option<PeerId> {
         let actual_peer_id_str =
-            if let Some(mapped_peer_id) = self.temp_peer_by_chat_id.get(target_peer_id) {
-                mapped_peer_id.clone()
+            if let Some(connected_members) = self.temp_peer_by_chat_id.get(target_peer_id) {
+                connected_members
+                    .iter()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| target_peer_id.to_string())
             } else if target_peer_id.starts_with("gh:") || target_peer_id.starts_with("lh:") {
                 if let Some(peer_id_string) =
                     crate::chat_identity::resolve_peer_id_for_direct_chat_id(target_peer_id)
@@ -1316,21 +1320,50 @@ impl NetworkManager {
 
     pub(super) fn cache_temporary_mapping(&mut self, chat_id: &str, peer_id: &str) {
         self.temp_peer_by_chat_id
-            .insert(chat_id.to_string(), peer_id.to_string());
+            .entry(chat_id.to_string())
+            .or_default()
+            .insert(peer_id.to_string());
         self.temp_chat_by_peer_id
             .insert(peer_id.to_string(), chat_id.to_string());
     }
 
     pub(super) fn remove_temporary_by_chat_id(&mut self, chat_id: &str) {
-        if let Some(peer_id) = self.temp_peer_by_chat_id.remove(chat_id) {
-            self.temp_chat_by_peer_id.remove(&peer_id);
+        if let Some(peers) = self.temp_peer_by_chat_id.remove(chat_id) {
+            for peer in peers {
+                self.temp_chat_by_peer_id.remove(&peer);
+            }
         }
     }
 
+    /// Remove one member from the temporary routing caches. Returns the chat
+    /// id the peer belonged to, or `None` when the peer was never tracked.
     pub(super) fn remove_temporary_by_peer_id(&mut self, peer_id: &str) -> Option<String> {
         let chat_id = self.temp_chat_by_peer_id.remove(peer_id)?;
-        self.temp_peer_by_chat_id.remove(&chat_id);
+        if let Some(peers) = self.temp_peer_by_chat_id.get_mut(&chat_id) {
+            peers.remove(peer_id);
+            if peers.is_empty() {
+                self.temp_peer_by_chat_id.remove(&chat_id);
+            }
+        }
         Some(chat_id)
+    }
+
+    /// Whether any member of a temporary chat still has a live connection.
+    pub(super) fn has_connected_temp_members(&self, chat_id: &str) -> bool {
+        self.temp_peer_by_chat_id
+            .get(chat_id)
+            .map(|peers| !peers.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Currently connected member peer ids of a temporary chat.
+    pub(super) fn connected_temp_members(&self, chat_id: &str) -> Vec<PeerId> {
+        self.temp_peer_by_chat_id
+            .get(chat_id)
+            .into_iter()
+            .flat_map(|peers| peers.iter())
+            .filter_map(|peer| peer.parse::<PeerId>().ok())
+            .collect()
     }
 
     pub(super) fn emit_connected_chat_ids_updated(&self) {

@@ -1363,6 +1363,7 @@ mod tests {
                     kind: rchat_core::app_state::TemporaryChatKind::Group,
                     expires_at: now_unix_secs() + 3600,
                     peer_id: Some(REMOTE_PEER_ID.to_string()),
+                    members: Vec::new(),
                     archived: false,
                 },
             );

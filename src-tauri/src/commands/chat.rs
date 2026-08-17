@@ -827,97 +827,12 @@ pub async fn save_temporary_chat_to_archive(
     state: State<'_, AppState>,
     net_state: State<'_, NetworkState>,
 ) -> Result<ArchivedChatResult, String> {
-    if !chat_kind::is_temporary_chat_id(&chat_id) {
-        return Err("Only temporary chats can be archived".to_string());
-    }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let archive_chat_id = format!("archived:{}:{}", chat_id, now);
-
-    let (session, messages) = {
-        let mut temp_state = net_state.temporary_state.lock().await;
-        let Some(session) = temp_state.chats.get(&chat_id).cloned() else {
-            return Err("Temporary chat not found".to_string());
-        };
-        let messages = temp_state
-            .messages
-            .get(&chat_id)
-            .cloned()
-            .unwrap_or_default();
-        if messages.is_empty() {
-            return Err("No temporary messages to archive".to_string());
-        }
-        temp_state.chats.remove(&chat_id);
-        temp_state.messages.remove(&chat_id);
-        (session, messages)
-    };
-
-    {
-        let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
-
-        if conn
-            .query_row("SELECT 1 FROM envelopes WHERE id = 'archived'", [], |_| {
-                Ok(())
-            })
-            .is_err()
-        {
-            storage::db::create_envelope(&conn, "archived", "Archived", None)
-                .map_err(|e| e.to_string())?;
-        }
-
-        let archived_is_group = matches!(session.kind, crate::app_state::TemporaryChatKind::Group);
-        storage::db::create_chat(&conn, &archive_chat_id, &session.name, archived_is_group)
+    let archived =
+        crate::chat::temporary::archive_temporary_chat(&state, &net_state, &chat_id)
+            .await
             .map_err(|e| e.to_string())?;
-        let _ = storage::db::add_chat_member(&conn, &archive_chat_id, "Me", "member");
-
-        for (idx, mut msg) in messages.into_iter().enumerate() {
-            msg.id = format!("{}-{}", msg.id, idx);
-            msg.chat_id = archive_chat_id.clone();
-            msg.status = "read".to_string();
-
-            if msg.peer_id != "Me" && !storage::db::is_peer(&conn, &msg.peer_id) {
-                let _ = storage::db::add_peer(&conn, &msg.peer_id, None, None, "archived");
-            }
-
-            if let Some(file_hash) = &msg.file_hash {
-                let file_exists: bool = conn
-                    .query_row(
-                        "SELECT 1 FROM files WHERE file_hash = ?1",
-                        [file_hash],
-                        |_| Ok(true),
-                    )
-                    .unwrap_or(false);
-                if !file_exists {
-                    msg.text_content = Some(
-                        msg.text_content
-                            .clone()
-                            .unwrap_or_else(|| "Media unavailable".to_string()),
-                    );
-                    msg.file_hash = None;
-                }
-            }
-
-            storage::db::insert_message(&conn, &msg).map_err(|e| e.to_string())?;
-        }
-
-        storage::db::assign_chat_to_envelope(&conn, &archive_chat_id, Some("archived"))
-            .map_err(|e| e.to_string())?;
-    }
-
-    {
-        let tx = net_state.sender.lock().await;
-        let _ = tx
-            .send(NetworkCommand::EndTemporarySession {
-                chat_id: chat_id.clone(),
-            })
-            .await;
-    }
-
     Ok(ArchivedChatResult {
-        chat_id: archive_chat_id,
-        name: session.name,
+        chat_id: archived.chat_id,
+        name: archived.name,
     })
 }

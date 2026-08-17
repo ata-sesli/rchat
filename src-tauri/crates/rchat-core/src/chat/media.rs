@@ -268,18 +268,23 @@ pub async fn retry_direct_attachment_fetch(
             "durable group attachment retry is not supported in rchat-tui yet"
         )),
         ChatKind::TemporaryGroup => {
-            let session =
-                temporary::validate_temp_group_session(net_state, &canonical_chat_id).await?;
-            let target_peer_id = session
-                .peer_id
-                .ok_or_else(|| anyhow!("temporary group peer is not connected yet"))?;
+            // Retry against every eligible remote member so any peer that
+            // holds the file can answer; the roster dedupes, so each member
+            // is targeted at most once.
+            let members =
+                temporary::temporary_group_remote_members(net_state, &canonical_chat_id).await?;
+            if members.is_empty() {
+                return Err(anyhow!("temporary group has no eligible remote members"));
+            }
             let tx = net_state.sender.lock().await;
-            tx.send(NetworkCommand::RequestDirectFileMetadata {
-                target_peer_id,
-                file_hash: file_hash.to_string(),
-            })
-            .await
-            .map_err(|error| anyhow!("network command channel is closed: {error}"))?;
+            for target_peer_id in members {
+                tx.send(NetworkCommand::RequestDirectFileMetadata {
+                    target_peer_id,
+                    file_hash: file_hash.to_string(),
+                })
+                .await
+                .map_err(|error| anyhow!("network command channel is closed: {error}"))?;
+            }
             Ok(())
         }
         ChatKind::Archived => Err(anyhow!("archived chats are read-only")),
@@ -705,6 +710,7 @@ mod tests {
                     kind: TemporaryChatKind::Group,
                     expires_at: now_unix_secs() + 3600,
                     peer_id: Some("12D3KooWAKrRudfV7S7XK418Jg4c8SvCkcnjwjhoATAQ1J6NAw86".to_string()),
+                    members: Vec::new(),
                     archived: false,
                 },
             );
@@ -765,6 +771,7 @@ mod tests {
                     kind: TemporaryChatKind::Group,
                     expires_at: now_unix_secs() + 3600,
                     peer_id: Some("12D3KooWAKrRudfV7S7XK418Jg4c8SvCkcnjwjhoATAQ1J6NAw86".to_string()),
+                    members: Vec::new(),
                     archived: false,
                 },
             );

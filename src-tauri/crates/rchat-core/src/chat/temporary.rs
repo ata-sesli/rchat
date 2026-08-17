@@ -86,6 +86,13 @@ pub async fn create_temporary_invite(
 
     let created_at = now_unix_secs();
     let expires_at = created_at + TEMP_INVITE_TTL_SECS;
+    // The inviter is the local member of a temporary group; seed the roster
+    // with the local peer id so membership is tracked explicitly from birth.
+    let local_membership = if matches!(kind, TemporaryChatKind::Group) {
+        vec![inviter_peer_id.clone()]
+    } else {
+        Vec::new()
+    };
     let payload = TemporaryInvitePayload {
         version: TEMP_INVITE_VERSION,
         kind: kind.clone(),
@@ -113,6 +120,7 @@ pub async fn create_temporary_invite(
                 kind,
                 expires_at,
                 peer_id: None,
+                members: local_membership,
                 archived: false,
             },
         );
@@ -150,6 +158,7 @@ pub async fn get_active_temporary_invite(
 }
 
 pub async fn cancel_temporary_invite(net_state: &NetworkState) -> Result<()> {
+    let local_peer_id = net_state.local_peer_id.lock().await.clone();
     let mut temp_state = net_state.temporary_state.lock().await;
     if let Some(active) = temp_state.active_invite.take() {
         if let Some(session) = temp_state.chats.get(&active.payload.chat_id).cloned() {
@@ -158,7 +167,15 @@ pub async fn cancel_temporary_invite(net_state: &NetworkState) -> Result<()> {
                 .get(&active.payload.chat_id)
                 .map(|messages| !messages.is_empty())
                 .unwrap_or(false);
-            if session.peer_id.is_none() && !has_messages {
+            // An empty session only ever contains the inviter themselves (a
+            // temporary group's local member); anything more means the chat
+            // has real history or remote members and must be preserved.
+            let only_local = session.peer_id.is_none()
+                && session
+                    .members
+                    .iter()
+                    .all(|member| Some(member.as_str()) == local_peer_id.as_deref());
+            if only_local && !has_messages {
                 temp_state.chats.remove(&active.payload.chat_id);
                 temp_state.messages.remove(&active.payload.chat_id);
             }
@@ -184,6 +201,15 @@ pub async fn redeem_temporary_invite(
     if payload.expires_at <= now {
         return Err(anyhow!("Temporary invite has expired"));
     }
+
+    // Read the local peer id before locking the temporary state so the lock
+    // order stays local_peer_id -> temporary_state everywhere.
+    let local_peer_id = net_state
+        .local_peer_id
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| "Me".to_string());
 
     let mut temp_state = net_state.temporary_state.lock().await;
     let Some(local_active) = temp_state.active_invite.clone() else {
@@ -213,6 +239,17 @@ pub async fn redeem_temporary_invite(
     } else {
         crate::chat_kind::default_temp_direct_name(&resolved_chat_id)
     };
+    // A redeemer joins the group as a member alongside the inviter; the local
+    // peer id seeds the roster so local and remote members are both explicit.
+    let seeded_members = if is_group {
+        let mut members = vec![local_peer_id];
+        if !members.contains(&payload.inviter_peer_id) {
+            members.push(payload.inviter_peer_id.clone());
+        }
+        members
+    } else {
+        Vec::new()
+    };
 
     if local_active.payload.chat_id != resolved_chat_id {
         temp_state.chats.remove(&local_active.payload.chat_id);
@@ -228,12 +265,18 @@ pub async fn redeem_temporary_invite(
             kind: payload.kind.clone(),
             expires_at,
             peer_id: Some(payload.inviter_peer_id.clone()),
+            members: seeded_members.clone(),
             archived: false,
         });
     entry.name = resolved_name.clone();
     entry.kind = payload.kind.clone();
     entry.expires_at = expires_at;
     entry.peer_id = Some(payload.inviter_peer_id.clone());
+    if is_group {
+        for member in seeded_members {
+            entry.add_member(&member);
+        }
+    }
     entry.archived = false;
     temp_state
         .messages
@@ -406,6 +449,182 @@ pub(crate) async fn validate_temp_group_session(
         return Err(anyhow!("Temporary group chat has expired: {chat_id}"));
     }
     Ok(session)
+}
+
+/// Remote member peer ids of a validated temporary-group session, excluding
+/// the local peer id.
+///
+/// Per-peer requests (file metadata retries, direct handshakes) fan out to
+/// every member returned here so routing targets all eligible remote members
+/// without duplicates.
+pub async fn temporary_group_remote_members(
+    net_state: &NetworkState,
+    chat_id: &str,
+) -> Result<Vec<String>> {
+    let session = validate_temp_group_session(net_state, chat_id).await?;
+    let local_peer_id = net_state.local_peer_id.lock().await.clone();
+    Ok(session.remote_members(local_peer_id.as_deref()))
+}
+
+/// Leave a temporary-group session locally.
+///
+/// Removes the session (and its in-memory history), clears the active invite
+/// if it points at this chat, tells the network manager to end the temporary
+/// session (unsubscribe + drop routing), and drops the connections to every
+/// remote member so their own membership updates consistently.
+pub async fn leave_temporary_group(
+    net_state: &NetworkState,
+    chat_id: &str,
+) -> Result<()> {
+    validate_temp_group_session(net_state, chat_id).await?;
+
+    let remote_members = {
+        let local_peer_id = net_state.local_peer_id.lock().await.clone();
+        let mut temp_state = net_state.temporary_state.lock().await;
+        let session = temp_state
+            .chats
+            .get(chat_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Temporary group chat not found: {chat_id}"))?;
+        let remote = session.remote_members(local_peer_id.as_deref());
+        if temp_state
+            .active_invite
+            .as_ref()
+            .map(|active| active.payload.chat_id == chat_id)
+            .unwrap_or(false)
+        {
+            temp_state.active_invite = None;
+        }
+        temp_state.chats.remove(chat_id);
+        temp_state.messages.remove(chat_id);
+        remote
+    };
+
+    let tx = net_state.sender.lock().await;
+    tx.send(NetworkCommand::EndTemporarySession {
+        chat_id: chat_id.to_string(),
+    })
+    .await
+    .map_err(|error| anyhow!("network command channel is closed: {error}"))?;
+    for member in remote_members {
+        let _ = tx
+            .send(NetworkCommand::DropConnection { peer_id: member })
+            .await;
+    }
+    Ok(())
+}
+
+/// Archive a temporary chat (direct or group) into the durable database.
+///
+/// Preserves the complete member roster of temporary-group sessions as chat
+/// members so the archive is a faithful copy of the conversation.
+pub async fn archive_temporary_chat(
+    app_state: &AppState,
+    net_state: &NetworkState,
+    chat_id: &str,
+) -> Result<ArchivedTemporaryChat> {
+    if !crate::chat_kind::is_temporary_chat_id(chat_id) {
+        return Err(anyhow!("Only temporary chats can be archived"));
+    }
+
+    let now = now_unix_secs() as i64;
+    let archive_chat_id = format!("archived:{}:{}", chat_id, now);
+
+    let (session, messages) = {
+        let mut temp_state = net_state.temporary_state.lock().await;
+        let Some(session) = temp_state.chats.get(chat_id).cloned() else {
+            return Err(anyhow!("Temporary chat not found"));
+        };
+        let messages = temp_state
+            .messages
+            .get(chat_id)
+            .cloned()
+            .unwrap_or_default();
+        if messages.is_empty() {
+            return Err(anyhow!("No temporary messages to archive"));
+        }
+        temp_state.chats.remove(chat_id);
+        temp_state.messages.remove(chat_id);
+        (session, messages)
+    };
+
+    {
+        let conn = app_state
+            .db_conn
+            .lock()
+            .map_err(|error| anyhow!("database lock failed: {error}"))?;
+
+        if conn
+            .query_row("SELECT 1 FROM envelopes WHERE id = 'archived'", [], |_| Ok(()))
+            .is_err()
+        {
+            crate::storage::db::create_envelope(&conn, "archived", "Archived", None)?;
+        }
+
+        let archived_is_group = matches!(session.kind, TemporaryChatKind::Group);
+        crate::storage::db::create_chat(&conn, &archive_chat_id, &session.name, archived_is_group)?;
+        let _ = crate::storage::db::add_chat_member(&conn, &archive_chat_id, "Me", "member");
+        // Preserve the complete member roster of group sessions.
+        for member in &session.members {
+            if member == "Me" {
+                continue;
+            }
+            if !crate::storage::db::is_peer(&conn, member) {
+                let _ = crate::storage::db::add_peer(&conn, member, None, None, "archived");
+            }
+            let _ = crate::storage::db::add_chat_member(&conn, &archive_chat_id, member, "member");
+        }
+
+        for (idx, mut msg) in messages.into_iter().enumerate() {
+            msg.id = format!("{}-{}", msg.id, idx);
+            msg.chat_id = archive_chat_id.clone();
+            msg.status = "read".to_string();
+
+            if msg.peer_id != "Me" && !crate::storage::db::is_peer(&conn, &msg.peer_id) {
+                let _ = crate::storage::db::add_peer(&conn, &msg.peer_id, None, None, "archived");
+            }
+
+            if let Some(file_hash) = &msg.file_hash {
+                let file_exists: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM files WHERE file_hash = ?1",
+                        [file_hash],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+                if !file_exists {
+                    msg.text_content = Some(
+                        msg.text_content
+                            .clone()
+                            .unwrap_or_else(|| "Media unavailable".to_string()),
+                    );
+                    msg.file_hash = None;
+                }
+            }
+
+            crate::storage::db::insert_message(&conn, &msg)?;
+        }
+
+        crate::storage::db::assign_chat_to_envelope(&conn, &archive_chat_id, Some("archived"))?;
+    }
+
+    let tx = net_state.sender.lock().await;
+    let _ = tx
+        .send(NetworkCommand::EndTemporarySession {
+            chat_id: chat_id.to_string(),
+        })
+        .await;
+
+    Ok(ArchivedTemporaryChat {
+        chat_id: archive_chat_id,
+        name: session.name,
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ArchivedTemporaryChat {
+    pub chat_id: String,
+    pub name: String,
 }
 
 fn now_unix_secs() -> u64 {
@@ -829,6 +1048,11 @@ mod tests {
                 kind: TemporaryChatKind::Group,
                 expires_at,
                 peer_id: Some(REMOTE_PEER_ID.to_string()),
+                members: vec![
+                    LOCAL_PEER_ID.to_string(),
+                    REMOTE_PEER_ID.to_string(),
+                    "12D3KooWHT5qT2qfE9L4q9v4mD4VqQwZgTnNqYp9rXm7kQjY3bWx1".to_string(),
+                ],
                 archived,
             },
         );
@@ -916,6 +1140,206 @@ mod tests {
             content_metadata: None,
             sender_alias: None,
         }
+    }
+
+    const THIRD_MEMBER_ID: &str = "12D3KooWHT5qT2qfE9L4q9v4mD4VqQwZgTnNqYp9rXm7kQjY3bWx1";
+
+    #[tokio::test]
+    async fn temporary_group_remote_members_excludes_local_without_duplicates() {
+        let (_temp, _app_state) = test_app_state().await;
+        let (net_state, _rx) = test_network_state();
+        let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            let mut session = TemporaryChatSession {
+                chat_id: chat_id.clone(),
+                name: "Design Crew".to_string(),
+                kind: TemporaryChatKind::Group,
+                expires_at: now_unix_secs() + 3600,
+                peer_id: Some(REMOTE_PEER_ID.to_string()),
+                members: vec![LOCAL_PEER_ID.to_string()],
+                archived: false,
+            };
+            // Add remote members twice: the roster must dedupe.
+            assert!(session.add_member(REMOTE_PEER_ID));
+            assert!(session.add_member(THIRD_MEMBER_ID));
+            assert!(!session.add_member(REMOTE_PEER_ID));
+            assert!(!session.add_member(LOCAL_PEER_ID));
+            temp_state.chats.insert(chat_id.clone(), session);
+        }
+
+        let members = temporary_group_remote_members(&net_state, &chat_id)
+            .await
+            .expect("remote members");
+
+        // Three-or-more member roster: every remote member exactly once, never
+        // the local peer.
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&REMOTE_PEER_ID.to_string()));
+        assert!(members.contains(&THIRD_MEMBER_ID.to_string()));
+        assert!(!members.contains(&LOCAL_PEER_ID.to_string()));
+        assert!(!members.contains(&"Me".to_string()));
+    }
+
+    #[test]
+    fn temporary_group_session_membership_updates_on_join_and_disconnect() {
+        let mut session = TemporaryChatSession {
+            chat_id: "temp-group:550e8400-e29b-41d4-a716-446655440000".to_string(),
+            name: "Design Crew".to_string(),
+            kind: TemporaryChatKind::Group,
+            expires_at: now_unix_secs() + 3600,
+            peer_id: Some(REMOTE_PEER_ID.to_string()),
+            members: vec![LOCAL_PEER_ID.to_string(), REMOTE_PEER_ID.to_string()],
+            archived: false,
+        };
+
+        // Join: a third member is added once and only once.
+        assert!(session.add_member(THIRD_MEMBER_ID));
+        assert!(!session.add_member(THIRD_MEMBER_ID));
+        assert!(session.is_member(THIRD_MEMBER_ID));
+        assert_eq!(session.remote_members(Some(LOCAL_PEER_ID)).len(), 2);
+
+        // Disconnect: the third member leaves the roster.
+        assert!(session.remove_member(THIRD_MEMBER_ID));
+        assert!(!session.remove_member(THIRD_MEMBER_ID));
+        assert!(!session.is_member(THIRD_MEMBER_ID));
+        assert_eq!(session.remote_members(Some(LOCAL_PEER_ID)), vec![REMOTE_PEER_ID.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn temporary_group_text_publishes_once_for_multi_member_roster() {
+        let (_temp, app_state) = test_app_state().await;
+        let (net_state, mut rx) = test_network_state();
+        let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+        insert_temp_group_session(&net_state, &chat_id, now_unix_secs() + 3600, false).await;
+
+        let msg_id = send_temporary_group_text(&app_state, &net_state, &chat_id, "hello all")
+            .await
+            .expect("send");
+
+        // A multi-member roster must still produce exactly one topic publish:
+        // gossip fans out to every subscriber, so per-member duplicates would
+        // double-deliver.
+        match rx.recv().await.expect("command") {
+            NetworkCommand::PublishGroup { envelope } => assert_eq!(envelope.id, msg_id),
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a multi-member send must not enqueue extra commands"
+        );
+    }
+
+    #[tokio::test]
+    async fn leave_temporary_group_removes_session_and_drops_member_connections() {
+        let (_temp, _app_state) = test_app_state().await;
+        let (net_state, mut rx) = test_network_state();
+        let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+        insert_temp_group_session(&net_state, &chat_id, now_unix_secs() + 3600, false).await;
+
+        leave_temporary_group(&net_state, &chat_id).await.expect("leave");
+
+        assert!(net_state
+            .temporary_state
+            .lock()
+            .await
+            .chats
+            .get(&chat_id)
+            .is_none());
+        assert!(net_state
+            .temporary_state
+            .lock()
+            .await
+            .messages
+            .get(&chat_id)
+            .is_none());
+
+        let mut commands = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            commands.push(command);
+        }
+        assert!(matches!(
+            commands.first(),
+            Some(NetworkCommand::EndTemporarySession { .. })
+        ));
+        let drops: Vec<&String> = commands
+            .iter()
+            .filter_map(|command| match command {
+                NetworkCommand::DropConnection { peer_id } => Some(peer_id),
+                _ => None,
+            })
+            .collect();
+        // One drop per remote member (the local peer is not a target).
+        assert_eq!(drops.len(), 2);
+        assert!(drops.iter().any(|peer| *peer == REMOTE_PEER_ID));
+        assert!(drops.iter().any(|peer| *peer == THIRD_MEMBER_ID));
+    }
+
+    #[tokio::test]
+    async fn archive_temporary_group_preserves_complete_member_roster() {
+        let (_temp, app_state) = crate::testing::test_app_state().await;
+        let (net_state, _rx) = test_network_state();
+        let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            temp_state.chats.insert(
+                chat_id.clone(),
+                TemporaryChatSession {
+                    chat_id: chat_id.clone(),
+                    name: "Design Crew".to_string(),
+                    kind: TemporaryChatKind::Group,
+                    expires_at: now_unix_secs() + 3600,
+                    peer_id: Some(REMOTE_PEER_ID.to_string()),
+                    members: vec![
+                        LOCAL_PEER_ID.to_string(),
+                        REMOTE_PEER_ID.to_string(),
+                        THIRD_MEMBER_ID.to_string(),
+                    ],
+                    archived: false,
+                },
+            );
+            temp_state.messages.insert(
+                chat_id.clone(),
+                vec![
+                    temp_group_message(&chat_id, "m1", "hello"),
+                    temp_group_message(&chat_id, "m2", "world"),
+                ],
+            );
+        }
+
+        let archived = archive_temporary_chat(&app_state, &net_state, &chat_id)
+            .await
+            .expect("archive");
+
+        assert!(archived.chat_id.starts_with(&format!("archived:{}:", chat_id)));
+        assert!(net_state
+            .temporary_state
+            .lock()
+            .await
+            .chats
+            .get(&chat_id)
+            .is_none());
+
+        let conn = app_state.db_conn.lock().expect("db");
+        let mut members: Vec<String> = conn
+            .prepare("SELECT peer_id FROM chat_peers WHERE chat_id = ?1")
+            .expect("prepare")
+            .query_map([archived.chat_id.as_str()], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows");
+        members.sort();
+
+        let mut expected = vec![LOCAL_PEER_ID.to_string(), REMOTE_PEER_ID.to_string()];
+        expected.push(THIRD_MEMBER_ID.to_string());
+        expected.push("Me".to_string());
+        expected.sort();
+        assert_eq!(members, expected);
+
+        let archived_messages = crate::storage::db::get_messages(&conn, &archived.chat_id)
+            .expect("archived history");
+        assert_eq!(archived_messages.len(), 2);
+        assert!(archived_messages.iter().all(|message| message.status == "read"));
     }
 
 }

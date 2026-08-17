@@ -45,6 +45,18 @@ impl GroupContentType {
     }
 }
 
+/// Payload carried by `TempHandshake` direct messages.
+///
+/// Besides identifying the temporary chat, it carries the sender's known
+/// member roster so joining peers converge on the same member set. Older
+/// peers that only send a bare chat id still parse (members defaults empty).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemporaryHandshakePayload {
+    pub chat_id: String,
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupMessageEnvelope {
     pub id: String,

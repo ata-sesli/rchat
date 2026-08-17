@@ -168,6 +168,20 @@ impl NetworkManager {
                 }
             }
         }
+        // Temporary-group members are all eligible sources; add every remote
+        // member once so media routing reaches the whole member set.
+        if crate::chat_kind::is_temp_group_chat_id(group_id) {
+            let local = self.swarm.local_peer_id().to_string();
+            let network_state = &self.network_state;
+            let temp_state = network_state.temporary_state.lock().await;
+            if let Some(session) = temp_state.chats.get(group_id) {
+                for member in session.remote_members(Some(&local)) {
+                    if !candidates.iter().any(|p| p == &member) {
+                        candidates.push(member);
+                    }
+                }
+            }
+        }
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

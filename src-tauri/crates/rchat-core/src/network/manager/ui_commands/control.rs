@@ -46,6 +46,12 @@ impl NetworkManager {
         self.remove_temporary_by_chat_id(chat_id);
         self.remove_punch_target(chat_id);
         self.unsubscribe_group(chat_id);
+        self.emit(CoreEvent::TemporaryChatEnded(
+            crate::events::TemporaryChatEndedEvent {
+                chat_id: chat_id.to_string(),
+                peer_id: self.swarm.local_peer_id().to_string(),
+            },
+        ));
     }
 
     /// Handle a connection request from UI (user pressed Connect on a peer)

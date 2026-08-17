@@ -591,8 +591,15 @@ impl NetworkManager {
         peer: PeerId,
         request: &crate::network::direct_message::DirectMessageRequest,
     ) {
-        let Some(chat_id) = request.text_content.clone() else {
+        let Some(handshake_text) = request.text_content.clone() else {
             return;
+        };
+        let (chat_id, announced_members) = match serde_json::from_str::<
+            crate::network::gossip::TemporaryHandshakePayload,
+        >(&handshake_text) {
+            Ok(payload) => (payload.chat_id, payload.members),
+            // Older peers send a bare chat id; treat it as a roster-less join.
+            Err(_) => (handshake_text, Vec::new()),
         };
 
         if !crate::chat_kind::is_temporary_chat_id(&chat_id) {
@@ -601,24 +608,52 @@ impl NetworkManager {
 
         self.cache_temporary_mapping(&chat_id, &peer.to_string());
 
-        let network_state = &self.network_state;
-        let mut temp_state = network_state.temporary_state.lock().await;
-        if let Some(session) = temp_state.chats.get_mut(&chat_id) {
-            session.peer_id = Some(peer.to_string());
-        } else {
-            let kind = if crate::chat_kind::is_temp_group_chat_id(&chat_id) {
-                crate::app_state::TemporaryChatKind::Group
+        let peer_id_str = peer.to_string();
+        let is_group = crate::chat_kind::is_temp_group_chat_id(&chat_id);
+        let mut roster_changed = false;
+        let mut respond_to_sender = false;
+        {
+            let network_state = &self.network_state;
+            let mut temp_state = network_state.temporary_state.lock().await;
+            if let Some(session) = temp_state.chats.get_mut(&chat_id) {
+                if is_group {
+                    let mut sender_known: std::collections::HashSet<String> =
+                        announced_members.iter().cloned().collect();
+                    sender_known.insert(peer_id_str.clone());
+                    for member in announced_members {
+                        if session.add_member(&member) {
+                            roster_changed = true;
+                        }
+                    }
+                    if session.add_member(&peer_id_str) {
+                        roster_changed = true;
+                    }
+                    // Tell the sender about members they haven't announced yet
+                    // (e.g. peers that joined while they were away), but only
+                    // when that is actually new information so handshakes do
+                    // not ping-pong forever.
+                    respond_to_sender = session
+                        .members
+                        .iter()
+                        .any(|member| !sender_known.contains(member));
+                }
+                if !is_group {
+                    session.peer_id = Some(peer_id_str.clone());
+                } else if session.peer_id.is_none() {
+                    session.peer_id = Some(peer_id_str.clone());
+                }
             } else {
-                crate::app_state::TemporaryChatKind::Dm
-            };
-            let name = if matches!(kind, crate::app_state::TemporaryChatKind::Group) {
-                crate::chat_kind::default_temp_group_name(&chat_id)
-            } else {
-                crate::chat_kind::default_temp_direct_name(&chat_id)
-            };
-            temp_state.chats.insert(
-                chat_id.clone(),
-                crate::app_state::TemporaryChatSession {
+                let kind = if is_group {
+                    crate::app_state::TemporaryChatKind::Group
+                } else {
+                    crate::app_state::TemporaryChatKind::Dm
+                };
+                let name = if is_group {
+                    crate::chat_kind::default_temp_group_name(&chat_id)
+                } else {
+                    crate::chat_kind::default_temp_direct_name(&chat_id)
+                };
+                let mut session = crate::app_state::TemporaryChatSession {
                     chat_id: chat_id.clone(),
                     name,
                     kind,
@@ -626,18 +661,100 @@ impl NetworkManager {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() + 120)
                         .unwrap_or(120),
-                    peer_id: Some(peer.to_string()),
+                    peer_id: Some(peer_id_str.clone()),
+                    members: Vec::new(),
                     archived: false,
-                },
-            );
+                };
+                if is_group {
+                    // Seed the roster with the local peer plus everything the
+                    // sender announced, then the sender itself.
+                    session.add_member(&self.swarm.local_peer_id().to_string());
+                    for member in announced_members {
+                        session.add_member(&member);
+                    }
+                    session.add_member(&peer_id_str);
+                    roster_changed = true;
+                    respond_to_sender = true;
+                }
+                temp_state.chats.insert(chat_id.clone(), session);
+            }
+        }
+
+        // Respond with our roster so the sender learns about the other
+        // members of the group, and push roster growth to every other
+        // connected member so join/leave/disconnect membership stays
+        // consistent group-wide. Both are gated on new information so the
+        // handshake exchange converges instead of ping-ponging.
+        if is_group && respond_to_sender {
+            self.send_temp_handshake_to(&peer, &chat_id).await;
+        }
+        if is_group && roster_changed {
+            self.broadcast_temp_group_roster(&chat_id, Some(&peer)).await;
         }
 
         self.emit(CoreEvent::TemporaryChatConnected(
             crate::events::TemporaryChatConnectedEvent {
                 chat_id,
-                peer_id: peer.to_string(),
+                peer_id: peer_id_str,
             },
         ));
+    }
+
+    /// Send a `TempHandshake` to `peer` carrying the current member roster of
+    /// `chat_id` so both sides converge on the same member set.
+    pub(crate) async fn send_temp_handshake_to(&mut self, peer: &PeerId, chat_id: &str) {
+        use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
+        let members = {
+            let network_state = &self.network_state;
+            let temp_state = network_state.temporary_state.lock().await;
+            temp_state
+                .chats
+                .get(chat_id)
+                .map(|session| session.members.clone())
+                .unwrap_or_default()
+        };
+        let payload = crate::network::gossip::TemporaryHandshakePayload {
+            chat_id: chat_id.to_string(),
+            members,
+        };
+        let text_content =
+            serde_json::to_string(&payload).unwrap_or_else(|_| chat_id.to_string());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let handshake = DirectMessageRequest {
+            id: format!("temp-handshake-{}", now),
+            sender_id: self.swarm.local_peer_id().to_string(),
+            msg_type: DirectMessageKind::TempHandshake,
+            text_content: Some(text_content),
+            file_hash: None,
+            timestamp: now,
+            chunk_hash: None,
+            chunk_data: None,
+            chunk_list: None,
+            sender_alias: None,
+        };
+        self.swarm
+            .behaviour_mut()
+            .direct_message
+            .send_request(peer, handshake);
+    }
+
+    /// Push the current roster to every connected member of a temporary
+    /// group, optionally skipping one peer (the sender of the triggering
+    /// handshake).
+    pub(crate) async fn broadcast_temp_group_roster(
+        &mut self,
+        chat_id: &str,
+        except: Option<&PeerId>,
+    ) {
+        let peers = self.connected_temp_members(chat_id);
+        for peer in peers {
+            if Some(&peer) != except {
+                self.send_temp_handshake_to(&peer, chat_id).await;
+            }
+        }
     }
 
     async fn handle_read_receipt(

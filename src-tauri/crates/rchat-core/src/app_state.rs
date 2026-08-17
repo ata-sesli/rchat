@@ -37,10 +37,54 @@ pub struct TemporaryChatSession {
     pub name: String,
     pub kind: TemporaryChatKind,
     pub expires_at: u64,
+    /// Primary remote peer id. Temporary direct chats use this as their single
+    /// remote peer; temporary groups keep it in sync with the member roster so
+    /// existing consumers keep working while `members` drives multi-party
+    /// routing.
     #[serde(default)]
     pub peer_id: Option<String>,
+    /// Full member roster for temporary-group sessions, including the local
+    /// peer id. Empty for temporary direct chats.
+    #[serde(default)]
+    pub members: Vec<String>,
     #[serde(default)]
     pub archived: bool,
+}
+
+impl TemporaryChatSession {
+    /// Whether `peer_id` is part of the tracked member roster.
+    pub fn is_member(&self, peer_id: &str) -> bool {
+        self.members.iter().any(|member| member == peer_id)
+    }
+
+    /// Add a member to the roster. Returns `true` when the roster changed.
+    pub fn add_member(&mut self, peer_id: &str) -> bool {
+        if self.is_member(peer_id) {
+            return false;
+        }
+        self.members.push(peer_id.to_string());
+        true
+    }
+
+    /// Remove a member from the roster. Returns `true` when the roster changed.
+    pub fn remove_member(&mut self, peer_id: &str) -> bool {
+        let before = self.members.len();
+        self.members.retain(|member| member != peer_id);
+        self.members.len() != before
+    }
+
+    /// Remote members of a temporary-group session, excluding the local peer
+    /// id (and the literal `"Me"` marker). Used to fan out per-peer requests
+    /// to every eligible member without duplicates.
+    pub fn remote_members(&self, local_peer_id: Option<&str>) -> Vec<String> {
+        self.members
+            .iter()
+            .filter(|member| {
+                member.as_str() != "Me" && Some(member.as_str()) != local_peer_id
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Debug, Default)]
