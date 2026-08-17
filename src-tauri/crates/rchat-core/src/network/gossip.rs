@@ -47,16 +47,17 @@ impl GroupContentType {
 
 /// Payload carried by `TempHandshake` direct messages.
 ///
-/// Besides identifying the temporary chat, it carries the sender's ordered
-/// membership-op log (adds and remove tombstones) so joining peers converge
-/// on the same member set instead of union-only merging resurrecting removed
-/// members. Older peers that only send a bare chat id still parse (ops
-/// defaults empty).
+/// Besides identifying the temporary chat, it carries the sender's per-target
+/// membership winners (adds and remove tombstones) — the complete,
+/// authoritative member-set state, bounded by the member cap. Joining peers
+/// merge winners last-writer-wins per target, so rosters converge instead of
+/// union-only merging resurrecting removed members. Older peers that only
+/// send a bare chat id still parse (winners defaults empty).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemporaryHandshakePayload {
     pub chat_id: String,
     #[serde(default)]
-    pub ops: Vec<crate::app_state::TemporaryMembershipOp>,
+    pub winners: Vec<crate::app_state::TemporaryMembershipOp>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

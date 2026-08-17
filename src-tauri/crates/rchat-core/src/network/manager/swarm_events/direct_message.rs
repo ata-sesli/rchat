@@ -452,13 +452,25 @@ impl NetworkManager {
         let chat_kind = crate::chat_kind::parse_chat_kind(&chat_id);
 
         if matches!(chat_kind, crate::chat_kind::ChatKind::TemporaryDirect) {
-                        let network_state = &self.network_state;
+            // Only record the message while the live session exists and is
+            // not being archived: a reserved (archived) session is about to
+            // be snapshotted, so appending now would lose the message when
+            // the session is removed, and a missing session must not grow
+            // phantom history.
+            let network_state = &self.network_state;
             let mut temp_state = network_state.temporary_state.lock().await;
-            temp_state
-                .messages
-                .entry(chat_id.clone())
-                .or_default()
-                .push(db_msg.clone());
+            let recordable = temp_state
+                .chats
+                .get(&chat_id)
+                .map(|session| !session.archived)
+                .unwrap_or(false);
+            if recordable {
+                temp_state
+                    .messages
+                    .entry(chat_id.clone())
+                    .or_default()
+                    .push(db_msg.clone());
+            }
         } else {
             self.persist_incoming_dm_message(request, chat_id.clone(), db_msg.clone())
                 .await
@@ -594,10 +606,10 @@ impl NetworkManager {
         let Some(handshake_text) = request.text_content.clone() else {
             return;
         };
-        let (chat_id, announced_ops) = match serde_json::from_str::<
+        let (chat_id, announced_winners) = match serde_json::from_str::<
             crate::network::gossip::TemporaryHandshakePayload,
         >(&handshake_text) {
-            Ok(payload) => (payload.chat_id, payload.ops),
+            Ok(payload) => (payload.chat_id, payload.winners),
             // Older peers send a bare chat id; treat it as a roster-less join.
             Err(_) => (handshake_text, Vec::new()),
         };
@@ -617,12 +629,17 @@ impl NetworkManager {
             let mut temp_state = network_state.temporary_state.lock().await;
             if let Some(session) = temp_state.chats.get_mut(&chat_id) {
                 if is_group {
-                    // Merge the sender's ordered membership ops (adds and
-                    // remove tombstones). Last-writer-wins per target keeps
-                    // removals convergent even when peers hold stale rosters.
-                    roster_changed = session.apply_membership_ops(&announced_ops);
+                    // Merge the sender's per-target winners (adds and remove
+                    // tombstones). Every op is bound to the authenticated
+                    // sender (this connection's peer id), and the winner per
+                    // target is the greatest (counter, actor) pair, so
+                    // removals stay convergent and nothing can be forged as
+                    // another member.
+                    roster_changed =
+                        session.apply_membership_ops(&announced_winners, &peer_id_str);
                     // The sender itself is a member by virtue of dialing us;
-                    // record it with a fresh add op so it is part of the log.
+                    // record it with a fresh add op so it is part of the
+                    // membership state.
                     if !session.is_member(&peer_id_str) {
                         roster_changed |= session.issue_membership_op(
                             &self.swarm.local_peer_id().to_string(),
@@ -630,9 +647,9 @@ impl NetworkManager {
                             &peer_id_str,
                         );
                     }
-                    // Bring the sender up to date when its op log is stale
-                    // (e.g. it reconnected after other members joined).
-                    respond_to_sender = session.has_ops_missing_from(&announced_ops);
+                    // Bring the sender up to date when its winner snapshot is
+                    // stale (e.g. it reconnected after other members joined).
+                    respond_to_sender = session.winners_missing_from(&announced_winners);
                 }
                 if !is_group {
                     session.peer_id = Some(peer_id_str.clone());
@@ -660,16 +677,16 @@ impl NetworkManager {
                         .unwrap_or(120),
                     peer_id: Some(peer_id_str.clone()),
                     members: Vec::new(),
-                    member_ops: Vec::new(),
                     member_op_winners: std::collections::HashMap::new(),
-                    next_member_op_seq: 0,
+                    next_member_op_counter: 0,
                     archived: false,
                 };
                 if is_group {
-                    // Seed the local peer, apply the sender's ops, then record
-                    // the sender itself.
+                    // Seed the local peer, apply the sender's winners, then
+                    // record the sender itself.
                     session.add_member(&self.swarm.local_peer_id().to_string());
-                    roster_changed = session.apply_membership_ops(&announced_ops);
+                    roster_changed =
+                        session.apply_membership_ops(&announced_winners, &peer_id_str);
                     roster_changed |= session.issue_membership_op(
                         &self.swarm.local_peer_id().to_string(),
                         crate::app_state::TemporaryMembershipOpKind::Add,
@@ -701,22 +718,23 @@ impl NetworkManager {
         ));
     }
 
-    /// Send a `TempHandshake` to `peer` carrying the current membership-op
-    /// log of `chat_id` so both sides converge on the same member set.
+    /// Send a `TempHandshake` to `peer` carrying the current per-target
+    /// membership winners of `chat_id` so both sides converge on the same
+    /// member set.
     pub(crate) async fn send_temp_handshake_to(&mut self, peer: &PeerId, chat_id: &str) {
         use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
-        let ops = {
+        let winners = {
             let network_state = &self.network_state;
             let temp_state = network_state.temporary_state.lock().await;
             temp_state
                 .chats
                 .get(chat_id)
-                .map(|session| session.member_ops.clone())
+                .map(|session| session.membership_winners())
                 .unwrap_or_default()
         };
         let payload = crate::network::gossip::TemporaryHandshakePayload {
             chat_id: chat_id.to_string(),
-            ops,
+            winners,
         };
         let text_content =
             serde_json::to_string(&payload).unwrap_or_else(|_| chat_id.to_string());

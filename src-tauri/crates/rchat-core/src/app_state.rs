@@ -47,16 +47,17 @@ pub struct TemporaryChatSession {
     /// peer id. Empty for temporary direct chats.
     #[serde(default)]
     pub members: Vec<String>,
-    /// Ordered, bounded membership-op log used to converge rosters across
-    /// peers (adds and remove tombstones).
+    /// Authoritative membership state: the winning membership op per target
+    /// (adds and remove tombstones). One winner per target keeps this bounded
+    /// by the member cap, and because it is the complete per-target state it
+    /// is safe to transmit in handshakes — unlike a truncated op log, it can
+    /// always reconstruct the current roster.
     #[serde(default)]
-    pub member_ops: Vec<TemporaryMembershipOp>,
-    /// Per-target winner of the membership-op merge: target -> (seq, issuer).
+    pub member_op_winners: HashMap<String, TemporaryMembershipOp>,
+    /// Next local membership-op counter (strictly increasing Lamport counter
+    /// for the local actor).
     #[serde(default)]
-    pub member_op_winners: HashMap<String, (u64, String)>,
-    /// Next local membership-op sequence number (strictly increasing).
-    #[serde(default)]
-    pub next_member_op_seq: u64,
+    pub next_member_op_counter: u64,
     #[serde(default)]
     pub archived: bool,
 }
@@ -66,18 +67,22 @@ pub struct TemporaryChatSession {
 /// rosters, handshake payloads, routing fan-out, or archived peer rows.
 pub const TEMP_GROUP_MAX_MEMBERS: usize = 64;
 
-/// Upper bound on the propagated membership-op log of a temporary-group
-/// session. Old ops may be trimmed from the log, but the per-target winner
-/// map keeps the applied state authoritative.
+/// Upper bound on the per-target winner map of a temporary-group session.
+/// Each target contributes exactly one winning operation, so with the member
+/// cap this is naturally bounded; the map is never trimmed, only new targets
+/// are rejected once the cap is reached, so the transmitted membership state
+/// stays complete.
 pub const TEMP_GROUP_MAX_MEMBERSHIP_OPS: usize = 256;
 
 /// A single ordered membership operation for a temporary group.
 ///
-/// Ops carry a wall-clock sequence number that is strictly increasing per
-/// issuer, so a removal issued later than an add wins regardless of arrival
-/// order. Merging is last-writer-wins per target (ties broken by issuer id),
-/// which makes rosters converge group-wide instead of union-only merging
-/// resurrecting removed members.
+/// Ops are bound to the actor that issued them (a libp2p peer id) and carry a
+/// Lamport-style counter that is strictly increasing per actor. The winner for
+/// a target is the op with the greatest `(counter, actor)` pair, compared
+/// lexicographically — a deterministic total order with no wall-clock skew —
+/// so a removal issued later than an add wins regardless of arrival order and
+/// rosters converge group-wide instead of union-only merging resurrecting
+/// removed members.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TemporaryMembershipOpKind {
@@ -87,8 +92,8 @@ pub enum TemporaryMembershipOpKind {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct TemporaryMembershipOp {
-    pub issuer: String,
-    pub seq: u64,
+    pub actor: String,
+    pub counter: u64,
     pub op: TemporaryMembershipOpKind,
     pub target: String,
 }
@@ -139,76 +144,98 @@ impl TemporaryChatSession {
             .collect()
     }
 
-    /// Issue a membership operation on behalf of `issuer` and apply it
-    /// locally. Returns `true` when the roster changed.
+    /// Issue a membership operation on behalf of `actor` (the local peer) and
+    /// apply it locally. The counter is a strictly increasing Lamport counter
+    /// for that actor, so locally issued ops always win over any earlier op
+    /// from the same actor. Returns `true` when the roster changed.
     pub fn issue_membership_op(
         &mut self,
-        issuer: &str,
+        actor: &str,
         op: TemporaryMembershipOpKind,
         target: &str,
     ) -> bool {
-        if !is_valid_temp_group_member(issuer) || !is_valid_temp_group_member(target) {
+        if !is_valid_temp_group_member(actor) || !is_valid_temp_group_member(target) {
             return false;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0);
-        let seq = now.max(self.next_member_op_seq + 1);
-        self.next_member_op_seq = seq;
+        self.next_member_op_counter += 1;
         self.apply_membership_op(TemporaryMembershipOp {
-            issuer: issuer.to_string(),
-            seq,
+            actor: actor.to_string(),
+            counter: self.next_member_op_counter,
             op,
             target: target.to_string(),
         })
     }
 
-    /// Apply incoming membership ops (from a handshake or broadcast). Ops are
-    /// last-writer-wins per target by `(seq, issuer)`, so stale adds cannot
+    /// Apply membership ops received from `authenticated_sender`.
+    ///
+    /// Every op must be bound to the peer that actually sent it: ops whose
+    /// `actor` does not match `authenticated_sender` are rejected outright, so
+    /// a participant cannot forge operations as another member or inflate
+    /// counters under someone else's identity. The winner for a target is the
+    /// op with the greatest `(counter, actor)` pair, so stale adds cannot
     /// resurrect a member that a newer remove already evicted. Returns `true`
     /// when the roster changed.
-    pub fn apply_membership_ops(&mut self, ops: &[TemporaryMembershipOp]) -> bool {
+    pub fn apply_membership_ops(
+        &mut self,
+        ops: &[TemporaryMembershipOp],
+        authenticated_sender: &str,
+    ) -> bool {
         let mut changed = false;
         for op in ops {
+            // Bind every received operation to its authenticated sender.
+            if op.actor != authenticated_sender {
+                continue;
+            }
             changed |= self.apply_membership_op(op.clone());
         }
         changed
     }
 
     fn apply_membership_op(&mut self, op: TemporaryMembershipOp) -> bool {
-        if !is_valid_temp_group_member(&op.issuer) || !is_valid_temp_group_member(&op.target) {
+        if !is_valid_temp_group_member(&op.actor) || !is_valid_temp_group_member(&op.target) {
             return false;
         }
-        let winner = self
-            .member_op_winners
-            .entry(op.target.clone())
-            .or_insert((0, String::new()));
-        if op.seq < winner.0 || (op.seq == winner.0 && op.issuer <= winner.1) {
+        if let Some(current) = self.member_op_winners.get(&op.target) {
+            // Lamport-style total order: `(counter, actor)`, strictly greater
+            // wins. Equal ops (same actor + counter) are replays and ignored.
+            if op.counter < current.counter
+                || (op.counter == current.counter && op.actor <= current.actor)
+            {
+                return false;
+            }
+        } else if self.member_op_winners.len() >= TEMP_GROUP_MAX_MEMBERSHIP_OPS {
+            // New targets are only admitted while the winner map is under its
+            // cap; the map is never trimmed, so tracked targets always keep
+            // their authoritative winner.
             return false;
         }
-        winner.0 = op.seq;
-        winner.1 = op.issuer.clone();
-        let changed = match op.op {
+        self.member_op_winners.insert(op.target.clone(), op.clone());
+        match op.op {
             TemporaryMembershipOpKind::Add => self.add_member(&op.target),
             TemporaryMembershipOpKind::Remove => self.remove_member(&op.target),
-        };
-        self.member_ops.push(op);
-        if self.member_ops.len() > TEMP_GROUP_MAX_MEMBERSHIP_OPS {
-            self.member_ops
-                .drain(0..self.member_ops.len() - TEMP_GROUP_MAX_MEMBERSHIP_OPS);
         }
-        changed
     }
 
-    /// Whether this session knows a membership op the `other` ops do not
-    /// (compared by issuer + sequence). Drives the handshake response so a
-    /// reconnecting member with a stale log is brought up to date.
-    pub fn has_ops_missing_from(&self, other: &[TemporaryMembershipOp]) -> bool {
-        self.member_ops.iter().any(|op| {
-            !other
+    /// The current winning ops of this session, one per target. This is the
+    /// complete, transferable membership state (bounded by the member cap).
+    pub fn membership_winners(&self) -> Vec<TemporaryMembershipOp> {
+        self.member_op_winners.values().cloned().collect()
+    }
+
+    /// Whether this session holds a winner that is newer than, or missing
+    /// from, the `other` ops for the same target. Drives the handshake
+    /// response so a reconnecting member with a stale roster is brought up to
+    /// date.
+    pub fn winners_missing_from(&self, other: &[TemporaryMembershipOp]) -> bool {
+        self.member_op_winners.values().any(|op| {
+            let newer = other
                 .iter()
-                .any(|candidate| candidate.issuer == op.issuer && candidate.seq == op.seq)
+                .filter(|candidate| candidate.target == op.target)
+                .all(|candidate| {
+                    op.counter > candidate.counter
+                        || (op.counter == candidate.counter && op.actor > candidate.actor)
+                });
+            newer
         })
     }
 }

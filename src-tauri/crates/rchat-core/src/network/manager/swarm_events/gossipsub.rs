@@ -122,8 +122,21 @@ impl NetworkManager {
 
         let is_temp_group = crate::chat_kind::is_temp_group_chat_id(&envelope.group_id);
         if is_temp_group {
-                        let network_state = &self.network_state;
+            // Only record the message while the live session exists and is
+            // not being archived: a reserved (archived) session is about to
+            // be snapshotted, so appending now would lose the message when
+            // the session is removed, and a missing session must not grow
+            // phantom history.
+            let network_state = &self.network_state;
             let mut temp_state = network_state.temporary_state.lock().await;
+            let recordable = temp_state
+                .chats
+                .get(&envelope.group_id)
+                .map(|session| !session.archived)
+                .unwrap_or(false);
+            if !recordable {
+                return;
+            }
             temp_state
                 .messages
                 .entry(envelope.group_id.clone())
