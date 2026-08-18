@@ -121,45 +121,64 @@ impl NetworkManager {
     /// that processed our leave re-admits the local peer. A failed archive
     /// therefore preserves the live conversation and its membership instead of
     /// leaving the user removed from a group that survives.
+    ///
+    /// The handler acknowledges only once reinsertion, re-subscription and the
+    /// signed rejoin have all succeeded. If the keypair is unavailable or the
+    /// rejoin add cannot be signed, the recovery data is still re-inserted (so
+    /// the user does not lose the conversation) but the acknowledgement
+    /// carries the error, and the roster is not re-announced — the caller must
+    /// not believe the peer rejoined when remote members still treat it as
+    /// removed.
     pub(super) async fn restore_temporary_session(
         &mut self,
         chat_id: &str,
         session: crate::app_state::TemporaryChatSession,
         messages: Vec<crate::storage::db::Message>,
         min_add_counter: u64,
+        ack: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     ) {
         let mut session = session;
         session.archived = false;
         if session.next_member_op_counter < min_add_counter {
             session.next_member_op_counter = min_add_counter;
         }
+        let mut rejoin_error: Option<String> = None;
         {
             let mut temp_state = self.network_state.temporary_state.lock().await;
-            if let Some(signer) =
-                crate::chat::group::load_or_create_local_keypair(&self.app_state).await.ok()
-            {
-                let local = self.swarm.local_peer_id().to_string();
-                if let Err(error) = session.issue_membership_op(
-                    &local,
-                    crate::app_state::TemporaryMembershipOpKind::Add,
-                    &local,
-                    &signer,
-                ) {
-                    eprintln!(
-                        "[TempGroup] failed to rejoin {chat_id} after failed archive: {error}"
-                    );
+            match crate::chat::group::load_or_create_local_keypair(&self.app_state).await {
+                Ok(signer) => {
+                    let local = self.swarm.local_peer_id().to_string();
+                    if let Err(error) = session.issue_membership_op(
+                        &local,
+                        crate::app_state::TemporaryMembershipOpKind::Add,
+                        &local,
+                        &signer,
+                    ) {
+                        rejoin_error = Some(format!(
+                            "[TempGroup] failed to rejoin {chat_id} after failed archive: {error}"
+                        ));
+                    }
                 }
-            } else {
-                eprintln!(
-                    "[TempGroup] no keypair available to rejoin {chat_id} after failed archive"
-                );
+                Err(error) => {
+                    rejoin_error = Some(format!(
+                        "[TempGroup] no keypair available to rejoin {chat_id} after failed archive: {error}"
+                    ));
+                }
             }
             temp_state.chats.insert(chat_id.to_string(), session.clone());
             temp_state.messages.insert(chat_id.to_string(), messages);
         }
-        if matches!(session.kind, crate::app_state::TemporaryChatKind::Group) {
+        let rejoined = rejoin_error.is_none();
+        if rejoined && matches!(session.kind, crate::app_state::TemporaryChatKind::Group) {
             self.subscribe_group(chat_id);
             self.broadcast_temp_group_roster(chat_id, None).await;
+        }
+        if let Some(ack) = ack {
+            if let Some(error) = rejoin_error {
+                let _ = ack.send(Err(error));
+            } else {
+                let _ = ack.send(Ok(()));
+            }
         }
     }
 

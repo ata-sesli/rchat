@@ -53,6 +53,12 @@ pub enum NetworkCommand {
     /// farewell was broadcast. Re-inserts the session and its messages,
     /// re-subscribes, and re-broadcasts a signed add tombstone that outranks
     /// the farewell remove so remaining members re-admit the local peer.
+    ///
+    /// The handler acknowledges only after local reinsertion, re-subscription
+    /// and the signed rejoin all succeed; a rejoin that cannot be signed is
+    /// reported through the ack (data is still preserved locally) so the
+    /// caller never believes the session was fully rejoined when remote
+    /// members still treat it as removed.
     RestoreTemporarySession {
         chat_id: String,
         session: crate::app_state::TemporaryChatSession,
@@ -60,6 +66,11 @@ pub enum NetworkCommand {
         /// The membership counter carried by the farewell remove; the rejoin
         /// add must exceed it to supersede that remove on every peer.
         min_add_counter: u64,
+        /// The caller awaits this before returning, so a failed or
+        /// unacknowledged restore is surfaced instead of silently discarding
+        /// the recovery copies or leaving the local client believing it
+        /// rejoined.
+        ack: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     },
     SubscribeGroup {
         group_id: String,

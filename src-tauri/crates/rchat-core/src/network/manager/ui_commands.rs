@@ -44,8 +44,9 @@ impl NetworkManager {
                 session,
                 messages,
                 min_add_counter,
+                ack,
             } => {
-                self.restore_temporary_session(&chat_id, session, messages, min_add_counter)
+                self.restore_temporary_session(&chat_id, session, messages, min_add_counter, ack)
                     .await;
             }
             NetworkCommand::SubscribeGroup { group_id } => self.subscribe_group(&group_id),
