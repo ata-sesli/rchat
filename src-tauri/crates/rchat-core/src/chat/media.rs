@@ -364,11 +364,14 @@ async fn send_stored_media(
         if matches!(chat_kind, ChatKind::TemporaryGroup) {
             temporary::validate_temp_group_session(net_state, &canonical_chat_id).await?;
         }
-        // Reserve a slot in the live history UNDER THE LOCK and before any
-        // network dispatch: an archiving session is rejected here (before the
-        // remote peer can receive the media), and if the dispatch fails the
-        // pending message is rolled back so a closed command channel cannot
-        // leave a phantom `delivered` message that retrying would duplicate.
+        // Reserve a slot in the live history AND an in-flight send token
+        // under the lock and before any network dispatch: an archiving
+        // session is rejected here (before the remote peer can receive the
+        // media), and the token keeps archive from snapshotting media whose
+        // delivery is still unresolved. The token is released once dispatch
+        // resolves, rolling the pending message back on failure so a closed
+        // command channel cannot leave a phantom `delivered` message that
+        // retrying would duplicate.
         {
             let mut temp_state = net_state.temporary_state.lock().await;
             let session_ok = temp_state
@@ -381,13 +384,19 @@ async fn send_stored_media(
                     "Temporary chat is being archived: {chat_id}"
                 ));
             }
+            if let Some(session) = temp_state.chats.get_mut(&canonical_chat_id) {
+                session.pending_send_count = session
+                    .pending_send_count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("too many concurrent temporary-chat sends"))?;
+            }
             temp_state
                 .messages
                 .entry(db_chat_id.clone())
                 .or_default()
                 .push(message.clone());
         }
-        if let Err(error) = dispatch_stored_media(
+        let dispatch = dispatch_stored_media(
             net_state,
             chat_kind,
             &canonical_chat_id,
@@ -395,13 +404,21 @@ async fn send_stored_media(
             &msg_id,
             timestamp,
         )
-        .await
+        .await;
+        // Resolve the in-flight send token under the lock and roll the media
+        // back when dispatch failed. The session may already be gone (leave
+        // ran concurrently); the token is then moot.
         {
             let mut temp_state = net_state.temporary_state.lock().await;
-            if let Some(messages) = temp_state.messages.get_mut(&db_chat_id) {
-                messages.retain(|stored| stored.id != msg_id);
+            if let Some(session) = temp_state.chats.get_mut(&canonical_chat_id) {
+                session.pending_send_count = session.pending_send_count.saturating_sub(1);
             }
-            return Err(error);
+            if let Err(error) = dispatch {
+                if let Some(messages) = temp_state.messages.get_mut(&db_chat_id) {
+                    messages.retain(|stored| stored.id != msg_id);
+                }
+                return Err(error);
+            }
         }
     } else {
         // Durable sends persist before dispatch so a late database failure
@@ -743,6 +760,7 @@ mod tests {
                     member_op_winners: HashMap::new(),
                     next_member_op_counter: 0,
                     archived: false,
+                    pending_send_count: 0,
                 },
             );
         }
@@ -783,6 +801,12 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+        let session = net_state.temporary_state.lock().await;
+        assert_eq!(
+            session.chats.get(&chat_id).expect("session").pending_send_count,
+            0,
+            "a successful media send must release its in-flight token"
+        );
     }
 
     #[tokio::test]
@@ -806,6 +830,7 @@ mod tests {
                     member_op_winners: HashMap::new(),
                     next_member_op_counter: 0,
                     archived: false,
+                    pending_send_count: 0,
                 },
             );
         }
@@ -835,6 +860,12 @@ mod tests {
         assert!(
             messages.is_empty(),
             "failed media send must not leave a phantom delivered message"
+        );
+        let temp_state = net_state.temporary_state.lock().await;
+        assert_eq!(
+            temp_state.chats.get(&chat_id).expect("session").pending_send_count,
+            0,
+            "a failed media send must release its in-flight token"
         );
     }
 

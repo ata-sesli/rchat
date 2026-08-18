@@ -280,12 +280,29 @@ impl NetworkManager {
                         let mut temp_state = network_state.temporary_state.lock().await;
                         if let Some(session) = temp_state.chats.get_mut(&chat_id) {
                             if session.is_member(&peer_id_str) {
-                                session.issue_membership_op(
-                                    &self.swarm.local_peer_id().to_string(),
-                                    crate::app_state::TemporaryMembershipOpKind::Remove,
-                                    &peer_id_str,
-                                    signer.as_ref(),
-                                );
+                                // Only a signed remove tombstone propagates
+                                // group-wide; without a matching keypair (or
+                                // on a signing failure) no op is issued so the
+                                // local roster is not mutated into a state
+                                // every remote peer would reject.
+                                let local = self.swarm.local_peer_id().to_string();
+                                match signer.as_ref() {
+                                    Some(keypair) => {
+                                        if let Err(error) = session.issue_membership_op(
+                                            &local,
+                                            crate::app_state::TemporaryMembershipOpKind::Remove,
+                                            &peer_id_str,
+                                            keypair,
+                                        ) {
+                                            eprintln!(
+                                                "[TempGroup] failed to sign remove tombstone for {peer_id_str}: {error}"
+                                            );
+                                        }
+                                    }
+                                    None => eprintln!(
+                                        "[TempGroup] no keypair available; skipping remove tombstone for {peer_id_str}"
+                                    ),
+                                }
                             }
                         }
                     }

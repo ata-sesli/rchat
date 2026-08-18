@@ -1,6 +1,7 @@
 use crate::network::command::NetworkCommand;
 use crate::storage::config::ConfigManager;
 use crate::storage::db::Message;
+use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -61,6 +62,12 @@ pub struct TemporaryChatSession {
     pub next_member_op_counter: u64,
     #[serde(default)]
     pub archived: bool,
+    /// Number of outgoing sends (text or media) whose network dispatch is
+    /// still in flight. Archive refuses to reserve the session while this is
+    /// non-zero so a snapshot can never capture a message whose delivery
+    /// status is unknown.
+    #[serde(default)]
+    pub pending_send_count: u32,
 }
 
 /// Hard cap on the number of members a temporary group tracks. Handshake-
@@ -222,21 +229,24 @@ impl TemporaryChatSession {
     /// Issue a membership operation on behalf of `actor` (the local peer) and
     /// apply it locally. The counter is a strictly increasing Lamport counter
     /// for that actor, so locally issued ops always win over any earlier op
-    /// from the same actor. When a `signer` keypair is provided (and matches
-    /// `actor`), the op is signed so it can be forwarded by any member and
-    /// verified on receipt. Returns `true` when the roster changed.
+    /// from the same actor. The op is signed with the provided `signer`
+    /// keypair so it can be forwarded by any member and verified on receipt.
+    /// Signing failures are propagated — unsigned ops are never accepted
+    /// because they cannot be verified by remote peers. Returns `Ok(true)`
+    /// when the roster changed, `Ok(false)` for valid no-ops, and `Err` when
+    /// signing fails.
     pub fn issue_membership_op(
         &mut self,
         actor: &str,
         op: TemporaryMembershipOpKind,
         target: &str,
-        signer: Option<&libp2p::identity::Keypair>,
-    ) -> bool {
+        signer: &libp2p::identity::Keypair,
+    ) -> Result<bool> {
         if !is_valid_temp_group_member(actor) || !is_valid_temp_group_member(target) {
-            return false;
+            return Ok(false);
         }
         self.next_member_op_counter += 1;
-        let mut op = TemporaryMembershipOp {
+        let mut signed_op = TemporaryMembershipOp {
             actor: actor.to_string(),
             counter: self.next_member_op_counter,
             op,
@@ -244,10 +254,12 @@ impl TemporaryChatSession {
             public_key_b64: String::new(),
             signature_b64: String::new(),
         };
-        if let Some(keypair) = signer {
-            op.sign(keypair);
+        if !signed_op.sign(signer) {
+            return Err(anyhow::anyhow!(
+                "failed to sign membership op: keypair does not match actor {actor}"
+            ));
         }
-        self.apply_membership_op(op)
+        Ok(self.apply_membership_op(signed_op))
     }
 
     /// Apply membership ops received from a handshake or broadcast.

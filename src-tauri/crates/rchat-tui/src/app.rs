@@ -1367,6 +1367,7 @@ mod tests {
                     member_op_winners: std::collections::HashMap::new(),
                     next_member_op_counter: 0,
                     archived: false,
+                    pending_send_count: 0,
                 },
             );
             if !messages.is_empty() {

@@ -618,13 +618,42 @@ impl NetworkManager {
         self.cache_temporary_mapping(&chat_id, &peer.to_string());
 
         let peer_id_str = peer.to_string();
+        let local_peer_id = self.swarm.local_peer_id().to_string();
         let is_group = crate::chat_kind::is_temp_group_chat_id(&chat_id);
         // Best-effort signing keypair: ops issued below are signed so they can
         // be forwarded by any member and verified on receipt. If the keypair
-        // cannot be loaded the ops are issued unsigned (legacy behavior).
+        // cannot be loaded or signing fails, no op is issued at all — an
+        // unsigned op would be rejected by every remote peer and produce
+        // permanent divergence, so membership is left unchanged instead.
         let signer = crate::chat::group::load_or_create_local_keypair(&self.app_state)
             .await
             .ok();
+        // Issue a signed membership op on behalf of the local peer, logging
+        // (and leaving the roster untouched) when no keypair is available or
+        // signing fails.
+        let issue_local_op = |session: &mut crate::app_state::TemporaryChatSession,
+                              op: crate::app_state::TemporaryMembershipOpKind,
+                              target: &str| {
+            match signer.as_ref() {
+                Some(keypair) => {
+                    match session.issue_membership_op(&local_peer_id, op, target, keypair) {
+                        Ok(changed) => changed,
+                        Err(error) => {
+                            eprintln!(
+                                "[TempGroup] failed to sign membership op for {target}: {error}"
+                            );
+                            false
+                        }
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "[TempGroup] no keypair available; skipping signed membership op for {target}"
+                    );
+                    false
+                }
+            }
+        };
         let mut roster_changed = false;
         let mut respond_to_sender = false;
         {
@@ -643,11 +672,10 @@ impl NetworkManager {
                     // record it with a fresh add op so it is part of the
                     // membership state.
                     if !session.is_member(&peer_id_str) {
-                        roster_changed |= session.issue_membership_op(
-                            &self.swarm.local_peer_id().to_string(),
+                        roster_changed |= issue_local_op(
+                            session,
                             crate::app_state::TemporaryMembershipOpKind::Add,
                             &peer_id_str,
-                            signer.as_ref(),
                         );
                     }
                     // Bring the sender up to date when its winner snapshot is
@@ -683,17 +711,17 @@ impl NetworkManager {
                     member_op_winners: std::collections::HashMap::new(),
                     next_member_op_counter: 0,
                     archived: false,
+                    pending_send_count: 0,
                 };
                 if is_group {
                     // Seed the local peer, apply the sender's winners, then
                     // record the sender itself.
                     session.add_member(&self.swarm.local_peer_id().to_string());
                     roster_changed = session.apply_membership_ops(&announced_winners);
-                    roster_changed |= session.issue_membership_op(
-                        &self.swarm.local_peer_id().to_string(),
+                    roster_changed |= issue_local_op(
+                        &mut session,
                         crate::app_state::TemporaryMembershipOpKind::Add,
                         &peer_id_str,
-                        signer.as_ref(),
                     );
                     respond_to_sender = true;
                 }
