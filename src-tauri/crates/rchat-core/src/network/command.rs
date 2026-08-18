@@ -9,7 +9,7 @@ pub enum DirectMediaKind {
     Audio,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum NetworkCommand {
     StartPunch {
         multiaddr: String,
@@ -41,6 +41,25 @@ pub enum NetworkCommand {
         /// where the caller removes the session and the handler must not
         /// depend on state that no longer exists.
         farewell_winners: Option<Vec<crate::app_state::TemporaryMembershipOp>>,
+        /// Archive path only: the handler broadcasts the farewell first (the
+        /// leave boundary), then drains the final message set and removes the
+        /// session in the same event-loop step, replying with the drained
+        /// messages so the caller can persist the entire archive in a single
+        /// transaction. Everything received after the broadcast is strictly
+        /// post-leave and may be dropped.
+        ack: Option<tokio::sync::oneshot::Sender<Vec<crate::storage::db::Message>>>,
+    },
+    /// Re-establish a temporary session whose archive failed after the
+    /// farewell was broadcast. Re-inserts the session and its messages,
+    /// re-subscribes, and re-broadcasts a signed add tombstone that outranks
+    /// the farewell remove so remaining members re-admit the local peer.
+    RestoreTemporarySession {
+        chat_id: String,
+        session: crate::app_state::TemporaryChatSession,
+        messages: Vec<crate::storage::db::Message>,
+        /// The membership counter carried by the farewell remove; the rejoin
+        /// add must exceed it to supersede that remove on every peer.
+        min_add_counter: u64,
     },
     SubscribeGroup {
         group_id: String,

@@ -35,8 +35,18 @@ impl NetworkManager {
             NetworkCommand::EndTemporarySession {
                 chat_id,
                 farewell_winners,
+                ack,
             } => {
-                self.end_temporary_session(&chat_id, farewell_winners).await;
+                self.end_temporary_session(&chat_id, farewell_winners, ack).await;
+            }
+            NetworkCommand::RestoreTemporarySession {
+                chat_id,
+                session,
+                messages,
+                min_add_counter,
+            } => {
+                self.restore_temporary_session(&chat_id, session, messages, min_add_counter)
+                    .await;
             }
             NetworkCommand::SubscribeGroup { group_id } => self.subscribe_group(&group_id),
             NetworkCommand::UnsubscribeGroup { group_id } => self.unsubscribe_group(&group_id),

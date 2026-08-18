@@ -46,6 +46,7 @@ impl NetworkManager {
         &mut self,
         chat_id: &str,
         farewell_winners: Option<Vec<crate::app_state::TemporaryMembershipOp>>,
+        ack: Option<tokio::sync::oneshot::Sender<Vec<crate::storage::db::Message>>>,
     ) {
         // Group-scoped exit: broadcast the farewell roster (including any
         // remove tombstones issued by leave or archive) so remaining members
@@ -53,6 +54,12 @@ impl NetworkManager {
         // The archive path passes the winners explicitly because it removes
         // the session before queueing this command; the leave path leaves the
         // session in place and reads the current roster from it.
+        //
+        // The farewell broadcast is the leave boundary and always happens
+        // first: messages received while the broadcast is in flight are still
+        // appended to the session (they were sent before we announced our
+        // leave) and are captured by the drain below, so no pre-farewell
+        // traffic is silently dropped.
         let network_state = self.network_state.clone();
         let is_group = if farewell_winners.is_some() {
             true
@@ -70,15 +77,29 @@ impl NetworkManager {
                 .unwrap_or(false)
         };
         if is_group {
-            match farewell_winners {
-                Some(winners) => self.broadcast_temp_group_winners(chat_id, winners, None).await,
+            match &farewell_winners {
+                Some(winners) => {
+                    self.broadcast_temp_group_winners(chat_id, winners.clone(), None)
+                        .await;
+                }
                 None => self.broadcast_temp_group_roster(chat_id, None).await,
             }
         }
+        // Tear the session down under one lock. For the archive path the final
+        // message set — everything received up to and during the farewell
+        // broadcast — is drained and acknowledged so the caller can persist
+        // the entire archive in one transaction; for the plain leave path the
+        // runtime state is simply removed.
         {
             let mut temp_state = network_state.temporary_state.lock().await;
-            temp_state.chats.remove(chat_id);
-            temp_state.messages.remove(chat_id);
+            if let Some(ack) = ack {
+                let messages = temp_state.messages.remove(chat_id).unwrap_or_default();
+                temp_state.chats.remove(chat_id);
+                let _ = ack.send(messages);
+            } else {
+                temp_state.chats.remove(chat_id);
+                temp_state.messages.remove(chat_id);
+            }
         }
         self.remove_temporary_by_chat_id(chat_id);
         self.remove_punch_target(chat_id);
@@ -89,6 +110,57 @@ impl NetworkManager {
                 peer_id: self.swarm.local_peer_id().to_string(),
             },
         ));
+    }
+
+    /// Re-establish a temporary session whose archive failed after the
+    /// farewell was broadcast.
+    ///
+    /// Re-inserts the session (reservation cleared) and its messages,
+    /// re-subscribes, and re-announces the roster with a fresh signed add
+    /// tombstone whose counter exceeds the farewell remove's, so every member
+    /// that processed our leave re-admits the local peer. A failed archive
+    /// therefore preserves the live conversation and its membership instead of
+    /// leaving the user removed from a group that survives.
+    pub(super) async fn restore_temporary_session(
+        &mut self,
+        chat_id: &str,
+        session: crate::app_state::TemporaryChatSession,
+        messages: Vec<crate::storage::db::Message>,
+        min_add_counter: u64,
+    ) {
+        let mut session = session;
+        session.archived = false;
+        if session.next_member_op_counter < min_add_counter {
+            session.next_member_op_counter = min_add_counter;
+        }
+        {
+            let mut temp_state = self.network_state.temporary_state.lock().await;
+            if let Some(signer) =
+                crate::chat::group::load_or_create_local_keypair(&self.app_state).await.ok()
+            {
+                let local = self.swarm.local_peer_id().to_string();
+                if let Err(error) = session.issue_membership_op(
+                    &local,
+                    crate::app_state::TemporaryMembershipOpKind::Add,
+                    &local,
+                    &signer,
+                ) {
+                    eprintln!(
+                        "[TempGroup] failed to rejoin {chat_id} after failed archive: {error}"
+                    );
+                }
+            } else {
+                eprintln!(
+                    "[TempGroup] no keypair available to rejoin {chat_id} after failed archive"
+                );
+            }
+            temp_state.chats.insert(chat_id.to_string(), session.clone());
+            temp_state.messages.insert(chat_id.to_string(), messages);
+        }
+        if matches!(session.kind, crate::app_state::TemporaryChatKind::Group) {
+            self.subscribe_group(chat_id);
+            self.broadcast_temp_group_roster(chat_id, None).await;
+        }
     }
 
     /// Handle a connection request from UI (user pressed Connect on a peer)
