@@ -82,6 +82,23 @@ pub const TEMP_GROUP_MAX_MEMBERS: usize = 64;
 /// stays complete.
 pub const TEMP_GROUP_MAX_MEMBERSHIP_OPS: usize = 256;
 
+/// Protocol domain for temporary-group membership ops, bound into every
+/// signature so an op minted for one group can never be replayed against a
+/// different group (or a different protocol).
+pub const TEMP_GROUP_PROTOCOL_DOMAIN: &str = "rchat-temp-group";
+
+/// Wire version of the temporary-group membership protocol. Bumped when the
+/// signed payload schema changes; ops signed under another version fail
+/// verification and are rejected.
+pub const TEMP_GROUP_PROTOCOL_VERSION: u8 = 1;
+
+/// Maximum acceptable Lamport-counter jump of a single received membership op
+/// above the current winner for its target. Bounds how far ahead a signed but
+/// attacker-controlled counter can leap, so a hostile participant cannot claim
+/// a near-`u64::MAX` counter and permanently lock out legitimate ops for a
+/// target.
+pub const MAX_MEMBERSHIP_OP_COUNTER_JUMP: u64 = 1_000_000;
+
 /// A single ordered membership operation for a temporary group.
 ///
 /// Ops are bound to the actor that issued them (a libp2p peer id), carry a
@@ -104,12 +121,26 @@ pub struct TemporaryMembershipOp {
     pub counter: u64,
     pub op: TemporaryMembershipOpKind,
     pub target: String,
+    /// The temporary-group chat id this op was minted for. Bound into the
+    /// signature below so a verified op can never be replayed into another
+    /// group.
+    #[serde(default)]
+    pub chat_id: String,
+    /// Protocol domain this op was minted under (see
+    /// `TEMP_GROUP_PROTOCOL_DOMAIN`).
+    #[serde(default)]
+    pub domain: String,
+    /// Protocol version this op was minted under (see
+    /// `TEMP_GROUP_PROTOCOL_VERSION`).
+    #[serde(default)]
+    pub version: u8,
     /// Base64 protobuf public key of the actor, used to verify `signature_b64`.
     #[serde(default)]
     pub public_key_b64: String,
     /// Base64 signature by the actor over the canonical serialization of
-    /// `(actor, counter, op, target)`. Signed ops are self-authenticating, so
-    /// they can be forwarded by any member and verified on receipt.
+    /// `(domain, version, chat_id, actor, counter, op, target)`. Signed ops are
+    /// self-authenticating, so they can be forwarded by any member and verified
+    /// on receipt.
     #[serde(default)]
     pub signature_b64: String,
 }
@@ -118,6 +149,9 @@ pub struct TemporaryMembershipOp {
 /// `verify` always agree on the exact bytes.
 #[derive(Debug, serde::Serialize)]
 struct TemporaryMembershipOpSigningPayload<'a> {
+    domain: &'a str,
+    version: u8,
+    chat_id: &'a str,
     actor: &'a str,
     counter: u64,
     op: &'a TemporaryMembershipOpKind,
@@ -127,12 +161,26 @@ struct TemporaryMembershipOpSigningPayload<'a> {
 impl TemporaryMembershipOp {
     /// Sign this operation with `keypair`, embedding the actor's public key so
     /// receivers can verify it without prior knowledge of the actor. Returns
-    /// `false` when the actor does not match the keypair or signing fails.
+    /// `false` when the actor does not match the keypair, the op is not bound
+    /// to a group (`chat_id` empty), or signing fails. `domain`/`version`
+    /// default to the current protocol when left empty.
     pub fn sign(&mut self, keypair: &libp2p::identity::Keypair) -> bool {
+        if self.chat_id.is_empty() {
+            return false;
+        }
+        if self.domain.is_empty() {
+            self.domain = TEMP_GROUP_PROTOCOL_DOMAIN.to_string();
+        }
+        if self.version == 0 {
+            self.version = TEMP_GROUP_PROTOCOL_VERSION;
+        }
         if libp2p::PeerId::from_public_key(&keypair.public()).to_string() != self.actor {
             return false;
         }
         let Ok(canonical) = serde_json::to_vec(&TemporaryMembershipOpSigningPayload {
+            domain: &self.domain,
+            version: self.version,
+            chat_id: &self.chat_id,
             actor: &self.actor,
             counter: self.counter,
             op: &self.op,
@@ -149,10 +197,18 @@ impl TemporaryMembershipOp {
     }
 
     /// Verify the signature over this operation. The embedded public key must
-    /// derive exactly to `actor`, and the signature must match the canonical
-    /// serialization of the op fields. Unsigned (legacy) ops fail verification.
+    /// derive exactly to `actor`, the op must be bound to the current protocol
+    /// domain/version and a non-empty chat id, and the signature must match the
+    /// canonical serialization of the op fields. Unsigned (legacy) ops fail
+    /// verification.
     pub fn verify(&self) -> bool {
         if self.public_key_b64.is_empty() || self.signature_b64.is_empty() {
+            return false;
+        }
+        if self.chat_id.is_empty()
+            || self.domain != TEMP_GROUP_PROTOCOL_DOMAIN
+            || self.version != TEMP_GROUP_PROTOCOL_VERSION
+        {
             return false;
         }
         let Ok(public_key_bytes) = BASE64.decode(&self.public_key_b64) else {
@@ -169,6 +225,9 @@ impl TemporaryMembershipOp {
             return false;
         }
         let Ok(canonical) = serde_json::to_vec(&TemporaryMembershipOpSigningPayload {
+            domain: &self.domain,
+            version: self.version,
+            chat_id: &self.chat_id,
             actor: &self.actor,
             counter: self.counter,
             op: &self.op,
@@ -182,6 +241,28 @@ impl TemporaryMembershipOp {
 
 fn is_valid_temp_group_member(peer_id: &str) -> bool {
     peer_id == "Me" || peer_id.parse::<libp2p::PeerId>().is_ok()
+}
+
+/// Admission context under which a membership op may change a session.
+///
+/// Authorization is distinct from signature authentication: a verified op is
+/// only admitted when the policy for its context allows it, so a valid actor
+/// can still never remove another member, and a removed member cannot re-add
+/// itself without a fresh invitation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipOpAdmission {
+    /// The op was issued locally by the session owner (its own join/leave, or
+    /// its endorsement of another peer). The owner is trusted for its own
+    /// session.
+    Local,
+    /// A remote op with no invitation capability: only self-ops of existing
+    /// members, and endorsement-adds signed by an existing member, are
+    /// admitted. Removing another member and non-member ops are rejected.
+    Standard,
+    /// A remote op accompanied by a valid invitation capability for this
+    /// group: additionally admits a non-member's self-add, which is how an
+    /// invited peer first joins.
+    Invited,
 }
 
 impl TemporaryChatSession {
@@ -245,12 +326,23 @@ impl TemporaryChatSession {
         if !is_valid_temp_group_member(actor) || !is_valid_temp_group_member(target) {
             return Ok(false);
         }
-        self.next_member_op_counter += 1;
+        // Strictly increasing per-actor Lamport counter. Refuses to wrap or
+        // reach the reserved `u64::MAX` sentinel instead of panicking.
+        let Some(next_counter) = self.next_member_op_counter.checked_add(1) else {
+            return Err(anyhow::anyhow!("temporary-group membership op counter exhausted"));
+        };
+        if next_counter == u64::MAX {
+            return Err(anyhow::anyhow!("temporary-group membership op counter exhausted"));
+        }
+        self.next_member_op_counter = next_counter;
         let mut signed_op = TemporaryMembershipOp {
             actor: actor.to_string(),
             counter: self.next_member_op_counter,
             op,
             target: target.to_string(),
+            chat_id: self.chat_id.clone(),
+            domain: TEMP_GROUP_PROTOCOL_DOMAIN.to_string(),
+            version: TEMP_GROUP_PROTOCOL_VERSION,
             public_key_b64: String::new(),
             signature_b64: String::new(),
         };
@@ -259,10 +351,14 @@ impl TemporaryChatSession {
                 "failed to sign membership op: keypair does not match actor {actor}"
             ));
         }
-        Ok(self.apply_membership_op(signed_op))
+        Ok(self.apply_membership_op(
+            signed_op,
+            MembershipOpAdmission::Local,
+        ))
     }
 
-    /// Apply membership ops received from a handshake or broadcast.
+    /// Apply membership ops received from a handshake or broadcast under the
+    /// standard admission policy (no invitation capability).
     ///
     /// Every op must be self-authenticating: only ops whose signature verifies
     /// against the embedded public key (which must derive exactly to the op's
@@ -272,20 +368,67 @@ impl TemporaryChatSession {
     /// while a participant still cannot forge operations as another member.
     /// The winner for a target is the op with the greatest `(counter, actor)`
     /// pair, so stale adds cannot resurrect a member that a newer remove
-    /// already evicted. Returns `true` when the roster changed.
+    /// already evicted. Returns `true` when the winner state changed (which
+    /// may or may not change the rendered roster).
     pub fn apply_membership_ops(&mut self, ops: &[TemporaryMembershipOp]) -> bool {
+        self.apply_membership_ops_admitted(ops, MembershipOpAdmission::Standard)
+    }
+
+    /// Apply membership ops with an explicit admission context (see
+    /// [`MembershipOpAdmission`]). Returns `true` when the winner state
+    /// changed.
+    pub fn apply_membership_ops_admitted(
+        &mut self,
+        ops: &[TemporaryMembershipOp],
+        admission: MembershipOpAdmission,
+    ) -> bool {
         let mut changed = false;
         for op in ops {
             if !op.verify() {
                 continue;
             }
-            changed |= self.apply_membership_op(op.clone());
+            if !self.acceptable_op_counter(&op) {
+                continue;
+            }
+            changed |= self.apply_membership_op(op.clone(), admission);
         }
         changed
     }
 
-    fn apply_membership_op(&mut self, op: TemporaryMembershipOp) -> bool {
+    /// Whether `op`'s Lamport counter is within the accepted bound for its
+    /// target. Ops are rejected when the counter reaches the reserved
+    /// `u64::MAX` sentinel or leaps more than `MAX_MEMBERSHIP_OP_COUNTER_JUMP`
+    /// above the current winner, so a signed but attacker-controlled counter
+    /// cannot dominate the winner map forever.
+    fn acceptable_op_counter(&self, op: &TemporaryMembershipOp) -> bool {
+        if op.counter == u64::MAX {
+            return false;
+        }
+        match self.member_op_winners.get(&op.target) {
+            Some(current) => {
+                op.counter
+                    <= current
+                        .counter
+                        .saturating_add(MAX_MEMBERSHIP_OP_COUNTER_JUMP)
+            }
+            None => op.counter <= MAX_MEMBERSHIP_OP_COUNTER_JUMP,
+        }
+    }
+
+    fn apply_membership_op(
+        &mut self,
+        op: TemporaryMembershipOp,
+        admission: MembershipOpAdmission,
+    ) -> bool {
         if !is_valid_temp_group_member(&op.actor) || !is_valid_temp_group_member(&op.target) {
+            return false;
+        }
+        // Ops are bound to the group they were minted for; a verified op from
+        // another group must never leak into this session's winner state.
+        if op.chat_id != self.chat_id {
+            return false;
+        }
+        if admission != MembershipOpAdmission::Local && !self.allowed_remote_op(&op, admission) {
             return false;
         }
         if let Some(current) = self.member_op_winners.get(&op.target) {
@@ -307,10 +450,86 @@ impl TemporaryChatSession {
         // this point supersedes it.
         self.next_member_op_counter = self.next_member_op_counter.max(op.counter);
         self.member_op_winners.insert(op.target.clone(), op.clone());
+        self.derive_roster();
+        true
+    }
+
+    /// Whether a remote op is authorized to change membership. Authentication
+    /// (a valid signature) is a separate concern enforced before this; here we
+    /// apply the group's admission policy so a member can never remove another
+    /// member, a non-member cannot mutate the roster, and a removed member
+    /// cannot re-admit itself without a fresh invitation.
+    fn allowed_remote_op(
+        &self,
+        op: &TemporaryMembershipOp,
+        admission: MembershipOpAdmission,
+    ) -> bool {
         match op.op {
-            TemporaryMembershipOpKind::Add => self.add_member(&op.target),
-            TemporaryMembershipOpKind::Remove => self.remove_member(&op.target),
+            TemporaryMembershipOpKind::Remove => {
+                // Only self-removal is permitted; evicting another member is
+                // never authorized by any admission context.
+                if op.actor != op.target {
+                    return false;
+                }
+                // The target must currently be an admitted member (in the
+                // rendered roster, whether seeded directly or via an add
+                // winner); re-removing a removed peer is a meaningless no-op.
+                self.is_member(&op.target)
+            }
+            TemporaryMembershipOpKind::Add => {
+                if op.actor == op.target {
+                    // Self-add: an existing member re-announcing is a replay
+                    // no-op (already admitted); a non-member joining needs the
+                    // invitation capability.
+                    self.is_member(&op.target)
+                        || admission == MembershipOpAdmission::Invited
+                } else {
+                    // Endorsement: only a current member may add a new peer.
+                    self.is_member(&op.actor)
+                }
+            }
         }
+    }
+
+    /// Re-derive the active roster from the authoritative winner state,
+    /// applying the member cap deterministically.
+    ///
+    /// Add-winner targets are admitted in `(counter, actor)` order (the same
+    /// deterministic total order used for winner comparison) up to
+    /// `TEMP_GROUP_MAX_MEMBERS`; entries that were seeded directly without a
+    /// signed winner (the local creator/redeemer before any ops flow) are
+    /// preserved unless superseded by a remove winner, so membership seeded at
+    /// session creation survives. Because every winner change re-runs this
+    /// derivation, an add that was queued out at full capacity is promoted the
+    /// moment a remove frees a slot.
+    fn derive_roster(&mut self) {
+        let mut roster: Vec<String> = self
+            .members
+            .iter()
+            .filter(|member| {
+                !matches!(
+                    self.member_op_winners.get(*member),
+                    Some(winner) if matches!(winner.op, TemporaryMembershipOpKind::Remove)
+                )
+            })
+            .cloned()
+            .collect();
+        let mut adds: Vec<(u64, String, String)> = self
+            .member_op_winners
+            .iter()
+            .filter(|(_, winner)| matches!(winner.op, TemporaryMembershipOpKind::Add))
+            .map(|(target, winner)| (winner.counter, winner.actor.clone(), target.clone()))
+            .collect();
+        adds.sort_unstable();
+        for (_, _, target) in adds {
+            if roster.len() >= TEMP_GROUP_MAX_MEMBERS {
+                break;
+            }
+            if !roster.iter().any(|member| member == &target) {
+                roster.push(target);
+            }
+        }
+        self.members = roster;
     }
 
     /// The current winning ops of this session, one per target. This is the
@@ -342,6 +561,39 @@ pub struct TemporaryRuntimeState {
     pub active_invite: Option<ActiveTemporaryInvite>,
     pub chats: HashMap<String, TemporaryChatSession>,
     pub messages: HashMap<String, Vec<Message>>,
+}
+
+/// Manager-owned record of a temporary session frozen for archiving (two-phase
+/// finalization).
+///
+/// The freeze retains everything needed to either commit the archive (final
+/// teardown of session, messages, routing, subscription and punch target) or
+/// abort it (full recovery of all of those), so a cancelled caller, an ack
+/// loss or a persistence failure can never orphan a reserved session or lose
+/// its conversation, routing or transport state.
+#[derive(Debug, Clone)]
+pub struct PendingTemporaryFinalization {
+    /// Monotonic per-freeze identifier. A stale recovery (e.g. a watchdog
+    /// firing after the caller moved on) only resolves the freeze it was
+    /// created for.
+    pub epoch: u64,
+    pub chat_id: String,
+    pub kind: TemporaryChatKind,
+    /// The session as frozen (reservation set); reactivated on abort, dropped
+    /// on commit.
+    pub session: TemporaryChatSession,
+    /// The final message set drained at the freeze boundary, restored on abort.
+    pub messages: Vec<Message>,
+    /// Connected member peer ids at freeze time, re-cached in both routing
+    /// directions on abort.
+    pub routing_peers: Vec<String>,
+    /// Whether the gossip topic was subscribed at freeze time.
+    pub was_subscribed: bool,
+    /// The punch target at freeze time (multiaddr string), restored on abort.
+    pub punch_target: Option<String>,
+    /// Membership counter carried by the farewell remove; a rejoin add must
+    /// exceed it to supersede that remove on every peer.
+    pub min_add_counter: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

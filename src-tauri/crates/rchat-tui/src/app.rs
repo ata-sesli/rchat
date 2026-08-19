@@ -5558,6 +5558,10 @@ fn drain_core_events(
                 state.app.status = format!("temporary chat ended {}", event.chat_id);
                 *refresh_requested = true;
             }
+            TuiEvent::Core(CoreEvent::TemporaryChatRestored(event)) => {
+                state.app.status = format!("temporary chat restored {}", event.chat_id);
+                *refresh_requested = true;
+            }
             TuiEvent::Core(CoreEvent::FileTransferComplete(event)) => {
                 state.app.status = format!("transfer complete {}", event.file_hash);
                 *refresh_requested = true;

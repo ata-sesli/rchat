@@ -32,6 +32,12 @@ pub struct TemporaryChatEndedEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TemporaryChatRestoredEvent {
+    pub chat_id: String,
+    pub peer_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct FileTransferCompleteEvent {
     pub file_hash: String,
 }
@@ -146,6 +152,7 @@ pub enum CoreEvent {
     NewGithubChat(NewGithubChatEvent),
     TemporaryChatConnected(TemporaryChatConnectedEvent),
     TemporaryChatEnded(TemporaryChatEndedEvent),
+    TemporaryChatRestored(TemporaryChatRestoredEvent),
     FileTransferComplete(FileTransferCompleteEvent),
     GroupInviteReceived(GroupInviteReceivedEvent),
     GroupRosterUpdated(GroupRosterUpdatedEvent),

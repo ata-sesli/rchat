@@ -33,43 +33,60 @@ pub enum NetworkCommand {
         multiaddr: String,
         is_group: bool,
     },
-    EndTemporarySession {
-        chat_id: String,
-        /// Signed membership winners to broadcast as the farewell roster.
-        /// `None` for the plain leave path (the session still exists, so the
-        /// handler reads the roster from it); `Some` for the archive path,
-        /// where the caller removes the session and the handler must not
-        /// depend on state that no longer exists.
-        farewell_winners: Option<Vec<crate::app_state::TemporaryMembershipOp>>,
-        /// Archive path only: the handler broadcasts the farewell first (the
-        /// leave boundary), then drains the final message set and removes the
-        /// session in the same event-loop step, replying with the drained
-        /// messages so the caller can persist the entire archive in a single
-        /// transaction. Everything received after the broadcast is strictly
-        /// post-leave and may be dropped.
-        ack: Option<tokio::sync::oneshot::Sender<Vec<crate::storage::db::Message>>>,
-    },
-    /// Re-establish a temporary session whose archive failed after the
-    /// farewell was broadcast. Re-inserts the session and its messages,
-    /// re-subscribes, and re-broadcasts a signed add tombstone that outranks
-    /// the farewell remove so remaining members re-admit the local peer.
+    /// Begin finalizing a temporary session (direct or group) for archiving —
+    /// phase one of a two-phase finalization.
     ///
-    /// The handler acknowledges only after local reinsertion, re-subscription
-    /// and the signed rejoin all succeed; a rejoin that cannot be signed is
-    /// reported through the ack (data is still preserved locally) so the
-    /// caller never believes the session was fully rejoined when remote
-    /// members still treat it as removed.
-    RestoreTemporarySession {
+    /// The manager retains the session, its message buffer, the routing maps
+    /// (both directions), the gossip subscription and the punch target in a
+    /// `pending_finalization` entry; the session stays in the temporary state
+    /// with its reservation (`archived`) set, so sends and incoming messages
+    /// keep being rejected while the freeze is unresolved. The farewell
+    /// winners are broadcast as the leave boundary (group sessions only),
+    /// then the final message set is drained and acknowledged so the caller
+    /// can persist the archive in a single transaction. `kind` is carried
+    /// explicitly so a direct-message archive is never mistaken for a group
+    /// one.
+    ///
+    /// `alive` is held by the caller until the freeze is resolved by a
+    /// Commit/Abort command; if it is dropped first (the caller's task was
+    /// cancelled) a manager watchdog aborts the archive so the conversation
+    /// is recovered instead of left reserved forever.
+    FreezeTemporaryArchive {
         chat_id: String,
-        session: crate::app_state::TemporaryChatSession,
-        messages: Vec<crate::storage::db::Message>,
-        /// The membership counter carried by the farewell remove; the rejoin
-        /// add must exceed it to supersede that remove on every peer.
+        kind: crate::app_state::TemporaryChatKind,
+        farewell_winners: Vec<crate::app_state::TemporaryMembershipOp>,
+        /// The membership counter carried by the farewell remove; an abort's
+        /// rejoin add must exceed it to supersede that remove on every peer.
         min_add_counter: u64,
-        /// The caller awaits this before returning, so a failed or
-        /// unacknowledged restore is surfaced instead of silently discarding
-        /// the recovery copies or leaving the local client believing it
-        /// rejoined.
+        alive: tokio::sync::watch::Sender<bool>,
+        ack: Option<
+            tokio::sync::oneshot::Sender<Result<Vec<crate::storage::db::Message>, String>>,
+        >,
+    },
+    /// Finalize an archived temporary session — phase two of a two-phase
+    /// finalization, sent after the caller has durably persisted the archive.
+    /// The manager removes the session, message buffer, routing maps, gossip
+    /// subscription and punch target, then emits `TemporaryChatEnded`. A no-op
+    /// when no freeze is pending for the chat (already committed or aborted).
+    CommitTemporaryArchive {
+        chat_id: String,
+    },
+    /// Recover a frozen temporary session whose archive failed, whose caller
+    /// was cancelled, or whose acknowledgement was lost — the safe default
+    /// whenever a freeze is never resolved. The manager clears the
+    /// reservation, restores the drained messages, re-caches the routing maps,
+    /// re-subscribes, re-adds the punch target, re-broadcasts a signed rejoin
+    /// add (group sessions only) that outranks the farewell remove, and emits
+    /// `TemporaryChatRestored`. A no-op when no freeze is pending.
+    ///
+    /// `epoch` pins the recovery to a specific freeze (used by the watchdog);
+    /// `None` resolves whichever freeze is currently pending. The handler
+    /// acknowledges only once the session, data and (for groups) the signed
+    /// rejoin are all restored, so the caller never believes the peer rejoined
+    /// while remote members still treat it as removed.
+    AbortTemporaryArchive {
+        chat_id: String,
+        epoch: Option<u64>,
         ack: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     },
     SubscribeGroup {

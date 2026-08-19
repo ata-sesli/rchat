@@ -32,22 +32,29 @@ impl NetworkManager {
             } => {
                 self.register_temporary_session(&chat_id, &peer_id, &multiaddr, is_group);
             }
-            NetworkCommand::EndTemporarySession {
+            NetworkCommand::FreezeTemporaryArchive {
                 chat_id,
+                kind,
                 farewell_winners,
-                ack,
-            } => {
-                self.end_temporary_session(&chat_id, farewell_winners, ack).await;
-            }
-            NetworkCommand::RestoreTemporarySession {
-                chat_id,
-                session,
-                messages,
                 min_add_counter,
+                alive,
                 ack,
             } => {
-                self.restore_temporary_session(&chat_id, session, messages, min_add_counter, ack)
-                    .await;
+                self.freeze_temporary_archive(
+                    &chat_id,
+                    kind,
+                    farewell_winners,
+                    min_add_counter,
+                    alive,
+                    ack,
+                )
+                .await;
+            }
+            NetworkCommand::CommitTemporaryArchive { chat_id } => {
+                self.commit_temporary_archive(&chat_id).await;
+            }
+            NetworkCommand::AbortTemporaryArchive { chat_id, epoch, ack } => {
+                self.abort_temporary_archive(&chat_id, epoch, ack).await;
             }
             NetworkCommand::SubscribeGroup { group_id } => self.subscribe_group(&group_id),
             NetworkCommand::UnsubscribeGroup { group_id } => self.unsubscribe_group(&group_id),

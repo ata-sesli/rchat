@@ -120,15 +120,22 @@ impl NetworkManager {
             }
         }
 
-        if let Some(chat_id) = self.temp_chat_by_peer_id.get(&peer_id_str).cloned() {
-            self.send_temp_handshake_to(&peer_id, &chat_id).await;
-
-            self.emit(CoreEvent::TemporaryChatConnected(
-                crate::events::TemporaryChatConnectedEvent {
-                    chat_id,
-                    peer_id: peer_id_str.clone(),
-                },
-            ));
+        if let Some(temp_chats) = self
+            .temp_chat_by_peer_id
+            .get(&peer_id_str)
+            .cloned()
+        {
+            let mut chats: Vec<String> = temp_chats.into_iter().collect();
+            chats.sort_unstable();
+            for chat_id in chats {
+                self.send_temp_handshake_to(&peer_id, &chat_id).await;
+                self.emit(CoreEvent::TemporaryChatConnected(
+                    crate::events::TemporaryChatConnectedEvent {
+                        chat_id,
+                        peer_id: peer_id_str.clone(),
+                    },
+                ));
+            }
         }
 
         let mut matched_data = None;
@@ -265,61 +272,30 @@ impl NetworkManager {
                 let peer_id_str = peer_id.to_string();
                 self.unmark_connected_chat_id(&peer_id_str).await;
                 self.note_chat_connection_closed(&peer_id_str).await;
-                if let Some(chat_id) = self.remove_temporary_by_peer_id(&peer_id_str) {
-                    // Update the in-memory session roster so presence is
-                    // derived from the member set: the dropped peer leaves the
-                    // roster via a remove tombstone signed by the local peer
-                    // (so the removal converges group-wide), and the group
-                    // only ends when the last member disconnects.
-                    let signer =
-                        crate::chat::group::load_or_create_local_keypair(&self.app_state)
-                            .await
-                            .ok();
-                    {
-                        let network_state = &self.network_state;
-                        let mut temp_state = network_state.temporary_state.lock().await;
-                        if let Some(session) = temp_state.chats.get_mut(&chat_id) {
-                            if session.is_member(&peer_id_str) {
-                                // Only a signed remove tombstone propagates
-                                // group-wide; without a matching keypair (or
-                                // on a signing failure) no op is issued so the
-                                // local roster is not mutated into a state
-                                // every remote peer would reject.
-                                let local = self.swarm.local_peer_id().to_string();
-                                match signer.as_ref() {
-                                    Some(keypair) => {
-                                        if let Err(error) = session.issue_membership_op(
-                                            &local,
-                                            crate::app_state::TemporaryMembershipOpKind::Remove,
-                                            &peer_id_str,
-                                            keypair,
-                                        ) {
-                                            eprintln!(
-                                                "[TempGroup] failed to sign remove tombstone for {peer_id_str}: {error}"
-                                            );
-                                        }
-                                    }
-                                    None => eprintln!(
-                                        "[TempGroup] no keypair available; skipping remove tombstone for {peer_id_str}"
-                                    ),
-                                }
-                            }
-                        }
-                    }
+                // Presence-only removal: membership (the signed admitted set)
+                // persists in the session across disconnects. Dropping the
+                // peer from the routing caches just loses its transport
+                // presence — we never sign a leave tombstone on its behalf,
+                // so it can rejoin on reconnect via the handshake winner log.
+                let affected_chats = self.remove_temporary_by_peer_id(&peer_id_str);
+                let ended_any_chat = !affected_chats.is_empty();
+                for chat_id in affected_chats {
                     if self.has_connected_temp_members(&chat_id) {
                         // Other members remain connected; keep the session
-                        // alive and push the updated roster to them.
-                        self.broadcast_temp_group_roster(&chat_id, None).await;
-                        return;
+                        // alive. The roster is unchanged (membership is
+                        // durable), so nothing is broadcast.
+                        continue;
                     }
                     self.unmark_connected_chat_id(&chat_id).await;
                     self.note_chat_connection_closed(&chat_id).await;
                     self.emit(CoreEvent::TemporaryChatEnded(
                         crate::events::TemporaryChatEndedEvent {
                             chat_id,
-                            peer_id: peer_id_str,
+                            peer_id: peer_id_str.clone(),
                         },
                     ));
+                }
+                if ended_any_chat {
                     return;
                 }
 

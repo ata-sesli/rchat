@@ -452,22 +452,37 @@ impl NetworkManager {
         let chat_kind = crate::chat_kind::parse_chat_kind(&chat_id);
 
         if matches!(chat_kind, crate::chat_kind::ChatKind::TemporaryDirect) {
-            // A missing session must not grow phantom history. While the
-            // session exists — including while it is reserved for archiving —
-            // the message is appended as an in-place buffer: the archive
-            // snapshot was already cloned, so the buffer is kept if the
-            // archive fails and discarded together with the session once it
-            // commits.
+            // The request's sender must be the authenticated transport source,
+            // and it must be the session's authorized remote peer. A missing,
+            // archived, or unauthorized session must not grow phantom history.
+            if request.sender_id != peer.to_string() {
+                eprintln!(
+                    "[DM] Rejecting spoofed temp sender {} from source {}",
+                    request.sender_id, peer
+                );
+                return Ok(());
+            }
             let network_state = &self.network_state;
             let mut temp_state = network_state.temporary_state.lock().await;
-            let session_exists = temp_state.chats.contains_key(&chat_id);
-            if session_exists {
-                temp_state
-                    .messages
-                    .entry(chat_id.clone())
-                    .or_default()
-                    .push(db_msg.clone());
+            let Some(session) = temp_state.chats.get(&chat_id) else {
+                return Ok(());
+            };
+            if session.archived {
+                return Ok(());
             }
+            let authorized = session.peer_id.as_deref() == Some(request.sender_id.as_str());
+            if !authorized {
+                eprintln!(
+                    "[DM] Rejecting message from non-member {} for {}",
+                    request.sender_id, chat_id
+                );
+                return Ok(());
+            }
+            temp_state
+                .messages
+                .entry(chat_id.clone())
+                .or_default()
+                .push(db_msg.clone());
         } else {
             self.persist_incoming_dm_message(request, chat_id.clone(), db_msg.clone())
                 .await
@@ -603,23 +618,37 @@ impl NetworkManager {
         let Some(handshake_text) = request.text_content.clone() else {
             return;
         };
-        let (chat_id, announced_winners) = match serde_json::from_str::<
+        let (chat_id, announced_winners, announced_invite) = match serde_json::from_str::<
             crate::network::gossip::TemporaryHandshakePayload,
         >(&handshake_text) {
-            Ok(payload) => (payload.chat_id, payload.winners),
+            Ok(payload) => (payload.chat_id, payload.winners, payload.invite),
             // Older peers send a bare chat id; treat it as a roster-less join.
-            Err(_) => (handshake_text, Vec::new()),
+            Err(_) => (handshake_text, Vec::new(), None),
         };
 
         if !crate::chat_kind::is_temporary_chat_id(&chat_id) {
             return;
         }
 
-        self.cache_temporary_mapping(&chat_id, &peer.to_string());
-
         let peer_id_str = peer.to_string();
         let local_peer_id = self.swarm.local_peer_id().to_string();
         let is_group = crate::chat_kind::is_temp_group_chat_id(&chat_id);
+        // The sender's invitation capability, validated against this chat:
+        // only a valid, unexpired invite for exactly this group admits a
+        // non-member's self-add (joining requires the invite, not mere
+        // dialing).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let invite_valid = announced_invite
+            .as_ref()
+            .map(|invite| {
+                matches!(invite.kind, crate::app_state::TemporaryChatKind::Group)
+                    && invite.chat_id == chat_id
+                    && invite.expires_at > now
+            })
+            .unwrap_or(false);
         // Best-effort signing keypair: ops issued below are signed so they can
         // be forwarded by any member and verified on receipt. If the keypair
         // cannot be loaded or signing fails, no op is issued at all — an
@@ -667,11 +696,20 @@ impl NetworkManager {
                     // so verified ops forwarded by any member converge
                     // transitively while forgeries stay impossible. The
                     // winner per target is the greatest (counter, actor) pair.
-                    roster_changed = session.apply_membership_ops(&announced_winners);
-                    // The sender itself is a member by virtue of dialing us;
-                    // record it with a fresh add op so it is part of the
-                    // membership state.
-                    if !session.is_member(&peer_id_str) {
+                    // The sender's invitation capability (validated above)
+                    // admits its own self-add; otherwise only self-ops of
+                    // existing members and endorsements by them are accepted.
+                    let admission = if invite_valid {
+                        crate::app_state::MembershipOpAdmission::Invited
+                    } else {
+                        crate::app_state::MembershipOpAdmission::Standard
+                    };
+                    roster_changed =
+                        session.apply_membership_ops_admitted(&announced_winners, admission);
+                    // The sender joins as a member only when it already is one
+                    // or it presented a valid invitation — never merely by
+                    // dialing us.
+                    if !session.is_member(&peer_id_str) && invite_valid {
                         roster_changed |= issue_local_op(
                             session,
                             crate::app_state::TemporaryMembershipOpKind::Add,
@@ -714,19 +752,51 @@ impl NetworkManager {
                     pending_send_count: 0,
                 };
                 if is_group {
-                    // Seed the local peer, apply the sender's winners, then
-                    // record the sender itself.
-                    session.add_member(&self.swarm.local_peer_id().to_string());
-                    roster_changed = session.apply_membership_ops(&announced_winners);
-                    roster_changed |= issue_local_op(
+                    // Seed the local peer with a signed self-add so it is part
+                    // of the authoritative winner state from birth; fall back
+                    // to a direct roster entry when no keypair is available.
+                    if !issue_local_op(
                         &mut session,
                         crate::app_state::TemporaryMembershipOpKind::Add,
-                        &peer_id_str,
-                    );
+                        &self.swarm.local_peer_id().to_string(),
+                    ) {
+                        session.add_member(&self.swarm.local_peer_id().to_string());
+                    }
+                    let admission = if invite_valid {
+                        crate::app_state::MembershipOpAdmission::Invited
+                    } else {
+                        crate::app_state::MembershipOpAdmission::Standard
+                    };
+                    roster_changed =
+                        session.apply_membership_ops_admitted(&announced_winners, admission);
+                    // The sender joins as a member only with a valid
+                    // invitation — never merely by dialing us.
+                    if !session.is_member(&peer_id_str) && invite_valid {
+                        roster_changed |= issue_local_op(
+                            &mut session,
+                            crate::app_state::TemporaryMembershipOpKind::Add,
+                            &peer_id_str,
+                        );
+                    }
                     respond_to_sender = true;
                 }
                 temp_state.chats.insert(chat_id.clone(), session);
             }
+        }
+
+        // Only connected members are routed: a dialing non-member without a
+        // valid invitation is not part of the group's fan-out or resolution.
+        let sender_is_member = {
+            let network_state = &self.network_state;
+            let temp_state = network_state.temporary_state.lock().await;
+            temp_state
+                .chats
+                .get(&chat_id)
+                .map(|session| session.is_member(&peer_id_str))
+                .unwrap_or(false)
+        };
+        if !is_group || sender_is_member {
+            self.cache_temporary_mapping(&chat_id, &peer.to_string());
         }
 
         // Respond with our op log so the sender learns about the other
@@ -754,18 +824,25 @@ impl NetworkManager {
     /// member set.
     pub(crate) async fn send_temp_handshake_to(&mut self, peer: &PeerId, chat_id: &str) {
         use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
-        let winners = {
+        let (winners, invite) = {
             let network_state = &self.network_state;
             let temp_state = network_state.temporary_state.lock().await;
-            temp_state
+            let winners = temp_state
                 .chats
                 .get(chat_id)
                 .map(|session| session.membership_winners())
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let invite = temp_state
+                .active_invite
+                .as_ref()
+                .filter(|active| active.payload.chat_id == chat_id)
+                .map(|active| active.payload.clone());
+            (winners, invite)
         };
         let payload = crate::network::gossip::TemporaryHandshakePayload {
             chat_id: chat_id.to_string(),
             winners,
+            invite,
         };
         let text_content =
             serde_json::to_string(&payload).unwrap_or_else(|_| chat_id.to_string());
@@ -837,9 +914,19 @@ impl NetworkManager {
         winners: &[crate::app_state::TemporaryMembershipOp],
     ) {
         use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
+        let invite = {
+            let network_state = &self.network_state;
+            let temp_state = network_state.temporary_state.lock().await;
+            temp_state
+                .active_invite
+                .as_ref()
+                .filter(|active| active.payload.chat_id == chat_id)
+                .map(|active| active.payload.clone())
+        };
         let payload = crate::network::gossip::TemporaryHandshakePayload {
             chat_id: chat_id.to_string(),
             winners: winners.to_vec(),
+            invite,
         };
         let text_content =
             serde_json::to_string(&payload).unwrap_or_else(|_| chat_id.to_string());

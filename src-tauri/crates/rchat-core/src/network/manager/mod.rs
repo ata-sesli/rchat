@@ -506,8 +506,17 @@ pub struct NetworkManager {
     github_by_peer_id: HashMap<String, String>,
     // Temporary chat routing cache: temp chat id -> connected member peer ids
     temp_peer_by_chat_id: HashMap<String, HashSet<String>>,
-    // Reverse temporary routing cache: peer id -> temp chat id
-    temp_chat_by_peer_id: HashMap<String, String>,
+    // Reverse temporary routing cache: peer id -> set of temp chat ids the
+    // peer is a connected member of (a peer can belong to several groups)
+    temp_chat_by_peer_id: HashMap<String, HashSet<String>>,
+    // Two-phase finalization: frozen temporary sessions awaiting a commit
+    // (archive persisted) or an abort (recovery), keyed by chat id. Owned by
+    // the manager so a cancelled caller, an ack loss or a persistence failure
+    // can never orphan a reserved session or lose its routing state.
+    pending_finalization: HashMap<String, crate::app_state::PendingTemporaryFinalization>,
+    // Monotonic per-freeze epoch used to scope recovery watches to the freeze
+    // they were created for.
+    pending_epoch_counter: u64,
     // Connection transport capability registry per peer.
     peer_transport_registry: PeerTransportRegistry,
     // Transfer per-file ordering/emit state.
@@ -868,6 +877,8 @@ impl NetworkManager {
             github_by_peer_id: HashMap::new(),
             temp_peer_by_chat_id: HashMap::new(),
             temp_chat_by_peer_id: HashMap::new(),
+            pending_finalization: HashMap::new(),
+            pending_epoch_counter: 0,
             peer_transport_registry: PeerTransportRegistry::default(),
             transfer_states: HashMap::new(),
             transfer_task_tx,
@@ -1280,8 +1291,10 @@ impl NetworkManager {
         sender_peer_id: &str,
         sender_alias: Option<&str>,
     ) -> String {
-        if let Some(temp_chat_id) = self.temp_chat_by_peer_id.get(sender_peer_id) {
-            return temp_chat_id.clone();
+        if let Some(temp_chats) = self.temp_chat_by_peer_id.get(sender_peer_id) {
+            if let Some(temp_chat_id) = temp_chats.iter().next() {
+                return temp_chat_id.clone();
+            }
         }
 
         if let Some(gh_user) = self.github_by_peer_id.get(sender_peer_id) {
@@ -1324,28 +1337,41 @@ impl NetworkManager {
             .or_default()
             .insert(peer_id.to_string());
         self.temp_chat_by_peer_id
-            .insert(peer_id.to_string(), chat_id.to_string());
+            .entry(peer_id.to_string())
+            .or_default()
+            .insert(chat_id.to_string());
     }
 
     pub(super) fn remove_temporary_by_chat_id(&mut self, chat_id: &str) {
         if let Some(peers) = self.temp_peer_by_chat_id.remove(chat_id) {
             for peer in peers {
-                self.temp_chat_by_peer_id.remove(&peer);
+                if let Some(chats) = self.temp_chat_by_peer_id.get_mut(&peer) {
+                    chats.remove(chat_id);
+                    if chats.is_empty() {
+                        self.temp_chat_by_peer_id.remove(&peer);
+                    }
+                }
             }
         }
     }
 
-    /// Remove one member from the temporary routing caches. Returns the chat
-    /// id the peer belonged to, or `None` when the peer was never tracked.
-    pub(super) fn remove_temporary_by_peer_id(&mut self, peer_id: &str) -> Option<String> {
-        let chat_id = self.temp_chat_by_peer_id.remove(peer_id)?;
-        if let Some(peers) = self.temp_peer_by_chat_id.get_mut(&chat_id) {
-            peers.remove(peer_id);
-            if peers.is_empty() {
-                self.temp_peer_by_chat_id.remove(&chat_id);
+    /// Remove one member from the temporary routing caches, dropping its
+    /// transport presence. Returns every chat id the peer was a connected
+    /// member of, or an empty vec when the peer was never tracked.
+    pub(super) fn remove_temporary_by_peer_id(&mut self, peer_id: &str) -> Vec<String> {
+        let mut affected_chats = Vec::new();
+        if let Some(chats) = self.temp_chat_by_peer_id.remove(peer_id) {
+            for chat_id in chats.iter() {
+                if let Some(peers) = self.temp_peer_by_chat_id.get_mut(chat_id) {
+                    peers.remove(peer_id);
+                    if peers.is_empty() {
+                        self.temp_peer_by_chat_id.remove(chat_id);
+                    }
+                }
             }
+            affected_chats.extend(chats);
         }
-        Some(chat_id)
+        affected_chats
     }
 
     /// Whether any member of a temporary chat still has a live connection.

@@ -111,7 +111,20 @@ impl NetworkManager {
         }
 
         if envelope.sender_id.is_empty() {
-            envelope.sender_id = message.source.map(|p| p.to_string()).unwrap_or_default();
+            if let Some(source) = message.source {
+                envelope.sender_id = source.to_string();
+            }
+        } else if let Some(source) = message.source {
+            // A non-empty sender_id must be the authenticated transport source:
+            // anything else is a spoofed publisher identity and is dropped
+            // before it can be stored, emitted or trigger a media request.
+            if envelope.sender_id != source.to_string() {
+                eprintln!(
+                    "[Group] Rejecting spoofed sender_id {} from source {}",
+                    envelope.sender_id, source
+                );
+                return;
+            }
         }
 
         if envelope.sender_id == self.swarm.local_peer_id().to_string() {
@@ -122,16 +135,25 @@ impl NetworkManager {
 
         let is_temp_group = crate::chat_kind::is_temp_group_chat_id(&envelope.group_id);
         if is_temp_group {
-            // A missing session must not grow phantom history. While the
-            // session exists — including while it is reserved for archiving —
-            // the message is appended as an in-place buffer: the archive
-            // snapshot was already cloned, so the buffer is kept if the
-            // archive fails and discarded together with the session once it
-            // commits, instead of being silently lost mid-archive.
+            // A missing, archived, or unauthorized session must not grow
+            // phantom history, and only an admitted member may publish into a
+            // temporary group. While the session is reserved for archiving the
+            // message is dropped: the snapshot was already taken, and letting
+            // a late message through would create history the archive can no
+            // longer capture coherently.
             let network_state = &self.network_state;
             let mut temp_state = network_state.temporary_state.lock().await;
-            let session_exists = temp_state.chats.contains_key(&envelope.group_id);
-            if !session_exists {
+            let Some(session) = temp_state.chats.get(&envelope.group_id) else {
+                return;
+            };
+            if session.archived {
+                return;
+            }
+            if !session.is_member(&envelope.sender_id) {
+                eprintln!(
+                    "[TempGroup] Rejecting message from non-member {} for {}",
+                    envelope.sender_id, envelope.group_id
+                );
                 return;
             }
             temp_state
@@ -166,6 +188,21 @@ impl NetworkManager {
         file_hash: &str,
         preferred_peer_id: &str,
     ) {
+        // Media routing into a temporary group is only authorized for admitted
+        // members of a live (non-archived) session.
+        if crate::chat_kind::is_temp_group_chat_id(group_id) {
+            let network_state = &self.network_state;
+            let temp_state = network_state.temporary_state.lock().await;
+            let Some(session) = temp_state.chats.get(group_id) else {
+                return;
+            };
+            if session.archived {
+                return;
+            }
+            if !session.is_member(preferred_peer_id) {
+                return;
+            }
+        }
         let mut candidates = vec![preferred_peer_id.to_string()];
         if let Ok(conn) = self.app_state.db_conn.lock() {
             if let Ok(sources) =

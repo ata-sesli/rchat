@@ -58,6 +58,11 @@ pub struct TemporaryHandshakePayload {
     pub chat_id: String,
     #[serde(default)]
     pub winners: Vec<crate::app_state::TemporaryMembershipOp>,
+    /// The sender's invitation capability for this group, if any. A receiver
+    /// validates it against its own chat id before admitting a non-member's
+    /// self-add, so joining requires the invite rather than mere dialing.
+    #[serde(default)]
+    pub invite: Option<crate::app_state::TemporaryInvitePayload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
