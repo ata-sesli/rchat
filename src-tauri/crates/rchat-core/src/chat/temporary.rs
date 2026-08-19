@@ -670,18 +670,27 @@ pub async fn archive_temporary_chat(
                 "Temporary chat has sends in flight; retry archiving: {chat_id}"
             ));
         }
-        let (farewell_winners, min_add_counter) = if let Some(local) = local_peer_id.as_deref() {
-            let mut clone = session.clone();
-            clone.issue_membership_op(
-                local,
-                TemporaryMembershipOpKind::Remove,
-                local,
-                &signer,
-            )?;
-            (clone.membership_winners(), clone.next_member_op_counter)
-        } else {
-            (session.membership_winners(), session.next_member_op_counter)
-        };
+        // The farewell remove tombstone is only meaningful for groups (a DM
+        // has no roster, and the manager broadcasts winners only for group
+        // sessions); mint it on a *clone* so the live membership state is
+        // never mutated by archiving. The session (and its messages) are torn
+        // down by the network manager below and restored by it if persistence
+        // fails.
+        let (farewell_winners, min_add_counter) =
+            if let (Some(local), TemporaryChatKind::Group) =
+                (local_peer_id.as_deref(), session.kind.clone())
+            {
+                let mut clone = session.clone();
+                clone.issue_membership_op(
+                    local,
+                    TemporaryMembershipOpKind::Remove,
+                    local,
+                    &signer,
+                )?;
+                (clone.membership_winners(), clone.next_member_op_counter)
+            } else {
+                (session.membership_winners(), session.next_member_op_counter)
+            };
         session.archived = true;
         (session.clone(), farewell_winners, min_add_counter)
     };
@@ -2015,6 +2024,106 @@ mod tests {
             .expect("archived history");
         assert_eq!(archived_messages.len(), 2);
         assert!(archived_messages.iter().all(|message| message.status == "read"));
+    }
+
+    #[tokio::test]
+    async fn archive_temporary_dm_carries_dm_kind_and_no_group_farewell() {
+        let (_temp, app_state) = crate::testing::test_app_state().await;
+        let (net_state, mut rx) = test_network_state();
+        let chat_id = crate::chat_kind::generate_temp_direct_chat_id();
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            temp_state.chats.insert(
+                chat_id.clone(),
+                TemporaryChatSession {
+                    chat_id: chat_id.clone(),
+                    name: crate::chat_kind::default_temp_direct_name(&chat_id),
+                    kind: TemporaryChatKind::Dm,
+                    expires_at: now_unix_secs() + 3600,
+                    peer_id: Some(REMOTE_PEER_ID.to_string()),
+                    members: Vec::new(),
+                    member_op_winners: HashMap::new(),
+                    next_member_op_counter: 0,
+                    archived: false,
+                    pending_send_count: 0,
+                },
+            );
+            temp_state.messages.insert(
+                chat_id.clone(),
+                vec![temp_group_message(&chat_id, "m1", "hello")],
+            );
+        }
+
+        // Play the manager's two-phase finalizer and witness the freeze: a DM
+        // archive must carry the explicit DM kind with no group membership
+        // winners, so the manager never broadcasts a group-style roster
+        // handshake to the peer.
+        let net = net_state.clone();
+        let driver = tokio::spawn(async move {
+            let (chat_id, kind, farewell_winners, ack) = match rx
+                .recv()
+                .await
+                .expect("the archive freeze command must arrive")
+            {
+                NetworkCommand::FreezeTemporaryArchive {
+                    chat_id,
+                    kind,
+                    farewell_winners,
+                    ack,
+                    ..
+                } => (chat_id, kind, farewell_winners, ack),
+                other => panic!("unexpected command: {other:?}"),
+            };
+            assert_eq!(
+                kind,
+                TemporaryChatKind::Dm,
+                "a DM archive must carry the DM kind"
+            );
+            assert!(
+                farewell_winners.is_empty(),
+                "a DM archive must not mint group membership winners"
+            );
+            let messages = {
+                let mut temp_state = net.temporary_state.lock().await;
+                temp_state.messages.remove(&chat_id).unwrap_or_default()
+            };
+            if let Some(ack) = ack {
+                let _ = ack.send(Ok(messages));
+            }
+            match rx
+                .recv()
+                .await
+                .expect("the archive commit command must arrive")
+            {
+                NetworkCommand::CommitTemporaryArchive {
+                    chat_id: committed,
+                } => {
+                    assert_eq!(committed, chat_id);
+                    let mut temp_state = net.temporary_state.lock().await;
+                    temp_state.chats.remove(&chat_id);
+                    temp_state.messages.remove(&chat_id);
+                }
+                other => panic!("unexpected command: {other:?}"),
+            }
+        });
+
+        let archived = archive_temporary_chat(&app_state, &net_state, &chat_id)
+            .await
+            .expect("archive");
+        driver.await.expect("driver");
+
+        assert!(archived.chat_id.starts_with(&format!("archived:{}:", chat_id)));
+        assert!(net_state
+            .temporary_state
+            .lock()
+            .await
+            .chats
+            .get(&chat_id)
+            .is_none());
+        let conn = app_state.db_conn.lock().expect("db");
+        let archived_messages = crate::storage::db::get_messages(&conn, &archived.chat_id)
+            .expect("archived history");
+        assert_eq!(archived_messages.len(), 1);
     }
 
     #[tokio::test]
