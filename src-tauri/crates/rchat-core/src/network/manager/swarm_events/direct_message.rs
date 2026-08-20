@@ -639,17 +639,19 @@ impl NetworkManager {
         let peer_id_str = peer.to_string();
         let local_peer_id = self.swarm.local_peer_id().to_string();
         let is_group = crate::chat_kind::is_temp_group_chat_id(&chat_id);
-        // The sender's invitation capability, validated against this chat:
-        // only a valid, unexpired, *signed* invite for exactly this group
-        // admits a non-member's self-add (joining requires the invite, not
-        // mere dialing). The signature is verified against the inviter's
-        // embedded public key (which must hash to the claimed inviter peer
-        // id), so a forged or re-signed invite is rejected here.
+        // The sender's invitation capability, validated against this chat.
+        // Signature and expiry alone are not authorization: on an existing
+        // session the inviter must be a currently admitted member (or the
+        // session's creator), and on a fresh peer only an invite the local
+        // peer itself issued — the local user is that group's creator — can
+        // bootstrap a session. A stranger's self-signed invite for a known
+        // group id proves only that its signer owns a key, so it admits
+        // nobody.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let invite_valid = announced_invite
+        let invite_capability_valid = announced_invite
             .as_ref()
             .map(|invite| {
                 matches!(invite.kind, crate::app_state::TemporaryChatKind::Group)
@@ -703,9 +705,15 @@ impl NetworkManager {
                     // so verified ops forwarded by any member converge
                     // transitively while forgeries stay impossible. The
                     // winner per target is the greatest (counter, actor) pair.
-                    // The sender's invitation capability (validated above)
-                    // admits its own self-add; otherwise only self-ops of
-                    // existing members and endorsements by them are accepted.
+                    // The sender's invitation capability (validated against
+                    // this session's member set / creator above) admits its
+                    // own self-add; otherwise only self-ops of existing
+                    // members and endorsements by them are accepted.
+                    let invite_valid = invite_capability_valid
+                        && announced_invite
+                            .as_ref()
+                            .map(|invite| session.invite_authorizes_join(invite, now))
+                            .unwrap_or(false);
                     let admission = if invite_valid {
                         crate::app_state::MembershipOpAdmission::Invited
                     } else {
@@ -735,21 +743,27 @@ impl NetworkManager {
                 } else if session.peer_id.is_none() {
                     session.peer_id = Some(peer_id_str.clone());
                 }
-            } else {
-                let kind = if is_group {
-                    crate::app_state::TemporaryChatKind::Group
-                } else {
-                    crate::app_state::TemporaryChatKind::Dm
-                };
-                let name = if is_group {
-                    crate::chat_kind::default_temp_group_name(&chat_id)
-                } else {
-                    crate::chat_kind::default_temp_direct_name(&chat_id)
-                };
+            } else if is_group {
+                // No local session for this group: a handshake alone cannot
+                // bootstrap one. A self-signed invite proves only that its
+                // signer owns a key, not authority over the group — so an
+                // unsolicited handshake for an unknown group is ignored. The
+                // one exception is an invite the LOCAL peer itself issued:
+                // the local user is this group's creator, so its own signature
+                // is the root authority (this recovers a session removed by a
+                // cancelled invite before any member joined).
+                let local_issued = invite_capability_valid
+                    && announced_invite
+                        .as_ref()
+                        .map(|invite| invite.inviter_peer_id == local_peer_id)
+                        .unwrap_or(false);
+                if !local_issued {
+                    return;
+                }
                 let mut session = crate::app_state::TemporaryChatSession {
                     chat_id: chat_id.clone(),
-                    name,
-                    kind,
+                    name: crate::chat_kind::default_temp_group_name(&chat_id),
+                    kind: crate::app_state::TemporaryChatKind::Group,
                     expires_at: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() + 120)
@@ -762,49 +776,53 @@ impl NetworkManager {
                     pending_send_count: 0,
                     admitted_invite: None,
                     admission_evidence: HashMap::new(),
+                                        creator_peer_id: local_peer_id.clone(),
                 };
-                if is_group {
-                    // Seed the local peer with a signed self-add so it is part
-                    // of the authoritative winner state from birth; fall back
-                    // to a direct roster entry when no keypair is available.
-                    if !issue_local_op(
+                // Seed the local peer with a signed self-add so it is part
+                // of the authoritative winner state from birth; fall back
+                // to a direct roster entry when no keypair is available.
+                if !issue_local_op(
+                    &mut session,
+                    crate::app_state::TemporaryMembershipOpKind::Add,
+                    &local_peer_id,
+                ) {
+                    session.add_member(&local_peer_id);
+                }
+                // The creator's own invite is authoritative: the sender
+                // joins through its self-add under the Invited admission.
+                roster_changed = session.apply_membership_ops_admitted(
+                    &announced_winners,
+                    &announced_evidence,
+                    crate::app_state::MembershipOpAdmission::Invited,
+                );
+                if !session.is_member(&peer_id_str) {
+                    roster_changed |= issue_local_op(
                         &mut session,
                         crate::app_state::TemporaryMembershipOpKind::Add,
-                        &self.swarm.local_peer_id().to_string(),
-                    ) {
-                        session.add_member(&self.swarm.local_peer_id().to_string());
-                    }
-                    // A valid invitation also seeds its inviter as a base
-                    // member: the inviter is the root of every endorsement
-                    // chain, so a fresh peer must be able to establish its
-                    // membership before it can verify anyone the inviter (or
-                    // a chain through it) admitted.
-                    if invite_valid {
-                        if let Some(invite) = announced_invite.as_ref() {
-                            session.add_member(&invite.inviter_peer_id);
-                        }
-                    }
-                    let admission = if invite_valid {
-                        crate::app_state::MembershipOpAdmission::Invited
-                    } else {
-                        crate::app_state::MembershipOpAdmission::Standard
-                    };
-                    roster_changed = session.apply_membership_ops_admitted(
-                        &announced_winners,
-                        &announced_evidence,
-                        admission,
+                        &peer_id_str,
                     );
-                    // The sender joins as a member only with a valid
-                    // invitation — never merely by dialing us.
-                    if !session.is_member(&peer_id_str) && invite_valid {
-                        roster_changed |= issue_local_op(
-                            &mut session,
-                            crate::app_state::TemporaryMembershipOpKind::Add,
-                            &peer_id_str,
-                        );
-                    }
-                    respond_to_sender = true;
                 }
+                respond_to_sender = true;
+                temp_state.chats.insert(chat_id.clone(), session);
+            } else {
+                let session = crate::app_state::TemporaryChatSession {
+                    chat_id: chat_id.clone(),
+                    name: crate::chat_kind::default_temp_direct_name(&chat_id),
+                    kind: crate::app_state::TemporaryChatKind::Dm,
+                    expires_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() + 120)
+                        .unwrap_or(120),
+                    peer_id: Some(peer_id_str.clone()),
+                    members: Vec::new(),
+                    member_op_winners: std::collections::HashMap::new(),
+                    next_member_op_counter: 0,
+                    archived: false,
+                    pending_send_count: 0,
+                    admitted_invite: None,
+                    admission_evidence: HashMap::new(),
+                                        creator_peer_id: String::new(),
+                };
                 temp_state.chats.insert(chat_id.clone(), session);
             }
         }

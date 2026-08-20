@@ -763,6 +763,7 @@ mod tests {
                     pending_send_count: 0,
                     admitted_invite: None,
                     admission_evidence: HashMap::new(),
+                    creator_peer_id: String::new(),
                 },
             );
         }
@@ -835,6 +836,7 @@ mod tests {
                     pending_send_count: 0,
                     admitted_invite: None,
                     admission_evidence: HashMap::new(),
+                    creator_peer_id: String::new(),
                 },
             );
         }

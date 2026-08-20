@@ -1370,6 +1370,7 @@ mod tests {
                     pending_send_count: 0,
                     admitted_invite: None,
                     admission_evidence: std::collections::HashMap::new(),
+                    creator_peer_id: String::new(),
                 },
             );
             if !messages.is_empty() {

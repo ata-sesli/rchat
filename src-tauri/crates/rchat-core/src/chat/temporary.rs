@@ -97,7 +97,7 @@ pub async fn create_temporary_invite(
         version: TEMP_INVITE_VERSION,
         kind: kind.clone(),
         chat_id: chat_id.clone(),
-        inviter_peer_id,
+        inviter_peer_id: inviter_peer_id.clone(),
         inviter_username,
         inviter_addr,
         created_at,
@@ -139,6 +139,7 @@ pub async fn create_temporary_invite(
                 pending_send_count: 0,
                 admitted_invite: None,
                 admission_evidence: HashMap::new(),
+                creator_peer_id: inviter_peer_id.clone(),
             },
         );
         temp_state.messages.entry(chat_id).or_default();
@@ -294,6 +295,7 @@ pub async fn redeem_temporary_invite(
             pending_send_count: 0,
             admitted_invite: Some(payload.clone()),
             admission_evidence: HashMap::new(),
+            creator_peer_id: payload.inviter_peer_id.clone(),
         });
     entry.name = resolved_name.clone();
     entry.kind = payload.kind.clone();
@@ -673,8 +675,35 @@ pub async fn archive_temporary_chat(
     // group sessions); mint it on a *clone* so the live membership state is
     // never mutated by archiving. The session (and its messages) are torn
     // down by the network manager below and restored by it if persistence
-    // fails. The group signing key is loaded only for group sessions, so a
-    // plain temporary DM never depends on group key material.
+    // fails.
+    //
+    // The group signing key is loaded *before* the temporary-state lock is
+    // taken (and only for group sessions, so a plain temporary DM never
+    // depends on group key material): key generation or config I/O can
+    // otherwise block every temporary-chat send/receive operation while the
+    // archive holds the lock. The session is revalidated atomically under the
+    // lock after the load, so a session that vanished or became reserved in
+    // the meantime is still rejected the same way.
+    let kind = {
+        let temp_state = net_state.temporary_state.lock().await;
+        if temp_state
+            .messages
+            .get(chat_id)
+            .map(|messages| messages.is_empty())
+            .unwrap_or(true)
+        {
+            return Err(anyhow!("No temporary messages to archive"));
+        }
+        match temp_state.chats.get(chat_id) {
+            Some(session) => session.kind.clone(),
+            None => return Err(anyhow!("Temporary chat not found")),
+        }
+    };
+    let signer = if matches!(kind, TemporaryChatKind::Group) {
+        Some(crate::chat::group::load_or_create_local_keypair(app_state).await?)
+    } else {
+        None
+    };
     let (session, farewell_winners, min_add_counter) = {
         let mut temp_state = net_state.temporary_state.lock().await;
         if temp_state
@@ -705,17 +734,13 @@ pub async fn archive_temporary_chat(
         // down by the network manager below and restored by it if persistence
         // fails.
         let (farewell_winners, min_add_counter) =
-            if let (Some(local), TemporaryChatKind::Group) =
-                (local_peer_id.as_deref(), session.kind.clone())
-            {
-                let signer =
-                    crate::chat::group::load_or_create_local_keypair(app_state).await?;
+            if let (Some(local), Some(signer)) = (local_peer_id.as_deref(), signer.as_ref()) {
                 let mut clone = session.clone();
                 clone.issue_membership_op(
                     local,
                     TemporaryMembershipOpKind::Remove,
                     local,
-                    &signer,
+                    signer,
                 )?;
                 (clone.membership_winners(), clone.next_member_op_counter)
             } else {
@@ -1193,22 +1218,42 @@ mod tests {
                                         min_add_counter,
                                     },
                                 );
-                                // Mirror the manager's watchdog: a dropped
-                                // `alive` sender (caller cancelled) resolves
-                                // the freeze from the caller's last decision —
-                                // still Pending recovers, Commit finalizes.
-                                // Only the receiver crosses into the task; the
-                                // arm's copy of the sender is dropped
-                                // immediately so the channel closes the moment
-                                // the caller drops its sender.
+                                // Mirror the manager's watchdog: the caller's
+                                // `alive` sender carries its synchronous
+                                // decision. A successful change to Commit
+                                // finalizes immediately; a dropped sender
+                                // (caller cancelled) resolves from the last
+                                // recorded decision — still Pending recovers,
+                                // Commit finalizes. Only the receiver crosses
+                                // into the task; the arm's copy of the sender
+                                // is dropped immediately so the channel closes
+                                // the moment the caller drops its sender.
                                 let wd_sender = wd_tx.clone();
                                 let watchdog_chat = chat_id.clone();
+                                // Subscribe synchronously (as the production
+                                // handler does) so the subscription is
+                                // registered before the ack below reaches the
+                                // caller; the task then only reacts to it.
                                 let mut alive_rx = alive.subscribe();
                                 drop(alive);
                                 tokio::spawn(async move {
-                                    if alive_rx.changed().await.is_err() {
+                                    loop {
+                                        if alive_rx.changed().await.is_err() {
+                                            let resolution = *alive_rx.borrow();
+                                            let _ =
+                                                wd_sender.send((watchdog_chat, resolution)).await;
+                                            return;
+                                        }
                                         let resolution = *alive_rx.borrow();
-                                        let _ = wd_sender.send((watchdog_chat, resolution)).await;
+                                        if matches!(
+                                            resolution,
+                                            crate::app_state::FreezeResolution::Commit
+                                        ) {
+                                            let _ = wd_sender
+                                                .send((watchdog_chat, resolution))
+                                                .await;
+                                            return;
+                                        }
                                     }
                                 });
                                 if let Some(ack) = ack {
@@ -1565,6 +1610,224 @@ mod tests {
             && dm.verify_capability(&chat_id, now)));
     }
 
+    #[test]
+    fn stranger_invite_does_not_authorize_join_on_existing_session() {
+        // A stranger who knows a group id signs a perfectly valid, unexpired
+        // invite for it. The signature proves only that the stranger owns a
+        // key — not authority over the group — so neither the stranger nor a
+        // sender it vouches for may be admitted on an existing session.
+        let chat_id = "temp-group:550e8400-e29b-41d4-a716-446655440000".to_string();
+        let local_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let local_peer = libp2p::PeerId::from_public_key(&local_keypair.public()).to_string();
+        let member_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let member_peer = libp2p::PeerId::from_public_key(&member_keypair.public()).to_string();
+        let stranger_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let stranger_peer =
+            libp2p::PeerId::from_public_key(&stranger_keypair.public()).to_string();
+        let now = now_unix_secs();
+        let mut session = TemporaryChatSession {
+            chat_id: chat_id.clone(),
+            name: "Design Crew".to_string(),
+            kind: TemporaryChatKind::Group,
+            expires_at: now + 3600,
+            peer_id: Some(member_peer.clone()),
+            members: vec![local_peer.clone(), member_peer.clone()],
+            member_op_winners: HashMap::new(),
+            next_member_op_counter: 0,
+            archived: false,
+            pending_send_count: 0,
+            admitted_invite: None,
+            admission_evidence: HashMap::new(),
+            creator_peer_id: local_peer.clone(),
+        };
+
+        // The stranger's invite is a genuine capability (signature, expiry,
+        // group binding all check out) but never authorizes this session.
+        let (stranger_invite, _) = signed_remote_invite(&stranger_keypair, TemporaryChatKind::Group, &chat_id);
+        assert!(stranger_invite.verify_capability(&chat_id, now));
+        assert!(
+            !session.invite_authorizes_join(&stranger_invite, now),
+            "a stranger's self-signed invite must not authorize an existing session"
+        );
+        // The handshake path then falls back to the Standard admission: the
+        // stranger's self-add is rejected, so the stranger cannot join.
+        let stranger_self_add = signed_op(
+            &stranger_keypair,
+            1,
+            TemporaryMembershipOpKind::Add,
+            &stranger_peer,
+        );
+        assert!(
+            !session.apply_membership_ops_admitted(
+                &[stranger_self_add],
+                &[],
+                crate::app_state::MembershipOpAdmission::Standard
+            ),
+            "a stranger presenting a self-signed invite must not be admitted"
+        );
+        assert!(!session.is_member(&stranger_peer));
+
+        // An invite issued by an admitted member does authorize a join.
+        let (member_invite, _) =
+            signed_remote_invite(&member_keypair, TemporaryChatKind::Group, &chat_id);
+        assert!(session.invite_authorizes_join(&member_invite, now));
+
+        // The creator's own capability is the group's root authority and
+        // re-admits the creator even after it removed itself (the rejoin
+        // after a failed archive): the creator's signature is what creates
+        // the group, so it stays authoritative for it.
+        let (creator_invite, _) =
+            signed_remote_invite(&local_keypair, TemporaryChatKind::Group, &chat_id);
+        assert!(session.invite_authorizes_join(&creator_invite, now));
+        let creator_remove = signed_op(
+            &local_keypair,
+            1,
+            TemporaryMembershipOpKind::Remove,
+            &local_peer,
+        );
+        assert!(session.apply_membership_ops(&[creator_remove]));
+        assert!(!session.is_member(&local_peer));
+        assert!(
+            session.invite_authorizes_join(&creator_invite, now),
+            "the creator's own capability must survive its own removal"
+        );
+        // But the stranger still cannot join the session afterwards.
+        assert!(!session.invite_authorizes_join(&stranger_invite, now));
+    }
+
+    #[test]
+    fn removed_member_cannot_readd_itself_with_stale_evidence() {
+        // A endorses B, B removes itself, then B replays the old endorsement
+        // as admission evidence alongside a newer self-add. The historical
+        // certificate does not descend from the current removal tombstone
+        // (its `after_remove` is bound into its signature and does not
+        // reference the tombstone), so B must remain removed.
+        let chat_id = "temp-group:550e8400-e29b-41d4-a716-446655440000".to_string();
+        let a_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let a_peer = libp2p::PeerId::from_public_key(&a_keypair.public()).to_string();
+        let b_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let b_peer = libp2p::PeerId::from_public_key(&b_keypair.public()).to_string();
+        let now = now_unix_secs();
+        let mut session = TemporaryChatSession {
+            chat_id: chat_id.clone(),
+            name: "Design Crew".to_string(),
+            kind: TemporaryChatKind::Group,
+            expires_at: now + 3600,
+            peer_id: Some(a_peer.clone()),
+            members: vec![LOCAL_PEER_ID.to_string(), a_peer.clone()],
+            member_op_winners: HashMap::new(),
+            next_member_op_counter: 0,
+            archived: false,
+            pending_send_count: 0,
+            admitted_invite: None,
+            admission_evidence: HashMap::new(),
+            creator_peer_id: LOCAL_PEER_ID.to_string(),
+        };
+
+        // A endorses B; B is admitted.
+        let endorse_b = signed_op(&a_keypair, 1, TemporaryMembershipOpKind::Add, &b_peer);
+        assert!(session.apply_membership_ops(std::slice::from_ref(&endorse_b)));
+        assert!(session.is_member(&b_peer));
+
+        // B removes itself; the tombstone now outranks the endorsement.
+        let b_remove = signed_op(&b_keypair, 2, TemporaryMembershipOpKind::Remove, &b_peer);
+        assert!(session.apply_membership_ops(std::slice::from_ref(&b_remove)));
+        assert!(!session.is_member(&b_peer));
+
+        // B replays the old endorsement as evidence with a newer self-add
+        // (even one that itself references the removal): the certificate —
+        // the historical endorsement — does not.
+        let b_self_add = signed_op_after(&b_keypair, 3, TemporaryMembershipOpKind::Add, &b_peer, Some(2));
+        assert!(
+            !session.apply_membership_ops_admitted(
+                &[b_self_add],
+                &[endorse_b],
+                crate::app_state::MembershipOpAdmission::Standard
+            ),
+            "a removed member replaying a historical endorsement must stay removed"
+        );
+        assert!(!session.is_member(&b_peer));
+    }
+
+    #[test]
+    fn fresh_endorsement_or_invite_descending_from_removal_readds_removed_member() {
+        // The two legitimate re-admission paths after a removal: a member's
+        // fresh endorsement that explicitly descends from the removal, or a
+        // verified invitation (the Invited admission the handshake grants).
+        let chat_id = "temp-group:550e8400-e29b-41d4-a716-446655440000".to_string();
+        let a_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let a_peer = libp2p::PeerId::from_public_key(&a_keypair.public()).to_string();
+        let b_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let b_peer = libp2p::PeerId::from_public_key(&b_keypair.public()).to_string();
+        let now = now_unix_secs();
+        let mut session = TemporaryChatSession {
+            chat_id: chat_id.clone(),
+            name: "Design Crew".to_string(),
+            kind: TemporaryChatKind::Group,
+            expires_at: now + 3600,
+            peer_id: Some(a_peer.clone()),
+            members: vec![LOCAL_PEER_ID.to_string(), a_peer.clone()],
+            member_op_winners: HashMap::new(),
+            next_member_op_counter: 0,
+            archived: false,
+            pending_send_count: 0,
+            admitted_invite: None,
+            admission_evidence: HashMap::new(),
+            creator_peer_id: LOCAL_PEER_ID.to_string(),
+        };
+
+        // A endorses B, then B removes itself.
+        assert!(session.apply_membership_ops(&[signed_op(
+            &a_keypair,
+            1,
+            TemporaryMembershipOpKind::Add,
+            &b_peer,
+        )]));
+        assert!(session.apply_membership_ops(&[signed_op(
+            &b_keypair,
+            2,
+            TemporaryMembershipOpKind::Remove,
+            &b_peer,
+        )]));
+        assert!(!session.is_member(&b_peer));
+
+        // Fresh endorsement: A has processed the removal and signs a new add
+        // that references it. B is a member again.
+        let fresh_endorse = signed_op_after(
+            &a_keypair,
+            3,
+            TemporaryMembershipOpKind::Add,
+            &b_peer,
+            Some(2),
+        );
+        assert!(session.apply_membership_ops(&[fresh_endorse]));
+        assert!(session.is_member(&b_peer));
+
+        // Remove B again; a verified invitation (Invited admission, which the
+        // handshake only grants for a member/creator-issued capability)
+        // re-admits B via its self-add.
+        assert!(session.apply_membership_ops(&[signed_op(
+            &b_keypair,
+            4,
+            TemporaryMembershipOpKind::Remove,
+            &b_peer,
+        )]));
+        assert!(!session.is_member(&b_peer));
+        let invited_readd = signed_op_after(
+            &b_keypair,
+            5,
+            TemporaryMembershipOpKind::Add,
+            &b_peer,
+            Some(4),
+        );
+        assert!(session.apply_membership_ops_admitted(
+            &[invited_readd],
+            &[],
+            crate::app_state::MembershipOpAdmission::Invited
+        ));
+        assert!(session.is_member(&b_peer));
+    }
+
     #[tokio::test]
     async fn redeem_rejects_forged_or_tampered_invite_links() {
         let (_temp, app_state) = test_app_state().await;
@@ -1815,6 +2078,7 @@ mod tests {
                 pending_send_count: 0,
                 admitted_invite: None,
                 admission_evidence: HashMap::new(),
+                creator_peer_id: String::new(),
             },
         );
     }
@@ -1925,6 +2189,7 @@ mod tests {
                 pending_send_count: 0,
                 admitted_invite: None,
                 admission_evidence: HashMap::new(),
+                creator_peer_id: String::new(),
             };
             // Add remote members twice: the roster must dedupe.
             assert!(session.add_member(REMOTE_PEER_ID));
@@ -1962,6 +2227,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
 
         // Join: a third member is added once and only once.
@@ -2160,6 +2426,7 @@ mod tests {
                     pending_send_count: 0,
                     admitted_invite: None,
                     admission_evidence: HashMap::new(),
+                    creator_peer_id: String::new(),
                 },
             );
             temp_state.messages.insert(
@@ -2296,6 +2563,7 @@ mod tests {
                     pending_send_count: 0,
                     admitted_invite: None,
                     admission_evidence: HashMap::new(),
+                    creator_peer_id: String::new(),
                 },
             );
             temp_state.messages.insert(
@@ -2406,6 +2674,7 @@ mod tests {
                     pending_send_count: 0,
                     admitted_invite: None,
                     admission_evidence: HashMap::new(),
+                    creator_peer_id: String::new(),
                 },
             );
             temp_state.messages.insert(
@@ -2501,6 +2770,7 @@ mod tests {
                     pending_send_count: 0,
                     admitted_invite: None,
                     admission_evidence: HashMap::new(),
+                    creator_peer_id: String::new(),
                 },
             );
             temp_state.messages.insert(
@@ -2550,6 +2820,7 @@ mod tests {
                     pending_send_count: 0,
                     admitted_invite: None,
                     admission_evidence: HashMap::new(),
+                    creator_peer_id: String::new(),
                 },
             );
             temp_state.messages.insert(
@@ -2637,6 +2908,7 @@ mod tests {
                     pending_send_count: 1,
                     admitted_invite: None,
                     admission_evidence: HashMap::new(),
+                    creator_peer_id: String::new(),
                 },
             );
             temp_state.messages.insert(
@@ -2769,6 +3041,7 @@ mod tests {
                     pending_send_count: 0,
                     admitted_invite: None,
                     admission_evidence: HashMap::new(),
+                    creator_peer_id: String::new(),
                 },
             );
             temp_state.messages.insert(
@@ -2840,6 +3113,7 @@ mod tests {
                     pending_send_count: 0,
                     admitted_invite: None,
                     admission_evidence: HashMap::new(),
+                    creator_peer_id: String::new(),
                 },
             );
             temp_state.messages.insert(
@@ -2957,6 +3231,7 @@ mod tests {
                     pending_send_count: 0,
                     admitted_invite: None,
                     admission_evidence: HashMap::new(),
+                    creator_peer_id: String::new(),
                 },
             );
             temp_state.messages.insert(
@@ -3074,6 +3349,7 @@ mod tests {
                     pending_send_count: 0,
                     admitted_invite: None,
                     admission_evidence: HashMap::new(),
+                    creator_peer_id: String::new(),
                 },
             );
             temp_state.messages.insert(
@@ -3173,6 +3449,7 @@ mod tests {
                     pending_send_count: 0,
                     admitted_invite: None,
                     admission_evidence: HashMap::new(),
+                    creator_peer_id: String::new(),
                 },
             );
             temp_state.messages.insert(
@@ -3240,6 +3517,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archive_watchdog_finalizes_on_commit_decision_even_while_caller_blocked() {
+        let (_temp, app_state) = crate::testing::test_app_state().await;
+        let (net_state, rx) = test_network_state();
+        let keypair = crate::chat::group::load_or_create_local_keypair(&app_state)
+            .await
+            .expect("keypair");
+        let local_peer_id = libp2p::PeerId::from_public_key(&keypair.public()).to_string();
+        *net_state.local_peer_id.lock().await = Some(local_peer_id.clone());
+        let chat_id = crate::chat_kind::generate_temp_group_chat_id();
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            temp_state.chats.insert(
+                chat_id.clone(),
+                TemporaryChatSession {
+                    chat_id: chat_id.clone(),
+                    name: "Design Crew".to_string(),
+                    kind: TemporaryChatKind::Group,
+                    expires_at: now_unix_secs() + 3600,
+                    peer_id: Some(REMOTE_PEER_ID.to_string()),
+                    members: vec![local_peer_id.clone(), REMOTE_PEER_ID.to_string()],
+                    member_op_winners: HashMap::new(),
+                    next_member_op_counter: 0,
+                    archived: false,
+                    pending_send_count: 0,
+                    admitted_invite: None,
+                    admission_evidence: HashMap::new(),
+                    creator_peer_id: String::new(),
+                },
+            );
+            temp_state.messages.insert(
+                chat_id.clone(),
+                vec![temp_group_message(&chat_id, "m1", "hello")],
+            );
+        }
+
+        let temp_state_handle = net_state.temporary_state.clone();
+        let driver = drive_archive_manager(
+            net_state.temporary_state.clone(),
+            app_state.clone(),
+            Some(local_peer_id.clone()),
+            None,
+            rx,
+        );
+
+        // The caller freezes, durably commits, records the Commit decision on
+        // the `alive` watch — and is then blocked/cancelled BEFORE its own
+        // direct commit enqueue can run, while still holding the `alive`
+        // sender. The watchdog must observe the successful value change itself
+        // and perform the teardown; it must not wait for the sender to be
+        // dropped (the caller may be cancelled while blocked, but the sender
+        // may also simply never fire again).
+        let (alive_tx, _alive_rx) = tokio::sync::watch::channel(
+            crate::app_state::FreezeResolution::Pending,
+        );
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            temp_state.chats.get_mut(&chat_id).expect("session").archived = true;
+        }
+        net_state
+            .sender
+            .lock()
+            .await
+            .send(NetworkCommand::FreezeTemporaryArchive {
+                chat_id: chat_id.clone(),
+                kind: TemporaryChatKind::Group,
+                farewell_winners: Vec::new(),
+                min_add_counter: 0,
+                alive: alive_tx.clone(),
+                ack: Some(ack_tx),
+            })
+            .await
+            .expect("freeze command sent");
+        // Wait for the driver to process the freeze (and subscribe its
+        // watchdog) before recording the decision, so the change is observed
+        // as a value transition rather than only through channel closure.
+        ack_rx.await.expect("freeze ack").expect("drained");
+        alive_tx
+            .send(crate::app_state::FreezeResolution::Commit)
+            .expect("commit decision recorded");
+        // The caller never completes its direct commit enqueue and never drops
+        // the sender (it stays alive until the end of this test): the watchdog
+        // alone must finalize the teardown.
+        let _caller_still_alive = alive_tx;
+
+        let mut gone = false;
+        for _ in 0..10_000 {
+            if !temp_state_handle.lock().await.chats.contains_key(&chat_id) {
+                gone = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            gone,
+            "a Commit decision must make the watchdog finalize even while the caller is blocked"
+        );
+
+        drop(net_state);
+        driver.await.expect("driver");
+    }
+
+    #[tokio::test]
     async fn reconnect_re_derives_handshake_targets_from_session_membership() {
         let (_temp, _app_state) = crate::testing::test_app_state().await;
         let (net_state, _rx) = test_network_state();
@@ -3262,6 +3642,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
         {
             let mut temp_state = net_state.temporary_state.lock().await;
@@ -3347,6 +3728,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
 
         // A keypair that does not match the actor cannot sign the op: it must
@@ -3387,6 +3769,16 @@ mod tests {
         op: TemporaryMembershipOpKind,
         target: &str,
     ) -> TemporaryMembershipOp {
+        signed_op_after(keypair, counter, op, target, None)
+    }
+
+    fn signed_op_after(
+        keypair: &libp2p::identity::Keypair,
+        counter: u64,
+        op: TemporaryMembershipOpKind,
+        target: &str,
+        after_remove: Option<u64>,
+    ) -> TemporaryMembershipOp {
         let mut op = TemporaryMembershipOp {
             actor: libp2p::PeerId::from_public_key(&keypair.public()).to_string(),
             counter,
@@ -3397,6 +3789,7 @@ mod tests {
             version: crate::app_state::TEMP_GROUP_PROTOCOL_VERSION,
             public_key_b64: String::new(),
             signature_b64: String::new(),
+            after_remove,
         };
         assert!(op.sign(keypair), "test op must sign");
         op
@@ -3420,6 +3813,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
         // A (a member) re-announces itself, then leaves with a later self-remove.
         let stale_add = signed_op(&a_keypair, 1, TemporaryMembershipOpKind::Add, &a_peer);
@@ -3472,6 +3866,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
 
         // An unsigned op cannot be applied at all.
@@ -3485,6 +3880,7 @@ mod tests {
             version: crate::app_state::TEMP_GROUP_PROTOCOL_VERSION,
             public_key_b64: String::new(),
             signature_b64: String::new(),
+            after_remove: None,
         };
         assert!(!session.apply_membership_ops(&[unsigned]));
         assert!(session.is_member(&a_peer));
@@ -3503,6 +3899,7 @@ mod tests {
             version: crate::app_state::TEMP_GROUP_PROTOCOL_VERSION,
             public_key_b64: String::new(),
             signature_b64: String::new(),
+            after_remove: None,
         };
         assert!(
             !forged.sign(&a_keypair),
@@ -3538,9 +3935,17 @@ mod tests {
         );
         assert!(!session.is_member(&a_peer));
 
-        // A different member may endorse-add the removed peer back, and the
-        // (counter, actor) order picks the greater winner — no wall clocks.
-        let add_from_c = signed_op(&c_keypair, 7, TemporaryMembershipOpKind::Add, &a_peer);
+        // A different member may endorse-add the removed peer back — the
+        // endorsement must explicitly descend from the removal it supersedes
+        // (a historical endorsement signed before the removal never re-admits)
+        // — and the (counter, actor) order picks the greater winner.
+        let add_from_c = signed_op_after(
+            &c_keypair,
+            7,
+            TemporaryMembershipOpKind::Add,
+            &a_peer,
+            Some(2),
+        );
         assert!(session.apply_membership_ops(&[add_from_c.clone()]));
         assert!(session.is_member(&a_peer));
         // And a replay of the older op cannot beat it.
@@ -3569,6 +3974,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
         // A re-announces itself, then leaves with a self-remove.
         a_session.apply_membership_ops(&[signed_op(
@@ -3603,6 +4009,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
         assert!(c_session.apply_membership_ops(&forwarded));
         assert!(
@@ -3637,6 +4044,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
         origin.apply_membership_ops(&[signed_op(
             &a_keypair,
@@ -3669,6 +4077,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
         let reversed = vec![
             signed_op(&b_keypair, 1, TemporaryMembershipOpKind::Add, &c_peer),
@@ -3706,6 +4115,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
         // A endorses B, then B self-reannounces with a higher counter: the
         // endorsement becomes B's admission certificate, not its winner.
@@ -3748,6 +4158,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
         assert!(fresh.apply_membership_ops_admitted(
             &winners,
@@ -3786,6 +4197,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
 
         // A high-counter remote self-remove arrives: the local clock must
@@ -3840,6 +4252,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
 
         // Churn a single target well past any log-truncation threshold: each
@@ -3899,6 +4312,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
         assert!(fresh.apply_membership_ops(&winners));
         assert!(!fresh.is_member(&a_peer));
@@ -3925,6 +4339,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
         let add_b = signed_op(&a_keypair, 1, TemporaryMembershipOpKind::Add, &b_peer);
         session.apply_membership_ops(&[add_b.clone()]);
@@ -3957,6 +4372,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
 
         // Invalid entries are rejected outright (before any signing).
@@ -4012,6 +4428,7 @@ mod tests {
             version: crate::app_state::TEMP_GROUP_PROTOCOL_VERSION,
             public_key_b64: String::new(),
             signature_b64: String::new(),
+            after_remove: None,
         };
         assert!(op.sign(keypair), "test op must sign");
         op
@@ -4036,6 +4453,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
 
         // An op minted and signed for another group verifies cryptographically
@@ -4075,6 +4493,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
 
         // A stranger (not a member) cannot endorse-add anyone.
@@ -4122,6 +4541,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
 
         // A signed op carrying the reserved u64::MAX sentinel is rejected even
@@ -4169,6 +4589,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
 
         // A re-announces itself: a newer winner is accepted (winner state
@@ -4203,6 +4624,7 @@ mod tests {
             pending_send_count: 0,
             admitted_invite: None,
             admission_evidence: HashMap::new(),
+            creator_peer_id: String::new(),
         };
 
         // A (a member) endorse-adds peers until the roster cap is reached.

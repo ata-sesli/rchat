@@ -115,14 +115,18 @@ impl NetworkManager {
             self.pending_finalization.insert(chat_id.to_string(), pending);
             messages
         };
-        // Watchdog: a dropped `alive` sender means the caller never resolved
-        // the freeze (cancellation or ack loss). The resolution depends on the
-        // caller's last decision: still `Pending` means the archive never
-        // became durable, so abort and recover the conversation; `Commit`
-        // means the archive is already persisted, so finalize the teardown
-        // instead of reviving a chat that now also exists in the archive.
-        // Epoch-scoped so a stale watchdog can never abort a later freeze of
-        // the same chat.
+        // Watchdog: the caller's `alive` sender carries its synchronous
+        // decision. The watchdog keeps watching for the whole freeze: a
+        // successful value change to `Commit` means the archive is already
+        // durable, so the watchdog finalizes the teardown itself — even if the
+        // caller is then cancelled or blocked before its own direct commit
+        // enqueue completes (a duplicate commit is a no-op). A dropped sender
+        // (cancellation or ack loss) resolves from the caller's last decision:
+        // still `Pending` means the archive never became durable, so abort and
+        // recover the conversation; `Commit` means the archive is already
+        // persisted, so finalize the teardown instead of reviving a chat that
+        // now also exists in the archive. Epoch-scoped so a stale watchdog can
+        // never abort a later freeze of the same chat.
         let watchdog_epoch = self.pending_epoch_counter;
         let watchdog_net = self.network_state.clone();
         let watchdog_chat = chat_id.to_string();
@@ -135,26 +139,46 @@ impl NetworkManager {
         let mut alive_rx = alive.subscribe();
         drop(alive);
         tokio::spawn(async move {
-            if alive_rx.changed().await.is_err() {
+            loop {
+                if alive_rx.changed().await.is_err() {
+                    // Caller cancelled without resolving: act on the last
+                    // recorded decision.
+                    let resolution = *alive_rx.borrow();
+                    let sender = watchdog_net.sender.lock().await;
+                    match resolution {
+                        crate::app_state::FreezeResolution::Pending => {
+                            let _ = sender
+                                .send(NetworkCommand::AbortTemporaryArchive {
+                                    chat_id: watchdog_chat,
+                                    epoch: Some(watchdog_epoch),
+                                    ack: None,
+                                })
+                                .await;
+                        }
+                        crate::app_state::FreezeResolution::Commit => {
+                            let _ = sender
+                                .send(NetworkCommand::CommitTemporaryArchive {
+                                    chat_id: watchdog_chat,
+                                })
+                                .await;
+                        }
+                    }
+                    return;
+                }
+                // The caller recorded a decision. A `Commit` means the archive
+                // is durable: finalize immediately instead of waiting for the
+                // caller's direct commit enqueue, which may never arrive. While
+                // the decision is still `Pending`, keep watching for closure or
+                // the Commit.
                 let resolution = *alive_rx.borrow();
-                let sender = watchdog_net.sender.lock().await;
-                match resolution {
-                    crate::app_state::FreezeResolution::Pending => {
-                        let _ = sender
-                            .send(NetworkCommand::AbortTemporaryArchive {
-                                chat_id: watchdog_chat,
-                                epoch: Some(watchdog_epoch),
-                                ack: None,
-                            })
-                            .await;
-                    }
-                    crate::app_state::FreezeResolution::Commit => {
-                        let _ = sender
-                            .send(NetworkCommand::CommitTemporaryArchive {
-                                chat_id: watchdog_chat,
-                            })
-                            .await;
-                    }
+                if matches!(resolution, crate::app_state::FreezeResolution::Commit) {
+                    let sender = watchdog_net.sender.lock().await;
+                    let _ = sender
+                        .send(NetworkCommand::CommitTemporaryArchive {
+                            chat_id: watchdog_chat,
+                        })
+                        .await;
+                    return;
                 }
             }
         });

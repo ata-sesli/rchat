@@ -158,6 +158,15 @@ pub struct TemporaryChatSession {
     /// winner map, one entry per target.
     #[serde(default)]
     pub admission_evidence: HashMap<String, TemporaryMembershipOp>,
+    /// The peer that created this group: the root of every admission chain.
+    /// Set to the local peer id when the local user creates the group, and to
+    /// the invite's inviter when a session is resolved from a redeemed
+    /// capability. The creator's own signature is the group's root authority:
+    /// only its invitations may bootstrap a session on a fresh peer, and only
+    /// it may re-admit itself after a removal (e.g. the rejoin after a failed
+    /// archive). Empty for temporary direct chats.
+    #[serde(default)]
+    pub creator_peer_id: String,
 }
 
 /// Hard cap on the number of members a temporary group tracks. Handshake-
@@ -228,11 +237,19 @@ pub struct TemporaryMembershipOp {
     #[serde(default)]
     pub public_key_b64: String,
     /// Base64 signature by the actor over the canonical serialization of
-    /// `(domain, version, chat_id, actor, counter, op, target)`. Signed ops are
-    /// self-authenticating, so they can be forwarded by any member and verified
-    /// on receipt.
+    /// `(domain, version, chat_id, actor, counter, op, target, after_remove)`.
+    /// Signed ops are self-authenticating, so they can be forwarded by any
+    /// member and verified on receipt.
     #[serde(default)]
     pub signature_b64: String,
+    /// The counter of the winning Remove tombstone for `target` that this op
+    /// descends from, when it is an Add issued after that removal. Bound into
+    /// the signature with the rest of the payload, so a receiver can tell a
+    /// fresh post-removal endorsement (which explicitly references the removal
+    /// it supersedes) from a historical certificate replayed after the
+    /// removal — a removed member can never re-admit itself with stale proof.
+    #[serde(default)]
+    pub after_remove: Option<u64>,
 }
 
 /// The fields a membership op signs, serialized canonically so `sign` and
@@ -246,6 +263,7 @@ struct TemporaryMembershipOpSigningPayload<'a> {
     counter: u64,
     op: &'a TemporaryMembershipOpKind,
     target: &'a str,
+    after_remove: Option<u64>,
 }
 
 impl TemporaryMembershipOp {
@@ -275,6 +293,7 @@ impl TemporaryMembershipOp {
             counter: self.counter,
             op: &self.op,
             target: &self.target,
+            after_remove: self.after_remove,
         }) else {
             return false;
         };
@@ -322,6 +341,7 @@ impl TemporaryMembershipOp {
             counter: self.counter,
             op: &self.op,
             target: &self.target,
+            after_remove: self.after_remove,
         }) else {
             return false;
         };
@@ -359,6 +379,21 @@ impl TemporaryChatSession {
     /// Whether `peer_id` is part of the tracked member roster.
     pub fn is_member(&self, peer_id: &str) -> bool {
         self.members.iter().any(|member| member == peer_id)
+    }
+
+    /// Whether a signed, unexpired invitation capability for this group
+    /// authorizes the `Invited` admission on this session: the inviter must be
+    /// a currently admitted member, or the session's creator. A stranger's
+    /// self-signed invite proves only that its signer owns a key — not
+    /// authority over the group — so it grants nothing.
+    pub fn invite_authorizes_join(&self, invite: &TemporaryInvitePayload, now: u64) -> bool {
+        if !matches!(invite.kind, TemporaryChatKind::Group) {
+            return false;
+        }
+        if !invite.verify_capability(&self.chat_id, now) {
+            return false;
+        }
+        self.is_member(&invite.inviter_peer_id) || self.creator_peer_id == invite.inviter_peer_id
     }
 
     /// Add a member to the roster. Rejects invalid peer ids and enforces the
@@ -425,6 +460,16 @@ impl TemporaryChatSession {
             return Err(anyhow::anyhow!("temporary-group membership op counter exhausted"));
         }
         self.next_member_op_counter = next_counter;
+        // An add issued for a target whose current winner is a removal
+        // tombstone descends from that removal: the reference is bound into
+        // the signature so receivers can verify the add is a fresh,
+        // post-removal authorization rather than a historical replay.
+        let after_remove = match self.member_op_winners.get(target) {
+            Some(winner) if matches!(winner.op, TemporaryMembershipOpKind::Remove) => {
+                Some(winner.counter)
+            }
+            _ => None,
+        };
         let mut signed_op = TemporaryMembershipOp {
             actor: actor.to_string(),
             counter: self.next_member_op_counter,
@@ -435,6 +480,7 @@ impl TemporaryChatSession {
             version: TEMP_GROUP_PROTOCOL_VERSION,
             public_key_b64: String::new(),
             signature_b64: String::new(),
+            after_remove,
         };
         if !signed_op.sign(signer) {
             return Err(anyhow::anyhow!(
@@ -611,16 +657,28 @@ impl TemporaryChatSession {
     /// (a valid signature) is a separate concern enforced before this; here we
     /// apply the group's admission policy so a member can never remove another
     /// member, a non-member cannot mutate the roster, and a removed member
-    /// cannot re-admit itself without a fresh invitation. `pending_evidence`
+    /// cannot re-admit itself without a fresh authorization. `pending_evidence`
     /// carries the sender's admission certificates for targets whose winner is
     /// a self-add, so a member whose endorsement was superseded by its own
-    /// re-announce is still provably admitted.
+    /// re-announce is still provably admitted. A target whose current winner is
+    /// a removal tombstone can only be re-admitted by proof that explicitly
+    /// descends from that removal (`after_remove` bound into the signature):
+    /// an endorsement signed or a certificate issued before the removal is
+    /// historical and never re-admits.
     fn allowed_remote_op(
         &self,
         op: &TemporaryMembershipOp,
         admission: MembershipOpAdmission,
         pending_evidence: &HashMap<String, TemporaryMembershipOp>,
     ) -> bool {
+        // The current removal tombstone for the op's target, if any. Every
+        // re-admission path must descend from exactly this removal.
+        let tombstone_counter = match self.member_op_winners.get(&op.target) {
+            Some(winner) if matches!(winner.op, TemporaryMembershipOpKind::Remove) => {
+                Some(winner.counter)
+            }
+            _ => None,
+        };
         match op.op {
             TemporaryMembershipOpKind::Remove => {
                 // Only self-removal is permitted; evicting another member is
@@ -648,11 +706,22 @@ impl TemporaryChatSession {
                     self.is_member(&op.target)
                         || admission == MembershipOpAdmission::Invited
                         || {
+                            // A tombstoned target is re-admitted only by a
+                            // certificate that descends from the current
+                            // removal. A removed member replaying an old
+                            // endorsement (even alongside a newer self-add)
+                            // stays removed: the historical certificate does
+                            // not reference the tombstone it must supersede.
                             let certificate = pending_evidence
                                 .get(&op.target)
                                 .or_else(|| self.admission_evidence.get(&op.target));
                             certificate
                                 .map(|certificate| {
+                                    if let Some(remove_counter) = tombstone_counter {
+                                        if certificate.after_remove != Some(remove_counter) {
+                                            return false;
+                                        }
+                                    }
                                     self.is_member(&certificate.actor)
                                         || pending_evidence
                                             .get(&certificate.actor)
@@ -664,8 +733,15 @@ impl TemporaryChatSession {
                                 .unwrap_or(false)
                         }
                 } else {
-                    // Endorsement: only a current member may add a new peer.
+                    // Endorsement: only a current member may add a new peer,
+                    // and a tombstoned target additionally requires the
+                    // endorsement to descend from the current removal — an
+                    // endorsement signed before the removal cannot re-admit
+                    // the target against it.
                     self.is_member(&op.actor)
+                        && tombstone_counter
+                            .map(|remove_counter| op.after_remove == Some(remove_counter))
+                            .unwrap_or(true)
                 }
             }
         }
