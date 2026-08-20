@@ -93,6 +93,27 @@ pub async fn create_temporary_invite(
     } else {
         Vec::new()
     };
+    // Bind the invite to the group's current removal epoch so a removed member
+    // cannot rejoin with a pre-removal link: if a target has since been removed
+    // (counter X), only an invite issued after that removal (bound to X) is
+    // accepted. For a brand-new group there is no removal yet, so the bound is
+    // None — the first invite is fresh by definition. Read under a short lock;
+    // the longer-lived temporary_state lock is acquired later, preserving the
+    // local_peer_id -> temporary_state ordering.
+    let bound_removal_counter = {
+        let temp_state = net_state.temporary_state.lock().await;
+        temp_state
+            .chats
+            .get(&chat_id)
+            .and_then(|existing| {
+                existing
+                    .member_op_winners
+                    .values()
+                    .filter(|winner| matches!(winner.op, crate::app_state::TemporaryMembershipOpKind::Remove))
+                    .map(|winner| winner.counter)
+                    .max()
+            })
+    };
     let payload = TemporaryInvitePayload {
         version: TEMP_INVITE_VERSION,
         kind: kind.clone(),
@@ -108,6 +129,8 @@ pub async fn create_temporary_invite(
             .unwrap_or(0),
         inviter_pubkey: String::new(),
         signature: String::new(),
+        bound_removal_counter,
+        intended_invitee: None,
     };
     // The invite is a capability, not a claim: sign it with the local
     // identity keypair so any redeemer can verify that it was genuinely
@@ -1413,6 +1436,8 @@ mod tests {
             nonce: 42,
             inviter_pubkey: String::new(),
             signature: String::new(),
+            bound_removal_counter: None,
+            intended_invitee: None,
         };
         payload.sign(keypair).expect("sign remote invite");
         let deep_link = format!(
@@ -1421,6 +1446,39 @@ mod tests {
             encode_temporary_payload(&payload).expect("encode")
         );
         (payload, deep_link)
+    }
+
+    /// A signed group invite bound to a specific invitee and the removal epoch
+    /// it was issued against. Mirrors `create_temporary_invite` but lets tests
+    /// pin `intended_invitee` / `bound_removal_counter` to exercise the
+    /// post-removal authorization gate.
+    fn signed_invite(
+        keypair: &libp2p::identity::Keypair,
+        kind: TemporaryChatKind,
+        chat_id: &str,
+        intended_invitee: &str,
+        bound_removal_counter: Option<u64>,
+    ) -> TemporaryInvitePayload {
+        let now = now_unix_secs();
+        let inviter_peer_id =
+            libp2p::PeerId::from_public_key(&keypair.public()).to_string();
+        let mut payload = TemporaryInvitePayload {
+            version: TEMP_INVITE_VERSION,
+            kind,
+            chat_id: chat_id.to_string(),
+            inviter_peer_id: inviter_peer_id.clone(),
+            inviter_username: "remote".to_string(),
+            inviter_addr: "/ip4/192.168.1.11/udp/5001/quic-v1".to_string(),
+            created_at: now,
+            expires_at: now + TEMP_INVITE_TTL_SECS,
+            nonce: 42,
+            inviter_pubkey: String::new(),
+            signature: String::new(),
+            bound_removal_counter,
+            intended_invitee: Some(intended_invitee.to_string()),
+        };
+        payload.sign(keypair).expect("sign invite");
+        payload
     }
 
     #[tokio::test]
@@ -1555,6 +1613,8 @@ mod tests {
             nonce: 7,
             inviter_pubkey: String::new(),
             signature: String::new(),
+            bound_removal_counter: None,
+            intended_invitee: None,
         };
 
         // A genuine invite signed by its inviter verifies for its own chat.
@@ -1661,7 +1721,8 @@ mod tests {
             !session.apply_membership_ops_admitted(
                 &[stranger_self_add],
                 &[],
-                crate::app_state::MembershipOpAdmission::Standard
+                crate::app_state::MembershipOpAdmission::Standard,
+                None
             ),
             "a stranger presenting a self-signed invite must not be admitted"
         );
@@ -1742,7 +1803,8 @@ mod tests {
             !session.apply_membership_ops_admitted(
                 &[b_self_add],
                 &[endorse_b],
-                crate::app_state::MembershipOpAdmission::Standard
+                crate::app_state::MembershipOpAdmission::Standard,
+                None
             ),
             "a removed member replaying a historical endorsement must stay removed"
         );
@@ -1813,17 +1875,153 @@ mod tests {
             &b_peer,
         )]));
         assert!(!session.is_member(&b_peer));
-        let invited_readd = signed_op_after(
+
+        // A pre-removal invite: signed by a member before B left, so its
+        // removal epoch is None. Replaying it (still unexpired and
+        // signature-verified) with a self-add whose after_remove references the
+        // current removal must NOT re-admit B — the invite itself predates the
+        // tombstone it would have to supersede.
+        let pre_removal_invite = signed_invite(
+            &a_keypair,
+            TemporaryChatKind::Group,
+            &chat_id,
+            &b_peer,
+            None,
+        );
+        let stale_self_add = signed_op_after(&b_keypair, 5, TemporaryMembershipOpKind::Add, &b_peer, None);
+        assert!(
+            !session.apply_membership_ops_admitted(
+                &[stale_self_add],
+                &[],
+                crate::app_state::MembershipOpAdmission::Invited,
+                Some(&pre_removal_invite),
+            ),
+            "a pre-removal invite must not re-admit a removed member"
+        );
+        // Even a self-add that references the removal is refused: the invite,
+        // not just the op, must demonstrate post-removal authority.
+        let stale_self_add_with_remove = signed_op_after(
             &b_keypair,
-            5,
+            6,
             TemporaryMembershipOpKind::Add,
             &b_peer,
             Some(4),
         );
+        assert!(
+            !session.apply_membership_ops_admitted(
+                &[stale_self_add_with_remove],
+                &[],
+                crate::app_state::MembershipOpAdmission::Invited,
+                Some(&pre_removal_invite),
+            ),
+            "a pre-removal invite must not re-admit a removed member even with a fresh self-add"
+        );
+        assert!(!session.is_member(&b_peer));
+
+        // A fresh invite issued after the removal (bound to counter 4) does
+        // re-admit B via its self-add referencing the same removal.
+        let fresh_invite = signed_invite(
+            &a_keypair,
+            TemporaryChatKind::Group,
+            &chat_id,
+            &b_peer,
+            Some(4),
+        );
+        let invited_readd = signed_op_after(&b_keypair, 7, TemporaryMembershipOpKind::Add, &b_peer, Some(4));
         assert!(session.apply_membership_ops_admitted(
             &[invited_readd],
             &[],
-            crate::app_state::MembershipOpAdmission::Invited
+            crate::app_state::MembershipOpAdmission::Invited,
+            Some(&fresh_invite)
+        ));
+        assert!(session.is_member(&b_peer));
+    }
+
+    #[test]
+    fn removed_member_cannot_rejoin_with_pre_removal_invite() {
+        // Regression for the re-admission hole: a member leaves, then replays
+        // the very invite issued before the removal — still unexpired and
+        // signature-verified — with a self-add lacking the current
+        // `after_remove`. The member must remain removed: a pre-removal
+        // invite does not survive the tombstone it would have to supersede.
+        let chat_id = "temp-group:550e8400-e29b-41d4-a716-446655440000".to_string();
+        let a_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let a_peer = libp2p::PeerId::from_public_key(&a_keypair.public()).to_string();
+        let b_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let b_peer = libp2p::PeerId::from_public_key(&b_keypair.public()).to_string();
+        let now = now_unix_secs();
+        let mut session = TemporaryChatSession {
+            chat_id: chat_id.clone(),
+            name: "Design Crew".to_string(),
+            kind: TemporaryChatKind::Group,
+            expires_at: now + 3600,
+            peer_id: Some(a_peer.clone()),
+            members: vec![LOCAL_PEER_ID.to_string(), a_peer.clone()],
+            member_op_winners: HashMap::new(),
+            next_member_op_counter: 0,
+            archived: false,
+            pending_send_count: 0,
+            admitted_invite: None,
+            admission_evidence: HashMap::new(),
+            creator_peer_id: LOCAL_PEER_ID.to_string(),
+        };
+
+        // A endorses B, then B removes itself.
+        assert!(session.apply_membership_ops(&[signed_op(
+            &a_keypair,
+            1,
+            crate::app_state::TemporaryMembershipOpKind::Add,
+            &b_peer,
+        )]));
+        assert!(session.apply_membership_ops(&[signed_op(
+            &b_keypair,
+            2,
+            crate::app_state::TemporaryMembershipOpKind::Remove,
+            &b_peer,
+        )]));
+        assert!(!session.is_member(&b_peer));
+
+        // The invite A issued to B before B left: its bound removal counter is
+        // None because no removal existed when it was created.
+        let pre_removal_invite =
+            signed_invite(&a_keypair, TemporaryChatKind::Group, &chat_id, &b_peer, None);
+
+        // Replay: a self-add lacking the current `after_remove`, under the
+        // pre-removal invite. The member must stay removed.
+        let replay = signed_op_after(
+            &b_keypair,
+            3,
+            crate::app_state::TemporaryMembershipOpKind::Add,
+            &b_peer,
+            None,
+        );
+        assert!(
+            !session.apply_membership_ops_admitted(
+                &[replay],
+                &[],
+                crate::app_state::MembershipOpAdmission::Invited,
+                Some(&pre_removal_invite),
+            ),
+            "a pre-removal invite must not re-admit a removed member"
+        );
+        assert!(!session.is_member(&b_peer));
+
+        // A fresh invite issued after the removal (bound to counter 2) still
+        // re-admits B, confirming the legitimate path is intact.
+        let fresh_invite =
+            signed_invite(&a_keypair, TemporaryChatKind::Group, &chat_id, &b_peer, Some(2));
+        let readd = signed_op_after(
+            &b_keypair,
+            4,
+            crate::app_state::TemporaryMembershipOpKind::Add,
+            &b_peer,
+            Some(2),
+        );
+        assert!(session.apply_membership_ops_admitted(
+            &[readd],
+            &[],
+            crate::app_state::MembershipOpAdmission::Invited,
+            Some(&fresh_invite)
         ));
         assert!(session.is_member(&b_peer));
     }
@@ -4163,7 +4361,8 @@ mod tests {
         assert!(fresh.apply_membership_ops_admitted(
             &winners,
             &evidence,
-            crate::app_state::MembershipOpAdmission::Standard
+            crate::app_state::MembershipOpAdmission::Standard,
+            None
         ));
         assert!(
             fresh.is_member(&b_peer),
@@ -4259,14 +4458,26 @@ mod tests {
         // re-entry is invite-gated (the invited admission) and the leave is a
         // self-remove, so every round is legitimate. The winner snapshot must
         // stay complete (one winning op per target, never trimmed) so a fresh
-        // peer can reconstruct the roster.
+        // peer can reconstruct the roster. Each re-add carries an invite
+        // issued after the latest removal (bound to its counter) and a
+        // self-add that descends from it — the same post-removal authority a
+        // fresh invite grants in production.
         let mut last_remove = None;
         for round in 0..(crate::app_state::TEMP_GROUP_MAX_MEMBERSHIP_OPS + 100) {
-            let add = signed_op(
+            let remove_counter = session.member_op_winners.get(&a_peer).map(|w| w.counter);
+            let add = signed_op_after(
                 &a_keypair,
                 (round * 2) as u64 + 1,
                 TemporaryMembershipOpKind::Add,
                 &a_peer,
+                remove_counter,
+            );
+            let invite = signed_invite(
+                &a_keypair,
+                TemporaryChatKind::Group,
+                &session.chat_id,
+                &a_peer,
+                remove_counter,
             );
             let remove = signed_op(
                 &a_keypair,
@@ -4278,9 +4489,10 @@ mod tests {
                 session.apply_membership_ops_admitted(
                     &[add],
                     &[],
-                    crate::app_state::MembershipOpAdmission::Invited
+                    crate::app_state::MembershipOpAdmission::Invited,
+                    Some(&invite)
                 ),
-                "an invited member may re-join"
+                "an invited member may re-join via an invite issued after its removal"
             );
             assert!(session.apply_membership_ops(&[remove.clone()]));
             last_remove = Some(remove);

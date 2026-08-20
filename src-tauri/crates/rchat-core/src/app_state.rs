@@ -44,6 +44,22 @@ pub struct TemporaryInvitePayload {
     /// must hash to `inviter_peer_id`) before the capability is accepted.
     #[serde(default)]
     pub signature: String,
+    /// The removal counter this invite was issued against for its intended
+    /// invitee. `None` means the invitee had not been removed when the invite
+    /// was created. A removed member can only rejoin through an invite issued
+    /// after its removal, so a pre-removal invite replays stale: once a newer
+    /// `Remove` wins for the target, the invite's `bound_removal_counter` no
+    /// longer matches and any self-add it authorizes is refused. This is what
+    /// closes the loop opened by `after_remove` on membership ops — the
+    /// invite itself must demonstrate post-removal authority, not just the
+    /// op it carries.
+    #[serde(default)]
+    pub bound_removal_counter: Option<u64>,
+    /// The peer this invite authorizes to join. `None` for a generic link;
+    /// when set, a joining self-add must target exactly this peer, so a leaked
+    /// link cannot admit a different member.
+    #[serde(default)]
+    pub intended_invitee: Option<String>,
 }
 
 impl TemporaryInvitePayload {
@@ -491,6 +507,7 @@ impl TemporaryChatSession {
             signed_op,
             &HashMap::new(),
             MembershipOpAdmission::Local,
+            None,
         ))
     }
 
@@ -508,12 +525,19 @@ impl TemporaryChatSession {
     /// already evicted. Returns `true` when the winner state changed (which
     /// may or may not change the rendered roster).
     pub fn apply_membership_ops(&mut self, ops: &[TemporaryMembershipOp]) -> bool {
-        self.apply_membership_ops_admitted(ops, &[], MembershipOpAdmission::Standard)
+        self.apply_membership_ops_admitted(ops, &[], MembershipOpAdmission::Standard, None)
     }
 
     /// Apply membership ops with an explicit admission context (see
     /// [`MembershipOpAdmission`]) and the sender's admission-certificate
     /// evidence (see [`TemporaryChatSession::admission_evidence`]).
+    ///
+    /// `invited` is the verified invitation capability that authorized the
+    /// `Invited` admission (when present). For a tombstoned target it must
+    /// demonstrate post-removal authority: its `bound_removal_counter` must
+    /// match the current `Remove` and, when set, its `intended_invitee` must
+    /// equal the joining peer — so a pre-removal or misdirected invite cannot
+    /// re-admit a removed member.
     ///
     /// Application is a **fixed point**: the ops are scanned repeatedly until
     /// a pass makes no change. Endorsement chains (A endorsed B, B endorsed C)
@@ -528,6 +552,7 @@ impl TemporaryChatSession {
         ops: &[TemporaryMembershipOp],
         evidence: &[TemporaryMembershipOp],
         admission: MembershipOpAdmission,
+        invited: Option<&TemporaryInvitePayload>,
     ) -> bool {
         // Evidence must be self-authenticating and bound to this group, like
         // any op; anything else is ignored so it cannot vouch for a target.
@@ -554,7 +579,7 @@ impl TemporaryChatSession {
                 if !self.acceptable_op_counter(op) {
                     continue;
                 }
-                if self.apply_membership_op(op.clone(), &pending_evidence, admission) {
+                if self.apply_membership_op(op.clone(), &pending_evidence, admission, invited) {
                     pass_changed = true;
                     changed = true;
                 }
@@ -591,6 +616,7 @@ impl TemporaryChatSession {
         op: TemporaryMembershipOp,
         pending_evidence: &HashMap<String, TemporaryMembershipOp>,
         admission: MembershipOpAdmission,
+        invited: Option<&TemporaryInvitePayload>,
     ) -> bool {
         if !is_valid_temp_group_member(&op.actor) || !is_valid_temp_group_member(&op.target) {
             return false;
@@ -601,7 +627,7 @@ impl TemporaryChatSession {
             return false;
         }
         if admission != MembershipOpAdmission::Local
-            && !self.allowed_remote_op(&op, admission, pending_evidence)
+            && !self.allowed_remote_op(&op, admission, pending_evidence, invited)
         {
             return false;
         }
@@ -670,6 +696,7 @@ impl TemporaryChatSession {
         op: &TemporaryMembershipOp,
         admission: MembershipOpAdmission,
         pending_evidence: &HashMap<String, TemporaryMembershipOp>,
+        invited: Option<&TemporaryInvitePayload>,
     ) -> bool {
         // The current removal tombstone for the op's target, if any. Every
         // re-admission path must descend from exactly this removal.
@@ -703,35 +730,74 @@ impl TemporaryChatSession {
                     // actor's own certificate. This is what lets a fresh peer
                     // reconstruct an endorsed member whose latest winner is a
                     // self-add.
-                    self.is_member(&op.target)
-                        || admission == MembershipOpAdmission::Invited
-                        || {
-                            // A tombstoned target is re-admitted only by a
-                            // certificate that descends from the current
-                            // removal. A removed member replaying an old
-                            // endorsement (even alongside a newer self-add)
-                            // stays removed: the historical certificate does
-                            // not reference the tombstone it must supersede.
-                            let certificate = pending_evidence
-                                .get(&op.target)
-                                .or_else(|| self.admission_evidence.get(&op.target));
-                            certificate
-                                .map(|certificate| {
-                                    if let Some(remove_counter) = tombstone_counter {
-                                        if certificate.after_remove != Some(remove_counter) {
-                                            return false;
-                                        }
-                                    }
-                                    self.is_member(&certificate.actor)
-                                        || pending_evidence
-                                            .get(&certificate.actor)
-                                            .map(|grandparent| {
-                                                self.is_member(&grandparent.actor)
-                                            })
-                                            .unwrap_or(false)
-                                })
-                                .unwrap_or(false)
+                    if self.is_member(&op.target) {
+                        return true;
+                    }
+                    // A tombstoned target (a removed member trying to re-add
+                    // itself) can only rejoin through proof that descends from
+                    // the current removal. Both the self-add and the verified
+                    // invite must reference it: a pre-removal invite replays
+                    // stale (its `bound_removal_counter` predates the removal)
+                    // and is refused even if the member forges a newer
+                    // self-add. The creator re-admitting itself is the group's
+                    // root authority and remains exempt (a self-issued invite
+                    // is always authoritative for its own peer).
+                    if let Some(remove_counter) = tombstone_counter {
+                        let invite_fresh = invited
+                            .map(|invite| {
+                                let bound_ok =
+                                    invite.bound_removal_counter == Some(remove_counter);
+                                let invitee_ok = invite
+                                    .intended_invitee
+                                    .as_ref()
+                                    .map(|invitee| invitee == &op.target)
+                                    .unwrap_or(true);
+                                let creator_self =
+                                    invite.inviter_peer_id == self.creator_peer_id
+                                        && op.target == self.creator_peer_id;
+                                (bound_ok && invitee_ok) || creator_self
+                            })
+                            .unwrap_or(false);
+                        if admission == MembershipOpAdmission::Invited && invite_fresh {
+                            return op.after_remove == Some(remove_counter);
                         }
+                        // Fall through to the certificate path; a removed
+                        // member has no retained certificate, so it stays
+                        // removed.
+                    } else if admission == MembershipOpAdmission::Invited {
+                        // No tombstone: a non-member joins under the verified
+                        // invitation capability (checking the invitee binding
+                        // when the link is targeted).
+                        let invitee_ok = invited
+                            .and_then(|invite| invite.intended_invitee.as_ref())
+                            .map(|invitee| invitee == &op.target)
+                            .unwrap_or(true);
+                        if invitee_ok {
+                            return true;
+                        }
+                    }
+                    // A tombstoned target is re-admitted only by a certificate
+                    // that descends from the current removal. A removed member
+                    // replaying an old endorsement (even alongside a newer
+                    // self-add) stays removed: the historical certificate does
+                    // not reference the tombstone it must supersede.
+                    let certificate = pending_evidence
+                        .get(&op.target)
+                        .or_else(|| self.admission_evidence.get(&op.target));
+                    certificate
+                        .map(|certificate| {
+                            if let Some(remove_counter) = tombstone_counter {
+                                if certificate.after_remove != Some(remove_counter) {
+                                    return false;
+                                }
+                            }
+                            self.is_member(&certificate.actor)
+                                || pending_evidence
+                                    .get(&certificate.actor)
+                                    .map(|grandparent| self.is_member(&grandparent.actor))
+                                    .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
                 } else {
                     // Endorsement: only a current member may add a new peer,
                     // and a tombstoned target additionally requires the

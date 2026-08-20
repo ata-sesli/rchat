@@ -713,7 +713,45 @@ impl NetworkManager {
                         && announced_invite
                             .as_ref()
                             .map(|invite| session.invite_authorizes_join(invite, now))
-                            .unwrap_or(false);
+                            .unwrap_or(false)
+                        // A removed (tombstoned) sender can only rejoin through
+                        // an invite issued after its removal: the invite must
+                        // record the current removal counter it was created
+                        // against (and, when targeted, name the sender). A
+                        // pre-removal invite replays stale and must not
+                        // authorize either the sender's self-add or the local
+                        // add we would otherwise issue for it. The creator
+                        // re-admitting itself is the group's root authority and
+                        // remains exempt.
+                        && {
+                            let target_tombstone = session
+                                .member_op_winners
+                                .get(&peer_id_str)
+                                .filter(|winner| {
+                                    matches!(
+                                        winner.op,
+                                        crate::app_state::TemporaryMembershipOpKind::Remove
+                                    )
+                                })
+                                .map(|winner| winner.counter);
+                            match (announced_invite.as_ref(), target_tombstone) {
+                                (Some(invite), Some(remove_counter)) => {
+                                    let bound_ok =
+                                        invite.bound_removal_counter == Some(remove_counter);
+                                    let invitee_ok = invite
+                                        .intended_invitee
+                                        .as_ref()
+                                        .map(|invitee| invitee == &peer_id_str)
+                                        .unwrap_or(true);
+                                    let creator_self = invite.inviter_peer_id
+                                        == session.creator_peer_id
+                                        && peer_id_str == session.creator_peer_id;
+                                    (bound_ok && invitee_ok) || creator_self
+                                }
+                                (Some(_), None) => true,
+                                (None, _) => false,
+                            }
+                        };
                     let admission = if invite_valid {
                         crate::app_state::MembershipOpAdmission::Invited
                     } else {
@@ -723,6 +761,7 @@ impl NetworkManager {
                         &announced_winners,
                         &announced_evidence,
                         admission,
+                        announced_invite.as_ref(),
                     );
                     // The sender joins as a member only when it already is one
                     // or it presented a valid invitation — never merely by
@@ -794,6 +833,7 @@ impl NetworkManager {
                     &announced_winners,
                     &announced_evidence,
                     crate::app_state::MembershipOpAdmission::Invited,
+                    announced_invite.as_ref(),
                 );
                 if !session.is_member(&peer_id_str) {
                     roster_changed |= issue_local_op(
