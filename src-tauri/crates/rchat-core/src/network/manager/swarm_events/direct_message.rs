@@ -618,13 +618,19 @@ impl NetworkManager {
         let Some(handshake_text) = request.text_content.clone() else {
             return;
         };
-        let (chat_id, announced_winners, announced_invite) = match serde_json::from_str::<
-            crate::network::gossip::TemporaryHandshakePayload,
-        >(&handshake_text) {
-            Ok(payload) => (payload.chat_id, payload.winners, payload.invite),
-            // Older peers send a bare chat id; treat it as a roster-less join.
-            Err(_) => (handshake_text, Vec::new(), None),
-        };
+        let (chat_id, announced_winners, announced_evidence, announced_invite) =
+            match serde_json::from_str::<
+                crate::network::gossip::TemporaryHandshakePayload,
+            >(&handshake_text) {
+                Ok(payload) => (
+                    payload.chat_id,
+                    payload.winners,
+                    payload.evidence,
+                    payload.invite,
+                ),
+                // Older peers send a bare chat id; treat it as a roster-less join.
+                Err(_) => (handshake_text, Vec::new(), Vec::new(), None),
+            };
 
         if !crate::chat_kind::is_temporary_chat_id(&chat_id) {
             return;
@@ -634,9 +640,11 @@ impl NetworkManager {
         let local_peer_id = self.swarm.local_peer_id().to_string();
         let is_group = crate::chat_kind::is_temp_group_chat_id(&chat_id);
         // The sender's invitation capability, validated against this chat:
-        // only a valid, unexpired invite for exactly this group admits a
-        // non-member's self-add (joining requires the invite, not mere
-        // dialing).
+        // only a valid, unexpired, *signed* invite for exactly this group
+        // admits a non-member's self-add (joining requires the invite, not
+        // mere dialing). The signature is verified against the inviter's
+        // embedded public key (which must hash to the claimed inviter peer
+        // id), so a forged or re-signed invite is rejected here.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -645,8 +653,7 @@ impl NetworkManager {
             .as_ref()
             .map(|invite| {
                 matches!(invite.kind, crate::app_state::TemporaryChatKind::Group)
-                    && invite.chat_id == chat_id
-                    && invite.expires_at > now
+                    && invite.verify_capability(&chat_id, now)
             })
             .unwrap_or(false);
         // Best-effort signing keypair: ops issued below are signed so they can
@@ -704,8 +711,11 @@ impl NetworkManager {
                     } else {
                         crate::app_state::MembershipOpAdmission::Standard
                     };
-                    roster_changed =
-                        session.apply_membership_ops_admitted(&announced_winners, admission);
+                    roster_changed = session.apply_membership_ops_admitted(
+                        &announced_winners,
+                        &announced_evidence,
+                        admission,
+                    );
                     // The sender joins as a member only when it already is one
                     // or it presented a valid invitation — never merely by
                     // dialing us.
@@ -750,6 +760,8 @@ impl NetworkManager {
                     next_member_op_counter: 0,
                     archived: false,
                     pending_send_count: 0,
+                    admitted_invite: None,
+                    admission_evidence: HashMap::new(),
                 };
                 if is_group {
                     // Seed the local peer with a signed self-add so it is part
@@ -762,13 +774,26 @@ impl NetworkManager {
                     ) {
                         session.add_member(&self.swarm.local_peer_id().to_string());
                     }
+                    // A valid invitation also seeds its inviter as a base
+                    // member: the inviter is the root of every endorsement
+                    // chain, so a fresh peer must be able to establish its
+                    // membership before it can verify anyone the inviter (or
+                    // a chain through it) admitted.
+                    if invite_valid {
+                        if let Some(invite) = announced_invite.as_ref() {
+                            session.add_member(&invite.inviter_peer_id);
+                        }
+                    }
                     let admission = if invite_valid {
                         crate::app_state::MembershipOpAdmission::Invited
                     } else {
                         crate::app_state::MembershipOpAdmission::Standard
                     };
-                    roster_changed =
-                        session.apply_membership_ops_admitted(&announced_winners, admission);
+                    roster_changed = session.apply_membership_ops_admitted(
+                        &announced_winners,
+                        &announced_evidence,
+                        admission,
+                    );
                     // The sender joins as a member only with a valid
                     // invitation — never merely by dialing us.
                     if !session.is_member(&peer_id_str) && invite_valid {
@@ -824,7 +849,7 @@ impl NetworkManager {
     /// member set.
     pub(crate) async fn send_temp_handshake_to(&mut self, peer: &PeerId, chat_id: &str) {
         use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
-        let (winners, invite) = {
+        let (winners, evidence, invite) = {
             let network_state = &self.network_state;
             let temp_state = network_state.temporary_state.lock().await;
             let winners = temp_state
@@ -832,16 +857,32 @@ impl NetworkManager {
                 .get(chat_id)
                 .map(|session| session.membership_winners())
                 .unwrap_or_default();
+            let evidence = temp_state
+                .chats
+                .get(chat_id)
+                .map(|session| session.membership_evidence())
+                .unwrap_or_default();
+            // The invitation capability this side can prove for the chat:
+            // a redeemed, verified invite retained on the session takes
+            // precedence; otherwise the inviter's own created invite (which
+            // lives in `active_invite`) is echoed.
             let invite = temp_state
-                .active_invite
-                .as_ref()
-                .filter(|active| active.payload.chat_id == chat_id)
-                .map(|active| active.payload.clone());
-            (winners, invite)
+                .chats
+                .get(chat_id)
+                .and_then(|session| session.admitted_invite.clone())
+                .or_else(|| {
+                    temp_state
+                        .active_invite
+                        .as_ref()
+                        .filter(|active| active.payload.chat_id == chat_id)
+                        .map(|active| active.payload.clone())
+                });
+            (winners, evidence, invite)
         };
         let payload = crate::network::gossip::TemporaryHandshakePayload {
             chat_id: chat_id.to_string(),
             winners,
+            evidence,
             invite,
         };
         let text_content =
@@ -876,16 +917,24 @@ impl NetworkManager {
         chat_id: &str,
         except: Option<&PeerId>,
     ) {
-        let winners = {
+        let (winners, evidence) = {
             let network_state = &self.network_state;
             let temp_state = network_state.temporary_state.lock().await;
-            temp_state
-                .chats
-                .get(chat_id)
-                .map(|session| session.membership_winners())
-                .unwrap_or_default()
+            (
+                temp_state
+                    .chats
+                    .get(chat_id)
+                    .map(|session| session.membership_winners())
+                    .unwrap_or_default(),
+                temp_state
+                    .chats
+                    .get(chat_id)
+                    .map(|session| session.membership_evidence())
+                    .unwrap_or_default(),
+            )
         };
-        self.broadcast_temp_group_winners(chat_id, winners, except).await;
+        self.broadcast_temp_group_winners(chat_id, winners, evidence, except)
+            .await;
     }
 
     /// Send an explicit winner snapshot to every connected member of a
@@ -896,12 +945,14 @@ impl NetworkManager {
         &mut self,
         chat_id: &str,
         winners: Vec<crate::app_state::TemporaryMembershipOp>,
+        evidence: Vec<crate::app_state::TemporaryMembershipOp>,
         except: Option<&PeerId>,
     ) {
         let peers = self.connected_temp_members(chat_id);
         for peer in peers {
             if Some(&peer) != except {
-                self.send_temp_handshake_winners_to(&peer, chat_id, &winners).await;
+                self.send_temp_handshake_winners_to(&peer, chat_id, &winners, &evidence)
+                    .await;
             }
         }
     }
@@ -912,20 +963,28 @@ impl NetworkManager {
         peer: &PeerId,
         chat_id: &str,
         winners: &[crate::app_state::TemporaryMembershipOp],
+        evidence: &[crate::app_state::TemporaryMembershipOp],
     ) {
         use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
         let invite = {
             let network_state = &self.network_state;
             let temp_state = network_state.temporary_state.lock().await;
             temp_state
-                .active_invite
-                .as_ref()
-                .filter(|active| active.payload.chat_id == chat_id)
-                .map(|active| active.payload.clone())
+                .chats
+                .get(chat_id)
+                .and_then(|session| session.admitted_invite.clone())
+                .or_else(|| {
+                    temp_state
+                        .active_invite
+                        .as_ref()
+                        .filter(|active| active.payload.chat_id == chat_id)
+                        .map(|active| active.payload.clone())
+                })
         };
         let payload = crate::network::gossip::TemporaryHandshakePayload {
             chat_id: chat_id.to_string(),
             winners: winners.to_vec(),
+            evidence: evidence.to_vec(),
             invite,
         };
         let text_content =

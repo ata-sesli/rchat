@@ -1,7 +1,7 @@
 use crate::network::command::NetworkCommand;
 use crate::storage::config::ConfigManager;
 use crate::storage::db::Message;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -15,6 +15,11 @@ pub enum TemporaryChatKind {
     Group,
 }
 
+/// Wire version of the temporary-invite capability. Bound into every payload
+/// and re-checked on redeem and in handshakes so an invite minted under a
+/// future (or past) scheme is never accepted.
+pub const TEMP_INVITE_VERSION: u8 = 1;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TemporaryInvitePayload {
     pub version: u8,
@@ -25,6 +30,76 @@ pub struct TemporaryInvitePayload {
     pub inviter_addr: String,
     pub created_at: u64,
     pub expires_at: u64,
+    /// Fresh per invite so a leaked or replayed invite stays distinguishable
+    /// even when the rest of the payload is identical.
+    #[serde(default)]
+    pub nonce: u64,
+    /// Base64 protobuf encoding of the inviter's ed25519 public key. The
+    /// peer id must hash from this key, which is what lets any holder verify
+    /// the signature without trusting the transport.
+    #[serde(default)]
+    pub inviter_pubkey: String,
+    /// Base64 signature over the canonical JSON of this payload with the
+    /// `signature` field cleared. Verified against `inviter_pubkey` (which
+    /// must hash to `inviter_peer_id`) before the capability is accepted.
+    #[serde(default)]
+    pub signature: String,
+}
+
+impl TemporaryInvitePayload {
+    /// The bytes the inviter signs: canonical JSON of this payload with the
+    /// signature field cleared, so signing and verification always agree.
+    fn canonical_signing_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let mut unsigned = self.clone();
+        unsigned.signature.clear();
+        serde_json::to_vec(&unsigned)
+    }
+
+    /// Sign this invite with the inviter's keypair, embedding the public key
+    /// and a fresh signature. The peer id must hash from the public key.
+    pub fn sign(&mut self, keypair: &libp2p::identity::Keypair) -> anyhow::Result<()> {
+        self.inviter_pubkey = BASE64.encode(keypair.public().encode_protobuf());
+        let signature = keypair
+            .sign(&self.canonical_signing_bytes()?)
+            .map_err(|error| anyhow!("Failed to sign temporary invite: {error}"))?;
+        self.signature = BASE64.encode(signature);
+        Ok(())
+    }
+
+    /// Whether this invite is a genuine, unexpired capability for `chat_id`
+    /// issued by the peer named in `inviter_peer_id`. A forged or re-signed
+    /// payload, a peer id that does not hash from the embedded public key, and
+    /// an expired invite all fail here.
+    pub fn verify_capability(&self, chat_id: &str, now: u64) -> bool {
+        if self.version != TEMP_INVITE_VERSION {
+            return false;
+        }
+        if self.chat_id != chat_id {
+            return false;
+        }
+        if self.expires_at <= now {
+            return false;
+        }
+        if self.signature.is_empty() || self.inviter_pubkey.is_empty() {
+            return false;
+        }
+        let Ok(pk_bytes) = BASE64.decode(&self.inviter_pubkey) else {
+            return false;
+        };
+        let Ok(public_key) = libp2p::identity::PublicKey::try_decode_protobuf(&pk_bytes) else {
+            return false;
+        };
+        if libp2p::PeerId::from_public_key(&public_key).to_string() != self.inviter_peer_id {
+            return false;
+        }
+        let Ok(signature) = BASE64.decode(&self.signature) else {
+            return false;
+        };
+        let Ok(bytes) = self.canonical_signing_bytes() else {
+            return false;
+        };
+        public_key.verify(&bytes, &signature)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -68,6 +143,21 @@ pub struct TemporaryChatSession {
     /// status is unknown.
     #[serde(default)]
     pub pending_send_count: u32,
+    /// The verified invitation capability that admitted this session: the
+    /// signed invite the local user redeemed. `None` on the inviter side,
+    /// where the created invite lives in `active_invite`. Echoed in
+    /// handshakes so a peer that joined via invitation can prove its
+    /// admission without being trusted.
+    #[serde(default)]
+    pub admitted_invite: Option<TemporaryInvitePayload>,
+    /// Admission certificates: for each target, the op that established its
+    /// membership. Retained even when the target's *winner* is later replaced
+    /// by a self-add re-announce, so the proof chain that authorized the
+    /// member stays reconstructable by fresh peers. Cleared when a remove
+    /// tombstone wins (the tombstone is then the authority). Bounded like the
+    /// winner map, one entry per target.
+    #[serde(default)]
+    pub admission_evidence: HashMap<String, TemporaryMembershipOp>,
 }
 
 /// Hard cap on the number of members a temporary group tracks. Handshake-
@@ -353,6 +443,7 @@ impl TemporaryChatSession {
         }
         Ok(self.apply_membership_op(
             signed_op,
+            &HashMap::new(),
             MembershipOpAdmission::Local,
         ))
     }
@@ -371,26 +462,60 @@ impl TemporaryChatSession {
     /// already evicted. Returns `true` when the winner state changed (which
     /// may or may not change the rendered roster).
     pub fn apply_membership_ops(&mut self, ops: &[TemporaryMembershipOp]) -> bool {
-        self.apply_membership_ops_admitted(ops, MembershipOpAdmission::Standard)
+        self.apply_membership_ops_admitted(ops, &[], MembershipOpAdmission::Standard)
     }
 
     /// Apply membership ops with an explicit admission context (see
-    /// [`MembershipOpAdmission`]). Returns `true` when the winner state
-    /// changed.
+    /// [`MembershipOpAdmission`]) and the sender's admission-certificate
+    /// evidence (see [`TemporaryChatSession::admission_evidence`]).
+    ///
+    /// Application is a **fixed point**: the ops are scanned repeatedly until
+    /// a pass makes no change. Endorsement chains (A endorsed B, B endorsed C)
+    /// therefore resolve regardless of the order the snapshot yields them in,
+    /// because a later pass admits C once the earlier pass has admitted B.
+    /// Admission certificates in `evidence` (each a verified op for this
+    /// chat) let a target whose winner is a self-add re-announce still prove
+    /// its original admission: the certificate's actor must itself resolve to
+    /// a member. Returns `true` when the winner state changed.
     pub fn apply_membership_ops_admitted(
         &mut self,
         ops: &[TemporaryMembershipOp],
+        evidence: &[TemporaryMembershipOp],
         admission: MembershipOpAdmission,
     ) -> bool {
+        // Evidence must be self-authenticating and bound to this group, like
+        // any op; anything else is ignored so it cannot vouch for a target.
+        let mut pending_evidence: HashMap<String, TemporaryMembershipOp> = HashMap::new();
+        for certificate in evidence {
+            if !certificate.verify()
+                || certificate.chat_id != self.chat_id
+                || !is_valid_temp_group_member(&certificate.target)
+            {
+                continue;
+            }
+            if pending_evidence.len() >= TEMP_GROUP_MAX_MEMBERSHIP_OPS {
+                break;
+            }
+            pending_evidence.insert(certificate.target.clone(), certificate.clone());
+        }
         let mut changed = false;
-        for op in ops {
-            if !op.verify() {
-                continue;
+        loop {
+            let mut pass_changed = false;
+            for op in ops {
+                if !op.verify() {
+                    continue;
+                }
+                if !self.acceptable_op_counter(op) {
+                    continue;
+                }
+                if self.apply_membership_op(op.clone(), &pending_evidence, admission) {
+                    pass_changed = true;
+                    changed = true;
+                }
             }
-            if !self.acceptable_op_counter(&op) {
-                continue;
+            if !pass_changed {
+                break;
             }
-            changed |= self.apply_membership_op(op.clone(), admission);
         }
         changed
     }
@@ -418,6 +543,7 @@ impl TemporaryChatSession {
     fn apply_membership_op(
         &mut self,
         op: TemporaryMembershipOp,
+        pending_evidence: &HashMap<String, TemporaryMembershipOp>,
         admission: MembershipOpAdmission,
     ) -> bool {
         if !is_valid_temp_group_member(&op.actor) || !is_valid_temp_group_member(&op.target) {
@@ -428,7 +554,9 @@ impl TemporaryChatSession {
         if op.chat_id != self.chat_id {
             return false;
         }
-        if admission != MembershipOpAdmission::Local && !self.allowed_remote_op(&op, admission) {
+        if admission != MembershipOpAdmission::Local
+            && !self.allowed_remote_op(&op, admission, pending_evidence)
+        {
             return false;
         }
         if let Some(current) = self.member_op_winners.get(&op.target) {
@@ -450,6 +578,31 @@ impl TemporaryChatSession {
         // this point supersedes it.
         self.next_member_op_counter = self.next_member_op_counter.max(op.counter);
         self.member_op_winners.insert(op.target.clone(), op.clone());
+        match op.op {
+            TemporaryMembershipOpKind::Add => {
+                // Record the admission certificate for the target. The
+                // certificate is the op that established membership: the
+                // sender-provided evidence when present (so a self-add
+                // re-announce never erases the endorser that admitted the
+                // target), otherwise the add itself. Once a target is
+                // admitted its certificate is retained, so the proof chain
+                // survives later winner churn; a remove tombstone clears it.
+                let certificate = pending_evidence
+                    .get(&op.target)
+                    .cloned()
+                    .unwrap_or_else(|| op.clone());
+                if self.admission_evidence.len() < TEMP_GROUP_MAX_MEMBERSHIP_OPS {
+                    self.admission_evidence
+                        .entry(op.target.clone())
+                        .or_insert(certificate);
+                }
+            }
+            TemporaryMembershipOpKind::Remove => {
+                // The tombstone is the authority; the certificate for the
+                // evicted target is no longer evidence of membership.
+                self.admission_evidence.remove(&op.target);
+            }
+        }
         self.derive_roster();
         true
     }
@@ -458,11 +611,15 @@ impl TemporaryChatSession {
     /// (a valid signature) is a separate concern enforced before this; here we
     /// apply the group's admission policy so a member can never remove another
     /// member, a non-member cannot mutate the roster, and a removed member
-    /// cannot re-admit itself without a fresh invitation.
+    /// cannot re-admit itself without a fresh invitation. `pending_evidence`
+    /// carries the sender's admission certificates for targets whose winner is
+    /// a self-add, so a member whose endorsement was superseded by its own
+    /// re-announce is still provably admitted.
     fn allowed_remote_op(
         &self,
         op: &TemporaryMembershipOp,
         admission: MembershipOpAdmission,
+        pending_evidence: &HashMap<String, TemporaryMembershipOp>,
     ) -> bool {
         match op.op {
             TemporaryMembershipOpKind::Remove => {
@@ -480,9 +637,32 @@ impl TemporaryChatSession {
                 if op.actor == op.target {
                     // Self-add: an existing member re-announcing is a replay
                     // no-op (already admitted); a non-member joining needs the
-                    // invitation capability.
+                    // invitation capability; and a member whose own re-announce
+                    // superseded its original endorsement is admitted again
+                    // through its admission certificate (from the sender's
+                    // evidence, or already retained locally), whose actor must
+                    // itself resolve to a member — directly or through that
+                    // actor's own certificate. This is what lets a fresh peer
+                    // reconstruct an endorsed member whose latest winner is a
+                    // self-add.
                     self.is_member(&op.target)
                         || admission == MembershipOpAdmission::Invited
+                        || {
+                            let certificate = pending_evidence
+                                .get(&op.target)
+                                .or_else(|| self.admission_evidence.get(&op.target));
+                            certificate
+                                .map(|certificate| {
+                                    self.is_member(&certificate.actor)
+                                        || pending_evidence
+                                            .get(&certificate.actor)
+                                            .map(|grandparent| {
+                                                self.is_member(&grandparent.actor)
+                                            })
+                                            .unwrap_or(false)
+                                })
+                                .unwrap_or(false)
+                        }
                 } else {
                     // Endorsement: only a current member may add a new peer.
                     self.is_member(&op.actor)
@@ -538,6 +718,13 @@ impl TemporaryChatSession {
         self.member_op_winners.values().cloned().collect()
     }
 
+    /// The admission certificates of this session, one per target. Transferred
+    /// alongside [`Self::membership_winners`] so a fresh peer can prove an
+    /// endorsed member whose latest winner is a self-add.
+    pub fn membership_evidence(&self) -> Vec<TemporaryMembershipOp> {
+        self.admission_evidence.values().cloned().collect()
+    }
+
     /// Whether this session holds a winner that is newer than, or missing
     /// from, the `other` ops for the same target. Drives the handshake
     /// response so a reconnecting member with a stale roster is brought up to
@@ -561,6 +748,44 @@ pub struct TemporaryRuntimeState {
     pub active_invite: Option<ActiveTemporaryInvite>,
     pub chats: HashMap<String, TemporaryChatSession>,
     pub messages: HashMap<String, Vec<Message>>,
+}
+
+impl TemporaryRuntimeState {
+    /// Chat ids this peer belongs to, derived purely from session membership
+    /// (group roster or DM peer). This is the source of truth that survives
+    /// disconnects: the routing caches in the manager are only transport
+    /// presence and may be cleared on disconnect, so reconnect re-derives its
+    /// handshake targets from here.
+    pub fn chat_ids_for_peer(&self, peer_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .chats
+            .iter()
+            .filter(|(_, session)| {
+                if session.archived {
+                    return false;
+                }
+                match session.kind {
+                    TemporaryChatKind::Dm => session.peer_id.as_deref() == Some(peer_id),
+                    TemporaryChatKind::Group => session.is_member(peer_id),
+                }
+            })
+            .map(|(chat_id, _)| chat_id.clone())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+}
+
+/// The caller's decision for a frozen session, carried on the freeze's `alive`
+/// watch channel. The watchdog resolves the freeze from the last observed
+/// value the moment the caller's sender is dropped: still `Pending` means the
+/// caller vanished before the archive became durable (abort and recover);
+/// `Commit` means the archive is already durably persisted (finalize the
+/// teardown instead of reviving a chat that now also exists in the archive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreezeResolution {
+    Pending,
+    Commit,
 }
 
 /// Manager-owned record of a temporary session frozen for archiving (two-phase

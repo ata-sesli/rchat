@@ -58,7 +58,7 @@ pub enum NetworkCommand {
         /// The membership counter carried by the farewell remove; an abort's
         /// rejoin add must exceed it to supersede that remove on every peer.
         min_add_counter: u64,
-        alive: tokio::sync::watch::Sender<bool>,
+        alive: tokio::sync::watch::Sender<crate::app_state::FreezeResolution>,
         ack: Option<
             tokio::sync::oneshot::Sender<Result<Vec<crate::storage::db::Message>, String>>,
         >,

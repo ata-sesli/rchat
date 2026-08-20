@@ -66,14 +66,17 @@ impl NetworkManager {
         kind: crate::app_state::TemporaryChatKind,
         farewell_winners: Vec<crate::app_state::TemporaryMembershipOp>,
         min_add_counter: u64,
-        alive: tokio::sync::watch::Sender<bool>,
+        alive: tokio::sync::watch::Sender<crate::app_state::FreezeResolution>,
         ack: Option<
             tokio::sync::oneshot::Sender<Result<Vec<crate::storage::db::Message>, String>>,
         >,
     ) {
         let network_state = self.network_state.clone();
         if matches!(kind, crate::app_state::TemporaryChatKind::Group) {
-            self.broadcast_temp_group_winners(chat_id, farewell_winners, None)
+            // The farewell is the leave boundary: the archiver's remove
+            // tombstone needs no admission evidence (recipients are current
+            // members), so the snapshot is broadcast without evidence.
+            self.broadcast_temp_group_winners(chat_id, farewell_winners, Vec::new(), None)
                 .await;
         }
         let drained = {
@@ -113,9 +116,13 @@ impl NetworkManager {
             messages
         };
         // Watchdog: a dropped `alive` sender means the caller never resolved
-        // the freeze (cancellation or ack loss); recover the session instead
-        // of leaving it reserved forever. Epoch-scoped so a stale watchdog can
-        // never abort a later freeze of the same chat.
+        // the freeze (cancellation or ack loss). The resolution depends on the
+        // caller's last decision: still `Pending` means the archive never
+        // became durable, so abort and recover the conversation; `Commit`
+        // means the archive is already persisted, so finalize the teardown
+        // instead of reviving a chat that now also exists in the archive.
+        // Epoch-scoped so a stale watchdog can never abort a later freeze of
+        // the same chat.
         let watchdog_epoch = self.pending_epoch_counter;
         let watchdog_net = self.network_state.clone();
         let watchdog_chat = chat_id.to_string();
@@ -129,14 +136,26 @@ impl NetworkManager {
         drop(alive);
         tokio::spawn(async move {
             if alive_rx.changed().await.is_err() {
+                let resolution = *alive_rx.borrow();
                 let sender = watchdog_net.sender.lock().await;
-                let _ = sender
-                    .send(NetworkCommand::AbortTemporaryArchive {
-                        chat_id: watchdog_chat,
-                        epoch: Some(watchdog_epoch),
-                        ack: None,
-                    })
-                    .await;
+                match resolution {
+                    crate::app_state::FreezeResolution::Pending => {
+                        let _ = sender
+                            .send(NetworkCommand::AbortTemporaryArchive {
+                                chat_id: watchdog_chat,
+                                epoch: Some(watchdog_epoch),
+                                ack: None,
+                            })
+                            .await;
+                    }
+                    crate::app_state::FreezeResolution::Commit => {
+                        let _ = sender
+                            .send(NetworkCommand::CommitTemporaryArchive {
+                                chat_id: watchdog_chat,
+                            })
+                            .await;
+                    }
+                }
             }
         });
         if let Some(ack) = ack {

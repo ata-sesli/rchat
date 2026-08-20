@@ -58,6 +58,11 @@ pub struct TemporaryHandshakePayload {
     pub chat_id: String,
     #[serde(default)]
     pub winners: Vec<crate::app_state::TemporaryMembershipOp>,
+    /// Admission certificates (one per target) backing the winner snapshot.
+    /// Transferred so a fresh peer can still prove an endorsed member whose
+    /// latest winner is a self-add re-announce.
+    #[serde(default)]
+    pub evidence: Vec<crate::app_state::TemporaryMembershipOp>,
     /// The sender's invitation capability for this group, if any. A receiver
     /// validates it against its own chat id before admitting a non-member's
     /// self-add, so joining requires the invite rather than mere dialing.

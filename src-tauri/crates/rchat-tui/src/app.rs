@@ -1368,6 +1368,8 @@ mod tests {
                     next_member_op_counter: 0,
                     archived: false,
                     pending_send_count: 0,
+                    admitted_invite: None,
+                    admission_evidence: std::collections::HashMap::new(),
                 },
             );
             if !messages.is_empty() {

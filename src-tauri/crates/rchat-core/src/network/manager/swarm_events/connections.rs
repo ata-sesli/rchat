@@ -120,6 +120,20 @@ impl NetworkManager {
             }
         }
 
+        // Re-establish temporary-chat routing for this peer. A disconnect only
+        // drops transport presence: membership (the signed admitted set) stays
+        // in the session, so any chat the peer belongs to must be re-cached
+        // here even if the disconnect cleared the routing maps. Otherwise a
+        // reconnect would find no entry in `temp_chat_by_peer_id` and never
+        // re-handshake.
+        let rejoin_chats = {
+            let temp_state = self.network_state.temporary_state.lock().await;
+            temp_state.chat_ids_for_peer(&peer_id_str)
+        };
+        for chat_id in &rejoin_chats {
+            self.cache_temporary_mapping(chat_id, &peer_id_str);
+        }
+
         if let Some(temp_chats) = self
             .temp_chat_by_peer_id
             .get(&peer_id_str)
