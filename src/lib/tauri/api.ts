@@ -86,6 +86,7 @@ export const COMMANDS = {
   createInvite: "create_invite",
   redeemAndConnect: "redeem_and_connect",
   createTemporaryInvite: "create_temporary_invite",
+  createTemporaryGroupInvite: "create_temporary_group_invite",
   redeemTemporaryInvite: "redeem_temporary_invite",
   getActiveTemporaryInvite: "get_active_temporary_invite",
   cancelTemporaryInvite: "cancel_temporary_invite",
@@ -656,6 +657,10 @@ type CommandSpec = {
     args: { kind: "dm" | "group"; name?: string | null };
     result: TemporaryInviteView;
   };
+  [COMMANDS.createTemporaryGroupInvite]: {
+    args: { chat_id: string; intended_invitee?: string | null };
+    result: TemporaryInviteView;
+  };
   [COMMANDS.redeemTemporaryInvite]: {
     args: { deep_link: string };
     result: TemporaryChatResult;
@@ -1016,6 +1021,13 @@ export const api = {
     invokeCommand(COMMANDS.redeemAndConnect, { inviter, password }),
   createTemporaryInvite: (kind: "dm" | "group", name?: string | null) =>
     invokeCommand(COMMANDS.createTemporaryInvite, { kind, name }),
+  createTemporaryGroupInvite: (chatId: string, intendedInvitee?: string | null) =>
+    invokeCommand(COMMANDS.createTemporaryGroupInvite, {
+      chatId,
+      chat_id: chatId,
+      intendedInvitee,
+      intended_invitee: intendedInvitee ?? null,
+    } as unknown as CommandSpec[typeof COMMANDS.createTemporaryGroupInvite]["args"]),
   redeemTemporaryInvite: (deepLink: string) =>
     invokeCommand(COMMANDS.redeemTemporaryInvite, {
       deepLink,
