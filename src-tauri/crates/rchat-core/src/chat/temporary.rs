@@ -175,6 +175,128 @@ pub async fn create_temporary_invite(
     })
 }
 
+/// Issue an invite into an *existing* temporary group.
+///
+/// [`create_temporary_invite`] always mints a brand-new group, so it can
+/// never produce the capability the post-removal admission policy requires:
+/// a removed member may only rejoin through an invite bound to its current
+/// winning `Remove` counter, and that counter only exists on a live session.
+/// This operation targets an existing group by id instead:
+///
+/// - the local user must currently be an admitted member or the recorded
+///   creator — the same authority [`TemporaryChatSession::invite_authorizes_join`]
+///   demands of an invite's signer on the receiving side;
+/// - when `intended_invitee` is set, the payload names exactly that peer and
+///   binds `bound_removal_counter` to *its* current winning `Remove` (`None`
+///   only while that peer was never removed), which is precisely what lets
+///   the targeted link satisfy the post-removal admission gate;
+/// - without an intended peer the link stays generic and unbound — usable by
+///   peers that were never removed and refused by policy for tombstoned
+///   ones, because one counter cannot soundly represent several targets;
+/// - the session, its winners/evidence and its messages are left untouched;
+///   only the shareable `active_invite` is replaced.
+pub async fn create_temporary_group_invite(
+    app_state: &AppState,
+    net_state: &NetworkState,
+    chat_id: &str,
+    intended_invitee: Option<&str>,
+) -> Result<TemporaryInviteView> {
+    // Resolve identity and key material before taking the temporary-state
+    // lock, preserving the established lock ordering (local_peer_id and
+    // config before temporary_state; no await points under the lock).
+    let inviter_peer_id = net_state
+        .local_peer_id
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| anyhow!("Network is not started yet"))?;
+    if let Some(invitee) = intended_invitee {
+        if invitee.parse::<libp2p::PeerId>().is_err() {
+            return Err(anyhow!("Invalid invitee peer id"));
+        }
+    }
+    let inviter_addr = resolve_current_public_address(net_state).await?;
+    let inviter_username = {
+        let mgr = app_state.config_manager.lock().await;
+        let config = mgr.load().await?;
+        config
+            .system
+            .github_username
+            .clone()
+            .or(config.user.profile.alias.clone())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    let keypair = crate::chat::group::load_or_create_local_keypair(app_state).await?;
+
+    let now = now_unix_secs();
+    let expires_at = now + TEMP_INVITE_TTL_SECS;
+
+    // Signing below is synchronous CPU work, so the lock is held across the
+    // whole read-decide-sign-publish sequence without an await point: the
+    // bound counter can never drift from the session state it was read from.
+    let mut temp_state = net_state.temporary_state.lock().await;
+    let session = temp_state
+        .chats
+        .get(chat_id)
+        .ok_or_else(|| anyhow!("Temporary chat {chat_id} not found"))?;
+    if !matches!(session.kind, TemporaryChatKind::Group) {
+        return Err(anyhow!("Temporary chat {chat_id} is not a group"));
+    }
+    if session.archived {
+        return Err(anyhow!("Temporary chat {chat_id} is archived"));
+    }
+    if !session.is_member(&inviter_peer_id) && session.creator_peer_id != inviter_peer_id {
+        return Err(anyhow!(
+            "Only an active member can invite into this group"
+        ));
+    }
+    let bound_removal_counter = intended_invitee.and_then(|invitee| {
+        match session.member_op_winners.get(invitee) {
+            Some(winner)
+                if matches!(
+                    winner.op,
+                    crate::app_state::TemporaryMembershipOpKind::Remove
+                ) =>
+            {
+                Some(winner.counter)
+            }
+            _ => None,
+        }
+    });
+    let mut payload = TemporaryInvitePayload {
+        version: TEMP_INVITE_VERSION,
+        kind: session.kind.clone(),
+        chat_id: chat_id.to_string(),
+        inviter_peer_id,
+        inviter_username,
+        inviter_addr,
+        created_at: now,
+        expires_at,
+        nonce: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0),
+        inviter_pubkey: String::new(),
+        signature: String::new(),
+        bound_removal_counter,
+        intended_invitee: intended_invitee.map(str::to_string),
+    };
+    payload.sign(&keypair)?;
+    let encoded = encode_temporary_payload(&payload)?;
+    let deep_link = format!("{}{}", TEMP_INVITE_SCHEME_PREFIX, encoded);
+
+    temp_state.active_invite = Some(ActiveTemporaryInvite {
+        deep_link: deep_link.clone(),
+        payload: payload.clone(),
+    });
+
+    Ok(TemporaryInviteView {
+        deep_link,
+        payload,
+        remaining_seconds: TEMP_INVITE_TTL_SECS,
+    })
+}
+
 pub async fn get_active_temporary_invite(
     net_state: &NetworkState,
 ) -> Result<Option<TemporaryInviteView>> {
@@ -256,6 +378,15 @@ pub async fn redeem_temporary_invite(
         .await
         .clone()
         .unwrap_or_else(|| "Me".to_string());
+
+    // A targeted invite authorizes exactly one peer: anyone else presenting
+    // the same link is refused up front instead of seeding a session that
+    // remote members would reject at admission anyway.
+    if let Some(intended) = payload.intended_invitee.as_ref() {
+        if *intended != local_peer_id {
+            return Err(anyhow!("This temporary invite is meant for another peer"));
+        }
+    }
 
     let mut temp_state = net_state.temporary_state.lock().await;
     let Some(local_active) = temp_state.active_invite.clone() else {
@@ -2024,6 +2155,263 @@ mod tests {
             Some(&fresh_invite)
         ));
         assert!(session.is_member(&b_peer));
+    }
+
+    #[tokio::test]
+    async fn production_reinvite_lets_removed_member_rejoin_existing_group() {
+        // End-to-end regression for the production invite creator: after B's
+        // Remove wins, only `create_temporary_group_invite` — not the
+        // fresh-group mint nor a replayed link — can produce the capability
+        // that re-admits B into the *existing* group.
+        let (_temp, app_state) = test_app_state().await;
+        let (net_state, _rx) = test_network_state();
+        // Align the network identity with the persisted local keypair so ops
+        // issued by the local member verify exactly as they do in production.
+        let local_keypair = crate::chat::group::load_or_create_local_keypair(&app_state)
+            .await
+            .expect("keypair");
+        let local_peer = libp2p::PeerId::from_public_key(&local_keypair.public()).to_string();
+        *net_state.local_peer_id.lock().await = Some(local_peer.clone());
+
+        let created =
+            create_temporary_invite(&app_state, &net_state, TemporaryChatKind::Group, None)
+                .await
+                .expect("create group");
+        let chat_id = created.payload.chat_id.clone();
+
+        let b_keypair = libp2p::identity::Keypair::generate_ed25519();
+        let b_peer = libp2p::PeerId::from_public_key(&b_keypair.public()).to_string();
+
+        // B joins via the creator's endorsement, then leaves with a later
+        // self-removal whose tombstone wins.
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            let session = temp_state.chats.get_mut(&chat_id).expect("session");
+            assert!(session
+                .issue_membership_op(
+                    &local_peer,
+                    TemporaryMembershipOpKind::Add,
+                    &b_peer,
+                    &local_keypair
+                )
+                .expect("endorse B"));
+            let removal = signed_op_in_chat(
+                &b_keypair,
+                2,
+                TemporaryMembershipOpKind::Remove,
+                &b_peer,
+                &chat_id,
+                None,
+            );
+            assert!(session.apply_membership_ops(&[removal]));
+            assert!(!session.is_member(&b_peer));
+        }
+
+        // The pre-removal generic link stays powerless even under the Invited
+        // admission with a self-add that references the current removal.
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            let session = temp_state.chats.get_mut(&chat_id).expect("session");
+            let stale_self_add = signed_op_in_chat(
+                &b_keypair,
+                3,
+                TemporaryMembershipOpKind::Add,
+                &b_peer,
+                &chat_id,
+                Some(2),
+            );
+            assert!(
+                !session.apply_membership_ops_admitted(
+                    &[stale_self_add],
+                    &[],
+                    crate::app_state::MembershipOpAdmission::Invited,
+                    Some(&created.payload),
+                ),
+                "the pre-removal generic link must not re-admit B"
+            );
+        }
+
+        // The production creator produces exactly the capability the policy
+        // demands: targeted at B and bound to B's winning Remove counter.
+        let view =
+            create_temporary_group_invite(&app_state, &net_state, &chat_id, Some(&b_peer))
+                .await
+                .expect("reinvite");
+        assert_eq!(view.payload.chat_id, chat_id);
+        assert_eq!(view.payload.intended_invitee.as_deref(), Some(b_peer.as_str()));
+        assert_eq!(view.payload.bound_removal_counter, Some(2));
+        assert!(
+            view.payload.verify_capability(&chat_id, now_unix_secs()),
+            "the production invite must be a verifiable capability"
+        );
+        assert!(view.deep_link.starts_with(TEMP_INVITE_SCHEME_PREFIX));
+
+        // Re-inviting never resets the live session: roster, winners and the
+        // message history are all untouched.
+        {
+            let temp_state = net_state.temporary_state.lock().await;
+            let session = temp_state.chats.get(&chat_id).expect("session");
+            assert!(!session.is_member(&b_peer));
+            let winner = session.member_op_winners.get(&b_peer).expect("winner");
+            assert!(matches!(
+                winner.op,
+                crate::app_state::TemporaryMembershipOpKind::Remove
+            ));
+            assert_eq!(winner.counter, 2);
+            assert_eq!(session.members.len(), 1);
+            assert!(temp_state.messages.contains_key(&chat_id));
+        }
+
+        // The targeted link refuses everyone except its intended invitee —
+        // including the issuing member redeeming its own link.
+        let error = redeem_temporary_invite(&net_state, &view.deep_link)
+            .await
+            .expect_err("targeted link must refuse other peers");
+        assert!(error.to_string().contains("another peer"));
+
+        // B's client redeems the link and rejoins: its self-add descending
+        // from the same removal is admitted by the production payload.
+        let readd = signed_op_in_chat(
+            &b_keypair,
+            4,
+            TemporaryMembershipOpKind::Add,
+            &b_peer,
+            &chat_id,
+            Some(2),
+        );
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            let session = temp_state.chats.get_mut(&chat_id).expect("session");
+            assert!(session.apply_membership_ops_admitted(
+                &[readd],
+                &[],
+                crate::app_state::MembershipOpAdmission::Invited,
+                Some(&view.payload),
+            ));
+            assert!(session.is_member(&b_peer));
+
+            // A leaked targeted link cannot admit anyone else either: C was
+            // never removed, so the invite's intended peer simply mismatches.
+            let c_keypair = libp2p::identity::Keypair::generate_ed25519();
+            let c_peer = libp2p::PeerId::from_public_key(&c_keypair.public()).to_string();
+            let c_add = signed_op_in_chat(
+                &c_keypair,
+                1,
+                TemporaryMembershipOpKind::Add,
+                &c_peer,
+                &chat_id,
+                None,
+            );
+            assert!(!session.apply_membership_ops_admitted(
+                &[c_add],
+                &[],
+                crate::app_state::MembershipOpAdmission::Invited,
+                Some(&view.payload),
+            ));
+            assert!(!session.is_member(&c_peer));
+        }
+
+        // The shareable active invite is now the targeted link.
+        let active = get_active_temporary_invite(&net_state)
+            .await
+            .expect("get")
+            .expect("active");
+        assert_eq!(active.payload.intended_invitee.as_deref(), Some(b_peer.as_str()));
+    }
+
+    #[tokio::test]
+    async fn production_group_reinvite_refuses_invalid_contexts() {
+        let (_temp, app_state) = test_app_state().await;
+        let (net_state, _rx) = test_network_state();
+
+        // Unknown chat ids are refused outright.
+        assert!(create_temporary_group_invite(&app_state, &net_state, "temp-group:missing", None)
+            .await
+            .is_err());
+
+        // Direct chats are not group-invitable.
+        let dm = create_temporary_invite(&app_state, &net_state, TemporaryChatKind::Dm, None)
+            .await
+            .expect("dm");
+        assert!(create_temporary_group_invite(&app_state, &net_state, &dm.payload.chat_id, None)
+            .await
+            .is_err());
+
+        // Archived groups refuse new invites.
+        let created =
+            create_temporary_invite(&app_state, &net_state, TemporaryChatKind::Group, None)
+                .await
+                .expect("group");
+        let chat_id = created.payload.chat_id.clone();
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            temp_state
+                .chats
+                .get_mut(&chat_id)
+                .expect("session")
+                .archived = true;
+        }
+        assert!(create_temporary_group_invite(&app_state, &net_state, &chat_id, None)
+            .await
+            .is_err());
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            temp_state
+                .chats
+                .get_mut(&chat_id)
+                .expect("session")
+                .archived = false;
+        }
+
+        // A peer that neither belongs to the roster nor created the group
+        // cannot invite: the local identity is a stranger to this session.
+        let stranger_chat = crate::chat_kind::generate_temp_group_chat_id();
+        {
+            let mut temp_state = net_state.temporary_state.lock().await;
+            temp_state.chats.insert(
+                stranger_chat.clone(),
+                TemporaryChatSession {
+                    chat_id: stranger_chat.clone(),
+                    name: "Foreign".to_string(),
+                    kind: TemporaryChatKind::Group,
+                    expires_at: now_unix_secs() + 3600,
+                    peer_id: Some(THIRD_MEMBER_ID.to_string()),
+                    members: vec![THIRD_MEMBER_ID.to_string()],
+                    member_op_winners: HashMap::new(),
+                    next_member_op_counter: 0,
+                    archived: false,
+                    pending_send_count: 0,
+                    admitted_invite: None,
+                    admission_evidence: HashMap::new(),
+                    creator_peer_id: THIRD_MEMBER_ID.to_string(),
+                },
+            );
+        }
+        assert!(create_temporary_group_invite(&app_state, &net_state, &stranger_chat, None)
+            .await
+            .is_err());
+
+        // Malformed invitee peer ids are refused before anything is signed.
+        assert!(
+            create_temporary_group_invite(&app_state, &net_state, &chat_id, Some("not-a-peer-id"))
+                .await
+                .is_err()
+        );
+
+        // The legitimate generic path into an existing group still works for
+        // never-seen peers: unbound, untargeted, session untouched.
+        let generic = create_temporary_group_invite(&app_state, &net_state, &chat_id, None)
+            .await
+            .expect("generic invite into existing group");
+        assert_eq!(generic.payload.chat_id, chat_id);
+        assert_eq!(generic.payload.bound_removal_counter, None);
+        assert_eq!(generic.payload.intended_invitee, None);
+        {
+            let temp_state = net_state.temporary_state.lock().await;
+            let session = temp_state.chats.get(&chat_id).expect("session");
+            assert_eq!(session.member_op_winners.len(), 0);
+            assert_eq!(session.members.len(), 1);
+        }
     }
 
     #[tokio::test]
@@ -3977,12 +4365,32 @@ mod tests {
         target: &str,
         after_remove: Option<u64>,
     ) -> TemporaryMembershipOp {
+        signed_op_in_chat(
+            keypair,
+            counter,
+            op,
+            target,
+            "temp-group:550e8400-e29b-41d4-a716-446655440000",
+            after_remove,
+        )
+    }
+
+    /// A signed op for an explicit chat id (the production invite tests work
+    /// against live sessions whose ids are generated at runtime).
+    fn signed_op_in_chat(
+        keypair: &libp2p::identity::Keypair,
+        counter: u64,
+        op: TemporaryMembershipOpKind,
+        target: &str,
+        chat_id: &str,
+        after_remove: Option<u64>,
+    ) -> TemporaryMembershipOp {
         let mut op = TemporaryMembershipOp {
             actor: libp2p::PeerId::from_public_key(&keypair.public()).to_string(),
             counter,
             op,
             target: target.to_string(),
-            chat_id: "temp-group:550e8400-e29b-41d4-a716-446655440000".to_string(),
+            chat_id: chat_id.to_string(),
             domain: crate::app_state::TEMP_GROUP_PROTOCOL_DOMAIN.to_string(),
             version: crate::app_state::TEMP_GROUP_PROTOCOL_VERSION,
             public_key_b64: String::new(),

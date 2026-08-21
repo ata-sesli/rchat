@@ -37,8 +37,9 @@ use crate::commands::envelopes::{
     move_chat_to_envelope, update_envelope,
 };
 use crate::commands::invite::{
-    cancel_temporary_invite, create_invite, create_temporary_invite, generate_invite_password,
-    get_active_temporary_invite, redeem_and_connect, redeem_temporary_invite,
+    cancel_temporary_invite, create_invite, create_temporary_group_invite, create_temporary_invite,
+    generate_invite_password, get_active_temporary_invite, redeem_and_connect,
+    redeem_temporary_invite,
 };
 use crate::commands::media::{
     add_sticker, add_stickers_batch, delete_sticker, get_audio_data, get_image_data,
@@ -232,6 +233,7 @@ pub fn run() {
             create_invite,
             redeem_and_connect,
             create_temporary_invite,
+            create_temporary_group_invite,
             redeem_temporary_invite,
             get_active_temporary_invite,
             cancel_temporary_invite,

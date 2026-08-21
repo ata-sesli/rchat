@@ -362,6 +362,23 @@ pub async fn create_temporary_invite(
 }
 
 #[tauri::command]
+pub async fn create_temporary_group_invite(
+    chat_id: String,
+    intended_invitee: Option<String>,
+    app_state: State<'_, AppState>,
+    net_state: State<'_, NetworkState>,
+) -> Result<TemporaryInviteView, String> {
+    temporary::create_temporary_group_invite(
+        &app_state,
+        &net_state,
+        &chat_id,
+        intended_invitee.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn get_active_temporary_invite(
     net_state: State<'_, NetworkState>,
 ) -> Result<Option<TemporaryInviteView>, String> {
