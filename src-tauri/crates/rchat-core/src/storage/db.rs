@@ -1171,6 +1171,47 @@ pub fn get_group_max_lamport_counter(conn: &Connection, group_id: &str) -> anyho
     Ok(max.unwrap_or(0) as u64)
 }
 
+/// Every verified policy-changing record strictly below `counter`. Used by
+/// the stale-branch check: an authorization-sensitive record must dominate
+/// (transitively contain) all of these. The policy kinds are filtered in SQL
+/// over the indexed `(group_id, lamport_counter)` columns, so long histories
+/// never require scanning or parsing non-policy payloads.
+pub fn get_policy_records_before_counter(
+    conn: &Connection,
+    group_id: &str,
+    counter: u64,
+) -> anyhow::Result<Vec<crate::network::gossip::SignedGroupRecord>> {
+    const POLICY_KINDS: [&str; 9] = [
+        "group_created",
+        "member_invited",
+        "member_joined",
+        "member_left",
+        "group_renamed",
+        "group_settings_updated",
+        "member_removed",
+        "admin_transferred",
+        "group_dissolved",
+    ];
+    let placeholders = POLICY_KINDS
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT payload_json FROM group_records
+         WHERE group_id = ?1 AND verified = 1 AND lamport_counter < ?2
+           AND record_type IN ({placeholders})
+         ORDER BY lamport_counter ASC, author_peer_id ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map((group_id, counter as i64), |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(serde_json::from_str(&row?)?);
+    }
+    Ok(out)
+}
+
 pub fn get_all_verified_group_records_ordered(
     conn: &Connection,
     group_id: &str,

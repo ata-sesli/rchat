@@ -21,6 +21,7 @@ pub fn create_app_state(app_dir: PathBuf) -> Result<AppState> {
         config_manager: Arc::new(tokio::sync::Mutex::new(config_manager)),
         db_conn: Arc::new(std::sync::Mutex::new(db_conn)),
         app_dir,
+        local_peer_id: Arc::new(std::sync::OnceLock::new()),
     })
 }
 

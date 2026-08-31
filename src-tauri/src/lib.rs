@@ -155,6 +155,7 @@ pub fn run() {
                 config_manager: Arc::new(tokio::sync::Mutex::new(config_manager)),
                 db_conn: Arc::new(std::sync::Mutex::new(db_connection)),
                 app_dir: app_dir.clone(),
+                local_peer_id: Arc::new(std::sync::OnceLock::new()),
             });
 
             println!("[Backend] Setup hook returning Ok");

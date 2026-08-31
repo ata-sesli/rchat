@@ -33,6 +33,7 @@ pub async fn test_app_state() -> (tempfile::TempDir, AppState) {
             config_manager: Arc::new(Mutex::new(manager)),
             db_conn: Arc::new(std::sync::Mutex::new(conn)),
             app_dir: PathBuf::from(app_dir),
+            local_peer_id: Arc::new(std::sync::OnceLock::new()),
         },
     )
 }

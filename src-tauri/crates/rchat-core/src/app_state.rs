@@ -1075,4 +1075,15 @@ pub struct AppState {
     pub config_manager: Arc<tokio::sync::Mutex<ConfigManager>>,
     pub db_conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
     pub app_dir: std::path::PathBuf,
+    /// The local peer's identity, populated when the keypair is first loaded.
+    /// Synchronously readable so the group projection/rebuild path can map
+    /// locally authored messages to the `Me` display identity without async.
+    pub local_peer_id: Arc<std::sync::OnceLock<String>>,
+}
+
+impl AppState {
+    /// The local peer id, if it has been resolved already.
+    pub fn local_peer_id(&self) -> Option<&str> {
+        self.local_peer_id.get().map(String::as_str)
+    }
 }
