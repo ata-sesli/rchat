@@ -527,7 +527,43 @@ pub(crate) fn create_tables(conn: &Connection) -> anyhow::Result<()> {
 
     seed_defaults(conn)?;
 
+    // Signature-failed pending rows must never occupy (author, counter)
+    // slots: drop them at startup so a legacy forgery cannot block the
+    // unique index for the real author's next record.
+    let purged = purge_invalid_pending_group_records(conn).unwrap_or(0);
+    if purged > 0 {
+        println!("[db] purged {purged} invalid pending group record(s)");
+    }
+
     Ok(())
+}
+
+/// Delete pending group records whose signatures do not verify. Pending rows
+/// participate in the unique `(group_id, author_peer_id, lamport_counter)`
+/// index, so a forged row claiming another author's next counter would
+/// permanently reserve that slot. Verified rows are never touched.
+pub fn purge_invalid_pending_group_records(conn: &Connection) -> anyhow::Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT id, payload_json FROM group_records WHERE pending = 1",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut invalid_ids = Vec::new();
+    for row in rows {
+        let (id, json) = row?;
+        let valid = serde_json::from_str::<crate::network::gossip::SignedGroupRecord>(&json)
+            .map(|record| record.verify())
+            .unwrap_or(false);
+        if !valid {
+            invalid_ids.push(id);
+        }
+    }
+    let mut purged = 0usize;
+    for id in invalid_ids {
+        purged += conn.execute("DELETE FROM group_records WHERE id = ?1", [&id])?;
+    }
+    Ok(purged)
 }
 
 fn seed_defaults(conn: &Connection) -> anyhow::Result<()> {
@@ -1171,16 +1207,17 @@ pub fn get_group_max_lamport_counter(conn: &Connection, group_id: &str) -> anyho
     Ok(max.unwrap_or(0) as u64)
 }
 
-/// Every verified policy-changing record strictly below `counter`. Used by
-/// the stale-branch check: an authorization-sensitive record must dominate
-/// (transitively contain) all of these. The policy kinds are filtered in SQL
-/// over the indexed `(group_id, lamport_counter)` columns, so long histories
-/// never require scanning or parsing non-policy payloads.
-pub fn get_policy_records_before_counter(
+/// Ids of every verified policy-changing record strictly below `counter`.
+/// Used by the stale-branch check: an authorization-sensitive record must
+/// dominate (transitively contain) all of these. Only ids are fetched — no
+/// payload parsing — and the policy kinds are filtered in SQL over the
+/// indexed `(group_id, lamport_counter)` columns, so per-message validation
+/// does not grow with the full history's payload bytes.
+pub fn get_policy_record_ids_before_counter(
     conn: &Connection,
     group_id: &str,
     counter: u64,
-) -> anyhow::Result<Vec<crate::network::gossip::SignedGroupRecord>> {
+) -> anyhow::Result<Vec<String>> {
     const POLICY_KINDS: [&str; 9] = [
         "group_created",
         "member_invited",
@@ -1198,7 +1235,7 @@ pub fn get_policy_records_before_counter(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT payload_json FROM group_records
+        "SELECT id FROM group_records
          WHERE group_id = ?1 AND verified = 1 AND lamport_counter < ?2
            AND record_type IN ({placeholders})
          ORDER BY lamport_counter ASC, author_peer_id ASC, id ASC"
@@ -1207,7 +1244,7 @@ pub fn get_policy_records_before_counter(
     let rows = stmt.query_map((group_id, counter as i64), |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(serde_json::from_str(&row?)?);
+        out.push(row?);
     }
     Ok(out)
 }

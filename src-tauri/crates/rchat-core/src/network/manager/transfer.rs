@@ -554,42 +554,20 @@ impl NetworkManager {
             }
         };
         for group_id in group_ids {
-            // The causal counter must come from the stored history so remote
-            // validators accept the record: compute it under the db lock
-            // before signing, then reuse the lock for the local insert.
-            let Ok(conn) = self.app_state.db_conn.lock() else {
-                continue;
-            };
-            let parents =
-                crate::storage::db::get_group_head_ids(&conn, &group_id).unwrap_or_default();
-            let lamport_counter = if parents.is_empty() {
-                1
-            } else {
-                let mut max_parent = 0u64;
-                for pid in &parents {
-                    if let Ok(Some(rec)) = crate::storage::db::get_group_record(&conn, pid) {
-                        max_parent = max_parent.max(rec.lamport_counter());
-                    }
-                }
-                max_parent.saturating_add(1)
-            };
-            let record = match crate::network::gossip::SignedGroupRecord::new(
+            // Issue through the validated production path: atomic counter
+            // reservation, dominate-all validation, and canonical projection.
+            // Bypassing it with a raw insert would let even a removed member
+            // publish file-availability records that skip authorization.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let record = match crate::chat::group::sign_record_at(
+                &self.app_state,
                 &keypair,
                 group_id.clone(),
-                format!(
-                    "group-file-{}-{}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                    rand::random::<u32>()
-                ),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0),
-                parents,
-                lamport_counter,
+                now,
+                Vec::new(),
                 crate::network::gossip::GroupRecordBody::FileAvailability {
                     file_hash: file_hash.to_string(),
                 },
@@ -600,14 +578,29 @@ impl NetworkManager {
                     continue;
                 }
             };
-            let _ = crate::storage::db::insert_group_record(&conn, &record, true, false);
-            let _ = crate::storage::db::upsert_group_file_source(
-                &conn,
-                &group_id,
-                file_hash,
-                "Me",
-            );
-            drop(conn);
+            match crate::chat::group::apply_signed_record(
+                &self.app_state,
+                Some(&self.event_sink),
+                &record,
+                true,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!(
+                        "[Group] File availability for {} stayed pending",
+                        record.id()
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[Group] File availability rejected for {}: {}",
+                        record.id(),
+                        err
+                    );
+                    continue;
+                }
+            }
             self.publish_group_record(&record);
         }
     }

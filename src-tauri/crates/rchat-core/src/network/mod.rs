@@ -75,6 +75,11 @@ pub async fn start(
 
     let local_peer_id = PeerId::from_public_key(&local_key.public());
     println!("[Backend] Local Peer ID: {local_peer_id}");
+    // Cache the identity on AppState before any inbound record is processed:
+    // group reconciliation maps locally authored messages to the `Me` display
+    // identity from this cache, and must not depend on a group action having
+    // run first. This covers both GUI and TUI, which both start here.
+    crate::chat::group::cache_local_peer_id(&app_state, &local_key);
 
     println!("[Backend] Building swarm...");
     let mut swarm = SwarmBuilder::with_existing_identity(local_key.clone())

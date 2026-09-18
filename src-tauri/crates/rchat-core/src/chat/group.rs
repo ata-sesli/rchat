@@ -929,32 +929,29 @@ fn validate_group_record(
     let closure_ids: std::collections::HashSet<String> =
         closure.iter().map(|r| r.id().to_string()).collect();
 
-    // Multi-head stale-branch check: an authorization-sensitive record must
-    // dominate **every** policy-changing record below its own counter, not
-    // just one arbitrarily selected "winning" head. Reducing the multi-head
-    // causal frontier to a single max_by(order) winner lets an attacker grind
-    // the tie-break and extend a concurrent branch that omits, say, their own
+    // Multi-head stale-branch check: every non-creation record must dominate
+    // **every** policy-changing record below its own counter, not just one
+    // arbitrarily selected "winning" head. Reducing the multi-head causal
+    // frontier to a single max_by(order) winner lets an attacker grind the
+    // tie-break and extend a concurrent branch that omits, say, their own
     // removal. With the dominate-all rule, a branch that omits a lower policy
-    // record can never supersede it; genuinely concurrent policy records at
-    // the *same* counter remain allowed and are resolved by the deterministic
+    // record can never supersede it; genuinely concurrent records at the
+    // *same* counter remain allowed and are resolved by the deterministic
     // (counter, author, id) total order inside `derive_group_policy`.
-    if !matches!(
-        record.body(),
-        GroupRecordBody::GroupCreated { .. }
-            | GroupRecordBody::Head { .. }
-            | GroupRecordBody::FileAvailability { .. }
-    ) {
-        for policy in db::get_policy_records_before_counter(
+    // `Head` and `FileAvailability` are not exempt: a removed member must not
+    // retain an unbounded signed-write path through them, and honest issuers
+    // always parent every head so their closure dominates everything anyway.
+    if !matches!(record.body(), GroupRecordBody::GroupCreated { .. }) {
+        for policy_id in db::get_policy_record_ids_before_counter(
             conn,
             record.group_id(),
             record.lamport_counter(),
         )? {
-            if !closure_ids.contains(policy.id()) {
+            if !closure_ids.contains(&policy_id) {
                 return Err(anyhow!(
-                    "Group record at {} must dominate policy record {} at {} (it builds on a stale branch)",
+                    "Group record at {} must dominate policy record {} (it builds on a stale branch)",
                     record.lamport_counter(),
-                    policy.id(),
-                    policy.lamport_counter()
+                    policy_id,
                 ));
             }
         }
@@ -1422,25 +1419,34 @@ fn apply_signed_record_locked(
     verified: bool,
     events: &mut Vec<CoreEvent>,
 ) -> anyhow::Result<bool> {
+    // Signature verification comes before both branches: the caller's
+    // `verified` flag is a claim, not a proof ("the ingress path checked
+    // this"), and validation below only reasons about causal structure. A
+    // signature-failed record must never be persisted — not even as pending —
+    // because pending rows participate in the unique
+    // `(group_id, author_peer_id, lamport_counter)` index and would otherwise
+    // permanently reserve another author's counter slot.
+    if !record.verify() {
+        // Purge a legacy pending forgery so it cannot keep blocking the slot.
+        // Only pending rows are removed here; verified history is never
+        // deleted on this path.
+        if matches!(
+            group_record_state(conn, record.id())?,
+            Some((false, true))
+        ) {
+            conn.execute("DELETE FROM group_records WHERE id = ?1", [record.id()])?;
+        }
+        return Err(anyhow!(
+            "Group record {} failed signature verification",
+            record.id()
+        ));
+    }
+
     if !verified {
         if db::group_record_exists(conn, record.id()) {
             return Ok(false);
         }
         return db::insert_group_record(conn, record, false, true);
-    }
-
-    // The caller's `verified` flag is a claim, not a proof: it means "the
-    // ingress path checked this", and nothing else. Validation below only
-    // reasons about causal structure, so without this check any caller that
-    // passes `verified = true` for an unsigned or forged record — the invite
-    // payload's `related_records`, or the pending-retry loop re-running rows
-    // that originally failed signature verification — would apply it with
-    // full policy effect.
-    if !record.verify() {
-        return Err(anyhow!(
-            "Group record {} failed signature verification",
-            record.id()
-        ));
     }
 
     let existing_state = group_record_state(conn, record.id())?;
@@ -1514,6 +1520,12 @@ pub fn apply_signed_record(
         // reconciliation fails, the record and its side effects roll back
         // together and no consumer ever observes events for them.
         let outcome = (|| {
+            // Verified frontier before this record: a record strictly beyond
+            // it cannot demote anything already verified (no existing record
+            // can name it as a required policy ancestor), so the rescan below
+            // is only needed for late/out-of-order arrivals.
+            let prev_max =
+                db::get_group_max_lamport_counter(&conn, record.group_id()).unwrap_or(0);
             let applied = apply_signed_record_locked(
                 &conn,
                 app_state.local_peer_id(),
@@ -1523,8 +1535,12 @@ pub fn apply_signed_record(
             )?;
             // Reconciliation is only needed when the policy frontier can
             // change; message/receipt traffic cannot invalidate any other
-            // record, so skip the full-history rescan for it.
-            if applied && is_policy_changing(record.body()) {
+            // record, so skip the full-history rescan for it. Frontier-
+            // extending records likewise cannot demote anything.
+            if applied
+                && is_policy_changing(record.body())
+                && record.lamport_counter() <= prev_max
+            {
                 revalidate_verified_records(&conn, app_state, record.group_id(), &mut events)?;
             }
             Ok::<bool, anyhow::Error>(applied)
@@ -1533,6 +1549,27 @@ pub fn apply_signed_record(
             Ok(applied) => record_applied = applied,
             Err(err) => {
                 let _ = conn.execute("ROLLBACK", []);
+                // The in-transaction reservation cleanup above was rolled
+                // back together with everything else. Redo it in autocommit
+                // so a terminally rejected local reservation does not block
+                // its (author, counter) slot forever. Only a record that
+                // still fails hard validation is removed: re-running the
+                // validator distinguishes terminal rejection from a
+                // transient storage failure (which validates cleanly on
+                // retry and therefore keeps its row).
+                if matches!(
+                    group_record_state(&conn, record.id()),
+                    Ok(Some((false, true)))
+                ) {
+                    let terminal = !record.verify()
+                        || matches!(validate_group_record(&conn, record), Err(_));
+                    if terminal {
+                        let _ = conn.execute(
+                            "DELETE FROM group_records WHERE id = ?1",
+                            [record.id()],
+                        );
+                    }
+                }
                 return Err(err);
             }
         }
@@ -1555,6 +1592,17 @@ pub fn apply_signed_record(
 }
 
 
+/// Counts full-history revalidation runs on the calling thread. Test-only
+/// instrumentation proving that frontier-extending records skip the rescan
+/// (see the adversarial policy-heavy test); zero cost outside tests.
+/// Thread-local so parallel tests cannot pollute each other's counts:
+/// `apply` runs revalidation synchronously on the caller's thread.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REVALIDATE_RUN_COUNT: std::cell::Cell<u64> =
+        std::cell::Cell::new(0);
+}
+
 /// Reconcile any verified records that became stale after a new policy
 /// record arrived. Runs inside the caller's transaction. A record is kept
 /// verified only if it still satisfies the same rules as fresh validation:
@@ -1568,6 +1616,8 @@ fn revalidate_verified_records(
     group_id: &str,
     events: &mut Vec<CoreEvent>,
 ) -> anyhow::Result<()> {
+    #[cfg(test)]
+    REVALIDATE_RUN_COUNT.with(|c| c.set(c.get() + 1));
     let all_verified = db::get_all_verified_group_records_ordered(conn, group_id)?;
     let mut valid_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut valid_records: Vec<SignedGroupRecord> = Vec::new();
@@ -1643,17 +1693,11 @@ fn revalidate_verified_records(
             }
         }
         // Multi-head stale-branch check mirroring validate_group_record. This
-        // has to test the whole closure, not just the direct parents: it is
-        // tempting to require only the policy records at counter-1, but that
-        // is not equivalent, because Head and FileAvailability records are
-        // exempt and can therefore be non-dominating parents — a child's
-        // closure is then not guaranteed to cover its grandparents'.
-        if !matches!(
-            rec.body(),
-            GroupRecordBody::GroupCreated { .. }
-                | GroupRecordBody::Head { .. }
-                | GroupRecordBody::FileAvailability { .. }
-        ) && mask.iter().map(|word| word.count_ones() as usize).sum::<usize>() != required
+        // has to test the whole closure, not just the direct parents: a
+        // child's closure is not guaranteed to cover its grandparents'
+        // policy records unless every link dominates.
+        if !matches!(rec.body(), GroupRecordBody::GroupCreated { .. })
+            && mask.iter().map(|word| word.count_ones() as usize).sum::<usize>() != required
         {
             to_demote.push(rec.id().to_string());
             continue;
@@ -1895,7 +1939,7 @@ fn sign_record(
     )
 }
 
-fn sign_record_at(
+pub(crate) fn sign_record_at(
     app_state: &AppState,
     keypair: &identity::Keypair,
     group_id: String,
@@ -1983,14 +2027,22 @@ fn sign_record_at(
     Err(anyhow!("Failed to allocate causal counter after retries"))
 }
 
+/// Record the local peer identity on `AppState` so synchronous paths
+/// (group projection/rebuild) can map locally authored messages to the
+/// `Me` display identity. Called at network/bootstrap startup — before any
+/// inbound record is processed — and whenever the keypair is loaded.
+/// Idempotent: `OnceLock::set` after the first call is a no-op.
+pub(crate) fn cache_local_peer_id(app_state: &AppState, keypair: &identity::Keypair) {
+    let _ = app_state
+        .local_peer_id
+        .set(PeerId::from_public_key(&keypair.public()).to_string());
+}
+
 pub async fn load_or_create_local_keypair(
     app_state: &AppState,
 ) -> anyhow::Result<identity::Keypair> {
     let config_manager = app_state.config_manager.lock().await;
     let mut config = config_manager.load().await.unwrap_or_default();
-    let cache_local_peer_id = |app_state: &AppState, keypair: &identity::Keypair| {
-        let _ = app_state.local_peer_id.set(PeerId::from_public_key(&keypair.public()).to_string());
-    };
     if let Some(ref key_b64) = config.user.libp2p_keypair {
         if let Ok(key_bytes) = BASE64.decode(key_b64) {
             if let Ok(keypair) = identity::Keypair::from_protobuf_encoding(&key_bytes) {
@@ -2147,14 +2199,12 @@ mod tests {
         apply_signed_record(app_state, None, record, true)
     }
 
-    /// An exempt record cannot be used to launder a stale branch.
-    ///
-    /// `Head` and `FileAvailability` are deliberately exempt from the
-    /// dominance check, so such a record may itself omit a concurrent policy
-    /// head. A child must therefore still be tested against its *whole*
-    /// closure: requiring only the policy records at counter-1 as direct
-    /// parents would let a removed member keep posting through an exempt
-    /// parent that never saw their removal.
+    /// No record type is exempt from the dominance check — not even `Head`
+    /// or `FileAvailability`. A removed member must not retain an unbounded
+    /// signed-write path through them: a `FileAvailability` that omits a
+    /// concurrent removal is rejected outright, and so is any child built
+    /// only on that stale branch. A `FileAvailability` that does dominate
+    /// the removal still applies.
     #[test]
     fn exempt_parent_cannot_launder_a_stale_branch() {
         let app = app_state();
@@ -2244,8 +2294,9 @@ mod tests {
         apply(&app, &removal).expect("removal applies");
         apply(&app, &concurrent).expect("concurrent message applies");
 
-        // An exempt FileAvailability building only on the concurrent message:
-        // it never saw the removal, which is allowed.
+        // A FileAvailability building only on the concurrent message omits
+        // the removal from its closure, so it must be rejected like any
+        // other stale-branch record — no exemption.
         let file = record(
             &member,
             "file",
@@ -2255,15 +2306,39 @@ mod tests {
                 file_hash: "hash".to_string(),
             },
         );
-        apply(&app, &file).expect("exempt record applies");
+        assert!(
+            apply(&app, &file).is_err(),
+            "stale FileAvailability omitting the removal must be rejected"
+        );
 
-        // A message descending only from that exempt parent still omits the
-        // removal from its closure, so it must be rejected.
+        // A FileAvailability that dominates the removal (parents both
+        // concurrent leaves) still applies and records its file source.
+        let file_ok = record(
+            &founder,
+            "file-ok",
+            5,
+            vec![
+                concurrent.id().to_string(),
+                removal.id().to_string(),
+            ],
+            GroupRecordBody::FileAvailability {
+                file_hash: "hash-ok".to_string(),
+            },
+        );
+        assert!(
+            apply(&app, &file_ok).expect("dominating FileAvailability applies"),
+            "dominating FileAvailability must apply"
+        );
+
+        // A message descending only from the stale concurrent message still
+        // omits the removal from its closure, so it must be rejected.
+        // (Its counter also skips the stale file that could never verify
+        // here, which fails closed as well.)
         let laundered = record(
             &member,
             "laundered",
             6,
-            vec![file.id().to_string()],
+            vec![concurrent.id().to_string()],
             GroupRecordBody::Message {
                 content_type: crate::network::gossip::GroupContentType::Text,
                 text_content: Some("still here".to_string()),
@@ -2273,7 +2348,7 @@ mod tests {
         );
         assert!(
             apply(&app, &laundered).is_err(),
-            "message routed around its own removal through an exempt parent"
+            "message routed around its own removal through a stale parent"
         );
         assert!(
             !get_group_policy(&app, &group_id)
@@ -2288,8 +2363,32 @@ mod tests {
         // first and must be demoted when reconciliation runs. This is the
         // path that revalidates the whole log, so it is the one that would
         // catch a dominance shortcut in `revalidate_verified_records`.
+        // Same log, opposite arrival order — but with a laundered message
+        // that correctly continues the stale file branch (counter 6 follows
+        // the file at 5). It lands while the removal is still in flight, so
+        // it is accepted at first and must be demoted when reconciliation
+        // runs.
+        let laundered_late = record(
+            &member,
+            "laundered-late",
+            6,
+            vec![file.id().to_string()],
+            GroupRecordBody::Message {
+                content_type: crate::network::gossip::GroupContentType::Text,
+                text_content: Some("still here".to_string()),
+                file_hash: None,
+                sender_alias: None,
+            },
+        );
         let late = app_state();
-        for rec in [&created, &invited, &joined, &concurrent, &file, &laundered] {
+        for rec in [
+            &created,
+            &invited,
+            &joined,
+            &concurrent,
+            &file,
+            &laundered_late,
+        ] {
             apply(&late, rec).expect("record applies before the removal");
         }
         assert!(
@@ -2299,7 +2398,7 @@ mod tests {
             )
             .expect("query")
             .iter()
-            .any(|rec| rec.id() == laundered.id()),
+            .any(|rec| rec.id() == laundered_late.id()),
             "laundered message should be verified until the removal arrives"
         );
 
@@ -2311,8 +2410,12 @@ mod tests {
         )
         .expect("query");
         assert!(
-            !survivors.iter().any(|rec| rec.id() == laundered.id()),
+            !survivors.iter().any(|rec| rec.id() == laundered_late.id()),
             "laundered message survived reconciliation"
+        );
+        assert!(
+            !survivors.iter().any(|rec| rec.id() == file.id()),
+            "stale FileAvailability survived reconciliation"
         );
         assert!(
             !get_group_policy(&late, &group_id)
@@ -2324,12 +2427,14 @@ mod tests {
     }
 
     /// Regression guard: a record whose signature does not verify must never
-    /// become verified. Network ingress stores signature-failed records as
-    /// `verified = 0, pending = 1`, and `retry_pending_group_records` later
-    /// re-runs `apply_signed_record` with `verified = true`; that path must
-    /// not resurrect a forgery that validation alone cannot detect.
+    /// be persisted — not even as pending. Pending rows participate in the
+    /// unique `(group_id, author_peer_id, lamport_counter)` index, so a
+    /// stored forgery claiming the victim's next counter would permanently
+    /// reserve that slot: a legitimate local reservation would then hit
+    /// `INSERT OR IGNORE` forever while a legitimate remote record fails the
+    /// fork check.
     #[test]
-    fn forged_record_is_not_resurrected_by_pending_retry() {
+    fn forged_record_is_never_persisted_and_slot_stays_free() {
         let app = app_state();
         GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
         GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
@@ -2356,22 +2461,48 @@ mod tests {
         forged.unsigned.author_peer_id = peer_id(&founder);
         assert!(!forged.verify(), "fixture must be a genuine forgery");
 
-        // Gossipsub ingress of a signature failure: stored pending.
-        apply_signed_record(&app, None, &forged, false).expect("stored as pending");
+        // Gossipsub ingress of a signature failure: rejected, never stored.
+        apply_signed_record(&app, None, &forged, false)
+            .expect_err("forgery must be rejected, not stored as pending");
+        assert!(
+            group_record_state(
+                &app.db_conn.lock().expect("db"),
+                forged.id()
+            )
+            .expect("query")
+            .is_none(),
+            "forged row must be gone, not parked as pending"
+        );
 
-        // Any later successful apply in this group drains the pending queue.
-        let trigger = child(
-            &member_b,
+        // The pending-retry path must not resurrect it either.
+        apply_signed_record(&app, None, &forged, true)
+            .expect_err("forgery must be rejected on retry too");
+        assert!(
+            group_record_state(
+                &app.db_conn.lock().expect("db"),
+                forged.id()
+            )
+            .expect("query")
+            .is_none(),
+            "forged row must still be gone after retry"
+        );
+
+        // The victim's legitimate record at the same counter now succeeds:
+        // the slot was never reserved.
+        let legitimate = child(
+            &founder,
             &group_id,
-            "trigger",
+            "legit-rename",
             6,
             vec![head_id],
-            GroupRecordBody::Head {
-                heads: Vec::new(),
+            GroupRecordBody::GroupRenamed {
+                name: "After forgery".to_string(),
             },
         );
-        apply(&app, &trigger).expect("trigger applies");
-
+        assert!(
+            apply(&app, &legitimate).expect("legitimate record applies"),
+            "slot must be free for the real author"
+        );
         let verified = db::get_all_verified_group_records_ordered(
             &app.db_conn.lock().expect("db"),
             &group_id,
@@ -2387,6 +2518,113 @@ mod tests {
                 .active_members
                 .contains(&peer_id(&member_b)),
             "forged removal took effect"
+        );
+    }
+
+    /// Regression guard: a local reservation that loses a policy race must
+    /// not block its (author, counter) slot forever. The in-transaction
+    /// cleanup of the reservation is rolled back together with the failed
+    /// apply, so the follow-up autocommit cleanup must remove it.
+    ///
+    /// The race: founder reserves rename@6 over head join_c@5, then a late
+    /// concurrent removal@4 (parents join_b@3) arrives and verifies. The
+    /// reserved rename no longer dominates every policy record below its
+    /// counter, so finalizing it fails — and the reservation row must be
+    /// gone afterwards, leaving the author free to sign again.
+    #[test]
+    fn rejected_local_reservation_frees_counter_for_resigning() {
+        let app = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
+        let (founder, member_b, _member_c, group_id, log) = test_team();
+        for record in &log {
+            apply(&app, record).expect("team log applies");
+        }
+
+        // Locally reserve a rename at the next counter through the same
+        // production path local callers use (parents = current heads).
+        let reserved = sign_record_at(
+            &app,
+            &founder,
+            group_id.clone(),
+            timestamp_now(),
+            Vec::new(),
+            GroupRecordBody::GroupRenamed {
+                name: "Stale".to_string(),
+            },
+        )
+        .expect("reservation signs");
+        assert_eq!(reserved.lamport_counter(), 6);
+        assert!(
+            group_record_state(
+                &app.db_conn.lock().expect("db"),
+                reserved.id()
+            )
+            .expect("query")
+            .is_some(),
+            "reservation row must exist as pending"
+        );
+
+        // The intervening policy change: a late concurrent removal of B at
+        // counter 5, descending from invite_c@4 rather than the head
+        // (counter 4 is already occupied by the founder's invite_c).
+        let removal = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("race-removal-{}", rand::random::<u64>()),
+            timestamp_now(),
+            vec![log[3].id().to_string()],
+            5,
+            GroupRecordBody::MemberRemoved {
+                peer_id: peer_id(&member_b),
+            },
+        )
+        .expect("removal signs");
+        assert!(apply(&app, &removal).expect("removal applies"));
+
+        // Finalizing the reservation now fails the dominate-all check...
+        let err = apply(&app, &reserved).expect_err("stale reservation must be rejected");
+        assert!(
+            err.to_string().contains("dominate"),
+            "wrong rejection: {err}"
+        );
+        // ...but the reservation row must be gone despite the rollback...
+        assert!(
+            group_record_state(
+                &app.db_conn.lock().expect("db"),
+                reserved.id()
+            )
+            .expect("query")
+            .is_none(),
+            "rejected reservation must not survive as pending"
+        );
+        // ...so the same author can sign again: the next counter is free and
+        // the new record builds on the removal head.
+        let message = sign_record_at(
+            &app,
+            &founder,
+            group_id.clone(),
+            timestamp_now(),
+            Vec::new(),
+            GroupRecordBody::Message {
+                content_type: GroupContentType::Text,
+                text_content: Some("after race".to_string()),
+                file_hash: None,
+                sender_alias: None,
+            },
+        )
+        .expect("resigning works after cleanup");
+        assert_eq!(message.lamport_counter(), 6);
+        assert!(
+            apply(&app, &message).expect("resigned record applies"),
+            "resigned message must apply"
+        );
+        assert!(
+            !get_group_policy(&app, &group_id)
+                .expect("policy")
+                .active_members
+                .contains(&peer_id(&member_b)),
+            "removal stays in effect after the race"
         );
     }
 
@@ -3843,6 +4081,164 @@ mod tests {
         assert!(policy.invited_members.contains(&fixed_peer_id(51)));
     }
 
+    /// Cold-start regression: a fresh `AppState` has an empty identity
+    /// cache, and inbound records can arrive before any group action runs.
+    /// After the bootstrap step populates the cache — via the same helper
+    /// network startup uses, not a manual field write — a late removal that
+    /// triggers reconciliation must keep locally authored messages mapped to
+    /// the `Me` display identity instead of rewriting them with the
+    /// cryptographic peer id.
+    #[test]
+    fn cold_start_rebuild_keeps_local_messages_as_me() {
+        let app = app_state();
+        assert!(
+            app.local_peer_id().is_none(),
+            "fresh state must start with an empty identity cache"
+        );
+        let founder = keypair();
+        let member_b = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        let founder_id = peer_id(&founder);
+        let b_id = peer_id(&member_b);
+
+        // Bootstrap step, exactly as `network::start` performs it.
+        cache_local_peer_id(&app, &founder);
+        assert_eq!(app.local_peer_id(), Some(founder_id.as_str()));
+
+        // Cold inbound log, applied the way gossipsub ingress applies it.
+        let mk = |author: &identity::Keypair,
+                  tag: &str,
+                  counter: u64,
+                  parents: Vec<String>,
+                  body: GroupRecordBody| {
+            SignedGroupRecord::new(
+                author,
+                group_id.clone(),
+                format!("{tag}-{}", rand::random::<u64>()),
+                1_700_000_000i64 + counter as i64,
+                parents,
+                counter,
+                body,
+            )
+            .expect("record")
+        };
+        let created = mk(
+            &founder,
+            "cold-created",
+            1,
+            vec![],
+            GroupRecordBody::GroupCreated {
+                name: "Cold".to_string(),
+                settings: None,
+                image_hash: None,
+            },
+        );
+        apply(&app, &created).expect("created applies");
+        let invite = mk(
+            &founder,
+            "cold-invite",
+            2,
+            vec![created.id().to_string()],
+            GroupRecordBody::MemberInvited {
+                peer_id: b_id.clone(),
+                role: "member".to_string(),
+            },
+        );
+        apply(&app, &invite).expect("invite applies");
+        let join = mk(
+            &member_b,
+            "cold-join",
+            3,
+            vec![invite.id().to_string()],
+            GroupRecordBody::MemberJoined { peer_id: b_id.clone() },
+        );
+        apply(&app, &join).expect("join applies");
+        let msg_f = mk(
+            &founder,
+            "cold-msg",
+            4,
+            vec![join.id().to_string()],
+            GroupRecordBody::Message {
+                content_type: GroupContentType::Text,
+                text_content: Some("hello".to_string()),
+                file_hash: None,
+                sender_alias: None,
+            },
+        );
+        apply(&app, &msg_f).expect("founder message applies");
+        // Concurrent stale branch from B at the same counter as the removal
+        // below, extended once.
+        let x = mk(
+            &member_b,
+            "cold-x",
+            5,
+            vec![msg_f.id().to_string()],
+            GroupRecordBody::Message {
+                content_type: GroupContentType::Text,
+                text_content: Some("stale".to_string()),
+                file_hash: None,
+                sender_alias: None,
+            },
+        );
+        apply(&app, &x).expect("concurrent message applies");
+        let y = mk(
+            &member_b,
+            "cold-y",
+            6,
+            vec![x.id().to_string()],
+            GroupRecordBody::Message {
+                content_type: GroupContentType::Text,
+                text_content: Some("stale child".to_string()),
+                file_hash: None,
+                sender_alias: None,
+            },
+        );
+        apply(&app, &y).expect("stale child applies before removal arrives");
+
+        // Late removal triggers revalidation + canonical rebuild.
+        let removal = mk(
+            &founder,
+            "cold-removal",
+            5,
+            vec![msg_f.id().to_string()],
+            GroupRecordBody::MemberRemoved {
+                peer_id: b_id.clone(),
+            },
+        );
+        apply(&app, &removal).expect("late removal applies");
+
+        // The stale child is demoted and its message row is gone...
+        let conn = app.db_conn.lock().expect("db");
+        let y_gone: bool = conn
+            .query_row(
+                "SELECT 1 FROM messages WHERE id = ?1",
+                [y.id()],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(!y_gone, "demoted stale message must be removed by rebuild");
+        // ...while the founder's message keeps the `Me` display identity.
+        let peer: String = conn
+            .query_row(
+                "SELECT peer_id FROM messages WHERE id = ?1",
+                [msg_f.id()],
+                |row| row.get(0),
+            )
+            .expect("founder message survives rebuild");
+        drop(conn);
+        assert_eq!(
+            peer, "Me",
+            "rebuilt local message must keep the Me identity, got {peer}"
+        );
+        assert!(
+            !get_group_policy(&app, &group_id)
+                .expect("policy")
+                .active_members
+                .contains(&b_id),
+            "removal stays in effect"
+        );
+    }
+
     #[tokio::test]
     async fn create_invite_join_two_messages_end_to_end() {
         let (temp_dir, app_state) = crate::testing::test_app_state().await;
@@ -4193,6 +4589,89 @@ mod tests {
             pending,
         )
     }
+    /// Adversarial policy-heavy history: a long in-order stream of policy
+    /// records must complete without any full-history revalidation run
+    /// (each record extends the frontier, so nothing already verified can go
+    /// stale), while one late concurrent policy record triggers exactly one
+    /// rescan that demotes precisely the branch that omits it.
+    #[test]
+    fn policy_heavy_stream_skips_rescan_until_late_arrival() {
+        REVALIDATE_RUN_COUNT.with(|c| c.set(0));
+        let app = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
+        let (founder, member_b, _member_c, group_id, log) = test_team();
+        for record in &log {
+            apply(&app, record).expect("team log applies");
+        }
+        // 100 sequential member invites, each extending the frontier. The
+        // team settings allow member invites and B stays active throughout.
+        let mut parent_id = log.last().expect("join_c").id().to_string();
+        for i in 0u8..100 {
+            let invite = child(
+                &member_b,
+                &group_id,
+                &format!("bulk-invite-{i}"),
+                6 + i as u64,
+                vec![parent_id],
+                GroupRecordBody::MemberInvited {
+                    peer_id: format!("invitee-{i}"),
+                    role: "member".to_string(),
+                },
+            );
+            assert!(
+                apply(&app, &invite).expect("bulk invite applies"),
+                "in-order invite {i} must apply"
+            );
+            parent_id = invite.id().to_string();
+        }
+        assert_eq!(
+            REVALIDATE_RUN_COUNT.with(|c| c.get()),
+            0,
+            "frontier-extending records must skip the full-history rescan"
+        );
+        let policy = get_group_policy(&app, &group_id).expect("policy");
+        assert_eq!(policy.invited_members.len(), 100);
+
+        // Late removal at counter 5 (parents invite_c@4; counter 4 is
+        // already occupied by the founder's invite_c): verifies, then
+        // exactly one rescan demotes the 100 invites that omit it.
+        let removal = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("late-removal-{}", rand::random::<u64>()),
+            timestamp_now(),
+            vec![log[3].id().to_string()],
+            5,
+            GroupRecordBody::MemberRemoved {
+                peer_id: peer_id(&member_b),
+            },
+        )
+        .expect("removal signs");
+        assert!(apply(&app, &removal).expect("late removal applies"));
+        assert_eq!(
+            REVALIDATE_RUN_COUNT.with(|c| c.get()),
+            1,
+            "exactly one rescan for the late arrival"
+        );
+        let conn = app.db_conn.lock().expect("db");
+        let verified = db::get_all_verified_group_records_ordered(&conn, &group_id)
+            .expect("query");
+        let verified_ids: std::collections::HashSet<String> =
+            verified.iter().map(|r| r.id().to_string()).collect();
+        drop(conn);
+        // 5 team records + removal survive; the 100 later invites are demoted
+        // back to pending.
+        assert_eq!(verified_ids.len(), 6, "only the stale branch is demoted");
+        assert!(
+            !get_group_policy(&app, &group_id)
+                .expect("policy")
+                .active_members
+                .contains(&peer_id(&member_b)),
+            "removal stays in effect"
+        );
+    }
+
 /// Multi-head attack: admin A removes B while B (still active at sign time)
     /// concurrently invites someone. A continuation extending only B's branch
     /// while omitting the removal R must be rejected — the causal frontier may
