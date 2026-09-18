@@ -96,6 +96,11 @@ impl NetworkManager {
             return;
         }
 
+        if crate::chat_kind::is_group_chat_id(&topic_group_id) {
+            eprintln!("[Group] Ignoring unsigned durable-group payload for mandatory protocol v3");
+            return;
+        }
+
         let mut envelope: crate::network::gossip::GroupMessageEnvelope =
             match serde_json::from_slice(&message.data) {
                 Ok(v) => v,

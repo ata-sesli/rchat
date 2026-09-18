@@ -554,22 +554,10 @@ impl NetworkManager {
             }
         };
         for group_id in group_ids {
-            let record = match crate::network::gossip::SignedGroupRecord::new(
+            let record = match crate::chat::group::sign_record(
+                &self.app_state,
                 &keypair,
                 group_id.clone(),
-                format!(
-                    "group-file-{}-{}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                    rand::random::<u32>()
-                ),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0),
-                Vec::new(),
                 crate::network::gossip::GroupRecordBody::FileAvailability {
                     file_hash: file_hash.to_string(),
                 },
@@ -580,14 +568,14 @@ impl NetworkManager {
                     continue;
                 }
             };
-            if let Ok(conn) = self.app_state.db_conn.lock() {
-                let _ = crate::storage::db::insert_group_record(&conn, &record, true, false);
-                let _ = crate::storage::db::upsert_group_file_source(
-                    &conn,
-                    &group_id,
-                    file_hash,
-                    "Me",
-                );
+            if let Err(error) = crate::chat::group::apply_signed_record(
+                &self.app_state,
+                Some(&self.event_sink),
+                &record,
+                true,
+            ) {
+                eprintln!("[Group] Failed to apply file availability: {error}");
+                continue;
             }
             self.publish_group_record(&record);
         }

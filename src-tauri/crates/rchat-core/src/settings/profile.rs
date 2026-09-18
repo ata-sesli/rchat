@@ -58,6 +58,7 @@ pub(crate) async fn test_app_state() -> (tempfile::TempDir, AppState) {
         AppState {
             config_manager: Arc::new(Mutex::new(manager)),
             db_conn: Arc::new(std::sync::Mutex::new(conn)),
+            local_peer_id: Arc::new(std::sync::RwLock::new(None)),
             app_dir: PathBuf::from(app_dir),
         },
     )

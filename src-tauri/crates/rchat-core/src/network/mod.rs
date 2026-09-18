@@ -74,6 +74,9 @@ pub async fn start(
     };
 
     let local_peer_id = PeerId::from_public_key(&local_key.public());
+    if let Ok(mut cached_peer_id) = app_state.local_peer_id.write() {
+        *cached_peer_id = Some(local_peer_id.to_string());
+    }
     println!("[Backend] Local Peer ID: {local_peer_id}");
 
     println!("[Backend] Building swarm...");

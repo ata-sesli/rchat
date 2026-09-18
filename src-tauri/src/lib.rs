@@ -154,6 +154,7 @@ pub fn run() {
             app.manage(AppState {
                 config_manager: Arc::new(tokio::sync::Mutex::new(config_manager)),
                 db_conn: Arc::new(std::sync::Mutex::new(db_connection)),
+                local_peer_id: Arc::new(std::sync::RwLock::new(None)),
                 app_dir: app_dir.clone(),
             });
 
