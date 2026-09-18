@@ -136,7 +136,7 @@ impl NetworkManager {
                             }
                         }
                         DirectMessageKind::GroupInvite => {
-                            match self.handle_group_invite(&request).await {
+                            match self.handle_group_invite(peer, &request).await {
                                 Ok(()) => self.send_status_response(
                                     channel,
                                     request.id,
@@ -152,7 +152,7 @@ impl NetworkManager {
                             }
                         }
                         DirectMessageKind::GroupDissolution => {
-                            match self.handle_group_dissolution(&request).await {
+                            match self.handle_group_dissolution(peer, &request).await {
                                 Ok(()) => self.send_status_response(channel, request.id, "delivered", None),
                                 Err(err) => self.send_status_response(channel, request.id, "error", Some(err)),
                             }
@@ -174,7 +174,7 @@ impl NetworkManager {
                             }
                         }
                         DirectMessageKind::GroupSyncResponse => {
-                            match self.handle_group_sync_response(&request).await {
+                            match self.handle_group_sync_response(peer, &request).await {
                                 Ok(()) => self.send_status_response(
                                     channel,
                                     request.id,
@@ -304,6 +304,7 @@ impl NetworkManager {
 
     async fn handle_group_invite(
         &mut self,
+        peer: PeerId,
         request: &crate::network::direct_message::DirectMessageRequest,
     ) -> Result<(), String> {
         let payload = request
@@ -317,11 +318,30 @@ impl NetworkManager {
             Some(&self.event_sink),
             &invite,
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        let wanted_record_ids = {
+            let conn = self
+                .app_state
+                .db_conn
+                .lock()
+                .map_err(|error| error.to_string())?;
+            let records = crate::storage::db::get_all_group_records(&conn, &invite.group_id)
+                .map_err(|error| error.to_string())?;
+            crate::chat::group_state::evaluate_group_records(&records).missing_dependency_ids()
+        };
+        let sync_request = crate::network::gossip::GroupSyncRequest {
+            version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
+            group_id: invite.group_id,
+            wanted_record_ids,
+            cursor: None,
+            limit: 256,
+        };
+        self.send_group_sync_request_to_peer(&peer, &sync_request)
     }
 
     async fn handle_group_dissolution(
         &mut self,
+        peer: PeerId,
         request: &crate::network::direct_message::DirectMessageRequest,
     ) -> Result<(), String> {
         let payload = request
@@ -331,6 +351,7 @@ impl NetworkManager {
         let record: crate::network::gossip::SignedGroupRecord =
             serde_json::from_str(payload).map_err(|e| format!("invalid group dissolution: {e}"))?;
         if !matches!(record.body(), crate::network::gossip::GroupRecordBody::GroupDissolved)
+            || record.validate_shape().is_err()
             || !record.verify()
         {
             return Err("invalid signed group dissolution".to_string());
@@ -341,8 +362,26 @@ impl NetworkManager {
             &record,
             true,
         )
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        let wanted_record_ids = {
+            let conn = self.app_state.db_conn.lock().map_err(|e| e.to_string())?;
+            let records = crate::storage::db::get_all_group_records(&conn, record.group_id())
+                .map_err(|e| e.to_string())?;
+            crate::chat::group_state::evaluate_group_records(&records).missing_dependency_ids()
+        };
+        if !wanted_record_ids.is_empty() {
+            self.send_group_sync_request_to_peer(
+                &peer,
+                &crate::network::gossip::GroupSyncRequest {
+                    version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
+                    group_id: record.group_id().to_string(),
+                    wanted_record_ids,
+                    cursor: None,
+                    limit: crate::network::gossip::MAX_GROUP_SYNC_RECORDS,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     async fn handle_group_sync_request(
@@ -356,6 +395,7 @@ impl NetworkManager {
             .ok_or_else(|| "missing group sync request payload".to_string())?;
         let sync_request: crate::network::gossip::GroupSyncRequest =
             serde_json::from_str(payload).map_err(|e| format!("invalid group sync request: {e}"))?;
+        sync_request.validate()?;
         let requester_peer_id = peer.to_string();
         let can_sync = crate::chat::group::can_peer_sync_group_records(
             &self.app_state,
@@ -364,9 +404,9 @@ impl NetworkManager {
         )
         .map_err(|e| e.to_string())?;
         if !can_sync {
-            return Err("peer is not an active group member".to_string());
+            return Err("peer is neither an active group member nor an open invitee".to_string());
         }
-        let records = {
+        let (records, next_cursor, has_more) = {
             let conn = self
                 .app_state
                 .db_conn
@@ -375,15 +415,18 @@ impl NetworkManager {
             crate::storage::db::get_group_records_for_sync(
                 &conn,
                 &sync_request.group_id,
-                &sync_request.known_record_ids,
-                sync_request.limit.clamp(1, 256),
+                sync_request.cursor.as_ref(),
+                &sync_request.wanted_record_ids,
+                sync_request.limit,
             )
             .map_err(|e| e.to_string())?
         };
         let response = crate::network::gossip::GroupSyncResponse {
-            version: 1,
+            version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
             group_id: sync_request.group_id.clone(),
             records,
+            next_cursor,
+            has_more,
         };
         let response_payload = serde_json::to_string(&response)
             .map_err(|e| format!("encode group sync response failed: {e}"))?;
@@ -412,6 +455,7 @@ impl NetworkManager {
 
     async fn handle_group_sync_response(
         &mut self,
+        peer: PeerId,
         request: &crate::network::direct_message::DirectMessageRequest,
     ) -> Result<(), String> {
         let payload = request
@@ -420,18 +464,10 @@ impl NetworkManager {
             .ok_or_else(|| "missing group sync response payload".to_string())?;
         let response: crate::network::gossip::GroupSyncResponse = serde_json::from_str(payload)
             .map_err(|e| format!("invalid group sync response: {e}"))?;
+        response.validate()?;
         let mut applied = 0usize;
         for record in &response.records {
             if record.group_id() != response.group_id {
-                continue;
-            }
-            if !record.verify() {
-                let _ = crate::chat::group::apply_signed_record(
-                    &self.app_state,
-                    Some(&self.event_sink),
-                    record,
-                    false,
-                );
                 continue;
             }
             let applied_remote_message = matches!(
@@ -455,11 +491,41 @@ impl NetworkManager {
                 Err(err) => eprintln!("[Group] Failed to apply synced record {}: {}", record.id(), err),
             }
         }
+        let wanted_record_ids = {
+            let conn = self
+                .app_state
+                .db_conn
+                .lock()
+                .map_err(|error| error.to_string())?;
+            let records = crate::storage::db::get_all_group_records(&conn, &response.group_id)
+                .map_err(|error| error.to_string())?;
+            crate::chat::group_state::evaluate_group_records(&records).missing_dependency_ids()
+        };
+        let should_continue =
+            response.has_more || (!response.records.is_empty() && !wanted_record_ids.is_empty());
+        if should_continue {
+            let follow_up = crate::network::gossip::GroupSyncRequest {
+                version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
+                group_id: response.group_id.clone(),
+                wanted_record_ids,
+                cursor: response.next_cursor.clone(),
+                limit: 256,
+            };
+            self.send_group_sync_request_to_peer(&peer, &follow_up)?;
+        }
         self.emit(CoreEvent::GroupSyncStateUpdated(
             crate::events::GroupSyncStateUpdatedEvent {
                 group_id: response.group_id,
-                state: "applied".to_string(),
-                detail: Some(format!("{applied} new record(s)")),
+                state: if should_continue {
+                    "applying".to_string()
+                } else {
+                    "applied".to_string()
+                },
+                detail: Some(if should_continue {
+                    format!("{applied} new record(s); requesting next page")
+                } else {
+                    format!("{applied} new record(s)")
+                }),
             },
         ));
         Ok(())

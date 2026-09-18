@@ -983,6 +983,19 @@ pub fn get_open_group_invitee_peer_ids(
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+pub fn get_group_invitee_peer_ids_for_sync(
+    conn: &Connection,
+    group_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT invitee_peer_id FROM group_invites
+         WHERE group_id = ?1 AND status IN ('sent', 'pending', 'revoked')
+         ORDER BY invitee_peer_id",
+    )?;
+    let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 pub fn delete_group_chat(conn: &Connection, chat_id: &str) -> anyhow::Result<()> {
     conn.execute("DELETE FROM messages WHERE chat_id = ?1", [chat_id])?;
     conn.execute("DELETE FROM chat_envelopes WHERE chat_id = ?1", [chat_id])?;
@@ -1029,6 +1042,43 @@ pub fn insert_group_record(
     Ok(inserted > 0)
 }
 
+pub fn replace_group_record(
+    conn: &Connection,
+    record: &crate::network::gossip::SignedGroupRecord,
+    verified: bool,
+    pending: bool,
+) -> anyhow::Result<()> {
+    let payload_json = serde_json::to_string(record)?;
+    conn.execute(
+        "UPDATE group_records SET
+             group_id = ?2,
+             record_type = ?3,
+             author_peer_id = ?4,
+             timestamp = ?5,
+             payload_json = ?6,
+             public_key_b64 = ?7,
+             signature_b64 = ?8,
+             verified = ?9,
+             pending = ?10,
+             received_at = ?11
+         WHERE id = ?1",
+        (
+            record.id(),
+            record.group_id(),
+            record.body().kind(),
+            record.author_peer_id(),
+            record.timestamp(),
+            payload_json,
+            &record.public_key_b64,
+            &record.signature_b64,
+            if verified { 1 } else { 0 },
+            if pending { 1 } else { 0 },
+            unix_now(),
+        ),
+    )?;
+    Ok(())
+}
+
 pub fn group_record_exists(conn: &Connection, record_id: &str) -> bool {
     conn.query_row(
         "SELECT 1 FROM group_records WHERE id = ?1",
@@ -1055,32 +1105,78 @@ pub fn get_group_record(
 pub fn get_group_records_for_sync(
     conn: &Connection,
     group_id: &str,
-    exclude_ids: &[String],
+    cursor: Option<&crate::network::gossip::GroupSyncCursor>,
+    wanted_record_ids: &[String],
     limit: usize,
+) -> anyhow::Result<(
+    Vec<crate::network::gossip::SignedGroupRecord>,
+    Option<crate::network::gossip::GroupSyncCursor>,
+    bool,
+)> {
+    let mut stmt = conn.prepare(
+        "SELECT payload_json
+         FROM group_records
+         WHERE group_id = ?1 AND verified = 1 AND pending = 0",
+    )?;
+    let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
+    let mut records = rows
+        .map(|row| serde_json::from_str(&row?).map_err(Into::into))
+        .collect::<anyhow::Result<Vec<crate::network::gossip::SignedGroupRecord>>>()?;
+    records.sort_by_key(crate::network::gossip::GroupSyncCursor::from_record);
+
+    let limit = limit.max(1);
+    let wanted = wanted_record_ids
+        .iter()
+        .take(64)
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut out = records
+        .iter()
+        .filter(|record| wanted.contains(record.id()))
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let wanted_sent = out.iter().map(|record| record.id()).collect::<HashSet<_>>();
+
+    let sequential = records
+        .iter()
+        .filter(|record| {
+            cursor.is_none_or(|cursor| {
+                crate::network::gossip::GroupSyncCursor::from_record(record) > *cursor
+            }) && !wanted_sent.contains(record.id())
+        })
+        .collect::<Vec<_>>();
+    let sequential_capacity = limit.saturating_sub(out.len());
+    let sequential_sent = sequential_capacity.min(sequential.len());
+    out.extend(
+        sequential
+            .iter()
+            .take(sequential_sent)
+            .map(|record| (*record).clone()),
+    );
+    let next_cursor = sequential_sent
+        .checked_sub(1)
+        .and_then(|index| sequential.get(index))
+        .map(|record| crate::network::gossip::GroupSyncCursor::from_record(record))
+        .or_else(|| cursor.cloned());
+    let has_more = sequential_sent < sequential.len();
+
+    Ok((out, next_cursor, has_more))
+}
+
+pub fn get_all_group_records(
+    conn: &Connection,
+    group_id: &str,
 ) -> anyhow::Result<Vec<crate::network::gossip::SignedGroupRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT id, payload_json
+        "SELECT payload_json
          FROM group_records
          WHERE group_id = ?1 AND verified = 1
-         ORDER BY timestamp ASC
-        ",
+         ORDER BY id ASC",
     )?;
-    let rows = stmt.query_map([group_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let exclude: HashSet<&str> = exclude_ids.iter().map(String::as_str).collect();
-    let mut out = Vec::new();
-    for row in rows {
-        let (id, json) = row?;
-        if exclude.contains(id.as_str()) {
-            continue;
-        }
-        out.push(serde_json::from_str(&json)?);
-        if out.len() >= limit {
-            break;
-        }
-    }
-    Ok(out)
+    let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
+    rows.map(|row| serde_json::from_str(&row?).map_err(Into::into))
+        .collect()
 }
 
 pub fn get_group_record_ids(conn: &Connection, group_id: &str) -> anyhow::Result<Vec<String>> {
@@ -1998,6 +2094,7 @@ mod tests {
             id.to_string(),
             timestamp,
             Vec::new(),
+            1,
             GroupRecordBody::Head {
                 heads: vec![id.to_string()],
             },
@@ -2076,7 +2173,7 @@ mod tests {
     }
 
     #[test]
-    fn group_sync_filters_known_records_before_applying_limit() {
+    fn group_sync_pages_canonically_and_prioritizes_wanted_dependencies() {
         let conn = Connection::open_in_memory().expect("in-memory db");
         create_tables(&conn).expect("schema");
         let keypair = identity::Keypair::generate_ed25519();
@@ -2084,20 +2181,67 @@ mod tests {
         let first = signed_group_record(&keypair, group_id, "record-1", 1);
         let second = signed_group_record(&keypair, group_id, "record-2", 2);
         let third = signed_group_record(&keypair, group_id, "record-3", 3);
+        let pending = signed_group_record(&keypair, group_id, "pending-record", 4);
+        insert_group_record(&conn, &first, true, false).expect("insert first");
+        insert_group_record(&conn, &second, true, false).expect("insert second");
+        insert_group_record(&conn, &third, true, false).expect("insert third");
+        insert_group_record(&conn, &pending, true, true).expect("insert pending");
+
+        let wanted = vec![pending.id().to_string(), third.id().to_string()];
+        let (records, next_cursor, has_more) =
+            get_group_records_for_sync(&conn, group_id, None, &wanted, 2).expect("sync records");
+
+        assert_eq!(
+            records.iter().map(|record| record.id()).collect::<Vec<_>>(),
+            vec![third.id(), first.id()]
+        );
+        assert_eq!(
+            next_cursor,
+            Some(crate::network::gossip::GroupSyncCursor::from_record(&first))
+        );
+        assert!(has_more);
+
+        let (records, next_cursor, has_more) =
+            get_group_records_for_sync(&conn, group_id, next_cursor.as_ref(), &[], 2)
+                .expect("next sync page");
+        assert_eq!(
+            records.iter().map(|record| record.id()).collect::<Vec<_>>(),
+            vec![second.id(), third.id()]
+        );
+        assert_eq!(
+            next_cursor,
+            Some(crate::network::gossip::GroupSyncCursor::from_record(&third))
+        );
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn group_sync_does_not_advance_cursor_past_unsent_sequential_records() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        create_tables(&conn).expect("schema");
+        let keypair = identity::Keypair::generate_ed25519();
+        let group_id = "group:550e8400-e29b-41d4-a716-446655440000";
+        let first = signed_group_record(&keypair, group_id, "record-1", 1);
+        let second = signed_group_record(&keypair, group_id, "record-2", 2);
+        let third = signed_group_record(&keypair, group_id, "record-3", 3);
         insert_group_record(&conn, &first, true, false).expect("insert first");
         insert_group_record(&conn, &second, true, false).expect("insert second");
         insert_group_record(&conn, &third, true, false).expect("insert third");
 
-        let records = get_group_records_for_sync(
-            &conn,
-            group_id,
-            &[first.id().to_string(), second.id().to_string()],
-            1,
-        )
-        .expect("sync records");
+        let wanted = vec![second.id().to_string(), third.id().to_string()];
+        let (records, next_cursor, has_more) =
+            get_group_records_for_sync(&conn, group_id, None, &wanted, 2).expect("wanted page");
+        assert_eq!(
+            records.iter().map(|record| record.id()).collect::<Vec<_>>(),
+            vec![second.id(), third.id()]
+        );
+        assert_eq!(next_cursor, None);
+        assert!(has_more);
 
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].id(), third.id());
+        let (records, _, _) =
+            get_group_records_for_sync(&conn, group_id, next_cursor.as_ref(), &[], 1)
+                .expect("first sequential page");
+        assert_eq!(records[0].id(), first.id());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatKind {
@@ -102,6 +103,20 @@ pub fn generate_group_chat_id() -> String {
     format!("group:{}", generate_uuid_v4())
 }
 
+pub fn derive_group_chat_id(founder_peer_id: &str, genesis_record_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rchat-group-v3\0");
+    hasher.update(founder_peer_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(genesis_record_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!("group:{}", format_uuid(bytes))
+}
+
 pub fn generate_temp_group_chat_id() -> String {
     format!("temp-group:{}", generate_uuid_v4())
 }
@@ -118,6 +133,10 @@ fn generate_uuid_v4() -> String {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
 
+    format_uuid(bytes)
+}
+
+fn format_uuid(bytes: [u8; 16]) -> String {
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         bytes[0],

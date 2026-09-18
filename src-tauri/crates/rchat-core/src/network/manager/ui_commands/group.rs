@@ -197,28 +197,12 @@ impl NetworkManager {
     }
 
     pub(super) async fn request_group_sync(&mut self, group_id: &str) {
-        let known_record_ids = {
-            let state = &self.app_state;
-            match state.db_conn.lock() {
-                Ok(conn) => {
-                    crate::storage::db::get_group_record_ids(&conn, group_id).unwrap_or_default()
-                }
-                Err(_) => Vec::new(),
-            }
-        };
         let request = crate::network::gossip::GroupSyncRequest {
-            version: 1,
+            version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
             group_id: group_id.to_string(),
-            known_record_ids,
             wanted_record_ids: Vec::new(),
+            cursor: None,
             limit: 256,
-        };
-        let payload = match serde_json::to_string(&request) {
-            Ok(payload) => payload,
-            Err(err) => {
-                eprintln!("[Group] ❌ Failed to encode sync request: {}", err);
-                return;
-            }
         };
         let peers = {
             let state = &self.app_state;
@@ -235,33 +219,12 @@ impl NetworkManager {
             let Ok(peer) = peer_id.parse() else {
                 continue;
             };
-            let request = crate::network::direct_message::DirectMessageRequest {
-                id: format!(
-                    "group-sync-{}-{}",
-                    group_id,
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0)
-                ),
-                sender_id: self.swarm.local_peer_id().to_string(),
-                msg_type: crate::network::direct_message::DirectMessageKind::GroupSyncRequest,
-                text_content: Some(payload.clone()),
-                file_hash: None,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0),
-                chunk_hash: None,
-                chunk_data: None,
-                chunk_list: None,
-                sender_alias: None,
-            };
-            self.swarm
-                .behaviour_mut()
-                .direct_message
-                .send_request(&peer, request);
-            sent += 1;
+            if self
+                .send_group_sync_request_to_peer(&peer, &request)
+                .is_ok()
+            {
+                sent += 1;
+            }
         }
         self.emit(crate::events::CoreEvent::GroupSyncStateUpdated(
             crate::events::GroupSyncStateUpdatedEvent {
@@ -270,5 +233,35 @@ impl NetworkManager {
                 detail: Some(format!("sent to {sent} peer(s)")),
             },
         ));
+    }
+
+    pub(crate) fn send_group_sync_request_to_peer(
+        &mut self,
+        peer: &libp2p::PeerId,
+        request: &crate::network::gossip::GroupSyncRequest,
+    ) -> Result<(), String> {
+        request.validate()?;
+        let payload = serde_json::to_string(request)
+            .map_err(|error| format!("failed to encode group sync request: {error}"))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let direct_request = crate::network::direct_message::DirectMessageRequest {
+            id: format!("group-sync-{}-{}", request.group_id, now.as_nanos()),
+            sender_id: self.swarm.local_peer_id().to_string(),
+            msg_type: crate::network::direct_message::DirectMessageKind::GroupSyncRequest,
+            text_content: Some(payload),
+            file_hash: None,
+            timestamp: now.as_secs() as i64,
+            chunk_hash: None,
+            chunk_data: None,
+            chunk_list: None,
+            sender_alias: None,
+        };
+        self.swarm
+            .behaviour_mut()
+            .direct_message
+            .send_request(peer, direct_request);
+        Ok(())
     }
 }

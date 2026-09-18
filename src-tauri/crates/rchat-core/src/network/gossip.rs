@@ -7,6 +7,11 @@ use crate::chat_kind;
 pub const CONTROL_TOPIC: &str = "rchat:control";
 pub const GROUP_TOPIC_PREFIX: &str = "rchat:group:";
 pub const TEMP_GROUP_TOPIC_PREFIX: &str = "rchat:temp-group:";
+pub const GROUP_PROTOCOL_VERSION: u16 = 3;
+pub const MAX_GROUP_RECORD_BYTES: usize = 1024 * 1024;
+pub const MAX_GROUP_RECORD_PARENTS: usize = 64;
+pub const MAX_GROUP_SYNC_RECORDS: usize = 256;
+pub const MAX_GROUP_SYNC_WANTED_IDS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -202,6 +207,7 @@ pub struct UnsignedGroupRecord {
     pub timestamp: i64,
     #[serde(default)]
     pub parents: Vec<String>,
+    pub lamport_counter: u64,
     pub body: GroupRecordBody,
 }
 
@@ -232,10 +238,17 @@ pub struct GroupSyncRequest {
     pub version: u16,
     pub group_id: String,
     #[serde(default)]
-    pub known_record_ids: Vec<String>,
-    #[serde(default)]
     pub wanted_record_ids: Vec<String>,
+    #[serde(default)]
+    pub cursor: Option<GroupSyncCursor>,
     pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GroupSyncCursor {
+    pub lamport_counter: u64,
+    pub author_peer_id: String,
+    pub record_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -243,10 +256,13 @@ pub struct GroupSyncResponse {
     pub version: u16,
     pub group_id: String,
     pub records: Vec<SignedGroupRecord>,
+    #[serde(default)]
+    pub next_cursor: Option<GroupSyncCursor>,
+    pub has_more: bool,
 }
 
 impl SignedGroupRecord {
-    pub const VERSION: u16 = 2;
+    pub const VERSION: u16 = GROUP_PROTOCOL_VERSION;
 
     pub fn new(
         keypair: &identity::Keypair,
@@ -254,6 +270,7 @@ impl SignedGroupRecord {
         id: String,
         timestamp: i64,
         parents: Vec<String>,
+        lamport_counter: u64,
         body: GroupRecordBody,
     ) -> anyhow::Result<Self> {
         let author_peer_id = PeerId::from_public_key(&keypair.public()).to_string();
@@ -264,6 +281,7 @@ impl SignedGroupRecord {
             author_peer_id,
             timestamp,
             parents,
+            lamport_counter,
             body,
         };
         let canonical = serde_json::to_vec(&unsigned)?;
@@ -276,7 +294,7 @@ impl SignedGroupRecord {
     }
 
     pub fn verify(&self) -> bool {
-        if !(1..=Self::VERSION).contains(&self.unsigned.version) {
+        if self.unsigned.version != Self::VERSION {
             return false;
         }
         let Ok(public_key_bytes) = BASE64.decode(&self.public_key_b64) else {
@@ -298,6 +316,45 @@ impl SignedGroupRecord {
         public_key.verify(&canonical, &signature)
     }
 
+    pub fn validate_shape(&self) -> Result<(), &'static str> {
+        if !crate::chat_kind::is_group_chat_id(&self.unsigned.group_id) {
+            return Err("group record has an invalid group id");
+        }
+        if self.unsigned.id.is_empty() || self.unsigned.id.len() > 256 {
+            return Err("group record id is outside its bounds");
+        }
+        if self.unsigned.lamport_counter == 0 || self.unsigned.lamport_counter == u64::MAX {
+            return Err("Lamport counter is outside its bounds");
+        }
+        if self.unsigned.parents.len() > MAX_GROUP_RECORD_PARENTS {
+            return Err("group record has too many parents");
+        }
+        if self
+            .unsigned
+            .parents
+            .iter()
+            .any(|parent| parent.len() > 256)
+        {
+            return Err("group record parent id is outside its bounds");
+        }
+        let unique_parent_count = self
+            .unsigned
+            .parents
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        if unique_parent_count != self.unsigned.parents.len() {
+            return Err("group record contains duplicate parents");
+        }
+        if serde_json::to_vec(self)
+            .map(|encoded| encoded.len() > MAX_GROUP_RECORD_BYTES)
+            .unwrap_or(true)
+        {
+            return Err("group record exceeds the encoded size limit");
+        }
+        Ok(())
+    }
+
     pub fn id(&self) -> &str {
         &self.unsigned.id
     }
@@ -314,8 +371,77 @@ impl SignedGroupRecord {
         self.unsigned.timestamp
     }
 
+    pub fn lamport_counter(&self) -> u64 {
+        self.unsigned.lamport_counter
+    }
+
     pub fn body(&self) -> &GroupRecordBody {
         &self.unsigned.body
+    }
+}
+
+impl GroupSyncCursor {
+    pub fn from_record(record: &SignedGroupRecord) -> Self {
+        Self {
+            lamport_counter: record.lamport_counter(),
+            author_peer_id: record.author_peer_id().to_string(),
+            record_id: record.id().to_string(),
+        }
+    }
+}
+
+impl GroupSyncRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != GROUP_PROTOCOL_VERSION {
+            return Err(format!(
+                "unsupported group sync protocol version {}",
+                self.version
+            ));
+        }
+        if !crate::chat_kind::is_group_chat_id(&self.group_id) {
+            return Err("invalid group id in sync request".to_string());
+        }
+        if !(1..=MAX_GROUP_SYNC_RECORDS).contains(&self.limit) {
+            return Err("group sync page limit is out of range".to_string());
+        }
+        if self.wanted_record_ids.len() > MAX_GROUP_SYNC_WANTED_IDS
+            || self.wanted_record_ids.iter().any(|id| id.len() > 256)
+        {
+            return Err("group sync dependency request exceeds its bounds".to_string());
+        }
+        if self
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.record_id.len() > 256 || cursor.author_peer_id.len() > 128)
+        {
+            return Err("group sync cursor exceeds its bounds".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl GroupSyncResponse {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != GROUP_PROTOCOL_VERSION {
+            return Err(format!(
+                "unsupported group sync protocol version {}",
+                self.version
+            ));
+        }
+        if !crate::chat_kind::is_group_chat_id(&self.group_id) {
+            return Err("invalid group id in sync response".to_string());
+        }
+        if self.records.len() > MAX_GROUP_SYNC_RECORDS {
+            return Err("group sync response exceeds the page limit".to_string());
+        }
+        if self
+            .records
+            .iter()
+            .any(|record| record.group_id() != self.group_id || record.validate_shape().is_err())
+        {
+            return Err("group sync response contains an invalid record".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -379,6 +505,7 @@ mod tests {
             "rec-1".to_string(),
             42,
             Vec::new(),
+            1,
             GroupRecordBody::GroupCreated {
                 name: "Test".to_string(),
                 settings: None,
@@ -389,11 +516,14 @@ mod tests {
 
         let json = serde_json::to_string(&record).expect("serialize");
         let decoded: SignedGroupRecord = serde_json::from_str(&json).expect("decode");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json value");
+        assert_eq!(SignedGroupRecord::VERSION, 3);
+        assert_eq!(value["lamport_counter"], 1);
         assert!(decoded.verify());
     }
 
     #[test]
-    fn version_one_group_records_remain_verifiable() {
+    fn version_one_group_records_are_rejected_by_mandatory_v3() {
         let key = identity::Keypair::generate_ed25519();
         let unsigned = UnsignedGroupRecord {
             version: 1,
@@ -402,6 +532,7 @@ mod tests {
             author_peer_id: PeerId::from_public_key(&key.public()).to_string(),
             timestamp: 42,
             parents: Vec::new(),
+            lamport_counter: 1,
             body: GroupRecordBody::GroupCreated {
                 name: "Legacy".to_string(),
                 settings: None,
@@ -417,14 +548,68 @@ mod tests {
             signature_b64: BASE64.encode(signature),
         };
 
-        assert!(record.verify());
+        assert!(!record.verify());
     }
 
     #[test]
-    fn legacy_group_envelope_still_decodes_without_signature_fields() {
+    fn group_sync_v3_rejects_legacy_and_unbounded_requests() {
+        let group_id = crate::chat_kind::derive_group_chat_id("founder", "genesis");
+        let mut request = GroupSyncRequest {
+            version: GROUP_PROTOCOL_VERSION,
+            group_id,
+            wanted_record_ids: Vec::new(),
+            cursor: None,
+            limit: MAX_GROUP_SYNC_RECORDS,
+        };
+        request.validate().expect("valid request");
+
+        request.version = 2;
+        assert!(request
+            .validate()
+            .expect_err("legacy version")
+            .contains("version"));
+        request.version = GROUP_PROTOCOL_VERSION;
+        request.wanted_record_ids = (0..=MAX_GROUP_SYNC_WANTED_IDS)
+            .map(|index| format!("record-{index}"))
+            .collect();
+        assert!(request
+            .validate()
+            .expect_err("wanted id cap")
+            .contains("bounds"));
+    }
+
+    #[test]
+    fn group_record_shape_reserves_the_maximum_lamport_counter() {
+        let key = identity::Keypair::generate_ed25519();
+        let record = SignedGroupRecord::new(
+            &key,
+            crate::chat_kind::derive_group_chat_id(
+                &PeerId::from_public_key(&key.public()).to_string(),
+                "rec-max",
+            ),
+            "rec-max".to_string(),
+            42,
+            Vec::new(),
+            u64::MAX,
+            GroupRecordBody::GroupCreated {
+                name: "Counter bound".to_string(),
+                settings: None,
+                image_hash: None,
+            },
+        )
+        .expect("signed record");
+
+        assert!(record
+            .validate_shape()
+            .expect_err("maximum counter is reserved")
+            .contains("counter"));
+    }
+
+    #[test]
+    fn temporary_group_envelope_decodes_without_durable_signature_fields() {
         let raw = r#"{
             "id":"m1",
-            "group_id":"group:550e8400-e29b-41d4-a716-446655440000",
+            "group_id":"temp-group:550e8400-e29b-41d4-a716-446655440000",
             "sender_id":"peer",
             "timestamp":1,
             "content_type":"text",
@@ -446,6 +631,7 @@ mod tests {
             "rec-1".to_string(),
             42,
             Vec::new(),
+            1,
             GroupRecordBody::GroupCreated {
                 name: "Test".to_string(),
                 settings: Some(GroupSettings {
