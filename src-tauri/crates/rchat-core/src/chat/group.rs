@@ -1429,6 +1429,20 @@ fn apply_signed_record_locked(
         return db::insert_group_record(conn, record, false, true);
     }
 
+    // The caller's `verified` flag is a claim, not a proof: it means "the
+    // ingress path checked this", and nothing else. Validation below only
+    // reasons about causal structure, so without this check any caller that
+    // passes `verified = true` for an unsigned or forged record — the invite
+    // payload's `related_records`, or the pending-retry loop re-running rows
+    // that originally failed signature verification — would apply it with
+    // full policy effect.
+    if !record.verify() {
+        return Err(anyhow!(
+            "Group record {} failed signature verification",
+            record.id()
+        ));
+    }
+
     let existing_state = group_record_state(conn, record.id())?;
     if let Some((_, false)) = existing_state {
         return Ok(false);
@@ -1577,7 +1591,7 @@ fn revalidate_verified_records(
             policy_counters.push(rec.lamport_counter());
         }
     }
-    let words = (policy_counters.len() + 63) / 64;
+    let words = policy_counters.len().div_ceil(64);
     // Record id -> bitset of the policy records in its parent closure.
     let mut policy_ancestors: std::collections::HashMap<&str, Vec<u64>> =
         std::collections::HashMap::new();
@@ -2306,6 +2320,73 @@ mod tests {
                 .active_members
                 .contains(&member_id),
             "removed member is still active after late delivery"
+        );
+    }
+
+    /// Regression guard: a record whose signature does not verify must never
+    /// become verified. Network ingress stores signature-failed records as
+    /// `verified = 0, pending = 1`, and `retry_pending_group_records` later
+    /// re-runs `apply_signed_record` with `verified = true`; that path must
+    /// not resurrect a forgery that validation alone cannot detect.
+    #[test]
+    fn forged_record_is_not_resurrected_by_pending_retry() {
+        let app = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
+        let (founder, member_b, _member_c, group_id, log) = test_team();
+        for record in &log {
+            apply(&app, record).expect("team log applies");
+        }
+        let head_id = log.last().expect("join_c").id().to_string();
+
+        // The attacker signs with their own key but claims the admin's
+        // identity, so `verify()` rejects it: the peer id derived from
+        // `public_key_b64` does not match `author_peer_id`.
+        let attacker = keypair();
+        let mut forged = child(
+            &attacker,
+            &group_id,
+            "forged-removal",
+            6,
+            vec![head_id.clone()],
+            GroupRecordBody::MemberRemoved {
+                peer_id: peer_id(&member_b),
+            },
+        );
+        forged.unsigned.author_peer_id = peer_id(&founder);
+        assert!(!forged.verify(), "fixture must be a genuine forgery");
+
+        // Gossipsub ingress of a signature failure: stored pending.
+        apply_signed_record(&app, None, &forged, false).expect("stored as pending");
+
+        // Any later successful apply in this group drains the pending queue.
+        let trigger = child(
+            &member_b,
+            &group_id,
+            "trigger",
+            6,
+            vec![head_id],
+            GroupRecordBody::Head {
+                heads: Vec::new(),
+            },
+        );
+        apply(&app, &trigger).expect("trigger applies");
+
+        let verified = db::get_all_verified_group_records_ordered(
+            &app.db_conn.lock().expect("db"),
+            &group_id,
+        )
+        .expect("query");
+        assert!(
+            !verified.iter().any(|record| record.id() == forged.id()),
+            "forged record was applied despite failing signature verification"
+        );
+        assert!(
+            get_group_policy(&app, &group_id)
+                .expect("policy")
+                .active_members
+                .contains(&peer_id(&member_b)),
+            "forged removal took effect"
         );
     }
 
