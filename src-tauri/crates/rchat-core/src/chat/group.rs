@@ -865,6 +865,14 @@ fn mark_group_record_verified(
         "UPDATE group_records SET verified = 1, pending = 0 WHERE id = ?1",
         [record_id],
     )?;
+    // Verified rows need no dependency edges: the dependents query only
+    // matches still-pending rows, and dropping edges here keeps the index
+    // table bounded by the pending set (row deletes are also covered by the
+    // foreign-key cascade as a backstop).
+    conn.execute(
+        "DELETE FROM group_pending_parents WHERE record_id = ?1",
+        [record_id],
+    )?;
     Ok(())
 }
 
@@ -885,10 +893,56 @@ fn pending_group_records(
     Ok(records)
 }
 
+/// Cheap structural gates that run before dependency resolution, so a
+/// record with random nonexistent parents cannot reach pending storage
+/// without first proving it is well-formed and within the known frontier.
+/// All of these are context-free (no parent contents needed); messages match
+/// the ones `validate_record_counter` reports. The fork check deliberately
+/// stays after the parents loop: a forked record whose parents are also
+/// missing parks as pending (quota-bounded) instead of being dropped, so a
+/// later demotion of the conflicting row can still let it converge.
+fn validate_record_shape(
+    conn: &rusqlite::Connection,
+    record: &SignedGroupRecord,
+) -> anyhow::Result<()> {
+    let counter = record.lamport_counter();
+    if counter == 0 {
+        return Err(anyhow!("Group record is missing its causal counter"));
+    }
+    if counter == u64::MAX {
+        return Err(anyhow!("Group record counter exhausted"));
+    }
+    if record.unsigned.parents.len() > SignedGroupRecord::MAX_PARENTS {
+        return Err(anyhow!(
+            "Group record names {} parents, over the limit of {}",
+            record.unsigned.parents.len(),
+            SignedGroupRecord::MAX_PARENTS
+        ));
+    }
+    let encoded_len = serde_json::to_vec(record)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX);
+    if encoded_len > SignedGroupRecord::MAX_RECORD_BYTES {
+        return Err(anyhow!(
+            "Group record is {encoded_len} bytes, over the limit of {}",
+            SignedGroupRecord::MAX_RECORD_BYTES
+        ));
+    }
+    let max_known = db::get_group_max_lamport_counter(conn, record.group_id()).unwrap_or(0);
+    if counter > max_known.saturating_add(SignedGroupRecord::MAX_COUNTER_JUMP) {
+        return Err(anyhow!(
+            "Group record counter {counter} leaps more than {} past the known frontier {max_known}",
+            SignedGroupRecord::MAX_COUNTER_JUMP
+        ));
+    }
+    Ok(())
+}
+
 fn validate_group_record(
     conn: &rusqlite::Connection,
     record: &SignedGroupRecord,
 ) -> anyhow::Result<RecordDisposition> {
+    validate_record_shape(conn, record)?;
     for parent_id in &record.unsigned.parents {
         let Some(parent) = db::get_group_record(conn, parent_id)? else {
             return Ok(RecordDisposition::PendingDependency);
@@ -965,8 +1019,20 @@ fn validate_group_record(
         derive_group_policy(&closure)
     };
 
+    // A dissolution rejects only records that causally descend from it —
+    // never older or concurrent records that may prove the dissolution
+    // itself stale. A concurrent join arriving after a dissolution must
+    // still validate against its own closure and apply; the late-policy
+    // reconciliation then demotes whichever branch loses. Without this, a
+    // D-first peer and a J-first peer would disagree forever.
     if current_policy.as_ref().is_some_and(|policy| policy.dissolved) {
-        return Err(anyhow!("Group has been dissolved"));
+        let descended = existing_records
+            .iter()
+            .filter(|rec| matches!(rec.body(), GroupRecordBody::GroupDissolved))
+            .any(|dissolution| closure_ids.contains(dissolution.id()));
+        if descended {
+            return Err(anyhow!("Group has been dissolved"));
+        }
     }
 
     match record.body() {
@@ -1230,6 +1296,7 @@ fn project_record_effects(
         }
         GroupRecordBody::MemberInvited { peer_id, role } => {
             ensure_peer(conn, peer_id, "group")?;
+            db::ensure_chat_exists(conn, group_id)?;
             db::upsert_chat_member_state(
                 conn,
                 group_id,
@@ -1247,6 +1314,7 @@ fn project_record_effects(
         }
         GroupRecordBody::MemberJoined { peer_id } => {
             ensure_peer(conn, peer_id, "group")?;
+            db::ensure_chat_exists(conn, group_id)?;
             db::upsert_chat_member_state(
                 conn,
                 group_id,
@@ -1287,6 +1355,7 @@ fn project_record_effects(
             // other joined member — including the transferring (old) admin —
             // becomes a regular member. Deriving roles from the roster keeps
             // the old admin from retaining the admin role after a replay.
+            db::ensure_chat_exists(conn, group_id)?;
             for member in db::get_group_roster(conn, group_id)? {
                 if member.membership_state == "joined" {
                     let role = if member.peer_id == *new_admin_peer_id {
@@ -1480,7 +1549,27 @@ fn apply_signed_record_locked(
         }
         RecordDisposition::PendingDependency => {
             if existing_state.is_none() {
+                // Bound pending capacity before storing: without quotas a
+                // signer could park unlimited missing-parent records and
+                // grow storage plus per-apply retry work without limit.
+                // Dropped records are not stored at all; the peer can send
+                // them again once dependents have resolved and freed space.
+                if db::pending_record_count(conn, record.group_id())?
+                    >= SignedGroupRecord::MAX_PENDING_PER_GROUP
+                    || db::pending_author_count(
+                        conn,
+                        record.group_id(),
+                        record.author_peer_id(),
+                    )? >= SignedGroupRecord::MAX_PENDING_PER_AUTHOR
+                {
+                    return Err(anyhow!(
+                        "Group {} pending queue full, dropping {}",
+                        record.group_id(),
+                        record.id()
+                    ));
+                }
                 db::insert_group_record(conn, record, false, true)?;
+                db::insert_pending_record_edges(conn, record.id(), &record.unsigned.parents)?;
             }
             return Ok(false);
         }
@@ -1512,6 +1601,7 @@ pub fn apply_signed_record(
 ) -> anyhow::Result<bool> {
     let mut events: Vec<CoreEvent> = Vec::new();
     let record_applied;
+    let demoted_any;
     {
         let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
         conn.execute("BEGIN IMMEDIATE", [])?;
@@ -1536,17 +1626,31 @@ pub fn apply_signed_record(
             // Reconciliation is only needed when the policy frontier can
             // change; message/receipt traffic cannot invalidate any other
             // record, so skip the full-history rescan for it. Frontier-
-            // extending records likewise cannot demote anything.
+            // extending records likewise cannot demote anything: every
+            // existing record holds a strictly smaller counter, so the new
+            // record cannot appear in any dominate set. Only late arrivals
+            // (counter at or below the previous maximum) can demote, and
+            // then only records strictly above their own counter.
+            let mut demoted = false;
             if applied
                 && is_policy_changing(record.body())
                 && record.lamport_counter() <= prev_max
             {
-                revalidate_verified_records(&conn, app_state, record.group_id(), &mut events)?;
+                demoted = revalidate_verified_records(
+                    &conn,
+                    app_state,
+                    record.group_id(),
+                    record.lamport_counter(),
+                    &mut events,
+                )?;
             }
-            Ok::<bool, anyhow::Error>(applied)
+            Ok::<(bool, bool), anyhow::Error>((applied, demoted))
         })();
         match outcome {
-            Ok(applied) => record_applied = applied,
+            Ok((applied, demoted)) => {
+                record_applied = applied;
+                demoted_any = demoted;
+            }
             Err(err) => {
                 let _ = conn.execute("ROLLBACK", []);
                 // The in-transaction reservation cleanup above was rolled
@@ -1562,7 +1666,7 @@ pub fn apply_signed_record(
                     Ok(Some((false, true)))
                 ) {
                     let terminal = !record.verify()
-                        || matches!(validate_group_record(&conn, record), Err(_));
+                        || validate_group_record(&conn, record).is_err();
                     if terminal {
                         let _ = conn.execute(
                             "DELETE FROM group_records WHERE id = ?1",
@@ -1585,10 +1689,55 @@ pub fn apply_signed_record(
         }
     }
     if record_applied {
-        retry_pending_group_records(app_state, event_sink, record.group_id());
+        // Dependents of the newly arrived record first: the parent index
+        // finds exactly the rows this arrival can unblock, without scanning
+        // the whole pending table.
+        retry_pending_dependents(app_state, event_sink, record.group_id(), record.id());
+        if demoted_any {
+            // Demotions can unblock rows that wait on nothing newly arrived
+            // (their conflict vanished); rescan the bounded pending set once.
+            retry_pending_group_records(app_state, event_sink, record.group_id());
+        }
     }
 
     Ok(record_applied)
+}
+
+/// Retry the pending rows that name `parent_id` as a dependency, cascading
+/// through newly verified records via an iterative worklist (the dependency
+/// edges point strictly upward in counter order, so the walk terminates).
+/// Each step runs the full validated apply path, so a dependent that is
+/// still stale fails again and stays pending.
+fn retry_pending_dependents(
+    app_state: &AppState,
+    event_sink: Option<&SharedCoreEventSink>,
+    group_id: &str,
+    parent_id: &str,
+) {
+    let mut queue = vec![parent_id.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(pid) = queue.pop() {
+        let dependents = {
+            let Ok(conn) = app_state.db_conn.lock() else {
+                return;
+            };
+            db::pending_dependents_of(&conn, group_id, &pid).unwrap_or_default()
+        };
+        for record in dependents {
+            if !seen.insert(record.id().to_string()) {
+                continue;
+            }
+            match apply_signed_record(app_state, event_sink, &record, true) {
+                Ok(true) => queue.push(record.id().to_string()),
+                Ok(false) => {}
+                Err(err) => eprintln!(
+                    "[Group] Failed to retry pending record {}: {}",
+                    record.id(),
+                    err
+                ),
+            }
+        }
+    }
 }
 
 
@@ -1603,22 +1752,64 @@ thread_local! {
         std::cell::Cell::new(0);
 }
 
+/// Counts records that actually went through the dominance check during
+/// revalidation. Test-only; proves rescans are scoped to affected
+/// descendants rather than the whole history.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REVALIDATE_CHECKED_COUNT: std::cell::Cell<u64> =
+        std::cell::Cell::new(0);
+}
+
 /// Reconcile any verified records that became stale after a new policy
-/// record arrived. Runs inside the caller's transaction. A record is kept
-/// verified only if it still satisfies the same rules as fresh validation:
-/// parents present, counter follows its parents, and (for authorization-
-/// sensitive records) its parent closure dominates **every** policy-changing
-/// record at a lower counter. Demoted records move back to pending and the
-/// whole group's materialized state is rebuilt from the surviving valid set.
+/// record arrived at `trigger_counter`. Runs inside the caller's
+/// transaction. Only records with a strictly greater counter can have gone
+/// stale — a record's validity depends solely on strictly lower counters,
+/// so everything at or below the trigger is unaffected — and of those, only
+/// records reachable from (or reaching) the affected set need masks. A
+/// record is kept verified only if it still satisfies the same rules as
+/// fresh validation: parents present, counter follows its parents, and (for
+/// authorization-sensitive records) its parent closure dominates **every**
+/// policy-changing record at a lower counter. Demoted records move back to
+/// pending and the whole group's materialized state is rebuilt from the
+/// surviving valid set.
 fn revalidate_verified_records(
     conn: &rusqlite::Connection,
     app_state: &AppState,
     group_id: &str,
+    trigger_counter: u64,
     events: &mut Vec<CoreEvent>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     #[cfg(test)]
     REVALIDATE_RUN_COUNT.with(|c| c.set(c.get() + 1));
     let all_verified = db::get_all_verified_group_records_ordered(conn, group_id)?;
+    // O(1) record lookup by id (replaces the previous linear scan per
+    // parent, which made the pass quadratic in history length).
+    let id_index: std::collections::HashMap<&str, &SignedGroupRecord> = all_verified
+        .iter()
+        .map(|rec| (rec.id(), rec))
+        .collect();
+    // The needed set: affected records (counter above the trigger) plus
+    // their transitive ancestors (whose masks feed the checks). Everything
+    // else provably keeps its status and is copied through untouched.
+    let mut needed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut stack: Vec<&str> = all_verified
+        .iter()
+        .filter(|rec| rec.lamport_counter() > trigger_counter)
+        .map(|rec| rec.id())
+        .collect();
+    while let Some(id) = stack.pop() {
+        if !needed.insert(id) {
+            continue;
+        }
+        if let Some(rec) = id_index.get(id) {
+            for parent in &rec.unsigned.parents {
+                if id_index.contains_key(parent.as_str()) && !needed.contains(parent.as_str()) {
+                    stack.push(parent.as_str());
+                }
+            }
+        }
+    }
     let mut valid_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut valid_records: Vec<SignedGroupRecord> = Vec::new();
     let mut to_demote = Vec::new();
@@ -1654,6 +1845,40 @@ fn revalidate_verified_records(
         {
             required += 1;
         }
+        let is_needed = needed.contains(rec.id());
+        // The policy ancestors of this record: the union of its parents'
+        // policy ancestors, plus any parent that is itself a policy record.
+        // Computed for every needed record, including exempt ones, because
+        // an exempt record still passes its ancestry on to its children.
+        // Non-needed records are copied through with an empty mask, which is
+        // safe: the needed set is closed under parents present in the
+        // snapshot, so every parent consulted by a needed record's union is
+        // itself needed and therefore holds a real mask.
+        let mut mask = vec![0u64; words];
+        if is_needed {
+            for pid in &rec.unsigned.parents {
+                if let Some(parent_mask) = policy_ancestors.get(pid.as_str()) {
+                    for (word, source) in mask.iter_mut().zip(parent_mask.iter()) {
+                        *word |= *source;
+                    }
+                }
+                if let Some(bit) = policy_index.get(pid.as_str()).copied() {
+                    mask[bit / 64] |= 1u64 << (bit % 64);
+                }
+            }
+        }
+        // Records at or below the trigger counter provably keep their
+        // status: every check they could fail involves only strictly lower
+        // counters (parents, counter succession, and the dominate set below
+        // their own counter), and the trigger — at a greater-or-equal
+        // counter — appears in none of those inputs. They still contribute
+        // their mask when needed, then are copied through unchecked.
+        if rec.lamport_counter() <= trigger_counter {
+            policy_ancestors.insert(rec.id(), mask);
+            valid_ids.insert(rec.id().to_string());
+            valid_records.push(rec.clone());
+            continue;
+        }
         // Parents must all be present and in the survivor set.
         let parents_ok = rec.unsigned.parents.iter().all(|p| valid_ids.contains(p));
         if !parents_ok {
@@ -1664,7 +1889,10 @@ fn revalidate_verified_records(
         if !rec.unsigned.parents.is_empty() {
             let mut max_parent = 0u64;
             for pid in &rec.unsigned.parents {
-                if let Some(parent) = valid_records.iter().find(|r| r.id() == pid) {
+                if let Some(parent) = id_index
+                    .get(pid.as_str())
+                    .filter(|_| valid_ids.contains(pid))
+                {
                     max_parent = max_parent.max(parent.lamport_counter());
                 }
             }
@@ -1677,25 +1905,12 @@ fn revalidate_verified_records(
             to_demote.push(rec.id().to_string());
             continue;
         }
-        // The policy ancestors of this record: the union of its parents'
-        // policy ancestors, plus any parent that is itself a policy record.
-        // Computed for every record, including exempt ones, because an exempt
-        // record still passes its ancestry on to its children.
-        let mut mask = vec![0u64; words];
-        for pid in &rec.unsigned.parents {
-            if let Some(parent_mask) = policy_ancestors.get(pid.as_str()) {
-                for (word, source) in mask.iter_mut().zip(parent_mask.iter()) {
-                    *word |= *source;
-                }
-            }
-            if let Some(bit) = policy_index.get(pid.as_str()).copied() {
-                mask[bit / 64] |= 1u64 << (bit % 64);
-            }
-        }
         // Multi-head stale-branch check mirroring validate_group_record. This
         // has to test the whole closure, not just the direct parents: a
         // child's closure is not guaranteed to cover its grandparents'
         // policy records unless every link dominates.
+        #[cfg(test)]
+        REVALIDATE_CHECKED_COUNT.with(|c| c.set(c.get() + 1));
         if !matches!(rec.body(), GroupRecordBody::GroupCreated { .. })
             && mask.iter().map(|word| word.count_ones() as usize).sum::<usize>() != required
         {
@@ -1708,7 +1923,7 @@ fn revalidate_verified_records(
     }
 
     if to_demote.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     for stale_id in &to_demote {
@@ -1716,6 +1931,12 @@ fn revalidate_verified_records(
             "UPDATE group_records SET verified = 0, pending = 1 WHERE id = ?1",
             [stale_id],
         )?;
+        // Re-register dependency edges (they were dropped when the row was
+        // verified) so a later arrival of a missing parent still finds this
+        // row through the parent index.
+        if let Some(rec) = all_verified.iter().find(|r| r.id() == stale_id) {
+            db::insert_pending_record_edges(conn, stale_id, &rec.unsigned.parents)?;
+        }
     }
     rebuild_group_materialized_state(conn, app_state, group_id, &valid_records)?;
     for stale_id in &to_demote {
@@ -1725,7 +1946,7 @@ fn revalidate_verified_records(
             record_type: "rebuilt".to_string(),
         }));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Rebuild all materialized group state from the valid set using the same
@@ -2765,6 +2986,137 @@ mod tests {
         )
         .expect_err("a known dissolution must reject backdated records too");
         assert!(error.to_string().contains("dissolved"));
+    }
+
+    /// A stale dissolution must not block the late policy record that
+    /// invalidates it. D-first and J-first delivery must converge to the
+    /// same verified set and the same restored chat/roster: J validates
+    /// against its own closure (which holds no dissolution), applies, and
+    /// the late-policy reconciliation demotes D and rebuilds.
+    #[test]
+    fn late_join_invalidates_stale_dissolution_in_both_orders() {
+        let founder = keypair();
+        let member = keypair();
+        let founder_id = peer_id(&founder);
+        let member_id = peer_id(&member);
+        let group_id = chat_kind::generate_group_chat_id();
+        let mk = |author: &identity::Keypair,
+                  tag: &str,
+                  counter: u64,
+                  parents: Vec<String>,
+                  body: GroupRecordBody| {
+            SignedGroupRecord::new(
+                author,
+                group_id.clone(),
+                format!("dissolve-race-{tag}-{}", rand::random::<u64>()),
+                1_700_000_000i64 + counter as i64,
+                parents,
+                counter,
+                body,
+            )
+            .expect("record")
+        };
+        let created = mk(
+            &founder,
+            "created",
+            1,
+            vec![],
+            GroupRecordBody::GroupCreated {
+                name: "Ephemeral".to_string(),
+                settings: None,
+                image_hash: None,
+            },
+        );
+        let invite = mk(
+            &founder,
+            "invite",
+            2,
+            vec![created.id().to_string()],
+            GroupRecordBody::MemberInvited {
+                peer_id: member_id.clone(),
+                role: "member".to_string(),
+            },
+        );
+        let head_x = mk(
+            &founder,
+            "head-x",
+            3,
+            vec![invite.id().to_string()],
+            GroupRecordBody::Head { heads: vec![] },
+        );
+        let dissolution = mk(
+            &founder,
+            "dissolution",
+            4,
+            vec![head_x.id().to_string()],
+            GroupRecordBody::GroupDissolved,
+        );
+        let join = mk(
+            &member,
+            "join",
+            3,
+            vec![invite.id().to_string()],
+            GroupRecordBody::MemberJoined {
+                peer_id: member_id.clone(),
+            },
+        );
+
+        // D-first order: the dissolution applies (sole active member in its
+        // closure), then the concurrent join must still validate against its
+        // own closure and apply; reconciliation demotes the dissolution.
+        let app_d_first = app_state();
+        for rec in [&created, &invite, &head_x, &dissolution] {
+            apply(&app_d_first, rec).expect("prefix applies");
+        }
+        assert!(
+            get_group_policy(&app_d_first, &group_id)
+                .expect("policy")
+                .dissolved,
+            "dissolution applies when received first"
+        );
+        assert!(
+            apply(&app_d_first, &join).expect("late join applies despite dissolution"),
+            "concurrent join must not be blocked by a stale dissolution"
+        );
+
+        // J-first order: the join applies, then the dissolution — which omits
+        // the join — is rejected outright.
+        let app_j_first = app_state();
+        for rec in [&created, &invite, &head_x, &join] {
+            apply(&app_j_first, rec).expect("prefix applies");
+        }
+        apply(&app_j_first, &dissolution).expect_err("stale dissolution must be rejected");
+
+        // Both peers converge: identical verified sets, restored chat, and a
+        // roster with the founder as admin and the member joined.
+        for (label, app) in [("d-first", &app_d_first), ("j-first", &app_j_first)] {
+            let conn = app.db_conn.lock().expect("db");
+            let verified: std::collections::HashSet<String> =
+                db::get_all_verified_group_records_ordered(&conn, &group_id)
+                    .expect("query")
+                    .iter()
+                    .map(|rec| rec.id().to_string())
+                    .collect();
+            let chat_exists: bool = conn
+                .query_row("SELECT 1 FROM chats WHERE id = ?1", [&group_id], |_| {
+                    Ok(true)
+                })
+                .unwrap_or(false);
+            drop(conn);
+            let expected: std::collections::HashSet<String> = [&created, &invite, &head_x, &join]
+                .iter()
+                .map(|rec| rec.id().to_string())
+                .collect();
+            assert_eq!(verified, expected, "{label}: verified sets must converge");
+            assert!(chat_exists, "{label}: dissolved chat must be restored");
+            let policy = get_group_policy(app, &group_id).expect("policy");
+            assert!(!policy.dissolved, "{label}: dissolution must be gone");
+            assert_eq!(policy.admin_peer_id, founder_id, "{label}: founder stays admin");
+            assert!(
+                policy.active_members.contains(&member_id),
+                "{label}: member stays joined"
+            );
+        }
     }
 
     #[test]
@@ -4589,6 +4941,106 @@ mod tests {
             pending,
         )
     }
+    /// Id of the verified record at `counter` (test helper for building
+    /// late arrivals that parent a specific causal height).
+    fn parent_at(app_state: &AppState, group_id: &str, counter: u64) -> String {
+        let conn = app_state.db_conn.lock().expect("db");
+        db::get_all_verified_group_records_ordered(&conn, group_id)
+            .expect("query")
+            .into_iter()
+            .find(|rec| rec.lamport_counter() == counter)
+            .expect("record at counter")
+            .id()
+            .to_string()
+    }
+
+    /// A late arrival high in a long history rescans only affected
+    /// descendants, not the whole log: with ~200 verified records, a late
+    /// policy record at counter 199 must check exactly the records above it
+    /// (here: one) while still converging correctly.
+    #[test]
+    fn late_arrival_checks_only_affected_descendants() {
+        REVALIDATE_RUN_COUNT.with(|c| c.set(0));
+        REVALIDATE_CHECKED_COUNT.with(|c| c.set(0));
+        let app = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
+        let (founder, member_b, _member_c, group_id, log) = test_team();
+        for record in &log {
+            apply(&app, record).expect("team log applies");
+        }
+        // Long linear chain of founder invites, counters 6..=200.
+        let mut parent_id = log.last().expect("join_c").id().to_string();
+        for counter in 6u64..=200 {
+            let invite = child(
+                &founder,
+                &group_id,
+                &format!("chain-{counter}"),
+                counter,
+                vec![parent_id],
+                GroupRecordBody::MemberInvited {
+                    peer_id: format!("chain-invitee-{counter}"),
+                    role: "member".to_string(),
+                },
+            );
+            assert!(
+                apply(&app, &invite).expect("chain invite applies"),
+                "in-order invite {counter} must apply"
+            );
+            parent_id = invite.id().to_string();
+        }
+        assert_eq!(
+            REVALIDATE_RUN_COUNT.with(|c| c.get()),
+            0,
+            "frontier-extending records must skip the rescan"
+        );
+        // Late concurrent invite at counter 199 by B (who never used that
+        // counter): verifies, then the rescan must check only the records
+        // above it — exactly the chain tip at 200.
+        let late = child(
+            &member_b,
+            &group_id,
+            "late-199",
+            199,
+            vec![parent_at(&app, &group_id, 198)],
+            GroupRecordBody::MemberInvited {
+                peer_id: "late-invitee".to_string(),
+                role: "member".to_string(),
+            },
+        );
+        assert!(apply(&app, &late).expect("late invite applies"));
+        assert_eq!(
+            REVALIDATE_RUN_COUNT.with(|c| c.get()),
+            1,
+            "exactly one rescan for the late arrival"
+        );
+        let checked = REVALIDATE_CHECKED_COUNT.with(|c| c.get());
+        assert!(
+            checked <= 3,
+            "rescan must be scoped to affected descendants, checked {checked} of ~200 records"
+        );
+        // The chain tip omits the late invite and is demoted; the rest stands.
+        let conn = app.db_conn.lock().expect("db");
+        let verified = db::get_all_verified_group_records_ordered(&conn, &group_id)
+            .expect("query");
+        drop(conn);
+        assert_eq!(verified.len(), 200, "exactly the stale tip is demoted");
+        assert!(
+            !get_group_policy(&app, &group_id)
+                .expect("policy")
+                .invited_members
+                .contains("chain-invitee-200"),
+            "stale tip invitee must be gone"
+        );
+        assert!(
+            get_group_policy(&app, &group_id)
+                .expect("policy")
+                .invited_members
+                .contains("late-invitee"),
+            "late invite survives"
+        );
+    }
+
     /// Adversarial policy-heavy history: a long in-order stream of policy
     /// records must complete without any full-history revalidation run
     /// (each record extends the frontier, so nothing already verified can go
@@ -4974,5 +5426,286 @@ mod tests {
             .is_ok();
         drop(conn);
         assert!(!chat_exists, "dissolved group chat must not be resurrected");
+    }
+
+    /// Structural gates run before dependency resolution: malformed counters,
+    /// oversized parent lists, and oversized payloads are rejected even when
+    /// every parent is missing (previously such records were parked pending
+    /// without any validation).
+    #[test]
+    fn structural_limits_reject_before_pending_storage() {
+        let app = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
+        let (founder, _member_b, _member_c, group_id, log) = test_team();
+        for record in &log {
+            apply(&app, record).expect("team log applies");
+        }
+        let head_id = log.last().expect("join_c").id().to_string();
+        let missing = "missing-parent".to_string();
+
+        // Zero / MAX counters are rejected despite missing parents.
+        for (tag, counter, expect) in
+            [("zero", 0u64, "causal counter"), ("max", u64::MAX, "exhausted")]
+        {
+            let rec = child(
+                &founder,
+                &group_id,
+                tag,
+                counter,
+                vec![missing.clone()],
+                GroupRecordBody::Head { heads: vec![] },
+            );
+            let err = apply(&app, &rec).expect_err("bad counter must fail");
+            assert!(
+                err.to_string().contains(expect),
+                "wrong error for {tag}: {err}"
+            );
+        }
+        // Parent-count bound.
+        let many_parents: Vec<String> =
+            (0..65).map(|i| format!("missing-{i}")).collect();
+        let rec = child(
+            &founder,
+            &group_id,
+            "many-parents",
+            6,
+            many_parents,
+            GroupRecordBody::Head { heads: vec![] },
+        );
+        let err = apply(&app, &rec).expect_err("too many parents must fail");
+        assert!(err.to_string().contains("over the limit"), "wrong error: {err}");
+
+        // Payload-size bound (300KB text).
+        let big = "x".repeat(300 * 1024);
+        let rec = child(
+            &founder,
+            &group_id,
+            "big-payload",
+            6,
+            vec![head_id],
+            GroupRecordBody::Message {
+                content_type: GroupContentType::Text,
+                text_content: Some(big),
+                file_hash: None,
+                sender_alias: None,
+            },
+        );
+        let err = apply(&app, &rec).expect_err("oversized payload must fail");
+        assert!(err.to_string().contains("over the limit"), "wrong error: {err}");
+
+        // None of the rejected records left a pending row behind.
+        let conn = app.db_conn.lock().expect("db");
+        let pending =
+            db::pending_record_count(&conn, &group_id).expect("pending count");
+        drop(conn);
+        assert_eq!(pending, 0, "rejected records must not be stored");
+    }
+
+    /// Per-author pending quota: one signer — even with valid signatures —
+    /// cannot park more than the quota of missing-parent records.
+    #[test]
+    fn pending_quota_bounds_single_author_spam() {
+        let app = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
+        let (_founder, _member_b, _member_c, group_id, log) = test_team();
+        for record in &log {
+            apply(&app, record).expect("team log applies");
+        }
+        let spammer = keypair();
+        let mut stored = 0;
+        let mut rejected = 0;
+        for i in 0..140 {
+            let rec = child(
+                &spammer,
+                &group_id,
+                &format!("spam-{i}"),
+                1000 + i as u64,
+                vec![format!("missing-{i}")],
+                GroupRecordBody::Message {
+                    content_type: GroupContentType::Text,
+                    text_content: Some("spam".to_string()),
+                    file_hash: None,
+                    sender_alias: None,
+                },
+            );
+            match apply(&app, &rec) {
+                Ok(false) => stored += 1,
+                Err(err) => {
+                    assert!(
+                        err.to_string().contains("pending queue full"),
+                        "wrong rejection: {err}"
+                    );
+                    rejected += 1;
+                }
+                Ok(true) => panic!("spam record must not verify"),
+            }
+        }
+        assert_eq!(stored, 128, "per-author quota must bind at 128");
+        assert_eq!(rejected, 12, "overflow must be dropped, not stored");
+        let conn = app.db_conn.lock().expect("db");
+        assert_eq!(
+            db::pending_record_count(&conn, &group_id).expect("count"),
+            128
+        );
+        assert_eq!(
+            db::pending_author_count(
+                &conn,
+                &group_id,
+                &peer_id(&spammer)
+            )
+            .expect("count"),
+            128
+        );
+    }
+
+    /// Per-group pending quota: many distinct authors together cannot park
+    /// more than the group quota, even though no single author exceeds the
+    /// per-author quota.
+    #[test]
+    fn pending_quota_bounds_whole_group_spam() {
+        let app = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
+        let (_founder, _member_b, _member_c, group_id, log) = test_team();
+        for record in &log {
+            apply(&app, record).expect("team log applies");
+        }
+        let mut stored = 0;
+        let mut rejected = 0;
+        for author in 0..9 {
+            let spammer = keypair();
+            for i in 0..120 {
+                let rec = child(
+                    &spammer,
+                    &group_id,
+                    &format!("gspam-{author}-{i}"),
+                    1000 + (author * 120 + i) as u64,
+                    vec![format!("gmissing-{author}-{i}")],
+                    GroupRecordBody::Message {
+                        content_type: GroupContentType::Text,
+                        text_content: Some("spam".to_string()),
+                        file_hash: None,
+                        sender_alias: None,
+                    },
+                );
+                match apply(&app, &rec) {
+                    Ok(false) => stored += 1,
+                    Err(err) => {
+                        assert!(
+                            err.to_string().contains("pending queue full"),
+                            "wrong rejection: {err}"
+                        );
+                        rejected += 1;
+                    }
+                    Ok(true) => panic!("spam record must not verify"),
+                }
+            }
+        }
+        // 9 authors x 120 stay under the per-author quota of 128 each, so
+        // the group quota of 1024 binds first at exactly 1024 rows.
+        assert_eq!(stored, 1024, "group quota must bind at 1024");
+        assert_eq!(rejected, 9 * 120 - 1024, "overflow must be dropped");
+        let conn = app.db_conn.lock().expect("db");
+        assert_eq!(
+            db::pending_record_count(&conn, &group_id).expect("count"),
+            1024
+        );
+    }
+
+    /// Applying the same record twice stores exactly one row.
+    #[test]
+    fn duplicate_apply_stores_single_row() {
+        let app = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
+        let (founder, _member_b, _member_c, group_id, log) = test_team();
+        for record in &log {
+            apply(&app, record).expect("team log applies");
+        }
+        let head_id = log.last().expect("join_c").id().to_string();
+        let rec = child(
+            &founder,
+            &group_id,
+            "dup",
+            6,
+            vec![head_id],
+            GroupRecordBody::GroupRenamed {
+                name: "Twice".to_string(),
+            },
+        );
+        assert!(apply(&app, &rec).expect("first apply"));
+        assert!(!apply(&app, &rec).expect("second apply is a no-op"));
+        let conn = app.db_conn.lock().expect("db");
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM group_records WHERE id = ?1",
+                [rec.id()],
+                |row| row.get(0),
+            )
+            .expect("count");
+        drop(conn);
+        assert_eq!(rows, 1, "duplicate must not create a second row");
+    }
+
+    /// Interruption and resume across a dependency chain: records applied
+    /// child-first all wait as pending, then the missing root arrives and
+    /// the parent-indexed retry converges the whole chain without a full
+    /// table scan per step.
+    #[test]
+    fn interrupted_chain_resumes_through_parent_index() {
+        let app = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
+        let (founder, _member_b, _member_c, group_id, log) = test_team();
+        for record in &log {
+            apply(&app, record).expect("team log applies");
+        }
+        let head_id = log.last().expect("join_c").id().to_string();
+        // Build head <- A <- B <- C but apply C, B first (both wait), then A.
+        let a = child(
+            &founder,
+            &group_id,
+            "chain-a",
+            6,
+            vec![head_id],
+            GroupRecordBody::GroupRenamed {
+                name: "A".to_string(),
+            },
+        );
+        let b = child(
+            &founder,
+            &group_id,
+            "chain-b",
+            7,
+            vec![a.id().to_string()],
+            GroupRecordBody::GroupRenamed {
+                name: "B".to_string(),
+            },
+        );
+        let c = child(
+            &founder,
+            &group_id,
+            "chain-c",
+            8,
+            vec![b.id().to_string()],
+            GroupRecordBody::GroupRenamed {
+                name: "C".to_string(),
+            },
+        );
+        assert!(!apply(&app, &c).expect("C waits on B"));
+        assert!(!apply(&app, &b).expect("B waits on A"));
+        assert!(apply(&app, &a).expect("A applies and unblocks the chain"));
+        let policy = get_group_policy(&app, &group_id).expect("policy");
+        let conn = app.db_conn.lock().expect("db");
+        let name: String = conn
+            .query_row("SELECT name FROM chats WHERE id = ?1", [&group_id], |row| {
+                row.get(0)
+            })
+            .expect("chat name");
+        drop(conn);
+        assert_eq!(name, "C", "chain must converge through indexed retry");
+        let _ = policy;
     }
 }

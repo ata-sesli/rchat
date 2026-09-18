@@ -519,6 +519,30 @@ pub(crate) fn create_tables(conn: &Connection) -> anyhow::Result<()> {
          ON group_file_sources(group_id, file_hash)",
         [],
     )?;
+    // Edges from a pending record to the parents it waits on, so retries
+    // find dependents of a newly arrived parent without scanning the whole
+    // pending table. Rows are removed by foreign-key cascade when the
+    // record row is deleted; the dependents query only matches rows that
+    // are still pending, so edges of verified rows are harmless.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS group_pending_parents (
+             record_id TEXT NOT NULL,
+             parent_id TEXT NOT NULL,
+             PRIMARY KEY (record_id, parent_id),
+             FOREIGN KEY (record_id) REFERENCES group_records(id) ON DELETE CASCADE
+         )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_group_pending_parents_parent
+         ON group_pending_parents(parent_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_group_records_pending_lookup
+         ON group_records(group_id, pending, author_peer_id)",
+        [],
+    )?;
 
     // known_devices index removed - table no longer exists
 
@@ -962,6 +986,22 @@ pub fn create_chat(
     Ok(())
 }
 
+/// Ensure the chat row exists without touching an existing name. The
+/// canonical projection must never assume parent rows: a record applied
+/// after a dissolution (or replayed before its `GroupCreated` in a partial
+/// rebuild) still needs a valid `chat_peers` parent row.
+pub fn ensure_chat_exists(conn: &Connection, chat_id: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO chats (id, name, is_group, encryption_key) VALUES (?1, ?2, 1, ?3)",
+        (
+            chat_id,
+            crate::chat_kind::default_group_name(chat_id),
+            vec![0u8; 32],
+        ),
+    )?;
+    Ok(())
+}
+
 pub fn upsert_chat(
     conn: &Connection,
     chat_id: &str,
@@ -1245,6 +1285,67 @@ pub fn get_policy_record_ids_before_counter(
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Number of rows currently waiting on dependencies in a group.
+pub fn pending_record_count(conn: &Connection, group_id: &str) -> anyhow::Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM group_records WHERE group_id = ?1 AND pending = 1",
+        [group_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Number of rows currently waiting on dependencies from one author in a
+/// group. Bounds how much pending capacity any single signer — including a
+/// removed member with a valid signature — can occupy.
+pub fn pending_author_count(
+    conn: &Connection,
+    group_id: &str,
+    author_peer_id: &str,
+) -> anyhow::Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM group_records WHERE group_id = ?1 AND pending = 1 AND author_peer_id = ?2",
+        (group_id, author_peer_id),
+        |row| row.get(0),
+    )?)
+}
+
+/// Record a pending row's dependency edges so retries can find dependents
+/// of a newly arrived parent without scanning the whole pending table.
+pub fn insert_pending_record_edges(
+    conn: &Connection,
+    record_id: &str,
+    parents: &[String],
+) -> anyhow::Result<()> {
+    for parent_id in parents {
+        conn.execute(
+            "INSERT OR IGNORE INTO group_pending_parents (record_id, parent_id) VALUES (?1, ?2)",
+            (record_id, parent_id),
+        )?;
+    }
+    Ok(())
+}
+
+/// Pending records in a group that name `parent_id` as a dependency.
+/// Joins against the record rows so only still-pending dependents match;
+/// edges of verified rows are ignored rather than maintained.
+pub fn pending_dependents_of(
+    conn: &Connection,
+    group_id: &str,
+    parent_id: &str,
+) -> anyhow::Result<Vec<crate::network::gossip::SignedGroupRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.payload_json FROM group_pending_parents e
+         JOIN group_records r ON r.id = e.record_id
+         WHERE e.parent_id = ?1 AND r.group_id = ?2 AND r.pending = 1",
+    )?;
+    let rows = stmt.query_map((parent_id, group_id), |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(serde_json::from_str(&row?)?);
     }
     Ok(out)
 }

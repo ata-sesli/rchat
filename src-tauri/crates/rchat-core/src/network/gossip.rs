@@ -265,6 +265,26 @@ impl SignedGroupRecord {
     /// refused instead of permanently occupying the top of the order.
     pub const MAX_COUNTER_JUMP: u64 = 1_000_000;
 
+    /// Upper bound on parent references per record. Honest issuers name the
+    /// current heads (a handful even under concurrency); an unbounded list
+    /// would let one record force expensive closure walks.
+    pub const MAX_PARENTS: usize = 64;
+
+    /// Upper bound on serialized record bytes accepted for storage. Bounds
+    /// per-row parse and validation cost; legitimate records (including
+    /// large receipts) are far smaller.
+    pub const MAX_RECORD_BYTES: usize = 256 * 1024;
+
+    /// Upper bound on pending (dependency-waiting) rows per group. Bounds
+    /// the retry queue so injected missing-parent records cannot grow
+    /// storage or per-apply retry work without limit.
+    pub const MAX_PENDING_PER_GROUP: i64 = 1024;
+
+    /// Upper bound on pending rows per author within a group. Bounds how
+    /// much pending capacity any single signer — including a removed member
+    /// with an internally valid signature — can occupy.
+    pub const MAX_PENDING_PER_AUTHOR: i64 = 128;
+
     pub fn new(
         keypair: &identity::Keypair,
         group_id: String,
