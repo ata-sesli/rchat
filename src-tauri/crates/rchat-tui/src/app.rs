@@ -3377,7 +3377,7 @@ async fn refresh_chat_details_files(
                 details.chat_id.clone(),
                 details.file_filter.clone(),
                 if append {
-                    details.file_offset + details.recent_files.len() as i64
+                    details.recent_files.len() as i64
                 } else {
                     0
                 },
@@ -3389,16 +3389,16 @@ async fn refresh_chat_details_files(
         network_state,
         &chat_id,
         Some(&filter),
-        Some(8),
+        Some(9),
         Some(offset),
     )
     .await?;
     let has_more = rows.len() > 8;
     if let Some(details) = state.app.chat_details.as_mut() {
-        let files = rows.into_iter().map(Into::into).collect::<Vec<_>>();
+        let files = rows.into_iter().take(8).map(Into::into).collect::<Vec<_>>();
         if append {
             details.recent_files.extend(files);
-            details.file_offset = offset;
+            details.file_offset = details.recent_files.len() as i64;
         } else {
             details.recent_files = files;
             details.selected_file_index = 0;
