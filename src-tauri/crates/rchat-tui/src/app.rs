@@ -18,6 +18,7 @@ use crate::{
         NewGroupStep, NewItemChoice, NewPersonField, NewPersonStep, SettingsField, SettingsPane,
         SettingsSection, StickerPickerMode, StickerPickerState, TuiAppState, TuiChat,
         TuiChatDetails, TuiEnvelope, TuiGroupDetails, TuiMessage, TuiSticker, TuiThemePreset,
+        VoiceRecordingPhase,
     },
 };
 use anyhow::{anyhow, Context, Result};
@@ -67,6 +68,7 @@ use rchat_core::{
     },
     storage,
     storage::config::ConnectivityMode,
+    voice_recording::VoiceRecorder,
     AppState, NetworkState,
 };
 use rchat_screen_capture::{ScreenCaptureConfig, ScreenCaptureProfile, ScreenCaptureSession};
@@ -2238,6 +2240,12 @@ async fn run_interactive() -> Result<()> {
         for chat_id in mark_read_chat_ids {
             let _ = direct::mark_direct_messages_read(&app_state, &network_state, &chat_id).await;
         }
+        if let Some(recorder) = state.voice_recorder.as_ref() {
+            state
+                .app
+                .voice_recording
+                .update_capture(recorder.elapsed(), recorder.sample_count().saturating_mul(2));
+        }
 
         state.pending_frame_drops = pending_frames.dropped_frames();
         state.decoder_dropped_delta = decoder.dropped_delta_before_keyframe();
@@ -3610,17 +3618,114 @@ async fn send_attachment_from_path(
     kind: chat_media::MediaKind,
     path: &str,
 ) -> Result<()> {
+    let chat_id = active_chat_id(state)?;
+    send_attachment_from_path_for_chat(app_state, network_state, state, &chat_id, kind, path).await
+}
+
+async fn send_attachment_from_path_for_chat(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+    chat_id: &str,
+    kind: chat_media::MediaKind,
+    path: &str,
+) -> Result<()> {
     let path = path.trim();
     if path.is_empty() {
         return Err(anyhow!("attachment path is empty"));
     }
-    let chat_id = active_chat_id(state)?;
     let result =
-        chat_media::send_file_from_path(app_state, network_state, &chat_id, kind, path).await?;
+        chat_media::send_file_from_path(app_state, network_state, chat_id, kind, path).await?;
     refresh_direct_chats(app_state, network_state, state).await?;
-    open_chat_list_item(app_state, network_state, state, &chat_id).await?;
+    open_chat_list_item(app_state, network_state, state, chat_id).await?;
     state.app.selected_attachment_message_id = Some(result.msg_id);
     state.app.status = format!("sent {}", attachment_kind_label(kind));
+    Ok(())
+}
+
+fn start_voice_recording(state: &mut UiState) -> Result<()> {
+    let chat_id = active_chat_id(state)?;
+    let recorder = VoiceRecorder::start().map_err(|error| {
+        let message = error.to_string();
+        state.app.voice_recording.fail(message.clone());
+        anyhow!(message)
+    })?;
+    state
+        .app
+        .voice_recording
+        .start(chat_id.clone())
+        .map_err(|error| anyhow!(error))?;
+    state.voice_recorder = Some(recorder);
+    state.app.status = "recording voice note".to_string();
+    Ok(())
+}
+
+fn stop_voice_recording(state: &mut UiState) -> Result<()> {
+    let Some(recorder) = state.voice_recorder.take() else {
+        let message = "no native microphone recorder is active".to_string();
+        state.app.voice_recording.fail(message.clone());
+        return Err(anyhow!(message));
+    };
+    let elapsed = recorder.elapsed();
+    match recorder.stop() {
+        Ok(recording) => state
+            .app
+            .voice_recording
+            .stop(recording.path, elapsed, recording.size_bytes)
+            .map_err(|error| anyhow!(error))?,
+        Err(error) => {
+            state.app.voice_recording.fail(error.to_string());
+            return Err(error);
+        }
+    }
+    state.app.status = "voice note ready: p preview, s send, c cancel".to_string();
+    Ok(())
+}
+
+fn cancel_voice_recording(state: &mut UiState) {
+    drop(state.voice_recorder.take());
+    if let Some(path) = state.app.voice_recording.cancel() {
+        let _ = fs::remove_file(path);
+    }
+    state.app.status = "voice recording cancelled".to_string();
+}
+
+async fn preview_voice_recording(state: &mut UiState) -> Result<()> {
+    let Some(path) = state.app.voice_recording.review_path().cloned() else {
+        return Err(anyhow!("no voice note is ready to preview"));
+    };
+    launch_path(&path)?;
+    state.app.status = "voice note preview opened".to_string();
+    Ok(())
+}
+
+async fn send_voice_recording(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+) -> Result<()> {
+    let (Some(chat_id), Some(path)) = (
+        state.app.voice_recording.review_chat_id().map(str::to_owned),
+        state.app.voice_recording.review_path().cloned(),
+    ) else {
+        return Err(anyhow!("no voice note is ready to send"));
+    };
+    let result = chat_media::send_file_from_path(
+        app_state,
+        network_state,
+        &chat_id,
+        MediaKind::Audio,
+        path.to_string_lossy().as_ref(),
+    )
+    .await?;
+    // The media pipeline has imported and dispatched the file; the temporary
+    // WAV is no longer needed even if a subsequent UI refresh fails.
+    let _ = fs::remove_file(&path);
+    state.app.voice_recording.clear();
+    state.app.selected_attachment_message_id = Some(result.msg_id);
+    state.app.status = "voice note sent".to_string();
+    refresh_direct_chats(app_state, network_state, state).await?;
+    open_chat_list_item(app_state, network_state, state, &chat_id).await?;
     Ok(())
 }
 
@@ -6097,12 +6202,55 @@ async fn create_new_group(
     Ok(())
 }
 
+async fn handle_voice_recording_key(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+    code: KeyCode,
+) -> Result<()> {
+    match state.app.voice_recording.phase {
+        VoiceRecordingPhase::Recording => match code {
+            KeyCode::Enter | KeyCode::Char('r') => {
+                if let Err(error) = stop_voice_recording(state) {
+                    state.app.last_error = Some(error.to_string());
+                    state.app.status = format!("voice recording stop failed: {error}");
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('c') => cancel_voice_recording(state),
+            _ => {}
+        },
+        VoiceRecordingPhase::Review => match code {
+            KeyCode::Enter | KeyCode::Char('s') => {
+                if let Err(error) = send_voice_recording(app_state, network_state, state).await {
+                    state.app.last_error = Some(error.to_string());
+                    state.app.status = format!("voice note send failed: {error}");
+                }
+            }
+            KeyCode::Char('p') => {
+                if let Err(error) = preview_voice_recording(state).await {
+                    state.app.last_error = Some(error.to_string());
+                    state.app.status = format!("voice note preview failed: {error}");
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('c') => cancel_voice_recording(state),
+            _ => {}
+        },
+        VoiceRecordingPhase::Idle => {}
+    }
+    Ok(())
+}
+
 async fn handle_interactive_key(
     app_state: &AppState,
     network_state: &NetworkState,
     state: &mut UiState,
     code: KeyCode,
 ) -> Result<bool> {
+    if state.app.voice_recording.phase != VoiceRecordingPhase::Idle {
+        handle_voice_recording_key(app_state, network_state, state, code).await?;
+        return Ok(false);
+    }
+
     if state.app.media_viewer.is_some() {
         if let Err(error) = handle_media_viewer_key(app_state, network_state, state, code).await {
             if let Some(viewer) = state.app.media_viewer.as_mut() {
@@ -6370,6 +6518,26 @@ async fn activate_composer_action(
                 .ok_or_else(|| anyhow!("select a chat first"))?;
             open_chat_details(app_state, network_state, state, &chat_id).await
         }
+        ComposerAction::Record => match state.app.voice_recording.phase {
+            VoiceRecordingPhase::Idle => {
+                if let Err(error) = start_voice_recording(state) {
+                    state.app.last_error = Some(error.to_string());
+                    state.app.status = format!("voice recording failed: {error}");
+                }
+                Ok(())
+            }
+            VoiceRecordingPhase::Recording => {
+                if let Err(error) = stop_voice_recording(state) {
+                    state.app.last_error = Some(error.to_string());
+                    state.app.status = format!("voice recording stop failed: {error}");
+                }
+                Ok(())
+            }
+            VoiceRecordingPhase::Review => {
+                state.app.status = "voice note ready: p preview, s send, c cancel".to_string();
+                Ok(())
+            }
+        },
     }
 }
 
@@ -8607,6 +8775,7 @@ struct UiState {
     kitty_detection_forced: bool,
     event_sink: TuiEventSink,
     voice_call_state: VoiceCallState,
+    voice_recorder: Option<VoiceRecorder>,
     broadcast_state: BroadcastState,
     incoming_session_id: Option<String>,
     active_session_id: Option<String>,
@@ -8658,6 +8827,7 @@ impl UiState {
             kitty_detection_forced: false,
             event_sink,
             voice_call_state: VoiceCallState::default(),
+            voice_recorder: None,
             broadcast_state: BroadcastState::default(),
             incoming_session_id: None,
             active_session_id: None,
@@ -10673,7 +10843,14 @@ fn render_composer_actions(frame: &mut Frame<'_>, area: Rect, state: &UiState, t
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
     let focused = state.app.focus == FocusPane::Composer;
-    let title = if state.app.active_chat_id.is_some() {
+    let recording_status = state.app.voice_recording.status_label();
+    let title = if recording_status.is_some() {
+        match state.app.voice_recording.phase {
+            VoiceRecordingPhase::Recording => " Recording ",
+            VoiceRecordingPhase::Review => " Voice note ",
+            VoiceRecordingPhase::Idle => " Message ",
+        }
+    } else if state.app.active_chat_id.is_some() {
         " Message "
     } else {
         " Select a chat "
@@ -10683,7 +10860,10 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &T
     } else {
         Style::default().fg(theme.muted)
     };
-    let text = format!("> {}", state.app.composer);
+    let text = match recording_status {
+        Some(status) => format!("> {status}"),
+        None => format!("> {}", state.app.composer),
+    };
     let paragraph = Paragraph::new(text)
         .block(
             themed_block(title, theme)
@@ -10702,6 +10882,18 @@ fn render_help_line(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &
 }
 
 fn help_line_text(state: &UiState, width: usize) -> String {
+    if state.app.voice_recording.phase != VoiceRecordingPhase::Idle {
+        return match state.app.voice_recording.phase {
+            VoiceRecordingPhase::Recording => {
+                fit_segments(&["Recording", "Enter stop", "Esc cancel", "duration + size"], width)
+            }
+            VoiceRecordingPhase::Review => fit_segments(
+                &["Voice note", "p preview", "s send", "c cancel", "Esc cancel"],
+                width,
+            ),
+            VoiceRecordingPhase::Idle => String::new(),
+        };
+    }
     if state.app.new_group.is_some() && state.app.new_person.is_none() {
         return fit_segments(
             &["New Group", "Up/Down move", "Enter activate", "Esc back"],
