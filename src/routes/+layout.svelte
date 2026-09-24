@@ -17,6 +17,7 @@
   import {
     appSession,
     applyConnectivitySettings,
+    acceptGroupInvite,
     chatState,
     clearClosedChatMarker,
     connectedChatIds,
@@ -34,6 +35,7 @@
     redeemTemporaryInvite,
     refreshChats,
     refreshUserProfile,
+    retryGroupInviteSync,
     saveTemporaryChatToArchive,
     selectEnvelope,
     setConnectivityMode,
@@ -49,6 +51,7 @@
   import EnvelopeModal from "../components/sidebar/EnvelopeModal.svelte";
   import NewPersonModal from "../components/sidebar/NewPersonModal.svelte";
   import GroupChatModal from "../components/chat/GroupChatModal.svelte";
+  import GroupInviteCard from "../components/chat/GroupInviteCard.svelte";
   import ChatDetailsModal from "../components/chat/ChatDetailsModal.svelte";
   import Sidebar from "../components/sidebar/Sidebar.svelte";
   import ThemeProvider from "../components/ThemeProvider.svelte";
@@ -321,6 +324,16 @@
   function closeContextMenu() {
     showContextMenu = false;
     contextMenuTarget = null;
+  }
+
+  async function acceptGroupInviteCard(invite: Parameters<typeof acceptGroupInvite>[0]) {
+    const groupId = await acceptGroupInvite(invite);
+    await refreshChats();
+    goto(`/chat/${groupId}`);
+  }
+
+  async function retryGroupInviteCard(invite: Parameters<typeof retryGroupInviteSync>[0]) {
+    await retryGroupInviteSync(invite);
   }
 
   function handleGlobalClick() {
@@ -610,6 +623,17 @@
     />
 
     <section class="flex-1 flex flex-col relative h-full overflow-hidden">
+      {#if Object.keys($chatState.groupInvites).length > 0}
+        <div class="space-y-3 border-b border-theme-base-800 bg-theme-base-950/60 p-4">
+          {#each Object.values($chatState.groupInvites) as invite (invite.groupId)}
+            <GroupInviteCard
+              {invite}
+              onaccept={acceptGroupInviteCard}
+              onretry={retryGroupInviteCard}
+            />
+          {/each}
+        </div>
+      {/if}
       <section class="flex-1 flex flex-col relative h-full overflow-hidden">
         {#if showEnvelopeSettings}
           <div class="flex-1 flex flex-col bg-theme-base-950">
