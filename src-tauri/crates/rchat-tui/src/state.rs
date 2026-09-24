@@ -2487,13 +2487,16 @@ impl TuiAppState {
         details.focus = fields[next_index(current, delta, fields.len())];
     }
 
-    pub fn scroll_group_details(&mut self, delta: isize) {
+    pub fn scroll_group_details(&mut self, delta: isize, max_offset: usize) {
         if let Some(group) = self
             .chat_details
             .as_mut()
             .and_then(|details| details.group.as_mut())
         {
-            group.viewport_offset = group.viewport_offset.saturating_add_signed(delta);
+            group.viewport_offset = group
+                .viewport_offset
+                .saturating_add_signed(delta)
+                .min(max_offset);
         }
     }
 
