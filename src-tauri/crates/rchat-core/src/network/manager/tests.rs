@@ -1,7 +1,8 @@
 use super::{
     build_incoming_dm_db_message, build_incoming_group_db_message, classify_outgoing_error_source,
-    incoming_call_reject_decision, quic_addresses_for_peer, record_group_sync_request,
-    ringing_call_peer_liveness_reason, ActiveCall, ActiveCallPhase, GroupSyncProgress,
+    incoming_call_reject_decision, punch_target_matches_peer, quic_addresses_for_peer,
+    record_group_sync_request, ringing_call_peer_liveness_reason, ActiveCall, ActiveCallPhase,
+    GroupSyncProgress,
     OutgoingDialSource, PeerTransportRegistry, RecentDial, VoiceStreamEvent,
 };
 use crate::app_state::CallKind;
@@ -56,6 +57,20 @@ fn incoming_call_reject_accepts_stale_requested_id_for_current_incoming_voice_ca
 
     assert_eq!(decision.call.call_id, "call-current");
     assert!(!decision.requested_call_id_matched);
+}
+
+#[test]
+fn punch_targets_only_complete_for_the_matching_peer_id() {
+    let expected = libp2p::identity::Keypair::generate_ed25519()
+        .public()
+        .to_peer_id();
+    let other = libp2p::identity::Keypair::generate_ed25519()
+        .public()
+        .to_peer_id();
+
+    assert!(punch_target_matches_peer(Some(expected), expected));
+    assert!(!punch_target_matches_peer(Some(expected), other));
+    assert!(!punch_target_matches_peer(None, expected));
 }
 
 #[test]

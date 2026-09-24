@@ -65,7 +65,11 @@ impl NetworkManager {
                                     invitee, payload.invitee_address
                                 );
                                 if let Ok(addr) = payload.invitee_address.parse::<Multiaddr>() {
-                                    self.add_punch_target(&invitee, addr);
+                                    self.add_punch_target_for_peer(
+                                        &invitee,
+                                        addr,
+                                        payload.invitee_peer_id.parse().ok(),
+                                    );
                                 }
                                 self.pending_shadow_polls.remove(&invitee);
                             }
@@ -127,12 +131,22 @@ impl NetworkManager {
 
     /// Add or replace a target and restart its bounded retry window.
     pub(super) fn add_punch_target(&mut self, name: &str, addr: Multiaddr) {
+        self.add_punch_target_for_peer(name, addr, None);
+    }
+
+    pub(super) fn add_punch_target_for_peer(
+        &mut self,
+        name: &str,
+        addr: Multiaddr,
+        peer_id: Option<PeerId>,
+    ) {
         println!("[Punch] 🎯 Added target: {} -> {}", name, addr);
         let now = std::time::Instant::now();
         self.active_punch_targets.insert(
             name.to_string(),
             PunchTarget {
                 address: addr,
+                peer_id,
                 started_at: now,
                 next_attempt_at: now,
                 attempt: 0,

@@ -34,27 +34,13 @@ impl NetworkManager {
 
         let mut to_remove = Vec::new();
         for (name, target) in self.active_punch_targets.iter() {
-            let target_ip = target
-                .address
-                .to_string()
-                .split('/')
-                .nth(2)
-                .unwrap_or("")
-                .to_string();
-            let connected_ip = remote_addr
-                .to_string()
-                .split('/')
-                .nth(2)
-                .unwrap_or("")
-                .to_string();
-
-            if !target_ip.is_empty() && target_ip == connected_ip {
-                to_remove.push(name.clone());
+            if super::super::punch_target_matches_peer(target.peer_id, peer_id) {
+                to_remove.push((name.clone(), target.attempt));
             }
         }
 
-        for name in to_remove {
-            self.emit_connectivity_state(&name, "connected", "connected", 0);
+        for (name, attempt) in to_remove {
+            self.emit_connectivity_state(&name, "connected", "connected", attempt);
             self.remove_punch_target(&name);
         }
 

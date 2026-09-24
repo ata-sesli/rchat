@@ -54,6 +54,7 @@ fn record_group_sync_request(
 #[derive(Debug, Clone)]
 struct PunchTarget {
     address: Multiaddr,
+    peer_id: Option<PeerId>,
     started_at: std::time::Instant,
     next_attempt_at: std::time::Instant,
     attempt: u32,
@@ -61,6 +62,10 @@ struct PunchTarget {
 
 const MAX_PUNCH_ATTEMPTS: u32 = 8;
 const PUNCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn punch_target_matches_peer(expected: Option<PeerId>, connected: PeerId) -> bool {
+    expected == Some(connected)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveCallPhase {

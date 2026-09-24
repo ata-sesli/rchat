@@ -14,6 +14,7 @@ pub enum NetworkCommand {
     StartPunch {
         multiaddr: String,
         target_username: String,
+        target_peer_id: Option<String>,
         my_username: String,
     },
     RequestConnection {

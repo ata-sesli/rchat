@@ -11,8 +11,14 @@ impl NetworkManager {
             NetworkCommand::StartPunch {
                 multiaddr,
                 target_username,
+                target_peer_id,
                 my_username,
-            } => self.handle_start_punch_command(multiaddr, target_username, my_username),
+            } => self.handle_start_punch_command(
+                multiaddr,
+                target_username,
+                target_peer_id,
+                my_username,
+            ),
             NetworkCommand::RequestConnection { peer_id } => {
                 self.handle_connection_request(&peer_id).await;
             }

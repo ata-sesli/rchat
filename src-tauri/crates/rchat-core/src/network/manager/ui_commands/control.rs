@@ -5,6 +5,7 @@ impl NetworkManager {
         &mut self,
         multiaddr: String,
         target_username: String,
+        target_peer_id: Option<String>,
         my_username: String,
     ) {
         println!(
@@ -15,7 +16,11 @@ impl NetworkManager {
         if let Ok(addr) = multiaddr.parse::<Multiaddr>() {
             self.pending_github_mappings
                 .insert(multiaddr, (target_username.clone(), my_username));
-            self.add_punch_target(&target_username, addr);
+            self.add_punch_target_for_peer(
+                &target_username,
+                addr,
+                target_peer_id.as_deref().and_then(|id| id.parse().ok()),
+            );
         }
     }
 
@@ -33,7 +38,7 @@ impl NetworkManager {
         }
 
         if let Ok(addr) = multiaddr.parse::<Multiaddr>() {
-            self.add_punch_target(chat_id, addr);
+            self.add_punch_target_for_peer(chat_id, addr, peer_id.parse().ok());
         } else {
             eprintln!(
                 "[Temp] Invalid multiaddr for temporary session {}: {}",
