@@ -4,7 +4,7 @@ use rchat_core::{
     chat_kind::{self, ChatKind},
     events::LocalPeerEvent,
     settings::camera::CaptureDeviceInfo,
-    storage::config::{ConnectivityMode, ConnectivitySettings},
+    storage::config::{ConnectivityMode, ConnectivitySettings, ThemeConfig},
     storage::db::{ChatFileRow, Message},
 };
 use std::{
@@ -574,6 +574,13 @@ pub enum SettingsField {
     ThemeSecondary,
     ThemeText,
     ThemeCreateCustom,
+    ThemeDescription,
+    ThemeEdit(usize),
+    ThemeDelete(usize),
+    ThemeSave,
+    ThemeCancel,
+    ThemeDeleteConfirm,
+    ThemeDeleteCancel,
     Sticker(usize),
     StickerPath,
     StickerImport,
@@ -597,7 +604,9 @@ pub enum SettingsPane {
 pub struct TuiThemePreset {
     pub key: String,
     pub name: String,
+    pub description: String,
     pub source: String,
+    pub theme: Option<ThemeConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -626,9 +635,12 @@ pub struct SettingsModalState {
     pub theme_presets: Vec<TuiThemePreset>,
     pub selected_preset: Option<String>,
     pub theme_custom_name: String,
+    pub theme_description: String,
     pub theme_primary: String,
     pub theme_secondary: String,
     pub theme_text: String,
+    pub theme_edit_key: Option<String>,
+    pub theme_delete_key: Option<String>,
     pub stickers: Vec<TuiSticker>,
     pub selected_sticker_hash: Option<String>,
     pub sticker_path: String,
@@ -668,9 +680,12 @@ impl Default for SettingsModalState {
             theme_presets: Vec::new(),
             selected_preset: None,
             theme_custom_name: String::new(),
+            theme_description: String::new(),
             theme_primary: "#14b8a6".to_string(),
             theme_secondary: "#a855f7".to_string(),
             theme_text: "#e2e8f0".to_string(),
+            theme_edit_key: None,
+            theme_delete_key: None,
             stickers: Vec::new(),
             selected_sticker_hash: None,
             sticker_path: String::new(),
@@ -741,19 +756,30 @@ impl SettingsModalState {
                 SettingsField::ConnectivitySave,
             ]),
             SettingsSection::Theme => {
-                fields.extend(
-                    (0..self.theme_presets.len())
-                        .take(8)
-                        .map(SettingsField::ThemePreset),
-                );
+                fields.extend((0..self.theme_presets.len()).map(SettingsField::ThemePreset));
                 fields.extend([
                     SettingsField::ThemeApply,
                     SettingsField::ThemeName,
+                    SettingsField::ThemeDescription,
                     SettingsField::ThemePrimary,
                     SettingsField::ThemeSecondary,
                     SettingsField::ThemeText,
                     SettingsField::ThemeCreateCustom,
                 ]);
+                for (index, preset) in self.theme_presets.iter().enumerate() {
+                    if preset.key.starts_with("custom:") {
+                        fields.push(SettingsField::ThemeEdit(index));
+                        fields.push(SettingsField::ThemeDelete(index));
+                    }
+                }
+                if self.theme_edit_key.is_some() {
+                    fields.push(SettingsField::ThemeSave);
+                    fields.push(SettingsField::ThemeCancel);
+                }
+                if self.theme_delete_key.is_some() {
+                    fields.push(SettingsField::ThemeDeleteConfirm);
+                    fields.push(SettingsField::ThemeDeleteCancel);
+                }
             }
             SettingsSection::Stickers => {
                 fields.extend((0..self.stickers.len()).take(8).map(SettingsField::Sticker));
@@ -920,6 +946,7 @@ impl SettingsModalState {
             SettingsField::ProfileAlias => self.profile_alias.push(ch),
             SettingsField::ProfileAvatar => self.profile_avatar_path.push(ch),
             SettingsField::ThemeName => self.theme_custom_name.push(ch),
+            SettingsField::ThemeDescription => self.theme_description.push(ch),
             SettingsField::ThemePrimary => self.theme_primary.push(ch),
             SettingsField::ThemeSecondary => self.theme_secondary.push(ch),
             SettingsField::ThemeText => self.theme_text.push(ch),
@@ -940,6 +967,9 @@ impl SettingsModalState {
             }
             SettingsField::ThemeName => {
                 self.theme_custom_name.pop();
+            }
+            SettingsField::ThemeDescription => {
+                self.theme_description.pop();
             }
             SettingsField::ThemePrimary => {
                 self.theme_primary.pop();
@@ -3208,6 +3238,25 @@ mod tests {
 
         modal.connectivity = ConnectivitySettings::from_mode(ConnectivityMode::Invisible);
         assert_eq!(modal.connectivity.mode, ConnectivityMode::Invisible);
+    }
+
+    #[test]
+    fn settings_theme_exposes_custom_edit_and_delete_actions() {
+        let mut modal = SettingsModalState::default();
+        modal.theme_presets.push(TuiThemePreset {
+            key: "custom:test".to_string(),
+            name: "Test".to_string(),
+            description: "desc".to_string(),
+            source: "custom".to_string(),
+            theme: Some(ThemeConfig::default()),
+        });
+        modal.activate_section(SettingsSection::Theme);
+        assert!(modal.content_fields().contains(&SettingsField::ThemeEdit(0)));
+        assert!(modal.content_fields().contains(&SettingsField::ThemeDelete(0)));
+        modal.theme_edit_key = Some("custom:test".to_string());
+        assert!(modal.content_fields().contains(&SettingsField::ThemeSave));
+        modal.theme_delete_key = Some("custom:test".to_string());
+        assert!(modal.content_fields().contains(&SettingsField::ThemeDeleteConfirm));
     }
 
     #[test]

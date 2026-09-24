@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 // Theme Color Structures
 // ============================================================================
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct BaseColors {
     #[serde(rename = "950")]
     pub c950: String,
@@ -29,7 +29,7 @@ pub struct BaseColors {
     pub c100: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct AccentColors {
     #[serde(rename = "600")]
     pub c600: String,
@@ -41,7 +41,7 @@ pub struct AccentColors {
     pub c300: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ThemeConfig {
     pub base: BaseColors,
     pub primary: AccentColors,
