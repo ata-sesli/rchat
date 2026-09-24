@@ -10697,6 +10697,7 @@ fn chat_details_button_line(
 const CHAT_DETAILS_WIDTH: u16 = 76;
 const CHAT_DETAILS_HEIGHT: u16 = 24;
 const CHAT_DETAILS_FILE_VIEW_ROWS: usize = 4;
+const CHAT_DETAILS_TEXT_WIDTH: usize = 72;
 
 fn direct_chat_file_start(details: &TuiChatDetails) -> usize {
     13 + if details.pending_delete { 2 } else { 0 }
@@ -10889,7 +10890,7 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
                 .filter(|size| *size >= 0)
                 .map(|size| format_bytes(size as u64))
                 .unwrap_or_else(|| "unknown size".to_string());
-            lines.push(Line::from(format!(
+            let row = format!(
                 "{} {}  {}  {}  {}  sender {}",
                 if index == details.selected_file_index { ">" } else { " " },
                 file.content_type,
@@ -10897,7 +10898,8 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
                 size,
                 short_hash(&file.file_hash),
                 short_identifier(&file.sender, 20),
-            )));
+            );
+            lines.push(Line::from(truncate_chars(&row, CHAT_DETAILS_TEXT_WIDTH)));
         }
     }
     lines.push(chat_details_button_line(
