@@ -3174,6 +3174,29 @@ async fn open_group_chat(
     Ok(())
 }
 
+async fn load_chat_file_page(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    chat_id: &str,
+    filter: &str,
+    offset: i64,
+) -> Result<(Vec<crate::state::TuiChatFileSummary>, bool)> {
+    let rows = details::files_for_chat(
+        app_state,
+        network_state,
+        chat_id,
+        Some(filter),
+        Some(9),
+        Some(offset),
+    )
+    .await?;
+    let has_more = rows.len() > 8;
+    Ok((
+        rows.into_iter().take(8).map(Into::into).collect(),
+        has_more,
+    ))
+}
+
 async fn open_chat_details(
     app_state: &AppState,
     network_state: &NetworkState,
@@ -3211,6 +3234,14 @@ async fn open_chat_details(
             .find(|chat| chat.id == chat_id)
             .map(|chat| chat.name.clone())
             .unwrap_or_else(|| chat_id.clone());
+        let (recent_files, file_has_more) = load_chat_file_page(
+            app_state,
+            network_state,
+            &chat_id,
+            "all",
+            0,
+        )
+        .await?;
         state.app.chat_details = Some(TuiChatDetails {
             chat_id: chat_id.clone(),
             peer_id: policy.admin_peer_id.clone(),
@@ -3227,7 +3258,13 @@ async fn open_chat_details(
             pending_delete: false,
             status: None,
             error: None,
-            recent_files: Vec::new(),
+            recent_files,
+            selected_file_index: 0,
+            file_filter: "all".to_string(),
+            file_offset: 0,
+            file_has_more,
+            file_status: None,
+            file_error: None,
             group: Some(TuiGroupDetails {
                 image_hash,
                 is_admin,
@@ -3241,12 +3278,60 @@ async fn open_chat_details(
         state.app.status = "group details".to_string();
         return Ok(());
     }
+    if !matches!(chat_kind::parse_chat_kind(&chat_id), chat_kind::ChatKind::Direct) {
+        let name = state
+            .app
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map(|chat| chat.name.clone())
+            .unwrap_or_else(|| chat_id.clone());
+        let (recent_files, file_has_more) = load_chat_file_page(
+            app_state,
+            network_state,
+            &chat_id,
+            "all",
+            0,
+        )
+        .await?;
+        state.app.chat_details = Some(TuiChatDetails {
+            chat_id: chat_id.clone(),
+            peer_id: chat_id.clone(),
+            peer_name: name,
+            peer_alias: None,
+            avatar_url: None,
+            connected: false,
+            remote_addr: None,
+            reconnect_count: 0,
+            sent_total: 0,
+            received_total: 0,
+            pinned: state.app.pinned_chat_keys.contains(&chat_id),
+            focus: ChatDetailsField::FileFilter,
+            pending_delete: false,
+            status: Some("archived/temporary chat: file browser only".to_string()),
+            error: None,
+            recent_files,
+            selected_file_index: 0,
+            file_filter: "all".to_string(),
+            file_offset: 0,
+            file_has_more,
+            file_status: None,
+            file_error: None,
+            group: None,
+        });
+        state.app.status = "chat details".to_string();
+        return Ok(());
+    }
     let overview = details::overview(app_state, network_state, &chat_id).await?;
     let stats = details::stats(app_state, &chat_id)?;
-    let recent_files = details::files(app_state, &chat_id, Some("all"), Some(8), Some(0))?
-        .into_iter()
-        .map(Into::into)
-        .collect();
+    let (recent_files, file_has_more) = load_chat_file_page(
+        app_state,
+        network_state,
+        &chat_id,
+        "all",
+        0,
+    )
+    .await?;
 
     state.app.chat_details = Some(TuiChatDetails {
         chat_id: overview.chat_id.clone(),
@@ -3265,9 +3350,64 @@ async fn open_chat_details(
         status: None,
         error: None,
         recent_files,
+        selected_file_index: 0,
+        file_filter: "all".to_string(),
+        file_offset: 0,
+        file_has_more,
+        file_status: None,
+        file_error: None,
         group: None,
     });
     state.app.status = "chat details".to_string();
+    Ok(())
+}
+
+async fn refresh_chat_details_files(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+    append: bool,
+) -> Result<()> {
+    let (chat_id, filter, offset) = state
+        .app
+        .chat_details
+        .as_ref()
+        .map(|details| {
+            (
+                details.chat_id.clone(),
+                details.file_filter.clone(),
+                if append {
+                    details.file_offset + details.recent_files.len() as i64
+                } else {
+                    0
+                },
+            )
+        })
+        .ok_or_else(|| anyhow!("chat details are not open"))?;
+    let rows = details::files_for_chat(
+        app_state,
+        network_state,
+        &chat_id,
+        Some(&filter),
+        Some(8),
+        Some(offset),
+    )
+    .await?;
+    let has_more = rows.len() > 8;
+    if let Some(details) = state.app.chat_details.as_mut() {
+        let files = rows.into_iter().map(Into::into).collect::<Vec<_>>();
+        if append {
+            details.recent_files.extend(files);
+            details.file_offset = offset;
+        } else {
+            details.recent_files = files;
+            details.selected_file_index = 0;
+            details.file_offset = 0;
+        }
+        details.file_has_more = has_more;
+        details.file_status = Some(format!("{} files loaded", details.recent_files.len()));
+        details.file_error = None;
+    }
     Ok(())
 }
 
@@ -3329,6 +3469,46 @@ async fn activate_chat_details_focus(
         ChatDetailsField::Drop => {
             details::drop_connection(network_state, &chat_id).await?;
             state.app.chat_details_status("connection drop requested");
+        }
+        ChatDetailsField::FileFilter => {
+            if let Some(details) = state.app.chat_details.as_mut() {
+                let filters = ["all", "image", "video", "audio", "document"];
+                let index = filters.iter().position(|filter| *filter == details.file_filter).unwrap_or(0);
+                details.file_filter = filters[(index + 1) % filters.len()].to_string();
+            }
+            refresh_chat_details_files(app_state, network_state, state, false).await?;
+        }
+        ChatDetailsField::FileNext => {
+            if state
+                .app
+                .chat_details
+                .as_ref()
+                .is_some_and(|details| details.file_has_more)
+            {
+                refresh_chat_details_files(app_state, network_state, state, true).await?;
+            }
+        }
+        ChatDetailsField::FileOpen => {
+            let file_hash = state
+                .app
+                .selected_file()
+                .map(|file| file.file_hash.clone())
+                .ok_or_else(|| anyhow!("no file selected"))?;
+            open_attachment_external(app_state, &file_hash)?;
+            state.app.chat_details_status("file opened externally");
+        }
+        ChatDetailsField::FileSave => {
+            let file = state
+                .app
+                .selected_file()
+                .cloned()
+                .ok_or_else(|| anyhow!("no file selected"))?;
+            let path = FileDialog::new()
+                .set_file_name(&file.display_name)
+                .save_file()
+                .ok_or_else(|| anyhow!("save cancelled"))?;
+            save_attachment_to_path(app_state, &file.file_hash, &path.to_string_lossy())?;
+            state.app.chat_details_status("file saved");
         }
         ChatDetailsField::Delete => {
             if let Some(details) = state.app.chat_details.as_mut() {
@@ -6173,6 +6353,21 @@ async fn handle_chat_details_mouse(
         return Ok(());
     };
     let area = Rect { x: 0, y: 0, width: size.width, height: size.height };
+    let popup = centered_rect(76, 20, area);
+    if state.app.chat_details.as_ref().is_some_and(|details| {
+        details.group.is_none()
+            && rect_contains(popup, mouse.column, mouse.row)
+            && {
+                let line = mouse.row.saturating_sub(popup.y.saturating_add(2)) as usize;
+                (14..14 + details.recent_files.len()).contains(&line)
+            }
+    }) {
+        let line = mouse.row.saturating_sub(popup.y.saturating_add(2)) as usize - 14;
+        if let Some(details) = state.app.chat_details.as_mut() {
+            details.selected_file_index = line;
+        }
+        return Ok(());
+    }
     let Some(field) = chat_details_click_target(area, mouse.column, mouse.row, state) else {
         return Ok(());
     };
@@ -6206,7 +6401,17 @@ fn chat_details_click_target(
         11 => Some(ChatDetailsField::Delete),
         12 if details.pending_delete => Some(ChatDetailsField::ConfirmDelete),
         13 if details.pending_delete => Some(ChatDetailsField::CancelDelete),
-        _ => None,
+        _ => {
+            let file_rows = details.recent_files.len().max(1);
+            let action_line = 14 + file_rows;
+            match line {
+                value if value == action_line => Some(ChatDetailsField::FileFilter),
+                value if value == action_line + 1 => Some(ChatDetailsField::FileNext),
+                value if value == action_line + 2 => Some(ChatDetailsField::FileOpen),
+                value if value == action_line + 3 => Some(ChatDetailsField::FileSave),
+                _ => None,
+            }
+        }
     }
 }
 
@@ -10648,21 +10853,37 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
             Style::default().fg(theme.muted),
         )));
     } else {
-        for file in &details.recent_files {
+        for (index, file) in details.recent_files.iter().enumerate() {
             let size = file
                 .size_bytes
                 .filter(|size| *size >= 0)
                 .map(|size| format_bytes(size as u64))
                 .unwrap_or_else(|| "unknown size".to_string());
             lines.push(Line::from(format!(
-                "{}  {}  {}  {}",
+                "{} {}  {}  {}  {}  sender {}",
+                if index == details.selected_file_index { ">" } else { " " },
                 file.content_type,
                 short_identifier(&file.display_name, 26),
                 size,
-                short_hash(&file.file_hash)
+                short_hash(&file.file_hash),
+                short_identifier(&file.sender, 20),
             )));
         }
     }
+    lines.push(chat_details_button_line(
+        details,
+        ChatDetailsField::FileFilter,
+        &format!("Filter: {}", details.file_filter),
+        theme,
+    ));
+    lines.push(chat_details_button_line(
+        details,
+        ChatDetailsField::FileNext,
+        if details.file_has_more { "Load more files" } else { "No more files" },
+        theme,
+    ));
+    lines.push(chat_details_button_line(details, ChatDetailsField::FileOpen, "Open selected file", theme));
+    lines.push(chat_details_button_line(details, ChatDetailsField::FileSave, "Save selected file", theme));
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(

@@ -184,6 +184,61 @@ pub fn files(
     )
 }
 
+pub async fn files_for_chat(
+    app_state: &AppState,
+    net_state: &NetworkState,
+    chat_id: &str,
+    filter: Option<&str>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Vec<ChatFileRow>> {
+    let limit = limit.unwrap_or(50).clamp(1, 200);
+    let offset = offset.unwrap_or(0).max(0);
+    let filter = filter.unwrap_or("all");
+    if chat_kind::is_temporary_chat_id(chat_id) {
+        let temporary = net_state.temporary_state.lock().await;
+        let Some(messages) = temporary.messages.get(chat_id) else {
+            return Ok(Vec::new());
+        };
+        let mut files = messages
+            .iter()
+            .filter_map(|message| {
+                let file_hash = message.file_hash.clone()?;
+                if !matches_file_filter(filter, &message.content_type) {
+                    return None;
+                }
+                Some(ChatFileRow {
+                    message_id: message.id.clone(),
+                    timestamp: message.timestamp,
+                    content_type: message.content_type.clone(),
+                    file_hash,
+                    file_name: None,
+                    size_bytes: None,
+                    mime_type: None,
+                    sender: message.peer_id.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        return Ok(files
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect());
+    }
+    let conn = app_state
+        .db_conn
+        .lock()
+        .map_err(|error| anyhow!("database lock failed: {error}"))?;
+    db::list_chat_files(&conn, chat_id, filter, limit, offset)
+}
+
+fn matches_file_filter(filter: &str, content_type: &str) -> bool {
+    matches!(filter, "all")
+        || (filter == "image" && matches!(content_type, "image" | "photo"))
+        || filter == content_type
+}
+
 pub async fn drop_connection(net_state: &NetworkState, chat_id: &str) -> Result<()> {
     let peer_id = resolve_dm_peer_id(chat_id)?;
     let sender = net_state.sender.lock().await;

@@ -49,9 +49,12 @@ pub struct TuiMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiChatFileSummary {
     pub message_id: String,
+    pub timestamp: i64,
     pub content_type: String,
     pub display_name: String,
     pub size_bytes: Option<i64>,
+    pub mime_type: Option<String>,
+    pub sender: String,
     pub file_hash: String,
 }
 
@@ -61,16 +64,24 @@ pub enum ChatDetailsField {
     Reconnect,
     Drop,
     Delete,
+    FileFilter,
+    FileNext,
+    FileOpen,
+    FileSave,
     ConfirmDelete,
     CancelDelete,
 }
 
 impl ChatDetailsField {
-    pub const ALL: [ChatDetailsField; 4] = [
+    pub const ALL: [ChatDetailsField; 8] = [
         ChatDetailsField::Pin,
         ChatDetailsField::Reconnect,
         ChatDetailsField::Drop,
         ChatDetailsField::Delete,
+        ChatDetailsField::FileFilter,
+        ChatDetailsField::FileNext,
+        ChatDetailsField::FileOpen,
+        ChatDetailsField::FileSave,
     ];
 }
 
@@ -92,6 +103,12 @@ pub struct TuiChatDetails {
     pub status: Option<String>,
     pub error: Option<String>,
     pub recent_files: Vec<TuiChatFileSummary>,
+    pub selected_file_index: usize,
+    pub file_filter: String,
+    pub file_offset: i64,
+    pub file_has_more: bool,
+    pub file_status: Option<String>,
+    pub file_error: Option<String>,
     pub group: Option<TuiGroupDetails>,
 }
 
@@ -1904,6 +1921,26 @@ impl TuiAppState {
         }
     }
 
+    pub fn move_file_selection(&mut self, delta: isize) {
+        if let Some(details) = self.chat_details.as_mut() {
+            if details.recent_files.is_empty() {
+                details.selected_file_index = 0;
+            } else {
+                details.selected_file_index = next_index(
+                    details.selected_file_index,
+                    delta,
+                    details.recent_files.len(),
+                );
+            }
+        }
+    }
+
+    pub fn selected_file(&self) -> Option<&TuiChatFileSummary> {
+        self.chat_details
+            .as_ref()
+            .and_then(|details| details.recent_files.get(details.selected_file_index))
+    }
+
     pub fn chat_details_error(&mut self, message: impl Into<String>) {
         if let Some(details) = self.chat_details.as_mut() {
             details.error = Some(message.into());
@@ -2309,12 +2346,15 @@ impl From<ChatFileRow> for TuiChatFileSummary {
     fn from(row: ChatFileRow) -> Self {
         Self {
             message_id: row.message_id,
+            timestamp: row.timestamp,
             content_type: row.content_type,
             display_name: row
                 .file_name
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| "attachment".to_string()),
             size_bytes: row.size_bytes,
+            mime_type: row.mime_type,
+            sender: row.sender,
             file_hash: row.file_hash,
         }
     }
@@ -2531,6 +2571,12 @@ mod tests {
             status: None,
             error: None,
             recent_files: Vec::new(),
+            selected_file_index: 0,
+            file_filter: "all".to_string(),
+            file_offset: 0,
+            file_has_more: false,
+            file_status: None,
+            file_error: None,
             group: None,
         });
 
@@ -2560,6 +2606,12 @@ mod tests {
             status: None,
             error: None,
             recent_files: Vec::new(),
+            selected_file_index: 0,
+            file_filter: "all".to_string(),
+            file_offset: 0,
+            file_has_more: false,
+            file_status: None,
+            file_error: None,
             group: None,
         });
         state.move_chat_details_focus(1);
