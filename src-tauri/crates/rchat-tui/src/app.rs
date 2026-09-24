@@ -5391,15 +5391,52 @@ async fn activate_settings_focus(
                 modal.error = None;
             }
         }
+        SettingsField::ConnectivityMdns
+        | SettingsField::ConnectivityGithub
+        | SettingsField::ConnectivityNat
+        | SettingsField::ConnectivityPunch => {
+            if let Some(modal) = state.app.settings.as_mut() {
+                let (label, enabled) = match focus {
+                    SettingsField::ConnectivityMdns => {
+                        modal.connectivity.mdns_enabled = !modal.connectivity.mdns_enabled;
+                        ("mDNS", modal.connectivity.mdns_enabled)
+                    }
+                    SettingsField::ConnectivityGithub => {
+                        modal.connectivity.github_sync_enabled = !modal.connectivity.github_sync_enabled;
+                        ("GitHub sync", modal.connectivity.github_sync_enabled)
+                    }
+                    SettingsField::ConnectivityNat => {
+                        modal.connectivity.nat_keepalive_enabled = !modal.connectivity.nat_keepalive_enabled;
+                        ("NAT keepalive", modal.connectivity.nat_keepalive_enabled)
+                    }
+                    SettingsField::ConnectivityPunch => {
+                        modal.connectivity.punch_assist_enabled = !modal.connectivity.punch_assist_enabled;
+                        ("punch assist", modal.connectivity.punch_assist_enabled)
+                    }
+                    _ => unreachable!(),
+                };
+                modal.status = Some(format!("{label} {}", if enabled { "enabled" } else { "disabled" }));
+                modal.error = None;
+            }
+        }
         SettingsField::ConnectivitySave => {
-            let mode = state
+            let settings = state
                 .app
                 .settings
                 .as_ref()
-                .map(|modal| modal.connectivity.mode)
-                .unwrap_or(ConnectivityMode::Reachable);
-            settings_connectivity::set_connectivity_mode(app_state, Some(network_state), mode)
-                .await?;
+                .map(|modal| modal.connectivity.clone())
+                .unwrap_or_default();
+            settings_connectivity::update_connectivity_settings(
+                app_state,
+                Some(network_state),
+                settings_connectivity::ConnectivitySettingsPatch {
+                    mdns_enabled: Some(settings.mdns_enabled),
+                    github_sync_enabled: Some(settings.github_sync_enabled),
+                    nat_keepalive_enabled: Some(settings.nat_keepalive_enabled),
+                    punch_assist_enabled: Some(settings.punch_assist_enabled),
+                },
+            )
+            .await?;
             refresh_settings_modal(app_state, state).await?;
             set_settings_status(state, "connectivity saved");
         }
@@ -6584,6 +6621,16 @@ async fn handle_settings_mouse(
     let Some(section) = state.app.settings.as_ref().map(|modal| modal.section) else {
         return Ok(());
     };
+    if section == SettingsSection::Connectivity {
+        let area = Rect { x: 0, y: 0, width: size.width, height: size.height };
+        let Some(field) = settings_connectivity_click_target(area, mouse.column, mouse.row) else {
+            return Ok(());
+        };
+        if let Some(modal) = state.app.settings.as_mut() {
+            modal.focus = field;
+        }
+        return activate_settings_focus(app_state, network_state, state).await;
+    }
     if section == SettingsSection::Peers {
         let area = Rect {
             x: 0,
@@ -6615,6 +6662,29 @@ async fn handle_settings_mouse(
         modal.focus = field;
     }
     activate_settings_focus(app_state, network_state, state).await
+}
+
+fn settings_connectivity_click_target(area: Rect, column: u16, row: u16) -> Option<SettingsField> {
+    let popup = centered_rect(92, 30, area);
+    let inner = inset_rect(popup, 2);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(22), Constraint::Min(20)])
+        .split(inner);
+    if !rect_contains(columns[1], column, row) {
+        return None;
+    }
+    match row.saturating_sub(columns[1].y.saturating_add(1)) as usize {
+        1 => Some(SettingsField::ConnectivityMode(ConnectivityMode::Invisible)),
+        2 => Some(SettingsField::ConnectivityMode(ConnectivityMode::Lan)),
+        3 => Some(SettingsField::ConnectivityMode(ConnectivityMode::Reachable)),
+        4 => Some(SettingsField::ConnectivityMdns),
+        5 => Some(SettingsField::ConnectivityGithub),
+        6 => Some(SettingsField::ConnectivityNat),
+        7 => Some(SettingsField::ConnectivityPunch),
+        8 => Some(SettingsField::ConnectivitySave),
+        _ => None,
+    }
 }
 
 fn settings_peer_click_target(
@@ -12300,13 +12370,31 @@ fn settings_connectivity_lines(
             ),
             theme,
         ),
-        Line::from(format!(
-            "mDNS={} GitHub={} NAT={} punch={}",
-            modal.connectivity.mdns_enabled,
-            modal.connectivity.github_sync_enabled,
-            modal.connectivity.nat_keepalive_enabled,
-            modal.connectivity.punch_assist_enabled
-        )),
+        settings_button_line(
+            modal,
+            SettingsField::ConnectivityMdns,
+            &format!("{} mDNS (scan + advertise)", checkbox(modal.connectivity.mdns_enabled)),
+            theme,
+        ),
+        settings_button_line(
+            modal,
+            SettingsField::ConnectivityGithub,
+            &format!("{} GitHub sync (discover + publish)", checkbox(modal.connectivity.github_sync_enabled)),
+            theme,
+        ),
+        settings_button_line(
+            modal,
+            SettingsField::ConnectivityNat,
+            &format!("{} NAT keepalive", checkbox(modal.connectivity.nat_keepalive_enabled)),
+            theme,
+        ),
+        settings_button_line(
+            modal,
+            SettingsField::ConnectivityPunch,
+            &format!("{} Punch assist", checkbox(modal.connectivity.punch_assist_enabled)),
+            theme,
+        ),
+        Line::from(format!("Active mode: {}", connectivity_mode_label(modal.connectivity.mode))),
         settings_button_line(
             modal,
             SettingsField::ConnectivitySave,
@@ -12631,6 +12719,10 @@ fn settings_button_line(
             Style::default().fg(theme.text)
         },
     ))
+}
+
+fn checkbox(selected: bool) -> &'static str {
+    selected_marker(selected)
 }
 
 fn selected_marker(selected: bool) -> &'static str {
