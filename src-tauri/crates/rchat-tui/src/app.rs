@@ -5115,9 +5115,6 @@ async fn refresh_settings_modal(app_state: &AppState, state: &mut UiState) -> Re
         modal.pinned_peers = pinned_peers;
         modal.connectivity = connectivity;
         modal.theme_presets = theme_presets;
-        modal.theme_edit_key = None;
-        modal.theme_delete_key = None;
-        modal.theme_description.clear();
         modal.selected_preset = selected_preset;
         modal.stickers = stickers;
         if modal.selected_sticker_hash().is_none() {
@@ -5562,6 +5559,11 @@ async fn activate_settings_focus(
             .await?;
             state.theme = Theme::from_config(&settings_theme::get_theme(app_state).await?);
             refresh_settings_modal(app_state, state).await?;
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.theme_edit_key = None;
+                modal.theme_custom_name.clear();
+                modal.theme_description.clear();
+            }
             set_settings_status(state, "custom theme saved");
         }
         SettingsField::ThemeCancel => {
@@ -5583,6 +5585,9 @@ async fn activate_settings_focus(
             settings_theme::delete_custom_theme(app_state, &key).await?;
             state.theme = Theme::from_config(&settings_theme::get_theme(app_state).await?);
             refresh_settings_modal(app_state, state).await?;
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.theme_delete_key = None;
+            }
             set_settings_status(state, "custom theme deleted");
         }
         SettingsField::ThemeDeleteCancel => {
