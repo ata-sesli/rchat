@@ -826,6 +826,19 @@ pub fn add_peer(
     Ok(())
 }
 
+/// Update the user-facing alias for an existing peer.
+pub fn update_peer_alias(conn: &Connection, peer_id: &str, alias: &str) -> anyhow::Result<bool> {
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return Err(anyhow::anyhow!("Peer alias cannot be empty"));
+    }
+    let updated = conn.execute(
+        "UPDATE peers SET alias = ?2 WHERE id = ?1",
+        (peer_id, alias),
+    )?;
+    Ok(updated > 0)
+}
+
 /// Get all peers from database
 pub fn get_all_peers(conn: &Connection) -> anyhow::Result<Vec<Peer>> {
     // Put "Me" first (method='self'), then sort others by last_seen DESC

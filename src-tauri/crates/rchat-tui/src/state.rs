@@ -506,7 +506,16 @@ pub enum SettingsField {
     ProfileAvatar,
     ProfileSave,
     Peer(usize),
+    PeerRename(usize),
+    PeerRemove(usize),
+    PeerInput,
+    PeerAddSubmit,
+    PeerRemoveConfirm,
+    PeerRemoveCancel,
+    RequestAccept(usize),
+    RequestReject(usize),
     Friend(usize),
+    FriendTogglePin,
     ConnectivityMode(ConnectivityMode),
     ConnectivitySave,
     ThemePreset(usize),
@@ -557,6 +566,11 @@ pub struct SettingsModalState {
     pub profile_alias: String,
     pub profile_avatar_path: String,
     pub trusted_peers: Vec<String>,
+    pub peer_aliases: HashMap<String, String>,
+    pub selected_peer: Option<String>,
+    pub peer_input: String,
+    pub pending_remove_peer: Option<String>,
+    pub incoming_requests: Vec<String>,
     pub friends: Vec<String>,
     pub pinned_peers: Vec<String>,
     pub connectivity: ConnectivitySettings,
@@ -594,6 +608,11 @@ impl Default for SettingsModalState {
             profile_alias: String::new(),
             profile_avatar_path: String::new(),
             trusted_peers: Vec::new(),
+            peer_aliases: HashMap::new(),
+            selected_peer: None,
+            peer_input: String::new(),
+            pending_remove_peer: None,
+            incoming_requests: Vec::new(),
             friends: Vec::new(),
             pinned_peers: Vec::new(),
             connectivity: ConnectivitySettings::default(),
@@ -642,12 +661,25 @@ impl SettingsModalState {
                 SettingsField::ProfileSave,
             ]),
             SettingsSection::Peers => {
-                fields.extend(
-                    (0..self.trusted_peers.len())
-                        .take(6)
-                        .map(SettingsField::Peer),
-                );
-                fields.extend((0..self.friends.len()).take(6).map(SettingsField::Friend));
+                fields.extend([SettingsField::PeerInput, SettingsField::PeerAddSubmit]);
+                for index in 0..self.incoming_requests.len().min(6) {
+                    fields.push(SettingsField::RequestAccept(index));
+                    fields.push(SettingsField::RequestReject(index));
+                }
+                for index in 0..self.trusted_peers.len().min(6) {
+                    fields.push(SettingsField::Peer(index));
+                    fields.push(SettingsField::PeerRename(index));
+                    fields.push(SettingsField::PeerRemove(index));
+                }
+                if self.pending_remove_peer.is_some() {
+                    fields.extend([
+                        SettingsField::PeerRemoveConfirm,
+                        SettingsField::PeerRemoveCancel,
+                    ]);
+                }
+                for index in 0..self.friends.len().min(6) {
+                    fields.push(SettingsField::Friend(index));
+                }
             }
             SettingsSection::Connectivity => fields.extend([
                 SettingsField::ConnectivityMode(ConnectivityMode::Invisible),
@@ -781,6 +813,33 @@ impl SettingsModalState {
         }
     }
 
+    pub fn select_peer(&mut self, index: usize) {
+        let Some(peer_id) = self.trusted_peers.get(index).cloned() else {
+            return;
+        };
+        self.peer_input = self
+            .peer_aliases
+            .get(&peer_id)
+            .cloned()
+            .unwrap_or_else(|| peer_id.clone());
+        self.selected_peer = Some(peer_id);
+        self.pending_remove_peer = None;
+    }
+
+    pub fn select_friend(&self, index: usize) -> Option<String> {
+        self.friends.get(index).cloned()
+    }
+
+    pub fn request_peer(&self, index: usize) -> Option<String> {
+        self.incoming_requests.get(index).cloned()
+    }
+
+    pub fn clear_peer_selection(&mut self) {
+        self.selected_peer = None;
+        self.peer_input.clear();
+        self.pending_remove_peer = None;
+    }
+
     pub fn select_sticker(&mut self, index: usize) {
         self.selected_sticker_hash = self
             .stickers
@@ -813,6 +872,7 @@ impl SettingsModalState {
             SettingsField::ThemeText => self.theme_text.push(ch),
             SettingsField::StickerPath => self.sticker_path.push(ch),
             SettingsField::RattyPath => self.ratty_path.push(ch),
+            SettingsField::PeerInput => self.peer_input.push(ch),
             _ => {}
         }
     }
@@ -842,6 +902,9 @@ impl SettingsModalState {
             }
             SettingsField::RattyPath => {
                 self.ratty_path.pop();
+            }
+            SettingsField::PeerInput => {
+                self.peer_input.pop();
             }
             _ => {}
         }
@@ -1516,6 +1579,7 @@ pub struct TuiAppState {
     pub connected_chat_ids: HashSet<String>,
     pub pinned_chat_keys: HashSet<String>,
     pub local_peers: Vec<TuiLocalPeer>,
+    pub incoming_peer_requests: Vec<String>,
     pub messages: Vec<TuiMessage>,
     pub history_scroll_offset: usize,
     pub selected_message_id: Option<String>,
@@ -1558,6 +1622,7 @@ impl Default for TuiAppState {
             connected_chat_ids: HashSet::new(),
             pinned_chat_keys: HashSet::new(),
             local_peers: Vec::new(),
+            incoming_peer_requests: Vec::new(),
             messages: Vec::new(),
             history_scroll_offset: 0,
             selected_message_id: None,
@@ -1760,6 +1825,9 @@ impl TuiAppState {
         self.context_menu = None;
         self.media_viewer = None;
         self.settings = Some(SettingsModalState::default());
+        if let Some(settings) = self.settings.as_mut() {
+            settings.incoming_requests = self.incoming_peer_requests.clone();
+        }
     }
 
     pub fn close_settings(&mut self) {
@@ -2958,6 +3026,33 @@ mod tests {
 
         modal.connectivity = ConnectivitySettings::from_mode(ConnectivityMode::Invisible);
         assert_eq!(modal.connectivity.mode, ConnectivityMode::Invisible);
+    }
+
+    #[test]
+    fn settings_peer_controls_cover_add_requests_and_confirmation() {
+        let mut modal = SettingsModalState::default();
+        modal.activate_section(SettingsSection::Peers);
+        assert_eq!(modal.focus, SettingsField::PeerInput);
+        modal.push_char('p');
+        modal.push_char('e');
+        modal.pop_char();
+        assert_eq!(modal.peer_input, "p");
+
+        modal.incoming_requests = vec!["peer-1".to_string()];
+        modal.trusted_peers = vec!["peer-1".to_string()];
+        modal.peer_aliases.insert("peer-1".to_string(), "Peer One".to_string());
+        modal.focus = SettingsField::Peer(0);
+        modal.select_peer(0);
+        assert_eq!(modal.selected_peer.as_deref(), Some("peer-1"));
+        assert_eq!(modal.peer_input, "Peer One");
+        modal.pending_remove_peer = modal.selected_peer.clone();
+        assert!(modal
+            .content_fields()
+            .contains(&SettingsField::PeerRemoveConfirm));
+        modal.pending_remove_peer = None;
+        assert!(!modal
+            .content_fields()
+            .contains(&SettingsField::PeerRemoveConfirm));
     }
 
     #[test]

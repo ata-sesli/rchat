@@ -20,6 +20,12 @@ pub enum NetworkCommand {
     RequestConnection {
         peer_id: String,
     },
+    AcceptConnectionRequest {
+        peer_id: String,
+    },
+    RejectConnectionRequest {
+        peer_id: String,
+    },
     DropConnection {
         peer_id: String,
     },

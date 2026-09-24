@@ -22,6 +22,12 @@ impl NetworkManager {
             NetworkCommand::RequestConnection { peer_id } => {
                 self.handle_connection_request(&peer_id).await;
             }
+            NetworkCommand::AcceptConnectionRequest { peer_id } => {
+                self.accept_connection_request(&peer_id);
+            }
+            NetworkCommand::RejectConnectionRequest { peer_id } => {
+                self.reject_connection_request(&peer_id);
+            }
             NetworkCommand::DropConnection { peer_id } => {
                 self.handle_drop_connection(&peer_id).await;
             }

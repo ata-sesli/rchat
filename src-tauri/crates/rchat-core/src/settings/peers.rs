@@ -18,6 +18,31 @@ pub fn get_trusted_peers(app_state: &AppState) -> Result<Vec<String>> {
         .collect())
 }
 
+pub fn add_trusted_peer(
+    app_state: &AppState,
+    peer_id: String,
+    alias: Option<String>,
+) -> Result<()> {
+    let peer_id = peer_id.trim().to_string();
+    if peer_id.is_empty() {
+        return Err(anyhow::anyhow!("Peer ID is required"));
+    }
+    let conn = app_state.db_conn.lock().map_err(|error| {
+        anyhow::anyhow!("failed to lock database while adding peer: {error}")
+    })?;
+    db::add_peer(&conn, &peer_id, alias.as_deref(), None, "manual")
+}
+
+pub fn rename_peer(app_state: &AppState, peer_id: &str, alias: String) -> Result<()> {
+    let conn = app_state.db_conn.lock().map_err(|error| {
+        anyhow::anyhow!("failed to lock database while renaming peer: {error}")
+    })?;
+    if !db::update_peer_alias(&conn, peer_id, &alias)? {
+        return Err(anyhow::anyhow!("Peer not found: {peer_id}"));
+    }
+    Ok(())
+}
+
 pub fn delete_peer(app_state: &AppState, peer_id: &str) -> Result<()> {
     let conn = app_state.db_conn.lock().map_err(|error| {
         anyhow::anyhow!("failed to lock database while deleting peer: {error}")
@@ -131,6 +156,25 @@ mod tests {
 
         remove_friend(&app_state, "ada").await.expect("remove");
         assert!(get_friends(&app_state).await.expect("friends").is_empty());
+    }
+
+    #[tokio::test]
+    async fn trusted_peer_add_rename_and_blank_alias_are_validated() {
+        let (_temp, app_state) = test_app_state().await;
+        {
+            let conn = app_state.db_conn.lock().expect("db");
+            db::add_peer(&conn, "peer-1", Some("Peer"), None, "manual").expect("insert peer");
+            assert!(db::update_peer_alias(&conn, "peer-1", "Renamed").expect("rename"));
+            let renamed = db::get_all_peers(&conn)
+                .expect("peers")
+                .into_iter()
+                .find(|peer| peer.id == "peer-1")
+                .expect("renamed peer");
+            assert_eq!(renamed.alias, "Renamed");
+            assert!(db::update_peer_alias(&conn, "peer-1", "  ").is_err());
+            assert!(!db::update_peer_alias(&conn, "missing", "Name").expect("missing"));
+        }
+        rename_peer(&app_state, "peer-1", "  ".to_string()).expect_err("blank alias");
     }
 
     #[tokio::test]
