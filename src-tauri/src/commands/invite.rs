@@ -325,6 +325,7 @@ pub async fn redeem_and_connect(
                                     .send(NetworkCommand::StartPunch {
                                         multiaddr: payload.ip_address.clone(),
                                         target_username: github_username.clone(),
+                                        target_peer_id: payload.inviter_peer_id.clone(),
                                         my_username: my_username.clone(),
                                     })
                                     .await

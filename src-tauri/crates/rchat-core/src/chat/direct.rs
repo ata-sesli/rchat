@@ -460,6 +460,7 @@ pub async fn redeem_github_invite(
     let _ = tx.send(NetworkCommand::StartPunch {
         multiaddr: payload.ip_address.clone(),
         target_username: github_username,
+        target_peer_id: payload.inviter_peer_id.clone(),
         my_username,
     })
     .await;
