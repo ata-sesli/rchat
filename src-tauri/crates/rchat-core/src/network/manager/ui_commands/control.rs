@@ -111,6 +111,10 @@ impl NetworkManager {
                     .active_punch_targets
                     .get(chat_id)
                     .map(|target| target.address.to_string()),
+                punch_target_peer_id: self
+                    .active_punch_targets
+                    .get(chat_id)
+                    .and_then(|target| target.peer_id.map(|peer_id| peer_id.to_string())),
                 min_add_counter,
             };
             // The session stays in the temporary state (reservation set) so
@@ -301,7 +305,14 @@ impl NetworkManager {
         }
         if let Some(addr) = &pending.punch_target {
             if let Ok(multiaddr) = addr.parse::<Multiaddr>() {
-                self.add_punch_target(chat_id, multiaddr);
+                self.add_punch_target_for_peer(
+                    chat_id,
+                    multiaddr,
+                    pending
+                        .punch_target_peer_id
+                        .as_deref()
+                        .and_then(|peer_id| peer_id.parse().ok()),
+                );
             }
         }
         let rejoined = rejoin_error.is_none();
