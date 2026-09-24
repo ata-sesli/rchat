@@ -164,6 +164,7 @@ pub async fn delete_custom_theme(app_state: &AppState, key: &str) -> Result<()> 
     }
     if config.user.selected_preset.as_deref() == Some(key) {
         config.user.selected_preset = None;
+        config.user.theme = ThemeConfig::default();
     }
     mgr.save(&config).await?;
     Ok(())
@@ -293,5 +294,7 @@ mod tests {
             .await
             .expect("delete custom");
         assert!(apply_preset(&app_state, &created.key).await.is_err());
+        let active = get_theme(&app_state).await.expect("active theme");
+        assert_eq!(active.primary.c500, ThemeConfig::default().primary.c500);
     }
 }
