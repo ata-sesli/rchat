@@ -6361,14 +6361,15 @@ async fn handle_chat_details_mouse(
             return None;
         }
         let line = mouse.row.saturating_sub(popup.y.saturating_add(1)) as usize;
-        if !(14..14 + CHAT_DETAILS_FILE_VIEW_ROWS).contains(&line) {
+        let file_start = direct_chat_file_start(details);
+        if !(file_start..file_start + CHAT_DETAILS_FILE_VIEW_ROWS).contains(&line) {
             return None;
         }
         let start = details
             .selected_file_index
             .saturating_sub(CHAT_DETAILS_FILE_VIEW_ROWS - 1)
             .min(details.recent_files.len().saturating_sub(CHAT_DETAILS_FILE_VIEW_ROWS));
-        Some(start + line - 14)
+        Some(start + line - file_start)
     });
     if let Some(index) = direct_file_row {
         if let Some(details) = state.app.chat_details.as_mut() {
@@ -6410,7 +6411,7 @@ fn chat_details_click_target(
         12 if details.pending_delete => Some(ChatDetailsField::ConfirmDelete),
         13 if details.pending_delete => Some(ChatDetailsField::CancelDelete),
         _ => {
-            let action_line = 14 + CHAT_DETAILS_FILE_VIEW_ROWS;
+            let action_line = direct_chat_file_start(details) + CHAT_DETAILS_FILE_VIEW_ROWS;
             match line {
                 value if value == action_line => Some(ChatDetailsField::FileFilter),
                 value if value == action_line + 1 => Some(ChatDetailsField::FileNext),
@@ -10696,6 +10697,15 @@ fn chat_details_button_line(
 const CHAT_DETAILS_WIDTH: u16 = 76;
 const CHAT_DETAILS_HEIGHT: u16 = 24;
 const CHAT_DETAILS_FILE_VIEW_ROWS: usize = 4;
+
+fn direct_chat_file_start(details: &TuiChatDetails) -> usize {
+    13 + if details.pending_delete { 2 } else { 0 }
+        + if details.error.is_some() || details.status.is_some() {
+            1
+        } else {
+            0
+        }
+}
 
 fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
     let Some(details) = state.app.chat_details.as_ref() else {
