@@ -3715,9 +3715,27 @@ async fn request_group_action(
                 }
             }
         }
-        GroupActionRoute::Remove { .. }
-        | GroupActionRoute::TransferAdmin { .. }
-        | GroupActionRoute::Leave { .. } => {
+        GroupActionRoute::Leave { group_id } => {
+            let outcome = group::preview_leave_group(app_state, &group_id).await?;
+            let confirmation = match outcome {
+                group::GroupLeaveOutcome::Left => "leave this group".to_string(),
+                group::GroupLeaveOutcome::TransferredThenLeft { successor_peer_id } => {
+                    format!("leave and transfer administration to {successor_peer_id}")
+                }
+                group::GroupLeaveOutcome::Dissolved => {
+                    "leave and dissolve this group; all invitations will be revoked".to_string()
+                }
+            };
+            if let Some(details) = state.app.chat_details.as_mut() {
+                if let Some(group) = details.group.as_mut() {
+                    group.pending_confirmation = Some(GroupAdminAction::Leave);
+                    details.status = Some(format!("confirm: {confirmation}"));
+                    details.error = None;
+                }
+                details.focus = ChatDetailsField::GroupConfirm;
+            }
+        }
+        GroupActionRoute::Remove { .. } | GroupActionRoute::TransferAdmin { .. } => {
             let action = GroupAdminAction::ALL
                 .into_iter()
                 .find(|action| action.field() == field)
@@ -7366,7 +7384,7 @@ async fn end_current_screen_share(network_state: &NetworkState, state: &mut UiSt
 }
 
 const GROUP_DETAILS_WIDTH: u16 = 90;
-const GROUP_DETAILS_HEIGHT: u16 = 24;
+const GROUP_DETAILS_HEIGHT: u16 = 40;
 const GROUP_ROSTER_START_LINE: usize = 4;
 const GROUP_ROSTER_VISIBLE: usize = 4;
 const GROUP_ACTIONS_START_LINE: usize = 9;
@@ -12060,7 +12078,55 @@ fn render_group_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiSta
         )));
     }
     lines.push(Line::from(Span::styled(
-        "Up/Down action | Left/Right peer | Enter activate | ? help | Esc close",
+        "Receipts",
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+    )));
+    if group.receipts.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No receipt details",
+            Style::default().fg(theme.muted),
+        )));
+    } else {
+        for receipt in &group.receipts {
+            lines.push(Line::from(format!("  {receipt}")));
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        "Shared files",
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+    )));
+    if details.recent_files.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No shared files yet",
+            Style::default().fg(theme.muted),
+        )));
+    } else {
+        for (index, file) in details.recent_files.iter().enumerate() {
+            lines.push(Line::from(format!(
+                "{} {} · {} · {}",
+                if index == details.selected_file_index { ">" } else { " " },
+                file.content_type,
+                truncate_chars(&file.display_name, 30),
+                short_hash(&file.file_hash)
+            )));
+        }
+    }
+    lines.push(chat_details_button_line(
+        details,
+        ChatDetailsField::FileFilter,
+        &format!("Filter: {}", details.file_filter),
+        theme,
+    ));
+    lines.push(chat_details_button_line(
+        details,
+        ChatDetailsField::FileNext,
+        if details.file_has_more { "Load more files" } else { "No more files" },
+        theme,
+    ));
+    lines.push(chat_details_button_line(details, ChatDetailsField::FileOpen, "Open selected file", theme));
+    lines.push(chat_details_button_line(details, ChatDetailsField::FileSave, "Save selected file", theme));
+    lines.push(Line::from(Span::styled(
+        "Up/Down action/file | Left/Right peer | Enter activate | ? help | Esc close",
         Style::default().fg(theme.muted),
     )));
 

@@ -300,13 +300,8 @@ impl TuiGroupDetails {
                 GroupAdminAction::Leave,
                 gate(
                     GroupAdminAction::Leave,
-                    !self.dissolved
-                        && (!self.is_admin || self.automatic_successor_peer_id.is_some()),
-                    if self.dissolved {
-                        "group is dissolved"
-                    } else {
-                        "transfer administration before leaving"
-                    },
+                    !self.dissolved,
+                    "group is dissolved",
                 ),
             ),
         ]
@@ -2461,10 +2456,17 @@ impl TuiAppState {
                     ChatDetailsField::GroupCancel,
                 ]
             } else {
-                GroupAdminAction::ALL
+                let mut fields = GroupAdminAction::ALL
                     .iter()
                     .map(|action| action.field())
-                    .collect()
+                    .collect::<Vec<_>>();
+                fields.extend([
+                    ChatDetailsField::FileFilter,
+                    ChatDetailsField::FileNext,
+                    ChatDetailsField::FileOpen,
+                    ChatDetailsField::FileSave,
+                ]);
+                fields
             }
         } else if details.pending_delete {
             vec![
@@ -3134,6 +3136,7 @@ mod tests {
         );
         assert!(member.action_state(GroupAdminAction::Sync).enabled);
         assert!(member.action_state(GroupAdminAction::Leave).enabled);
+        assert!(admin.action_state(GroupAdminAction::Leave).enabled);
     }
 
     #[test]
