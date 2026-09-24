@@ -10,7 +10,7 @@ use libp2p::{
     swarm::{ConnectionId, SwarmEvent},
     Multiaddr, PeerId, Swarm,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -33,6 +33,13 @@ mod voice_call;
 mod tests;
 
 const NAT_KEEPALIVE_ADDR: &str = "/ip4/1.1.1.1/udp/9/quic-v1";
+const MAX_GROUP_SYNC_DEPENDENCY_ROUNDS: u8 = 4;
+
+#[derive(Debug, Clone, Default)]
+struct GroupSyncProgress {
+    explicit_record_ids: BTreeSet<String>,
+    explicit_rounds: u8,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveCallPhase {
@@ -500,6 +507,8 @@ pub struct NetworkManager {
     active_punch_targets: HashMap<String, (Multiaddr, std::time::Instant)>,
     // Joined group IDs we are currently subscribed to
     subscribed_group_ids: HashSet<String>,
+    // Explicit dependency requests already attempted for each group/peer repair.
+    group_sync_explicit_requests: HashMap<String, GroupSyncProgress>,
     // Fast lookup cache: GitHub username -> PeerId string
     peer_id_by_github: HashMap<String, String>,
     // Reverse lookup cache: PeerId string -> GitHub username
@@ -795,6 +804,10 @@ impl NetworkManager {
     const AUTO_CONNECT_INFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
     const AUTO_CONNECT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
+    pub(super) fn group_sync_progress_key(group_id: &str, peer: &PeerId) -> String {
+        format!("{group_id}\u{0}{peer}")
+    }
+
     pub(super) fn emit(&self, event: CoreEvent) {
         self.event_sink.emit(event);
     }
@@ -880,6 +893,7 @@ impl NetworkManager {
             pending_shadow_polls: HashMap::new(),
             active_punch_targets: HashMap::new(),
             subscribed_group_ids: HashSet::new(),
+            group_sync_explicit_requests: HashMap::new(),
             peer_id_by_github: HashMap::new(),
             github_by_peer_id: HashMap::new(),
             temp_peer_by_chat_id: HashMap::new(),

@@ -1127,33 +1127,51 @@ pub fn get_group_records_for_sync(
     let limit = limit.max(1);
     let wanted = wanted_record_ids
         .iter()
-        .take(64)
+        .take(crate::network::gossip::MAX_GROUP_SYNC_WANTED_IDS)
         .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let mut out = records
+        .collect::<std::collections::BTreeSet<_>>();
+    let wanted_records = records
         .iter()
         .filter(|record| wanted.contains(record.id()))
-        .take(limit)
-        .cloned()
         .collect::<Vec<_>>();
-    let wanted_sent = out.iter().map(|record| record.id()).collect::<HashSet<_>>();
+
+    // Explicit dependency requests are their own phase. Mixing an out-of-order
+    // dependency into a cursor page would make the next page repeat that record
+    // (or skip records between it and the cursor).
+    if !wanted_records.is_empty() {
+        let sequential_remaining = records
+            .iter()
+            .filter(|record| {
+                cursor.is_none_or(|cursor| {
+                    crate::network::gossip::GroupSyncCursor::from_record(record) > *cursor
+                }) && !wanted.contains(record.id())
+            })
+            .count();
+        return Ok((
+            wanted_records
+                .into_iter()
+                .take(limit)
+                .map(|record| (*record).clone())
+                .collect(),
+            cursor.cloned(),
+            sequential_remaining > 0,
+        ));
+    }
 
     let sequential = records
         .iter()
         .filter(|record| {
             cursor.is_none_or(|cursor| {
                 crate::network::gossip::GroupSyncCursor::from_record(record) > *cursor
-            }) && !wanted_sent.contains(record.id())
+            })
         })
         .collect::<Vec<_>>();
-    let sequential_capacity = limit.saturating_sub(out.len());
-    let sequential_sent = sequential_capacity.min(sequential.len());
-    out.extend(
-        sequential
-            .iter()
-            .take(sequential_sent)
-            .map(|record| (*record).clone()),
-    );
+    let sequential_sent = limit.min(sequential.len());
+    let out = sequential
+        .iter()
+        .take(sequential_sent)
+        .map(|record| (*record).clone())
+        .collect::<Vec<_>>();
     let next_cursor = sequential_sent
         .checked_sub(1)
         .and_then(|index| sequential.get(index))
@@ -2296,12 +2314,9 @@ mod tests {
 
         assert_eq!(
             records.iter().map(|record| record.id()).collect::<Vec<_>>(),
-            vec![third.id(), first.id()]
+            vec![third.id()]
         );
-        assert_eq!(
-            next_cursor,
-            Some(crate::network::gossip::GroupSyncCursor::from_record(&first))
-        );
+        assert_eq!(next_cursor, None);
         assert!(has_more);
 
         let (records, next_cursor, has_more) =
@@ -2309,13 +2324,65 @@ mod tests {
                 .expect("next sync page");
         assert_eq!(
             records.iter().map(|record| record.id()).collect::<Vec<_>>(),
-            vec![second.id(), third.id()]
+            vec![first.id(), second.id()]
         );
+        assert_eq!(
+            next_cursor,
+            Some(crate::network::gossip::GroupSyncCursor::from_record(&second))
+        );
+        assert!(has_more);
+
+        let (records, next_cursor, has_more) =
+            get_group_records_for_sync(&conn, group_id, next_cursor.as_ref(), &[], 2)
+                .expect("final sync page");
+        assert_eq!(records.iter().map(|record| record.id()).collect::<Vec<_>>(), vec![third.id()]);
         assert_eq!(
             next_cursor,
             Some(crate::network::gossip::GroupSyncCursor::from_record(&third))
         );
         assert!(!has_more);
+    }
+
+    #[test]
+    fn group_sync_pages_are_bounded_deduplicated_and_resumable() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        create_tables(&conn).expect("schema");
+        let keypair = identity::Keypair::generate_ed25519();
+        let group_id = "group:550e8400-e29b-41d4-a716-446655440000";
+        for counter in 1..=300 {
+            let record = signed_group_record(
+                &keypair,
+                group_id,
+                &format!("record-{counter}"),
+                counter,
+            );
+            insert_group_record(&conn, &record, true, false).expect("insert record");
+        }
+
+        let mut cursor = None;
+        let mut seen = HashSet::new();
+        let mut pages = 0usize;
+        loop {
+            let (records, next_cursor, has_more) =
+                get_group_records_for_sync(&conn, group_id, cursor.as_ref(), &[], 64)
+                    .expect("sync page");
+            assert!(records.len() <= 64);
+            assert!(records
+                .iter()
+                .all(|record| seen.insert(record.id().to_string())));
+            pages += 1;
+            assert!(pages <= 5);
+            if !has_more {
+                assert_eq!(records.len(), if pages == 5 { 44 } else { 0 });
+                break;
+            }
+            let next_cursor = next_cursor.expect("next cursor");
+            if let Some(previous) = cursor.as_ref() {
+                assert!(next_cursor > *previous);
+            }
+            cursor = Some(next_cursor);
+        }
+        assert_eq!(seen.len(), 300);
     }
 
     #[test]
