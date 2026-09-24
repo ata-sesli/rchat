@@ -1214,30 +1214,7 @@ fn extract_temporary_payload_token(input: &str) -> Result<String> {
 }
 
 async fn resolve_current_public_address(net_state: &NetworkState) -> Result<String> {
-    let v4_stun = net_state.public_address_v4.lock().await.clone();
-    let stun_port = *net_state.stun_external_port.lock().await;
-
-    if let (Some(ip), Some(port)) = (v4_stun, stun_port) {
-        return Ok(format!("/ip4/{ip}/udp/{port}/quic-v1"));
-    }
-
-    let addrs = net_state.listening_addresses.lock().await;
-    addrs
-        .iter()
-        .find(|addr| {
-            addr.contains("/udp/")
-                && addr.contains("/quic-v1")
-                && !addr.contains("127.0.0.1")
-                && !addr.contains("::1")
-        })
-        .or_else(|| {
-            addrs.iter().find(|addr| {
-                addr.contains("/tcp/") && !addr.contains("127.0.0.1") && !addr.contains("::1")
-            })
-        })
-        .or_else(|| addrs.first())
-        .cloned()
-        .ok_or_else(|| anyhow!("No listening address available. Is the network started?"))
+    crate::network::refresh_current_public_address(net_state).await
 }
 
 #[cfg(test)]

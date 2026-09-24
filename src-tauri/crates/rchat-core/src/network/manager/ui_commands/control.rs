@@ -105,7 +105,7 @@ impl NetworkManager {
                 punch_target: self
                     .active_punch_targets
                     .get(chat_id)
-                    .map(|(addr, _)| addr.to_string()),
+                    .map(|target| target.address.to_string()),
                 min_add_counter,
             };
             // The session stays in the temporary state (reservation set) so

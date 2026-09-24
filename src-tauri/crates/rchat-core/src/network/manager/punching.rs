@@ -1,5 +1,10 @@
 use super::*;
 
+fn punch_backoff(attempt: u32) -> std::time::Duration {
+    let exponent = attempt.saturating_sub(1).min(3);
+    std::time::Duration::from_millis(500u64 * 2u64.pow(exponent))
+}
+
 impl NetworkManager {
     /// Register a pending shadow poll (called when creating an invite).
     pub(super) fn register_shadow_poll(
@@ -25,7 +30,6 @@ impl NetworkManager {
         use crate::network::gist;
         use crate::network::invite;
 
-        // Skip if no pending polls
         if self.pending_shadow_polls.is_empty() {
             return;
         }
@@ -35,11 +39,9 @@ impl NetworkManager {
             .unwrap()
             .as_secs();
 
-        // Remove expired polls (2 minute TTL)
         self.pending_shadow_polls
             .retain(|_, (_, _, created)| now - *created < 120);
 
-        // Clone keys to avoid borrow issues
         let invitees: Vec<String> = self.pending_shadow_polls.keys().cloned().collect();
 
         for invitee in invitees {
@@ -48,11 +50,9 @@ impl NetworkManager {
                 None => continue,
             };
 
-            // Fetch shadow invites from invitee's Gist
             match gist::get_friend_shadows(&invitee).await {
                 Ok(shadows) => {
                     for shadow in shadows {
-                        // Try to decrypt with our key
                         match invite::decrypt_shadow_invite(
                             &shadow,
                             &password,
@@ -64,85 +64,122 @@ impl NetworkManager {
                                     "[Shadow] 🎯 Found shadow from {}: {}",
                                     invitee, payload.invitee_address
                                 );
-
-                                // Add to active punch targets for continuous punching
                                 if let Ok(addr) = payload.invitee_address.parse::<Multiaddr>() {
                                     self.add_punch_target(&invitee, addr);
                                 }
-
-                                // Remove from pending shadow polls
                                 self.pending_shadow_polls.remove(&invitee);
                             }
-                            Ok(None) => {
-                                // Wrong key or not for us, continue
-                            }
-                            Err(e) => {
-                                eprintln!("[Shadow] Decrypt error: {}", e);
-                            }
+                            Ok(None) => {}
+                            Err(e) => eprintln!("[Shadow] Decrypt error: {}", e),
                         }
                     }
                 }
-                Err(e) => {
-                    eprintln!("[Shadow] Failed to fetch shadows from {}: {:?}", invitee, e);
-                }
+                Err(e) => eprintln!("[Shadow] Failed to fetch shadows from {}: {:?}", invitee, e),
             }
         }
     }
 
-    /// Continuously punch all active targets (called every 500ms)
+    /// Punch active targets with bounded attempts and exponential backoff.
     pub(super) fn punch_active_targets(&mut self) {
         if self.active_punch_targets.is_empty() {
             return;
         }
 
         let now = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(30);
+        let names = self.active_punch_targets.keys().cloned().collect::<Vec<_>>();
 
-        // Remove expired targets (older than 30 seconds)
-        let expired: Vec<String> = self
-            .active_punch_targets
-            .iter()
-            .filter(|(_, (_, start))| now.duration_since(*start) > timeout)
-            .map(|(name, _)| name.clone())
-            .collect();
-
-        for name in expired {
-            println!("[Punch] ⏰ Timeout for {}", name);
-            self.active_punch_targets.remove(&name);
-        }
-
-        // Punch all remaining active targets
-        let punch_targets: Vec<(String, Multiaddr, std::time::Instant)> = self
-            .active_punch_targets
-            .iter()
-            .map(|(name, (addr, start))| (name.clone(), addr.clone(), *start))
-            .collect();
-
-        for (name, addr, start) in punch_targets {
-            let attempt = (now.duration_since(start).as_millis() / 500) + 1;
-            self.record_outgoing_dial(&addr, OutgoingDialSource::Punch);
-            let _ = self.swarm.dial(addr.clone());
-            // Only log every 10th attempt to reduce spam
-            if attempt % 10 == 1 || attempt <= 3 {
-                println!("[Punch] 📤 {}/60 to {}", attempt.min(60), name);
+        for name in names {
+            let Some(target) = self.active_punch_targets.get(&name).cloned() else {
+                continue;
+            };
+            let elapsed = now.saturating_duration_since(target.started_at);
+            if elapsed > PUNCH_WINDOW {
+                self.active_punch_targets.remove(&name);
+                self.emit_connectivity_state(&name, "failed", "punch_timeout", target.attempt);
+                println!("[Punch] ⏰ Timeout for {}", name);
+                continue;
             }
+            if target.attempt >= MAX_PUNCH_ATTEMPTS || now < target.next_attempt_at {
+                if target.attempt >= MAX_PUNCH_ATTEMPTS {
+                    self.active_punch_targets.remove(&name);
+                    self.emit_connectivity_state(
+                        &name,
+                        "failed",
+                        "unreachable_peer",
+                        target.attempt,
+                    );
+                }
+                continue;
+            }
+
+            let attempt = target.attempt + 1;
+            self.emit_connectivity_state(&name, "punching", "retry", attempt);
+            self.record_outgoing_dial(&target.address, OutgoingDialSource::Punch);
+            let _ = self.swarm.dial(target.address.clone());
+            let next_attempt_at = now + punch_backoff(attempt);
+            if let Some(target) = self.active_punch_targets.get_mut(&name) {
+                target.attempt = attempt;
+                target.next_attempt_at = next_attempt_at;
+            }
+            println!("[Punch] 📤 {}/{} to {}", attempt, MAX_PUNCH_ATTEMPTS, name);
         }
     }
 
-    /// Add a target to active punch list
+    /// Add or replace a target and restart its bounded retry window.
     pub(super) fn add_punch_target(&mut self, name: &str, addr: Multiaddr) {
         println!("[Punch] 🎯 Added target: {} -> {}", name, addr);
-        self.active_punch_targets
-            .insert(name.to_string(), (addr, std::time::Instant::now()));
+        let now = std::time::Instant::now();
+        self.active_punch_targets.insert(
+            name.to_string(),
+            PunchTarget {
+                address: addr,
+                started_at: now,
+                next_attempt_at: now,
+                attempt: 0,
+            },
+        );
     }
 
-    /// Remove a target from active punch list (e.g., on connection success)
+    /// Remove a target after connection or explicit cancellation.
     pub(super) fn remove_punch_target(&mut self, name: &str) -> bool {
-        if self.active_punch_targets.remove(name).is_some() {
+        if let Some(target) = self.active_punch_targets.remove(name) {
+            self.emit_connectivity_state(name, "connected", "connected", target.attempt);
             println!("[Punch] 🎉 {} connected, removed from targets", name);
             true
         } else {
             false
         }
+    }
+
+    fn emit_connectivity_state(
+        &self,
+        peer_id: &str,
+        state: &str,
+        reason: &str,
+        attempt: u32,
+    ) {
+        self.emit(crate::events::CoreEvent::ConnectivityStateUpdated(
+            crate::events::ConnectivityStateUpdatedEvent {
+                peer_id: peer_id.to_string(),
+                state: state.to_string(),
+                reason: reason.to_string(),
+                attempt,
+                max_attempts: MAX_PUNCH_ATTEMPTS,
+            },
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::punch_backoff;
+
+    #[test]
+    fn punch_backoff_is_bounded_and_increases() {
+        assert_eq!(punch_backoff(1).as_millis(), 500);
+        assert_eq!(punch_backoff(2).as_millis(), 1_000);
+        assert_eq!(punch_backoff(3).as_millis(), 2_000);
+        assert_eq!(punch_backoff(4).as_millis(), 4_000);
+        assert_eq!(punch_backoff(99).as_millis(), 4_000);
     }
 }

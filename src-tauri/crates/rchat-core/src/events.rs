@@ -7,6 +7,15 @@ pub struct LocalPeerEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ConnectivityStateUpdatedEvent {
+    pub peer_id: String,
+    pub state: String,
+    pub reason: String,
+    pub attempt: u32,
+    pub max_attempts: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct MessageStatusUpdatedEvent {
     pub msg_id: String,
     pub status: String,
@@ -144,6 +153,7 @@ pub enum CoreEvent {
     ConnectedChatIdsUpdated(Vec<String>),
     LocalPeerDiscovered(LocalPeerEvent),
     LocalPeerExpired(String),
+    ConnectivityStateUpdated(ConnectivityStateUpdatedEvent),
     ConnectionWaiting(String),
     ConnectionRequestReceived(String),
     PeerConnected(String),
