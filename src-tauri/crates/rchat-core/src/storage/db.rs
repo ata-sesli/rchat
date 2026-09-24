@@ -1009,17 +1009,19 @@ pub fn get_group_invitee_peer_ids_for_sync(
 }
 
 pub fn delete_direct_chat(conn: &Connection, chat_id: &str) -> anyhow::Result<()> {
-    conn.execute("DELETE FROM messages WHERE chat_id = ?1", [chat_id])?;
-    conn.execute("DELETE FROM chat_envelopes WHERE chat_id = ?1", [chat_id])?;
-    conn.execute("DELETE FROM chat_peers WHERE chat_id = ?1", [chat_id])?;
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM messages WHERE chat_id = ?1", [chat_id])?;
+    tx.execute("DELETE FROM chat_envelopes WHERE chat_id = ?1", [chat_id])?;
+    tx.execute("DELETE FROM chat_peers WHERE chat_id = ?1", [chat_id])?;
+    tx.execute(
         "DELETE FROM chat_connection_stats WHERE chat_id = ?1",
         [chat_id],
     )?;
-    conn.execute(
+    tx.execute(
         "DELETE FROM chats WHERE id = ?1 AND is_group = 0",
         [chat_id],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2216,6 +2218,55 @@ mod tests {
             },
         )
         .expect("signed group record")
+    }
+
+    #[test]
+    fn direct_chat_deletion_is_atomic_and_removes_related_rows() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        create_tables(&conn).expect("schema");
+        conn.execute(
+            "INSERT INTO chats (id, name, is_group, encryption_key) VALUES ('peer-1', 'Peer', 0, ?1)",
+            [vec![0u8; 32]],
+        )
+        .expect("insert chat");
+        conn.execute(
+            "INSERT INTO peers (id, alias, last_seen, public_key, method) VALUES ('peer-1', 'Peer', 1, ?1, 'manual')",
+            [vec![0u8; 32]],
+        )
+        .expect("insert peer");
+        conn.execute(
+            "INSERT INTO chat_peers (chat_id, peer_id, joined_at) VALUES ('peer-1', 'peer-1', 1)",
+            [],
+        )
+        .expect("insert chat peer");
+        conn.execute(
+            "INSERT INTO messages (id, chat_id, peer_id, timestamp, content_type, text_content, file_hash, status) VALUES ('m1', 'peer-1', 'peer-1', 1, 'text', 'hello', NULL, 'delivered')",
+            [],
+        )
+        .expect("insert message");
+        conn.execute(
+            "INSERT INTO envelopes (id, name, icon) VALUES ('env1', 'Env', NULL)",
+            [],
+        )
+        .expect("insert envelope");
+        conn.execute(
+            "INSERT INTO chat_envelopes (chat_id, envelope_id) VALUES ('peer-1', 'env1')",
+            [],
+        )
+        .expect("insert assignment");
+        conn.execute(
+            "INSERT INTO chat_connection_stats (chat_id, first_connected_at, last_connected_at, reconnect_count) VALUES ('peer-1', 1, 1, 0)",
+            [],
+        )
+        .expect("insert stats");
+
+        delete_direct_chat(&conn, "peer-1").expect("delete direct chat");
+        assert!(!chat_exists(&conn, "peer-1"));
+        assert!(get_messages(&conn, "peer-1").expect("messages").is_empty());
+        assert!(get_chat_connection_stats(&conn, "peer-1")
+            .expect("stats")
+            .last_connected_at
+            .is_none());
     }
 
     #[test]
