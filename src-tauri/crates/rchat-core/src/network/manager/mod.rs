@@ -41,6 +41,16 @@ struct GroupSyncProgress {
     explicit_rounds: u8,
 }
 
+fn record_group_sync_request(
+    progress: &mut GroupSyncProgress,
+    request: &crate::network::gossip::GroupSyncRequest,
+) {
+    if request.cursor.is_none() && !request.wanted_record_ids.is_empty() {
+        progress.explicit_record_ids = request.wanted_record_ids.iter().cloned().collect();
+        progress.explicit_rounds = progress.explicit_rounds.saturating_add(1);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveCallPhase {
     OutgoingRinging,
@@ -806,6 +816,11 @@ impl NetworkManager {
 
     pub(super) fn group_sync_progress_key(group_id: &str, peer: &PeerId) -> String {
         format!("{group_id}\u{0}{peer}")
+    }
+
+    pub(super) fn begin_group_sync(&mut self, group_id: &str, peer: &PeerId) {
+        self.group_sync_explicit_requests
+            .remove(&Self::group_sync_progress_key(group_id, peer));
     }
 
     pub(super) fn emit(&self, event: CoreEvent) {
