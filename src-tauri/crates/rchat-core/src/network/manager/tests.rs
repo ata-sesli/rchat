@@ -1,8 +1,8 @@
 use super::{
     build_incoming_dm_db_message, build_incoming_group_db_message, classify_outgoing_error_source,
-    incoming_call_reject_decision, quic_addresses_for_peer, ringing_call_peer_liveness_reason,
-    ActiveCall, ActiveCallPhase, OutgoingDialSource, PeerTransportRegistry, RecentDial,
-    VoiceStreamEvent,
+    incoming_call_reject_decision, quic_addresses_for_peer, record_group_sync_request,
+    ringing_call_peer_liveness_reason, ActiveCall, ActiveCallPhase, GroupSyncProgress,
+    OutgoingDialSource, PeerTransportRegistry, RecentDial, VoiceStreamEvent,
 };
 use crate::app_state::CallKind;
 use crate::network::command::NetworkCommand;
@@ -56,6 +56,42 @@ fn incoming_call_reject_accepts_stale_requested_id_for_current_incoming_voice_ca
 
     assert_eq!(decision.call.call_id, "call-current");
     assert!(!decision.requested_call_id_matched);
+}
+
+#[test]
+fn group_sync_progress_survives_empty_cursor_page_requests() {
+    let group_id = "group:550e8400-e29b-41d4-a716-446655440000".to_string();
+    let mut progress = GroupSyncProgress::default();
+    let explicit = crate::network::gossip::GroupSyncRequest {
+        version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
+        group_id: group_id.clone(),
+        wanted_record_ids: vec!["missing-parent".to_string()],
+        cursor: None,
+        limit: crate::network::gossip::MAX_GROUP_SYNC_RECORDS,
+    };
+    record_group_sync_request(&mut progress, &explicit);
+    assert_eq!(progress.explicit_rounds, 1);
+
+    let page = crate::network::gossip::GroupSyncRequest {
+        version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
+        group_id,
+        wanted_record_ids: Vec::new(),
+        cursor: None,
+        limit: crate::network::gossip::MAX_GROUP_SYNC_RECORDS,
+    };
+    record_group_sync_request(&mut progress, &page);
+    assert_eq!(progress.explicit_rounds, 1);
+    assert_eq!(progress.explicit_record_ids, ["missing-parent".to_string()].into());
+
+    let retry = crate::network::gossip::GroupSyncRequest {
+        version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
+        group_id: "group:550e8400-e29b-41d4-a716-446655440000".to_string(),
+        wanted_record_ids: vec!["missing-parent".to_string()],
+        cursor: None,
+        limit: crate::network::gossip::MAX_GROUP_SYNC_RECORDS,
+    };
+    record_group_sync_request(&mut progress, &retry);
+    assert_eq!(progress.explicit_rounds, 2);
 }
 
 #[test]

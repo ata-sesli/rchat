@@ -219,6 +219,7 @@ impl NetworkManager {
             let Ok(peer) = peer_id.parse() else {
                 continue;
             };
+            self.begin_group_sync(group_id, &peer);
             if self
                 .send_group_sync_request_to_peer(&peer, &request)
                 .is_ok()
@@ -249,16 +250,10 @@ impl NetworkManager {
         request: &crate::network::gossip::GroupSyncRequest,
     ) -> Result<(), String> {
         request.validate()?;
-        if request.cursor.is_none() {
+        if request.cursor.is_none() && !request.wanted_record_ids.is_empty() {
             let key = Self::group_sync_progress_key(&request.group_id, peer);
             let progress = self.group_sync_explicit_requests.entry(key).or_default();
-            if request.wanted_record_ids.is_empty() {
-                *progress = Default::default();
-            } else {
-                progress.explicit_record_ids =
-                    request.wanted_record_ids.iter().cloned().collect();
-                progress.explicit_rounds = progress.explicit_rounds.saturating_add(1);
-            }
+            super::record_group_sync_request(progress, request);
         }
         let payload = serde_json::to_string(request)
             .map_err(|error| format!("failed to encode group sync request: {error}"))?;

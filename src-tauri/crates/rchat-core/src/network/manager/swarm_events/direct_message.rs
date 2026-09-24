@@ -338,6 +338,7 @@ impl NetworkManager {
             cursor: None,
             limit: 256,
         };
+        self.begin_group_sync(&group_id, &peer);
         self.send_group_sync_request_to_peer(&peer, &sync_request)
             .map_err(|error| {
                 self.emit(crate::events::CoreEvent::GroupSyncStateUpdated(
@@ -392,6 +393,7 @@ impl NetworkManager {
             crate::chat::group_state::evaluate_group_records(&records).missing_dependency_ids()
         };
         if !wanted_record_ids.is_empty() {
+            self.begin_group_sync(record.group_id(), &peer);
             self.send_group_sync_request_to_peer(
                 &peer,
                 &crate::network::gossip::GroupSyncRequest {
