@@ -3436,6 +3436,8 @@ async fn handle_chat_details_key(
         }
         KeyCode::Up => state.app.move_chat_details_focus(-1),
         KeyCode::Down => state.app.move_chat_details_focus(1),
+        KeyCode::Right => state.app.move_file_selection(1),
+        KeyCode::Left => state.app.move_file_selection(-1),
         KeyCode::Enter => activate_chat_details_focus(app_state, network_state, state).await?,
         _ => {}
     }
@@ -6354,17 +6356,23 @@ async fn handle_chat_details_mouse(
     };
     let area = Rect { x: 0, y: 0, width: size.width, height: size.height };
     let popup = centered_rect(76, 20, area);
-    if state.app.chat_details.as_ref().is_some_and(|details| {
-        details.group.is_none()
-            && rect_contains(popup, mouse.column, mouse.row)
-            && {
-                let line = mouse.row.saturating_sub(popup.y.saturating_add(2)) as usize;
-                (14..14 + details.recent_files.len()).contains(&line)
-            }
-    }) {
-        let line = mouse.row.saturating_sub(popup.y.saturating_add(2)) as usize - 14;
+    let direct_file_row = state.app.chat_details.as_ref().and_then(|details| {
+        if details.group.is_some() || !rect_contains(popup, mouse.column, mouse.row) {
+            return None;
+        }
+        let line = mouse.row.saturating_sub(popup.y.saturating_add(2)) as usize;
+        if !(14..14 + CHAT_DETAILS_FILE_VIEW_ROWS).contains(&line) {
+            return None;
+        }
+        let start = details
+            .selected_file_index
+            .saturating_sub(CHAT_DETAILS_FILE_VIEW_ROWS - 1)
+            .min(details.recent_files.len().saturating_sub(CHAT_DETAILS_FILE_VIEW_ROWS));
+        Some(start + line - 14)
+    });
+    if let Some(index) = direct_file_row {
         if let Some(details) = state.app.chat_details.as_mut() {
-            details.selected_file_index = line;
+            details.selected_file_index = index.min(details.recent_files.len().saturating_sub(1));
         }
         return Ok(());
     }
@@ -6402,8 +6410,7 @@ fn chat_details_click_target(
         12 if details.pending_delete => Some(ChatDetailsField::ConfirmDelete),
         13 if details.pending_delete => Some(ChatDetailsField::CancelDelete),
         _ => {
-            let file_rows = details.recent_files.len().max(1);
-            let action_line = 14 + file_rows;
+            let action_line = 14 + CHAT_DETAILS_FILE_VIEW_ROWS;
             match line {
                 value if value == action_line => Some(ChatDetailsField::FileFilter),
                 value if value == action_line + 1 => Some(ChatDetailsField::FileNext),
@@ -10692,6 +10699,8 @@ fn chat_details_button_line(
     ))
 }
 
+const CHAT_DETAILS_FILE_VIEW_ROWS: usize = 4;
+
 fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
     let Some(details) = state.app.chat_details.as_ref() else {
         return;
@@ -10858,8 +10867,16 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
             "No shared files yet",
             Style::default().fg(theme.muted),
         )));
+        for _ in 1..CHAT_DETAILS_FILE_VIEW_ROWS {
+            lines.push(Line::from(""));
+        }
     } else {
-        for (index, file) in details.recent_files.iter().enumerate() {
+        let start = details
+            .selected_file_index
+            .saturating_sub(CHAT_DETAILS_FILE_VIEW_ROWS - 1)
+            .min(details.recent_files.len().saturating_sub(CHAT_DETAILS_FILE_VIEW_ROWS));
+        for index in start..(start + CHAT_DETAILS_FILE_VIEW_ROWS).min(details.recent_files.len()) {
+            let file = &details.recent_files[index];
             let size = file
                 .size_bytes
                 .filter(|size| *size >= 0)
@@ -10893,7 +10910,7 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Up/Down select | Enter activate | Esc close",
+        "Up/Down action | Left/Right file | Enter activate | Esc close",
         Style::default().fg(theme.muted),
     )));
 
