@@ -73,6 +73,15 @@ pub enum ChatDetailsField {
     FileSave,
     ConfirmDelete,
     CancelDelete,
+    GroupRename,
+    GroupPolicy,
+    GroupInvite,
+    GroupRemove,
+    GroupTransferAdmin,
+    GroupSync,
+    GroupLeave,
+    GroupConfirm,
+    GroupCancel,
 }
 
 impl ChatDetailsField {
@@ -115,15 +124,206 @@ pub struct TuiChatDetails {
     pub group: Option<TuiGroupDetails>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupAdminAction {
+    Rename,
+    Policy,
+    Invite,
+    Remove,
+    TransferAdmin,
+    Sync,
+    Leave,
+}
+
+impl GroupAdminAction {
+    pub const ALL: [GroupAdminAction; 7] = [
+        Self::Rename,
+        Self::Policy,
+        Self::Invite,
+        Self::Remove,
+        Self::TransferAdmin,
+        Self::Sync,
+        Self::Leave,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rename => "Rename group",
+            Self::Policy => "Toggle member invites",
+            Self::Invite => "Invite peer",
+            Self::Remove => "Remove selected",
+            Self::TransferAdmin => "Transfer admin",
+            Self::Sync => "Sync now",
+            Self::Leave => "Leave group",
+        }
+    }
+
+    pub fn field(self) -> ChatDetailsField {
+        match self {
+            Self::Rename => ChatDetailsField::GroupRename,
+            Self::Policy => ChatDetailsField::GroupPolicy,
+            Self::Invite => ChatDetailsField::GroupInvite,
+            Self::Remove => ChatDetailsField::GroupRemove,
+            Self::TransferAdmin => ChatDetailsField::GroupTransferAdmin,
+            Self::Sync => ChatDetailsField::GroupSync,
+            Self::Leave => ChatDetailsField::GroupLeave,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiGroupMember {
+    pub peer_id: String,
+    pub display_name: String,
+    pub role: String,
+    pub membership_state: String,
+}
+
+impl TuiGroupMember {
+    pub fn is_admin(&self) -> bool {
+        self.role.eq_ignore_ascii_case("admin")
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.membership_state.eq_ignore_ascii_case("active")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupDetailsInput {
+    Rename { value: String },
+    Invite { peer_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupAdminActionState {
+    pub action: GroupAdminAction,
+    pub enabled: bool,
+    pub disabled_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiGroupDetails {
     pub image_hash: Option<String>,
     pub is_admin: bool,
     pub members_can_invite: bool,
-    pub roster: Vec<String>,
+    pub dissolved: bool,
+    pub automatic_successor_peer_id: Option<String>,
+    pub roster: Vec<TuiGroupMember>,
+    pub selected_member_index: usize,
     pub receipts: Vec<String>,
     pub pending_count: i64,
     pub sync_status: Option<String>,
+    pub input: Option<GroupDetailsInput>,
+    pub pending_confirmation: Option<GroupAdminAction>,
+    pub pending_confirmation_peer_id: Option<String>,
+}
+
+impl TuiGroupDetails {
+    pub fn selected_member(&self) -> Option<&TuiGroupMember> {
+        self.roster.get(self.selected_member_index)
+    }
+
+    pub fn action_states(&self) -> Vec<GroupAdminActionState> {
+        let selected = self.selected_member();
+        let selected_non_admin = selected.is_some_and(|member| !member.is_admin());
+        let selected_active_non_admin = selected.is_some_and(|member| {
+            !member.is_admin() && member.is_active()
+        });
+        let gate = |action, enabled: bool, reason: &str| GroupAdminActionState {
+            action,
+            enabled,
+            disabled_reason: (!enabled).then(|| reason.to_string()),
+        };
+        [
+            (
+                GroupAdminAction::Rename,
+                gate(
+                    GroupAdminAction::Rename,
+                    !self.dissolved && self.is_admin,
+                    "administrator only",
+                ),
+            ),
+            (
+                GroupAdminAction::Policy,
+                gate(
+                    GroupAdminAction::Policy,
+                    !self.dissolved && self.is_admin,
+                    "administrator only",
+                ),
+            ),
+            (
+                GroupAdminAction::Invite,
+                gate(
+                    GroupAdminAction::Invite,
+                    !self.dissolved && (self.is_admin || self.members_can_invite),
+                    "administrator only; member invites are disabled",
+                ),
+            ),
+            (
+                GroupAdminAction::Remove,
+                gate(
+                    GroupAdminAction::Remove,
+                    !self.dissolved && self.is_admin && selected_non_admin,
+                    if !self.is_admin {
+                        "administrator only"
+                    } else if selected.is_some_and(TuiGroupMember::is_admin) {
+                        "transfer administration before removing the administrator"
+                    } else {
+                        "select a roster member first"
+                    },
+                ),
+            ),
+            (
+                GroupAdminAction::TransferAdmin,
+                gate(
+                    GroupAdminAction::TransferAdmin,
+                    !self.dissolved && self.is_admin && selected_active_non_admin,
+                    if !self.is_admin {
+                        "administrator only"
+                    } else if selected.is_some_and(TuiGroupMember::is_admin) {
+                        "the selected peer is already administrator"
+                    } else {
+                        "select an active member first"
+                    },
+                ),
+            ),
+            (
+                GroupAdminAction::Sync,
+                gate(
+                    GroupAdminAction::Sync,
+                    !self.dissolved,
+                    "group is dissolved",
+                ),
+            ),
+            (
+                GroupAdminAction::Leave,
+                gate(
+                    GroupAdminAction::Leave,
+                    !self.dissolved
+                        && (!self.is_admin || self.automatic_successor_peer_id.is_some()),
+                    if self.dissolved {
+                        "group is dissolved"
+                    } else {
+                        "transfer administration before leaving"
+                    },
+                ),
+            ),
+        ]
+        .into_iter()
+        .map(|(action, mut state)| {
+            state.action = action;
+            state
+        })
+        .collect()
+    }
+
+    pub fn action_state(&self, action: GroupAdminAction) -> GroupAdminActionState {
+        self.action_states()
+            .into_iter()
+            .find(|state| state.action == action)
+            .expect("all group actions are represented")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2251,7 +2451,22 @@ impl TuiAppState {
         let Some(details) = self.chat_details.as_mut() else {
             return;
         };
-        let fields = if details.pending_delete {
+        let fields = if let Some(group) = details.group.as_mut() {
+            if group.input.is_some() {
+                return;
+            }
+            if group.pending_confirmation.is_some() {
+                vec![
+                    ChatDetailsField::GroupConfirm,
+                    ChatDetailsField::GroupCancel,
+                ]
+            } else {
+                GroupAdminAction::ALL
+                    .iter()
+                    .map(|action| action.field())
+                    .collect()
+            }
+        } else if details.pending_delete {
             vec![
                 ChatDetailsField::ConfirmDelete,
                 ChatDetailsField::CancelDelete,
@@ -2259,11 +2474,42 @@ impl TuiAppState {
         } else {
             ChatDetailsField::ALL.to_vec()
         };
+        if fields.is_empty() {
+            return;
+        }
         let current = fields
             .iter()
             .position(|field| *field == details.focus)
             .unwrap_or(0);
         details.focus = fields[next_index(current, delta, fields.len())];
+    }
+
+    pub fn move_group_member_selection(&mut self, delta: isize) {
+        let Some(details) = self.chat_details.as_mut() else {
+            return;
+        };
+        let Some(group) = details.group.as_mut() else {
+            return;
+        };
+        if group.input.is_some() || group.pending_confirmation.is_some() {
+            return;
+        }
+        if group.roster.is_empty() {
+            group.selected_member_index = 0;
+        } else {
+            group.selected_member_index = next_index(
+                group.selected_member_index,
+                delta,
+                group.roster.len(),
+            );
+        }
+    }
+
+    pub fn selected_group_member(&self) -> Option<&TuiGroupMember> {
+        self.chat_details
+            .as_ref()
+            .and_then(|details| details.group.as_ref())
+            .and_then(TuiGroupDetails::selected_member)
     }
 
     pub fn chat_details_status(&mut self, message: impl Into<String>) {
@@ -2800,6 +3046,107 @@ mod tests {
             content_metadata: None,
             sender_alias: None,
         }
+    }
+
+    fn group_details(is_admin: bool, members_can_invite: bool) -> TuiGroupDetails {
+        TuiGroupDetails {
+            image_hash: None,
+            is_admin,
+            members_can_invite,
+            dissolved: false,
+            automatic_successor_peer_id: (!is_admin).then(|| "peer-2".to_string()),
+            roster: vec![
+                TuiGroupMember {
+                    peer_id: "peer-1".to_string(),
+                    display_name: "Admin".to_string(),
+                    role: "admin".to_string(),
+                    membership_state: "active".to_string(),
+                },
+                TuiGroupMember {
+                    peer_id: "peer-2".to_string(),
+                    display_name: "Member".to_string(),
+                    role: "member".to_string(),
+                    membership_state: "active".to_string(),
+                },
+            ],
+            selected_member_index: 0,
+            receipts: Vec::new(),
+            pending_count: 0,
+            sync_status: None,
+            input: None,
+            pending_confirmation: None,
+            pending_confirmation_peer_id: None,
+        }
+    }
+
+    fn chat_details_with_group(group: TuiGroupDetails) -> TuiChatDetails {
+        TuiChatDetails {
+            chat_id: "group:one".to_string(),
+            peer_id: "peer-1".to_string(),
+            peer_name: "Group One".to_string(),
+            peer_alias: None,
+            avatar_url: None,
+            connected: true,
+            remote_addr: None,
+            reconnect_count: 0,
+            sent_total: 0,
+            received_total: 0,
+            pinned: false,
+            focus: ChatDetailsField::GroupRename,
+            pending_delete: false,
+            status: None,
+            error: None,
+            recent_files: Vec::new(),
+            selected_file_index: 0,
+            file_filter: "all".to_string(),
+            file_offset: 0,
+            file_has_more: false,
+            file_status: None,
+            file_error: None,
+            group: Some(group),
+        }
+    }
+
+    #[test]
+    fn group_actions_expose_role_and_policy_gates_with_reasons() {
+        let mut admin = group_details(true, false);
+        assert!(admin.action_state(GroupAdminAction::Rename).enabled);
+        assert!(admin.action_state(GroupAdminAction::Policy).enabled);
+        assert!(admin.action_state(GroupAdminAction::Invite).enabled);
+        assert_eq!(
+            admin
+                .action_state(GroupAdminAction::Remove)
+                .disabled_reason
+                .as_deref(),
+            Some("transfer administration before removing the administrator")
+        );
+
+        admin.selected_member_index = 1;
+        assert!(admin.action_state(GroupAdminAction::Remove).enabled);
+        assert!(admin.action_state(GroupAdminAction::TransferAdmin).enabled);
+
+        let member = group_details(false, false);
+        assert!(!member.action_state(GroupAdminAction::Rename).enabled);
+        assert!(!member.action_state(GroupAdminAction::Policy).enabled);
+        assert_eq!(
+            member.action_state(GroupAdminAction::Invite).disabled_reason,
+            Some("administrator only; member invites are disabled".to_string())
+        );
+        assert!(member.action_state(GroupAdminAction::Sync).enabled);
+        assert!(member.action_state(GroupAdminAction::Leave).enabled);
+    }
+
+    #[test]
+    fn group_confirmation_and_member_navigation_use_actionable_state() {
+        let mut state = TuiAppState::default();
+        state.chat_details = Some(chat_details_with_group(group_details(true, false)));
+        state.move_group_member_selection(1);
+        assert_eq!(state.selected_group_member().unwrap().peer_id, "peer-2");
+        state.chat_details.as_mut().unwrap().group.as_mut().unwrap().pending_confirmation =
+            Some(GroupAdminAction::Remove);
+        state.chat_details.as_mut().unwrap().focus = ChatDetailsField::GroupConfirm;
+        state.move_chat_details_focus(1);
+        assert_eq!(state.chat_details.unwrap().focus, ChatDetailsField::GroupCancel);
     }
 
     #[test]
