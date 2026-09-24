@@ -7360,6 +7360,12 @@ fn drain_core_events(
                 state.app.apply_local_peer_expired(&peer_id);
                 state.last_peer_event = Some(format!("expired {peer_id}"));
             }
+            TuiEvent::Core(CoreEvent::ConnectivityStateUpdated(event)) => {
+                state.app.status = format!(
+                    "connectivity {} for {}: {} (attempt {}/{})",
+                    event.state, event.peer_id, event.reason, event.attempt, event.max_attempts
+                );
+            }
             TuiEvent::Core(CoreEvent::MessageReceived(message)) => {
                 let chat_id = message.chat_id.clone();
                 let peer_id = message.peer_id.clone();

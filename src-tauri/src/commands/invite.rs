@@ -65,34 +65,9 @@ pub async fn create_invite(
         .await
         .clone()
         .ok_or("Network peer id not available. Is the network started?")?;
-    let my_address = {
-        let v4_stun = net_state.public_address_v4.lock().await.clone();
-        let stun_port = net_state.stun_external_port.lock().await.clone();
-
-        if let (Some(ref ip), Some(port)) = (&v4_stun, stun_port) {
-            let addr = format!("/ip4/{}/udp/{}/quic-v1", ip, port);
-            println!("[Invite] Using QUIC STUN: {}", addr);
-            addr
-        } else {
-            let addrs = net_state.listening_addresses.lock().await;
-            addrs
-                .iter()
-                .find(|a| {
-                    a.contains("/udp/")
-                        && a.contains("/quic-v1")
-                        && !a.contains("127.0.0.1")
-                        && !a.contains("::1")
-                })
-                .or_else(|| {
-                    addrs.iter().find(|a| {
-                        a.contains("/tcp/") && !a.contains("127.0.0.1") && !a.contains("::1")
-                    })
-                })
-                .or_else(|| addrs.first())
-                .cloned()
-                .ok_or("No listening address available. Is the network started?")?
-        }
-    };
+    let my_address = crate::network::refresh_current_public_address(&net_state)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let encrypted_invite = invite::generate_invite(
         &password,
@@ -124,7 +99,7 @@ pub async fn create_invite(
     }
 
     println!("[Backend] Publishing invite to Gist immediately...");
-    discovery::publish_peer_info(&token, vec![], &app_state)
+    discovery::publish_peer_info(&token, vec![my_address.clone()], &app_state)
         .await
         .map_err(|e| format!("Failed to publish invite: {}", e))?;
 
@@ -275,25 +250,9 @@ pub async fn redeem_and_connect(
             }
 
             {
-                let my_address = {
-                    let v4_stun = net_state.public_address_v4.lock().await.clone();
-                    let stun_port = net_state.stun_external_port.lock().await.clone();
-
-                    if let (Some(ip), Some(port)) = (v4_stun, stun_port) {
-                        format!("/ip4/{}/udp/{}/quic-v1", ip, port)
-                    } else {
-                        let addrs = net_state.listening_addresses.lock().await;
-                        addrs
-                            .iter()
-                            .find(|a| {
-                                a.contains("/udp/")
-                                    && a.contains("/quic-v1")
-                                    && !a.contains("127.0.0.1")
-                            })
-                            .cloned()
-                            .unwrap_or_else(|| "unknown".to_string())
-                    }
-                };
+                let my_address = crate::network::refresh_current_public_address(&net_state)
+                    .await
+                    .unwrap_or_else(|_| "unknown".to_string());
 
                 let github_token = {
                     let mgr = app_state.config_manager.lock().await;
@@ -302,6 +261,15 @@ pub async fn redeem_and_connect(
                 };
 
                 if let Some(token) = github_token {
+                    if let Err(error) = crate::network::discovery::publish_peer_info(
+                        &token,
+                        vec![my_address.clone()],
+                        &app_state,
+                    )
+                    .await
+                    {
+                        eprintln!("[Discovery] Failed to refresh peer endpoints: {}", error);
+                    }
                     match invite::generate_shadow_invite(
                         &password,
                         &inviter,
@@ -314,11 +282,6 @@ pub async fn redeem_and_connect(
                                 eprintln!("[Shadow] Failed to publish: {}", e);
                             } else {
                                 println!("[Shadow] ✅ Published to Gist for {}", inviter);
-
-                                println!(
-                                    "[Shadow] ⏳ Waiting 2.5s for shadow invite propagation..."
-                                );
-                                tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
                                 println!(
                                     "[Backend] Sending punch command: {} -> {}",

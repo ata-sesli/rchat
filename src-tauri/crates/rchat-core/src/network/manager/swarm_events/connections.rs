@@ -33,8 +33,14 @@ impl NetworkManager {
             .push(remote_addr.clone());
 
         let mut to_remove = Vec::new();
-        for (name, (addr, _)) in self.active_punch_targets.iter() {
-            let target_ip = addr.to_string().split('/').nth(2).unwrap_or("").to_string();
+        for (name, target) in self.active_punch_targets.iter() {
+            let target_ip = target
+                .address
+                .to_string()
+                .split('/')
+                .nth(2)
+                .unwrap_or("")
+                .to_string();
             let connected_ip = remote_addr
                 .to_string()
                 .split('/')

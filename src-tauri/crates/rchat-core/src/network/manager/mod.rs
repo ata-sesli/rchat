@@ -51,6 +51,17 @@ fn record_group_sync_request(
     }
 }
 
+#[derive(Debug, Clone)]
+struct PunchTarget {
+    address: Multiaddr,
+    started_at: std::time::Instant,
+    next_attempt_at: std::time::Instant,
+    attempt: u32,
+}
+
+const MAX_PUNCH_ATTEMPTS: u32 = 8;
+const PUNCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveCallPhase {
     OutgoingRinging,
@@ -514,7 +525,7 @@ pub struct NetworkManager {
     pending_shadow_polls: HashMap<String, (String, String, u64)>,
     // Active punch targets: target_name → (Multiaddr, start_time)
     // Continuous 500ms punching for 30 seconds
-    active_punch_targets: HashMap<String, (Multiaddr, std::time::Instant)>,
+    active_punch_targets: HashMap<String, PunchTarget>,
     // Joined group IDs we are currently subscribed to
     subscribed_group_ids: HashSet<String>,
     // Explicit dependency requests already attempted for each group/peer repair.
