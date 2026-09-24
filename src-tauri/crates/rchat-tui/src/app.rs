@@ -12,7 +12,8 @@ use crate::{
     smoke::SmokeFrameGenerator,
     state::{
         db_chat_id, message_is_attachment, AppSessionPhase, AttachmentActionField,
-        AttachmentFileEntry, AttachmentModalField, ComposerAction, ContextMenuAction,
+        AttachmentFileEntry, AttachmentModalField, ChatDetailsField, ComposerAction,
+        ContextMenuAction,
         ContextMenuState, ContextMenuTarget, FocusPane, MediaViewerAction, MediaViewerKind,
         NewGroupStep, NewItemChoice, NewPersonField, NewPersonStep, SettingsField, SettingsPane,
         SettingsSection, StickerPickerMode, StickerPickerState, TuiAppState, TuiChat,
@@ -3221,6 +3222,11 @@ async fn open_chat_details(
             reconnect_count: 0,
             sent_total: 0,
             received_total: 0,
+            pinned: state.app.pinned_chat_keys.contains(&chat_id),
+            focus: ChatDetailsField::Pin,
+            pending_delete: false,
+            status: None,
+            error: None,
             recent_files: Vec::new(),
             group: Some(TuiGroupDetails {
                 image_hash,
@@ -3243,7 +3249,7 @@ async fn open_chat_details(
         .collect();
 
     state.app.chat_details = Some(TuiChatDetails {
-        chat_id: overview.chat_id,
+        chat_id: overview.chat_id.clone(),
         peer_id: overview.peer_id,
         peer_name: overview.peer_name,
         peer_alias: overview.peer_alias,
@@ -3253,10 +3259,109 @@ async fn open_chat_details(
         reconnect_count: stats.reconnect_count,
         sent_total: stats.sent_total,
         received_total: stats.received_total,
+        pinned: state.app.pinned_chat_keys.contains(&overview.chat_id),
+        focus: ChatDetailsField::Pin,
+        pending_delete: false,
+        status: None,
+        error: None,
         recent_files,
         group: None,
     });
     state.app.status = "chat details".to_string();
+    Ok(())
+}
+
+async fn handle_chat_details_key(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+    code: KeyCode,
+) -> Result<()> {
+    match code {
+        KeyCode::Esc => {
+            if state
+                .app
+                .chat_details
+                .as_ref()
+                .is_some_and(|details| details.pending_delete)
+            {
+                if let Some(details) = state.app.chat_details.as_mut() {
+                    details.pending_delete = false;
+                    details.focus = ChatDetailsField::Delete;
+                    details.status = Some("delete cancelled".to_string());
+                }
+            } else {
+                state.app.close_modal();
+            }
+        }
+        KeyCode::Up => state.app.move_chat_details_focus(-1),
+        KeyCode::Down => state.app.move_chat_details_focus(1),
+        KeyCode::Enter => activate_chat_details_focus(app_state, network_state, state).await?,
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn activate_chat_details_focus(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+) -> Result<()> {
+    let Some((field, chat_id, peer_id)) = state.app.chat_details.as_ref().map(|details| {
+        (details.focus, details.chat_id.clone(), details.peer_id.clone())
+    }) else {
+        return Ok(());
+    };
+    match field {
+        ChatDetailsField::Pin => {
+            let pinned = settings_peers::toggle_pin_peer(app_state, peer_id).await?;
+            refresh_direct_chats(app_state, network_state, state).await?;
+            if let Some(details) = state.app.chat_details.as_mut() {
+                details.pinned = pinned;
+                details.status = Some(if pinned { "chat pinned" } else { "chat unpinned" }.to_string());
+                details.error = None;
+            }
+        }
+        ChatDetailsField::Reconnect => {
+            details::force_reconnect(network_state, &chat_id).await?;
+            state.app.chat_details_status("reconnect requested");
+        }
+        ChatDetailsField::Drop => {
+            details::drop_connection(network_state, &chat_id).await?;
+            state.app.chat_details_status("connection drop requested");
+        }
+        ChatDetailsField::Delete => {
+            if let Some(details) = state.app.chat_details.as_mut() {
+                details.pending_delete = true;
+                details.focus = ChatDetailsField::ConfirmDelete;
+                details.status = Some("confirm chat deletion".to_string());
+                details.error = None;
+            }
+        }
+        ChatDetailsField::ConfirmDelete => {
+            let old_index = state
+                .app
+                .chats
+                .iter()
+                .position(|chat| chat.id == chat_id)
+                .unwrap_or(state.app.selected_chat_index);
+            details::delete_direct_chat(app_state, &chat_id)?;
+            state.app.chat_details = None;
+            refresh_direct_chats(app_state, network_state, state).await?;
+            if let Some(fallback) = state.app.select_fallback_after_removal(&chat_id, old_index) {
+                if let Err(error) = open_chat_list_item(app_state, network_state, state, &fallback).await {
+                    state.app.last_error = Some(error.to_string());
+                }
+            }
+        }
+        ChatDetailsField::CancelDelete => {
+            if let Some(details) = state.app.chat_details.as_mut() {
+                details.pending_delete = false;
+                details.focus = ChatDetailsField::Delete;
+                details.status = Some("delete cancelled".to_string());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4317,6 +4422,16 @@ fn context_menu_actions(menu: &ContextMenuState, state: &UiState) -> Vec<Context
     match &menu.target {
         ContextMenuTarget::Chat(index) => {
             let mut actions = vec![ContextMenuAction::Open, ContextMenuAction::Details];
+            if state.app.chats.get(*index).is_some_and(|chat| {
+                matches!(chat_kind::parse_chat_kind(&chat.id), chat_kind::ChatKind::Direct)
+            }) {
+                actions.extend([
+                    ContextMenuAction::Pin,
+                    ContextMenuAction::Reconnect,
+                    ContextMenuAction::Drop,
+                    ContextMenuAction::Delete,
+                ]);
+            }
             if state
                 .app
                 .chats
@@ -4342,6 +4457,10 @@ fn context_menu_action_label(action: ContextMenuAction) -> &'static str {
     match action {
         ContextMenuAction::Open => "Open",
         ContextMenuAction::Details => "Details",
+        ContextMenuAction::Pin => "Pin/unpin chat",
+        ContextMenuAction::Reconnect => "Reconnect",
+        ContextMenuAction::Drop => "Drop connection",
+        ContextMenuAction::Delete => "Delete chat",
         ContextMenuAction::Archive => "Save to archive",
         ContextMenuAction::MoveToRoot => "Remove from envelope",
         ContextMenuAction::DeleteEnvelope => "Delete envelope",
@@ -4374,6 +4493,36 @@ async fn activate_context_menu_action(
         (ContextMenuTarget::Chat(index), ContextMenuAction::Details) => {
             if let Some(chat_id) = state.app.chats.get(index).map(|chat| chat.id.clone()) {
                 open_chat_details(app_state, network_state, state, &chat_id).await?;
+            }
+        }
+        (ContextMenuTarget::Chat(index), ContextMenuAction::Pin) => {
+            if let Some(chat_id) = state.app.chats.get(index).map(|chat| chat.id.clone()) {
+                let peer_id = details::resolve_dm_peer_id(&chat_id)?;
+                let pinned = settings_peers::toggle_pin_peer(app_state, peer_id).await?;
+                refresh_direct_chats(app_state, network_state, state).await?;
+                state.app.status = if pinned { "chat pinned" } else { "chat unpinned" }.to_string();
+            }
+        }
+        (ContextMenuTarget::Chat(index), ContextMenuAction::Reconnect) => {
+            if let Some(chat_id) = state.app.chats.get(index).map(|chat| chat.id.clone()) {
+                details::force_reconnect(network_state, &chat_id).await?;
+                state.app.status = "reconnect requested".to_string();
+            }
+        }
+        (ContextMenuTarget::Chat(index), ContextMenuAction::Drop) => {
+            if let Some(chat_id) = state.app.chats.get(index).map(|chat| chat.id.clone()) {
+                details::drop_connection(network_state, &chat_id).await?;
+                state.app.status = "connection drop requested".to_string();
+            }
+        }
+        (ContextMenuTarget::Chat(index), ContextMenuAction::Delete) => {
+            if let Some(chat_id) = state.app.chats.get(index).map(|chat| chat.id.clone()) {
+                open_chat_details(app_state, network_state, state, &chat_id).await?;
+                if let Some(details) = state.app.chat_details.as_mut() {
+                    details.pending_delete = true;
+                    details.focus = ChatDetailsField::ConfirmDelete;
+                    details.status = Some("confirm chat deletion".to_string());
+                }
             }
         }
         (ContextMenuTarget::Chat(index), ContextMenuAction::Archive) => {
@@ -5682,6 +5831,13 @@ async fn handle_interactive_key(
         return Ok(false);
     }
 
+    if state.app.chat_details.is_some() {
+        if let Err(error) = handle_chat_details_key(app_state, network_state, state, code).await {
+            state.app.chat_details_error(error.to_string());
+        }
+        return Ok(false);
+    }
+
     if state.app.show_command_palette {
         match code {
             KeyCode::Esc => state.app.close_command_palette(),
@@ -6006,6 +6162,54 @@ async fn end_current_screen_share(network_state: &NetworkState, state: &mut UiSt
     Ok(())
 }
 
+async fn handle_chat_details_mouse(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+    mouse: MouseEvent,
+    size: Size,
+) -> Result<()> {
+    let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
+        return Ok(());
+    };
+    let area = Rect { x: 0, y: 0, width: size.width, height: size.height };
+    let Some(field) = chat_details_click_target(area, mouse.column, mouse.row, state) else {
+        return Ok(());
+    };
+    if let Some(details) = state.app.chat_details.as_mut() {
+        details.focus = field;
+    }
+    activate_chat_details_focus(app_state, network_state, state).await
+}
+
+fn chat_details_click_target(
+    area: Rect,
+    column: u16,
+    row: u16,
+    state: &UiState,
+) -> Option<ChatDetailsField> {
+    let popup = centered_rect(76, 20, area);
+    if !rect_contains(popup, column, row) {
+        return None;
+    }
+    let Some(details) = state.app.chat_details.as_ref() else {
+        return None;
+    };
+    if details.group.is_some() {
+        return None;
+    }
+    let line = row.saturating_sub(popup.y.saturating_add(2)) as usize;
+    match line {
+        8 => Some(ChatDetailsField::Pin),
+        9 => Some(ChatDetailsField::Reconnect),
+        10 => Some(ChatDetailsField::Drop),
+        11 => Some(ChatDetailsField::Delete),
+        12 if details.pending_delete => Some(ChatDetailsField::ConfirmDelete),
+        13 if details.pending_delete => Some(ChatDetailsField::CancelDelete),
+        _ => None,
+    }
+}
+
 async fn handle_mouse_event(
     app_state: &AppState,
     network_state: &NetworkState,
@@ -6013,6 +6217,10 @@ async fn handle_mouse_event(
     mouse: MouseEvent,
     size: Size,
 ) -> Result<()> {
+    if state.app.chat_details.is_some() {
+        return handle_chat_details_mouse(app_state, network_state, state, mouse, size).await;
+    }
+
     if state.app.new_person.is_some() {
         return handle_new_person_mouse(app_state, network_state, state, mouse, size).await;
     }
@@ -10262,6 +10470,23 @@ fn help_overlay_text_lines() -> &'static [&'static str] {
     ]
 }
 
+fn chat_details_button_line(
+    details: &TuiChatDetails,
+    field: ChatDetailsField,
+    label: &str,
+    theme: &Theme,
+) -> Line<'static> {
+    let focused = details.focus == field;
+    Line::from(Span::styled(
+        format!("{} {label}", if focused { ">" } else { " " }),
+        if focused {
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text)
+        },
+    ))
+}
+
 fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
     let Some(details) = state.app.chat_details.as_ref() else {
         return;
@@ -10310,12 +10535,44 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
             "Messages: {} sent, {} received",
             details.sent_total, details.received_total
         )),
+        Line::from("Actions"),
+        chat_details_button_line(details, ChatDetailsField::Pin, if details.pinned { "Unpin chat" } else { "Pin chat" }, theme),
+        chat_details_button_line(details, ChatDetailsField::Reconnect, "Reconnect", theme),
+        chat_details_button_line(details, ChatDetailsField::Drop, "Drop connection", theme),
+        chat_details_button_line(details, ChatDetailsField::Delete, "Delete chat", theme),
+    ];
+    if details.pending_delete {
+        lines.push(chat_details_button_line(
+            details,
+            ChatDetailsField::ConfirmDelete,
+            "Confirm delete",
+            theme,
+        ));
+        lines.push(chat_details_button_line(
+            details,
+            ChatDetailsField::CancelDelete,
+            "Cancel delete",
+            theme,
+        ));
+    }
+    if let Some(error) = details.error.as_ref() {
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    } else if let Some(status) = details.status.as_ref() {
+        lines.push(Line::from(Span::styled(
+            status.clone(),
+            Style::default().fg(theme.accent),
+        )));
+    }
+    lines.extend([
         Line::from(""),
         Line::from(Span::styled(
             "Recent files",
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         )),
-    ];
+    ]);
 
     if let Some(group) = details.group.as_ref() {
         lines = vec![
@@ -10415,7 +10672,7 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Esc closes",
+        "Up/Down select | Enter activate | Esc close",
         Style::default().fg(theme.muted),
     )));
 
