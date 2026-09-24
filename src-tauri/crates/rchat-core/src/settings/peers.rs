@@ -178,6 +178,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adding_existing_peer_without_alias_preserves_existing_alias() {
+        let (_temp, app_state) = test_app_state().await;
+        add_trusted_peer(&app_state, "peer-1".to_string(), Some("User Alias".to_string()))
+            .expect("initial add");
+        add_trusted_peer(&app_state, "peer-1".to_string(), None).expect("duplicate add");
+        let peers = get_all_peer_rows(&app_state).expect("peers");
+        assert_eq!(
+            peers.iter().find(|peer| peer.id == "peer-1").expect("peer").alias,
+            "User Alias"
+        );
+    }
+
+    #[tokio::test]
     async fn trusted_peers_list_and_delete_use_database_peers() {
         let (_temp, app_state) = test_app_state().await;
         {

@@ -808,7 +808,6 @@ pub fn add_peer(
     public_key: Option<&[u8]>,
     method: &str, // "local", "gist", "manual"
 ) -> anyhow::Result<()> {
-    let alias = alias.unwrap_or(peer_id);
     let public_key = public_key.unwrap_or(&[0u8; 32]);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -817,7 +816,7 @@ pub fn add_peer(
 
     conn.execute(
         "INSERT INTO peers (id, alias, last_seen, public_key, method)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+         VALUES (?1, COALESCE(?2, ?1), ?3, ?4, ?5)
          ON CONFLICT(id) DO UPDATE SET
              last_seen = ?3,
              alias = COALESCE(?2, alias)",
