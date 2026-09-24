@@ -328,7 +328,7 @@ pub async fn create_github_invite(
         mgr.save(&config).await?;
     }
 
-    discovery::publish_peer_info(&token, vec![my_address.clone()], app_state).await?;
+    discovery::publish_peer_info(&token, vec![], app_state).await?;
     let tx = net_state.sender.lock().await;
     let _ = tx.send(NetworkCommand::RegisterShadow {
         invitee: invitee.to_string(),
@@ -446,13 +446,9 @@ pub async fn redeem_github_invite(
         let mgr = app_state.config_manager.lock().await;
         mgr.load().await?.system.github_token.clone()
     } {
-        let my_address = resolve_current_public_address(net_state).await?;
-        let _ = crate::network::discovery::publish_peer_info(
-            &token,
-            vec![my_address.clone()],
-            app_state,
-        )
-        .await;
+        let my_address = resolve_current_public_address(net_state)
+            .await
+            .unwrap_or_else(|_| "unknown".to_string());
         if let Ok(shadow) =
             invite::generate_shadow_invite(password, inviter, &my_username, &my_address, "pending")
         {
@@ -514,7 +510,30 @@ pub(crate) async fn canonical_direct_or_self_chat_id(
 }
 
 async fn resolve_current_public_address(net_state: &NetworkState) -> Result<String> {
-    crate::network::refresh_current_public_address(net_state).await
+    let v4_stun = net_state.public_address_v4.lock().await.clone();
+    let stun_port = *net_state.stun_external_port.lock().await;
+
+    if let (Some(ip), Some(port)) = (v4_stun, stun_port) {
+        return Ok(format!("/ip4/{}/udp/{}/quic-v1", ip, port));
+    }
+
+    let addrs = net_state.listening_addresses.lock().await;
+    addrs
+        .iter()
+        .find(|addr| {
+            addr.contains("/udp/")
+                && addr.contains("/quic-v1")
+                && !addr.contains("127.0.0.1")
+                && !addr.contains("::1")
+        })
+        .or_else(|| {
+            addrs
+                .iter()
+                .find(|addr| addr.contains("/tcp/") && !addr.contains("127.0.0.1") && !addr.contains("::1"))
+        })
+        .or_else(|| addrs.first())
+        .cloned()
+        .ok_or_else(|| anyhow!("No listening address available. Is the network started?"))
 }
 
 async fn mapped_github_chat_id_for_peer(app_state: &AppState, peer_id: &str) -> Option<String> {

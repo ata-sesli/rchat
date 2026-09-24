@@ -16,7 +16,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::events::SharedCoreEventSink;
-use crate::NetworkState;
 use crate::network::behaviour::RChatBehaviour;
 use crate::network::manager::NetworkManager;
 
@@ -221,62 +220,6 @@ pub async fn start(
         manager.run().await;
     });
     Ok(network_state)
-}
-
-pub async fn refresh_current_public_address(net_state: &NetworkState) -> anyhow::Result<String> {
-    let local_port = {
-        let addresses = net_state.listening_addresses.lock().await;
-        addresses
-            .iter()
-            .filter(|address| address.contains("/udp/") && address.contains("quic"))
-            .find_map(|address| {
-                address
-                    .parse::<libp2p::Multiaddr>()
-                    .ok()
-                    .and_then(|address| get_port_from_multiaddr(&address))
-            })
-    };
-
-    if let Some(local_port) = local_port {
-        let refreshed = stun::discover_on_port(local_port).await;
-        if let Some(address) = refreshed.ipv4 {
-            *net_state.public_address_v4.lock().await = Some(address.ip().to_string());
-            *net_state.stun_external_port.lock().await = Some(address.port());
-            return Ok(format!("/ip4/{}/udp/{}/quic-v1", address.ip(), address.port()));
-        }
-
-        // The live QUIC transport owns this UDP port, so a second ordinary
-        // STUN socket cannot observe it. Keep the last known endpoint rather
-        // than blocking direct/LAN and invitation flows; the bounded punch
-        // worker will report an unreachable mapping if it is no longer valid.
-        eprintln!(
-            "[STUN] Unable to observe a fresh mapping for active QUIC port {}; retaining the last endpoint",
-            local_port
-        );
-        let cached_ip = net_state.public_address_v4.lock().await.clone();
-        let cached_port = *net_state.stun_external_port.lock().await;
-        if let (Some(ip), Some(port)) = (cached_ip, cached_port) {
-            return Ok(format!("/ip4/{ip}/udp/{port}/quic-v1"));
-        }
-    }
-
-    let addresses = net_state.listening_addresses.lock().await;
-    addresses
-        .iter()
-        .find(|address| {
-            address.contains("/udp/")
-                && address.contains("/quic-v1")
-                && !address.contains("127.0.0.1")
-                && !address.contains("::1")
-        })
-        .or_else(|| {
-            addresses.iter().find(|address| {
-                address.contains("/tcp/") && !address.contains("127.0.0.1")
-            })
-        })
-        .or_else(|| addresses.first())
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("No listening address available. Is the network started?"))
 }
 
 fn get_port_from_multiaddr(addr: &libp2p::Multiaddr) -> Option<u16> {
