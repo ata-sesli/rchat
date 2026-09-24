@@ -252,7 +252,7 @@ pub async fn redeem_and_connect(
             {
                 let my_address = crate::network::refresh_current_public_address(&net_state)
                     .await
-                    .unwrap_or_else(|_| "unknown".to_string());
+                    .map_err(|error| error.to_string())?;
 
                 let github_token = {
                     let mgr = app_state.config_manager.lock().await;

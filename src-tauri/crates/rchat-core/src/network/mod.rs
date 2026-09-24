@@ -239,18 +239,14 @@ pub async fn refresh_current_public_address(net_state: &NetworkState) -> anyhow:
 
     if let Some(local_port) = local_port {
         let refreshed = stun::discover_on_port(local_port).await;
-        if let Some(address) = refreshed.ipv4 {
-            *net_state.public_address_v4.lock().await = Some(address.ip().to_string());
-        }
-        if let Some(port) = refreshed.external_port {
-            *net_state.stun_external_port.lock().await = Some(port);
-        }
-    }
-
-    let v4 = net_state.public_address_v4.lock().await.clone();
-    let port = *net_state.stun_external_port.lock().await;
-    if let (Some(ip), Some(port)) = (v4, port) {
-        return Ok(format!("/ip4/{ip}/udp/{port}/quic-v1"));
+        let Some(address) = refreshed.ipv4 else {
+            return Err(anyhow::anyhow!(
+                "Unable to observe a fresh public mapping for QUIC port {local_port}"
+            ));
+        };
+        *net_state.public_address_v4.lock().await = Some(address.ip().to_string());
+        *net_state.stun_external_port.lock().await = Some(address.port());
+        return Ok(format!("/ip4/{}/udp/{}/quic-v1", address.ip(), address.port()));
     }
 
     let addresses = net_state.listening_addresses.lock().await;
