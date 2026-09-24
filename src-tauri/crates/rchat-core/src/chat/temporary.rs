@@ -1370,6 +1370,7 @@ mod tests {
                                         routing_peers: Vec::new(),
                                         was_subscribed: false,
                                         punch_target: None,
+                                        punch_target_peer_id: None,
                                         min_add_counter,
                                     },
                                 );

@@ -958,6 +958,8 @@ pub struct PendingTemporaryFinalization {
     pub was_subscribed: bool,
     /// The punch target at freeze time (multiaddr string), restored on abort.
     pub punch_target: Option<String>,
+    /// The expected peer identity for the punch target, when known.
+    pub punch_target_peer_id: Option<String>,
     /// Membership counter carried by the farewell remove; a rejoin add must
     /// exceed it to supersede that remove on every peer.
     pub min_add_counter: u64,

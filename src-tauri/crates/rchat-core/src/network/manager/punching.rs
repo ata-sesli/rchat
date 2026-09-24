@@ -130,10 +130,6 @@ impl NetworkManager {
     }
 
     /// Add or replace a target and restart its bounded retry window.
-    pub(super) fn add_punch_target(&mut self, name: &str, addr: Multiaddr) {
-        self.add_punch_target_for_peer(name, addr, None);
-    }
-
     pub(super) fn add_punch_target_for_peer(
         &mut self,
         name: &str,
