@@ -55,6 +55,25 @@ pub struct TuiChatFileSummary {
     pub file_hash: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatDetailsField {
+    Pin,
+    Reconnect,
+    Drop,
+    Delete,
+    ConfirmDelete,
+    CancelDelete,
+}
+
+impl ChatDetailsField {
+    pub const ALL: [ChatDetailsField; 4] = [
+        ChatDetailsField::Pin,
+        ChatDetailsField::Reconnect,
+        ChatDetailsField::Drop,
+        ChatDetailsField::Delete,
+    ];
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiChatDetails {
     pub chat_id: String,
@@ -67,6 +86,11 @@ pub struct TuiChatDetails {
     pub reconnect_count: i64,
     pub sent_total: i64,
     pub received_total: i64,
+    pub pinned: bool,
+    pub focus: ChatDetailsField,
+    pub pending_delete: bool,
+    pub status: Option<String>,
+    pub error: Option<String>,
     pub recent_files: Vec<TuiChatFileSummary>,
     pub group: Option<TuiGroupDetails>,
 }
@@ -124,6 +148,10 @@ pub enum ContextMenuTarget {
 pub enum ContextMenuAction {
     Open,
     Details,
+    Pin,
+    Reconnect,
+    Drop,
+    Delete,
     Archive,
     MoveToRoot,
     DeleteEnvelope,
@@ -1664,6 +1692,22 @@ impl TuiAppState {
         }
     }
 
+    pub fn select_fallback_after_removal(&mut self, removed_chat_id: &str, old_index: usize) -> Option<String> {
+        if self.active_chat_id.as_deref() == Some(removed_chat_id) {
+            self.active_chat_id = self.chats.get(old_index).map(|chat| chat.id.clone());
+            self.selected_chat_index = old_index.min(self.chats.len().saturating_sub(1));
+            self.messages.clear();
+            self.selected_message_id = None;
+        }
+        if self.chats.is_empty() {
+            self.active_chat_id = None;
+            self.selected_chat_index = 0;
+            self.messages.clear();
+            self.selected_message_id = None;
+        }
+        self.selected_chat_id().map(ToOwned::to_owned)
+    }
+
     pub fn replace_envelopes(&mut self, mut envelopes: Vec<TuiEnvelope>) {
         envelopes.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
         self.envelopes = envelopes;
@@ -1832,6 +1876,39 @@ impl TuiAppState {
 
     pub fn close_settings(&mut self) {
         self.settings = None;
+    }
+
+    pub fn move_chat_details_focus(&mut self, delta: isize) {
+        let Some(details) = self.chat_details.as_mut() else {
+            return;
+        };
+        let fields = if details.pending_delete {
+            vec![
+                ChatDetailsField::ConfirmDelete,
+                ChatDetailsField::CancelDelete,
+            ]
+        } else {
+            ChatDetailsField::ALL.to_vec()
+        };
+        let current = fields
+            .iter()
+            .position(|field| *field == details.focus)
+            .unwrap_or(0);
+        details.focus = fields[next_index(current, delta, fields.len())];
+    }
+
+    pub fn chat_details_status(&mut self, message: impl Into<String>) {
+        if let Some(details) = self.chat_details.as_mut() {
+            details.status = Some(message.into());
+            details.error = None;
+        }
+    }
+
+    pub fn chat_details_error(&mut self, message: impl Into<String>) {
+        if let Some(details) = self.chat_details.as_mut() {
+            details.error = Some(message.into());
+            details.status = None;
+        }
     }
 
     pub fn open_attachment_modal(&mut self) {
@@ -2448,6 +2525,11 @@ mod tests {
             reconnect_count: 0,
             sent_total: 0,
             received_total: 0,
+            pinned: false,
+            focus: ChatDetailsField::Pin,
+            pending_delete: false,
+            status: None,
+            error: None,
             recent_files: Vec::new(),
             group: None,
         });
@@ -2456,6 +2538,46 @@ mod tests {
 
         assert!(!state.show_help);
         assert!(state.chat_details.is_none());
+    }
+
+    #[test]
+    fn chat_details_actions_and_fallback_selection_are_deterministic() {
+        let mut state = TuiAppState::default();
+        state.chat_details = Some(TuiChatDetails {
+            chat_id: "peer-1".to_string(),
+            peer_id: "peer-1".to_string(),
+            peer_name: "Peer One".to_string(),
+            peer_alias: None,
+            avatar_url: None,
+            connected: false,
+            remote_addr: None,
+            reconnect_count: 0,
+            sent_total: 0,
+            received_total: 0,
+            pinned: false,
+            focus: ChatDetailsField::Pin,
+            pending_delete: false,
+            status: None,
+            error: None,
+            recent_files: Vec::new(),
+            group: None,
+        });
+        state.move_chat_details_focus(1);
+        assert_eq!(state.chat_details.as_ref().unwrap().focus, ChatDetailsField::Reconnect);
+        state.chat_details.as_mut().unwrap().pending_delete = true;
+        state.chat_details.as_mut().unwrap().focus = ChatDetailsField::ConfirmDelete;
+        state.move_chat_details_focus(1);
+        assert_eq!(state.chat_details.as_ref().unwrap().focus, ChatDetailsField::CancelDelete);
+
+        state.chats = vec![
+            TuiChat { id: "peer-1".into(), name: "One".into(), latest_timestamp: 3, unread_count: 0 },
+            TuiChat { id: "peer-2".into(), name: "Two".into(), latest_timestamp: 2, unread_count: 0 },
+            TuiChat { id: "peer-3".into(), name: "Three".into(), latest_timestamp: 1, unread_count: 0 },
+        ];
+        state.active_chat_id = Some("peer-1".into());
+        state.selected_chat_index = 0;
+        state.chats.remove(0);
+        assert_eq!(state.select_fallback_after_removal("peer-1", 0).as_deref(), Some("peer-2"));
     }
 
     #[test]
