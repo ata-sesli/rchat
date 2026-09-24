@@ -446,9 +446,7 @@ pub async fn redeem_github_invite(
         let mgr = app_state.config_manager.lock().await;
         mgr.load().await?.system.github_token.clone()
     } {
-        let my_address = resolve_current_public_address(net_state)
-            .await
-            .unwrap_or_else(|_| "unknown".to_string());
+        let my_address = resolve_current_public_address(net_state).await?;
         let _ = crate::network::discovery::publish_peer_info(
             &token,
             vec![my_address.clone()],

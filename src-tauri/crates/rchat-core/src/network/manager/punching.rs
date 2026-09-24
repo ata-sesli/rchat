@@ -142,8 +142,7 @@ impl NetworkManager {
 
     /// Remove a target after connection or explicit cancellation.
     pub(super) fn remove_punch_target(&mut self, name: &str) -> bool {
-        if let Some(target) = self.active_punch_targets.remove(name) {
-            self.emit_connectivity_state(name, "connected", "connected", target.attempt);
+        if self.active_punch_targets.remove(name).is_some() {
             println!("[Punch] 🎉 {} connected, removed from targets", name);
             true
         } else {
@@ -151,7 +150,7 @@ impl NetworkManager {
         }
     }
 
-    fn emit_connectivity_state(
+    pub(super) fn emit_connectivity_state(
         &self,
         peer_id: &str,
         state: &str,

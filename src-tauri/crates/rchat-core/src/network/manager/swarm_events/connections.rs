@@ -54,6 +54,7 @@ impl NetworkManager {
         }
 
         for name in to_remove {
+            self.emit_connectivity_state(&name, "connected", "connected", 0);
             self.remove_punch_target(&name);
         }
 
