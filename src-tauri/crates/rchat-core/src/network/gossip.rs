@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use libp2p::{gossipsub::IdentTopic, identity, PeerId};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 use crate::chat_kind;
 
@@ -406,9 +407,20 @@ impl GroupSyncRequest {
             return Err("group sync page limit is out of range".to_string());
         }
         if self.wanted_record_ids.len() > MAX_GROUP_SYNC_WANTED_IDS
-            || self.wanted_record_ids.iter().any(|id| id.len() > 256)
+            || self.wanted_record_ids.iter().any(|id| id.is_empty() || id.len() > 256)
         {
             return Err("group sync dependency request exceeds its bounds".to_string());
+        }
+        let mut unique_wanted = BTreeSet::new();
+        if self
+            .wanted_record_ids
+            .iter()
+            .any(|id| !unique_wanted.insert(id.as_str()))
+        {
+            return Err("group sync dependency request contains duplicate ids".to_string());
+        }
+        if self.wanted_record_ids.len() > self.limit {
+            return Err("group sync dependency request exceeds the page limit".to_string());
         }
         if self
             .cursor
@@ -435,12 +447,31 @@ impl GroupSyncResponse {
         if self.records.len() > MAX_GROUP_SYNC_RECORDS {
             return Err("group sync response exceeds the page limit".to_string());
         }
+        if self.records.is_empty() && self.has_more {
+            return Err("group sync response claims more pages without records".to_string());
+        }
         if self
             .records
             .iter()
             .any(|record| record.group_id() != self.group_id || record.validate_shape().is_err())
         {
             return Err("group sync response contains an invalid record".to_string());
+        }
+        let mut unique_ids = BTreeSet::new();
+        if self
+            .records
+            .iter()
+            .any(|record| !unique_ids.insert(record.id()))
+        {
+            return Err("group sync response contains duplicate records".to_string());
+        }
+        if self.next_cursor.as_ref().is_some_and(|cursor| {
+            cursor.record_id.is_empty()
+                || cursor.record_id.len() > 256
+                || cursor.author_peer_id.is_empty()
+                || cursor.author_peer_id.len() > 128
+        }) {
+            return Err("group sync response cursor exceeds its bounds".to_string());
         }
         Ok(())
     }
@@ -577,6 +608,61 @@ mod tests {
             .validate()
             .expect_err("wanted id cap")
             .contains("bounds"));
+    }
+
+    #[test]
+    fn group_sync_rejects_duplicate_dependency_and_response_records() {
+        let group_id = crate::chat_kind::derive_group_chat_id("founder", "genesis");
+        let request = GroupSyncRequest {
+            version: GROUP_PROTOCOL_VERSION,
+            group_id: group_id.clone(),
+            wanted_record_ids: vec!["record-1".into(), "record-1".into()],
+            cursor: None,
+            limit: MAX_GROUP_SYNC_RECORDS,
+        };
+        assert!(request
+            .validate()
+            .expect_err("duplicate wanted id")
+            .contains("duplicate"));
+
+        let key = identity::Keypair::generate_ed25519();
+        let record = SignedGroupRecord::new(
+            &key,
+            group_id.clone(),
+            "record-1".to_string(),
+            1,
+            Vec::new(),
+            1,
+            GroupRecordBody::GroupCreated {
+                name: "Test".to_string(),
+                settings: None,
+                image_hash: None,
+            },
+        )
+        .expect("sign record");
+        let response = GroupSyncResponse {
+            version: GROUP_PROTOCOL_VERSION,
+            group_id,
+            records: vec![record.clone(), record],
+            next_cursor: None,
+            has_more: false,
+        };
+        assert!(response
+            .validate()
+            .expect_err("duplicate response record")
+            .contains("duplicate"));
+
+        let empty_page = GroupSyncResponse {
+            version: GROUP_PROTOCOL_VERSION,
+            group_id: "group:550e8400-e29b-41d4-a716-446655440000".to_string(),
+            records: Vec::new(),
+            next_cursor: None,
+            has_more: true,
+        };
+        assert!(empty_page
+            .validate()
+            .expect_err("empty page with more")
+            .contains("without records"));
     }
 
     #[test]

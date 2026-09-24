@@ -784,6 +784,17 @@ mod tests {
     }
 
     #[test]
+    fn missing_dependencies_are_retried_after_the_parent_arrives() {
+        let (records, _, _) = fixture();
+        let incomplete = vec![records[0].clone(), records[2].clone()];
+        let pending = evaluate_group_records(&incomplete);
+        assert_eq!(pending.missing_dependency_ids(), vec!["invited"]);
+
+        let complete = evaluate_group_records(&records);
+        assert!(complete.missing_dependency_ids().is_empty());
+    }
+
+    #[test]
     fn next_frontier_includes_every_effective_policy_record() {
         let (records, _, _) = fixture();
         let evaluation = evaluate_group_records(&records);

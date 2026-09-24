@@ -486,7 +486,23 @@ impl NetworkManager {
             .ok_or_else(|| "missing group sync response payload".to_string())?;
         let response: crate::network::gossip::GroupSyncResponse = serde_json::from_str(payload)
             .map_err(|e| format!("invalid group sync response: {e}"))?;
-        response.validate()?;
+        if let Err(error) = response.validate() {
+            self.emit(crate::events::CoreEvent::GroupSyncStateUpdated(
+                crate::events::GroupSyncStateUpdatedEvent {
+                    group_id: response.group_id.clone(),
+                    state: "failed".to_string(),
+                    detail: Some(format!("invalid group sync response: {error}")),
+                },
+            ));
+            return Err(error);
+        }
+        let progress_key = Self::group_sync_progress_key(&response.group_id, &peer);
+        let previous_progress = self
+            .group_sync_explicit_requests
+            .get(&progress_key)
+            .cloned()
+            .unwrap_or_default();
+        let previous_explicit_requests = previous_progress.explicit_record_ids;
         let mut applied = 0usize;
         for record in &response.records {
             if record.group_id() != response.group_id {
@@ -523,8 +539,20 @@ impl NetworkManager {
                 .map_err(|error| error.to_string())?;
             crate::chat::group_state::evaluate_group_records(&records).missing_dependency_ids()
         };
-        let should_continue =
-            response.has_more || (!response.records.is_empty() && !wanted_record_ids.is_empty());
+        let should_continue_pages = response.has_more;
+        let wanted_set = wanted_record_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let dependency_retries_exhausted = !should_continue_pages
+            && !wanted_record_ids.is_empty()
+            && wanted_set != previous_explicit_requests
+            && previous_progress.explicit_rounds >= super::super::MAX_GROUP_SYNC_DEPENDENCY_ROUNDS;
+        let should_request_missing = !should_continue_pages
+            && !wanted_record_ids.is_empty()
+            && wanted_set != previous_explicit_requests
+            && !dependency_retries_exhausted;
+        let should_continue = should_continue_pages || should_request_missing;
         let (bootstrap_complete, ready_invites) = if should_continue {
             (false, 0)
         } else {
@@ -534,29 +562,67 @@ impl NetworkManager {
             )
             .map_err(|error| error.to_string())?
         };
-        let state = if should_continue {
+        let state = if should_continue_pages {
+            "applying".to_string()
+        } else if should_request_missing {
             "applying".to_string()
         } else if bootstrap_complete {
             "complete".to_string()
         } else {
             "incomplete".to_string()
         };
-        let detail = if should_continue {
+        let detail = if should_continue_pages {
             format!("{applied} new record(s); requesting next page")
+        } else if should_request_missing {
+            format!(
+                "{applied} new record(s); requesting {} missing dependency record(s)",
+                wanted_record_ids.len()
+            )
+        } else if dependency_retries_exhausted {
+            format!("{applied} new record(s); dependency retries exhausted")
         } else if bootstrap_complete {
             format!("{applied} new record(s); {ready_invites} invitation(s) ready")
         } else {
             format!("{applied} new record(s); missing dependencies remain")
         };
-        if should_continue {
+        if should_continue_pages {
+            let follow_up = crate::network::gossip::GroupSyncRequest {
+                version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
+                group_id: response.group_id.clone(),
+                wanted_record_ids: Vec::new(),
+                cursor: response.next_cursor.clone(),
+                limit: crate::network::gossip::MAX_GROUP_SYNC_RECORDS,
+            };
+            if let Err(error) = self.send_group_sync_request_to_peer(&peer, &follow_up) {
+                self.emit(crate::events::CoreEvent::GroupSyncStateUpdated(
+                    crate::events::GroupSyncStateUpdatedEvent {
+                        group_id: response.group_id.clone(),
+                        state: "failed".to_string(),
+                        detail: Some(format!("failed to continue group repair: {error}")),
+                    },
+                ));
+                return Err(error);
+            }
+        } else if should_request_missing {
             let follow_up = crate::network::gossip::GroupSyncRequest {
                 version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
                 group_id: response.group_id.clone(),
                 wanted_record_ids,
-                cursor: response.next_cursor.clone(),
-                limit: 256,
+                cursor: None,
+                limit: crate::network::gossip::MAX_GROUP_SYNC_RECORDS,
             };
-            self.send_group_sync_request_to_peer(&peer, &follow_up)?;
+            if let Err(error) = self.send_group_sync_request_to_peer(&peer, &follow_up) {
+                self.emit(crate::events::CoreEvent::GroupSyncStateUpdated(
+                    crate::events::GroupSyncStateUpdatedEvent {
+                        group_id: response.group_id.clone(),
+                        state: "failed".to_string(),
+                        detail: Some(format!("failed to request missing group records: {error}")),
+                    },
+                ));
+                return Err(error);
+            }
+        } else if wanted_record_ids.is_empty() {
+            self.group_sync_explicit_requests.remove(&progress_key);
         }
         self.emit(CoreEvent::GroupSyncStateUpdated(
             crate::events::GroupSyncStateUpdatedEvent {

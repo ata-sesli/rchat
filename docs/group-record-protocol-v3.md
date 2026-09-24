@@ -55,7 +55,8 @@ unrelated concurrent or future change.
 ## Synchronization
 
 Sync pages are ordered by the canonical record cursor, not timestamps. A page
-contains at most 256 records and prioritizes up to 64 explicitly requested
-missing dependencies. `has_more` and `next_cursor` continue repair until the
-remote history is exhausted; an empty terminal response stops retrying an
+contains at most 256 records. Explicit dependency requests are handled as a
+separate phase (up to 64 IDs), then cursor pages continue without repeating
+those out-of-order records. `has_more` and `next_cursor` continue repair until
+the remote history is exhausted; an empty terminal response stops retrying an
 unavailable dependency.
