@@ -562,6 +562,10 @@ pub enum SettingsField {
     Friend(usize),
     FriendTogglePin,
     ConnectivityMode(ConnectivityMode),
+    ConnectivityMdns,
+    ConnectivityGithub,
+    ConnectivityNat,
+    ConnectivityPunch,
     ConnectivitySave,
     ThemePreset(usize),
     ThemeApply,
@@ -730,6 +734,10 @@ impl SettingsModalState {
                 SettingsField::ConnectivityMode(ConnectivityMode::Invisible),
                 SettingsField::ConnectivityMode(ConnectivityMode::Lan),
                 SettingsField::ConnectivityMode(ConnectivityMode::Reachable),
+                SettingsField::ConnectivityMdns,
+                SettingsField::ConnectivityGithub,
+                SettingsField::ConnectivityNat,
+                SettingsField::ConnectivityPunch,
                 SettingsField::ConnectivitySave,
             ]),
             SettingsSection::Theme => {
@@ -3200,6 +3208,23 @@ mod tests {
 
         modal.connectivity = ConnectivitySettings::from_mode(ConnectivityMode::Invisible);
         assert_eq!(modal.connectivity.mode, ConnectivityMode::Invisible);
+    }
+
+    #[test]
+    fn settings_connectivity_exposes_all_custom_flags() {
+        let mut modal = SettingsModalState::default();
+        modal.activate_section(SettingsSection::Connectivity);
+        let fields = modal.content_fields();
+        assert!(fields.contains(&SettingsField::ConnectivityMdns));
+        assert!(fields.contains(&SettingsField::ConnectivityGithub));
+        assert!(fields.contains(&SettingsField::ConnectivityNat));
+        assert!(fields.contains(&SettingsField::ConnectivityPunch));
+        assert!(fields.contains(&SettingsField::ConnectivitySave));
+        modal.connectivity.mdns_enabled = false;
+        modal.connectivity.github_sync_enabled = false;
+        modal.connectivity.nat_keepalive_enabled = true;
+        modal.connectivity.punch_assist_enabled = false;
+        assert_eq!(modal.connectivity.with_derived_mode().mode, ConnectivityMode::Custom);
     }
 
     #[test]
