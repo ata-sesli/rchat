@@ -12237,6 +12237,11 @@ fn render_group_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiSta
         Style::default().fg(theme.muted),
     )));
 
+    let text_width = usize::from(popup.width.saturating_sub(2));
+    let lines: Vec<Line<'static>> = lines
+        .into_iter()
+        .map(|line| truncate_line_display_width(&line, text_width))
+        .collect();
     let visible_lines = usize::from(popup.height.saturating_sub(2));
     let scroll_offset = group
         .viewport_offset
