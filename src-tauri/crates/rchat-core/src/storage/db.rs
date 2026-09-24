@@ -1008,6 +1008,21 @@ pub fn get_group_invitee_peer_ids_for_sync(
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+pub fn delete_direct_chat(conn: &Connection, chat_id: &str) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM messages WHERE chat_id = ?1", [chat_id])?;
+    conn.execute("DELETE FROM chat_envelopes WHERE chat_id = ?1", [chat_id])?;
+    conn.execute("DELETE FROM chat_peers WHERE chat_id = ?1", [chat_id])?;
+    conn.execute(
+        "DELETE FROM chat_connection_stats WHERE chat_id = ?1",
+        [chat_id],
+    )?;
+    conn.execute(
+        "DELETE FROM chats WHERE id = ?1 AND is_group = 0",
+        [chat_id],
+    )?;
+    Ok(())
+}
+
 pub fn delete_group_chat(conn: &Connection, chat_id: &str) -> anyhow::Result<()> {
     conn.execute("DELETE FROM messages WHERE chat_id = ?1", [chat_id])?;
     conn.execute("DELETE FROM chat_envelopes WHERE chat_id = ?1", [chat_id])?;

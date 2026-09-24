@@ -153,6 +153,15 @@ pub fn stats(app_state: &AppState, chat_id: &str) -> Result<ChatStats> {
     })
 }
 
+pub fn delete_direct_chat(app_state: &AppState, chat_id: &str) -> Result<()> {
+    ensure_dm_chat(chat_id)?;
+    let conn = app_state
+        .db_conn
+        .lock()
+        .map_err(|error| anyhow!("database lock failed: {error}"))?;
+    db::delete_direct_chat(&conn, chat_id)
+}
+
 pub fn files(
     app_state: &AppState,
     chat_id: &str,
