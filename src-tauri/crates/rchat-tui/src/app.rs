@@ -2503,8 +2503,14 @@ async fn run_interactive() -> Result<()> {
                     }
                     let viewer_key_started = std::time::Instant::now();
                     let previous_view = ratty_viewer_snapshot(&state);
-                    if handle_interactive_key(&app_state, &network_state, &mut state, key.code)
-                        .await?
+                    if handle_interactive_key(
+                        &app_state,
+                        &network_state,
+                        &mut state,
+                        key.code,
+                        terminal.size()?,
+                    )
+                    .await?
                     {
                         return Ok(());
                     }
@@ -3862,6 +3868,7 @@ async fn handle_chat_details_key(
     network_state: &NetworkState,
     state: &mut UiState,
     code: KeyCode,
+    size: Size,
 ) -> Result<()> {
     let has_group_input = state
         .app
@@ -3951,14 +3958,42 @@ async fn handle_chat_details_key(
                 state.app.close_modal();
             }
         }
-        KeyCode::PageUp if state.app.chat_details.as_ref().is_some_and(|details| details.group.is_some()) => {
-            state.app.scroll_group_details(-5)
-        }
-        KeyCode::PageDown if state.app.chat_details.as_ref().is_some_and(|details| details.group.is_some()) => {
-            state.app.scroll_group_details(5)
+        KeyCode::PageUp | KeyCode::PageDown
+            if state.app.chat_details.as_ref().is_some_and(|details| details.group.is_some()) =>
+        {
+            let delta = if code == KeyCode::PageUp { -5 } else { 5 };
+            let max_offset = state
+                .app
+                .chat_details
+                .as_ref()
+                .map(|details| group_details_max_viewport_offset(details, size))
+                .unwrap_or(0);
+            state.app.scroll_group_details(delta, max_offset)
         }
         KeyCode::Up => state.app.move_chat_details_focus(-1),
         KeyCode::Down => state.app.move_chat_details_focus(1),
+        KeyCode::Right
+            if state.app.chat_details.as_ref().is_some_and(|details| {
+                details.group.is_some()
+                    && matches!(
+                        details.focus,
+                        ChatDetailsField::FileFilter
+                            | ChatDetailsField::FileNext
+                            | ChatDetailsField::FileOpen
+                            | ChatDetailsField::FileSave
+                    )
+            }) => state.app.move_file_selection(1),
+        KeyCode::Left
+            if state.app.chat_details.as_ref().is_some_and(|details| {
+                details.group.is_some()
+                    && matches!(
+                        details.focus,
+                        ChatDetailsField::FileFilter
+                            | ChatDetailsField::FileNext
+                            | ChatDetailsField::FileOpen
+                            | ChatDetailsField::FileSave
+                    )
+            }) => state.app.move_file_selection(-1),
         KeyCode::Right if state.app.chat_details.as_ref().is_some_and(|details| details.group.is_some()) => {
             state.app.move_group_member_selection(1)
         }
@@ -6959,6 +6994,7 @@ async fn handle_interactive_key(
     network_state: &NetworkState,
     state: &mut UiState,
     code: KeyCode,
+    size: Size,
 ) -> Result<bool> {
     if state.app.voice_recording.phase != VoiceRecordingPhase::Idle {
         handle_voice_recording_key(app_state, network_state, state, code).await?;
@@ -7041,7 +7077,7 @@ async fn handle_interactive_key(
     }
 
     if state.app.chat_details.is_some() {
-        if let Err(error) = handle_chat_details_key(app_state, network_state, state, code).await {
+        if let Err(error) = handle_chat_details_key(app_state, network_state, state, code, size).await {
             state.app.chat_details_error(error.to_string());
         }
         return Ok(false);
@@ -7391,11 +7427,19 @@ async fn end_current_screen_share(network_state: &NetworkState, state: &mut UiSt
     Ok(())
 }
 
+const CHAT_DETAILS_WIDTH: u16 = 76;
+const CHAT_DETAILS_HEIGHT: u16 = 24;
 const GROUP_DETAILS_WIDTH: u16 = 90;
 const GROUP_DETAILS_HEIGHT: u16 = 40;
 const GROUP_ROSTER_START_LINE: usize = 4;
 const GROUP_ROSTER_VISIBLE: usize = 4;
 const GROUP_ACTIONS_START_LINE: usize = 9;
+
+fn group_details_max_viewport_offset(details: &TuiChatDetails, size: Size) -> usize {
+    let popup_height = GROUP_DETAILS_HEIGHT.min(size.height);
+    let visible_lines = usize::from(popup_height.saturating_sub(2));
+    (group_file_section_start(details) + 10).saturating_sub(visible_lines)
+}
 
 fn group_file_section_start(details: &TuiChatDetails) -> usize {
     20 + if details
@@ -11755,7 +11799,7 @@ fn help_line_text(state: &UiState, width: usize) -> String {
     }
     if state.app.chat_details.as_ref().is_some_and(|details| details.group.is_some()) {
         return fit_segments(
-            &["Group details", "Up/Down action", "Left/Right peer", "PageUp/PageDown scroll", "Enter activate", "Esc close"],
+            &["Group details", "Up/Down action", "Left/Right peer/file", "PageUp/PageDown scroll", "Enter activate", "Esc close"],
             width,
         );
     }
@@ -12191,7 +12235,7 @@ fn render_group_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiSta
     lines.push(chat_details_button_line(details, ChatDetailsField::FileOpen, "Open selected file", theme));
     lines.push(chat_details_button_line(details, ChatDetailsField::FileSave, "Save selected file", theme));
     lines.push(Line::from(Span::styled(
-        "Up/Down action/file | Left/Right peer | PageUp/PageDown scroll | Enter activate | ? help | Esc close",
+        "Up/Down action/file | Left/Right peer/file | PageUp/PageDown scroll | Enter activate | ? help | Esc close",
         Style::default().fg(theme.muted),
     )));
 
