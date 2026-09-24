@@ -15,10 +15,10 @@ use crate::{
         AttachmentFileEntry, AttachmentModalField, ChatDetailsField, ComposerAction,
         ContextMenuAction,
         ContextMenuState, ContextMenuTarget, FocusPane, MediaViewerAction, MediaViewerKind,
-        NewGroupStep, NewItemChoice, NewPersonField, NewPersonStep, SettingsField,
-        SettingsModalState, SettingsPane, SettingsSection, StickerPickerMode, StickerPickerState,
-        TuiAppState, TuiChat,
-        TuiChatDetails, TuiEnvelope, TuiGroupDetails, TuiMessage, TuiSticker, TuiThemePreset,
+        GroupAdminAction, GroupDetailsInput, NewGroupStep, NewItemChoice, NewPersonField,
+        NewPersonStep, SettingsField, SettingsModalState, SettingsPane, SettingsSection,
+        StickerPickerMode, StickerPickerState, TuiAppState, TuiChat, TuiChatDetails, TuiEnvelope,
+        TuiGroupDetails, TuiGroupMember, TuiMessage, TuiSticker, TuiThemePreset,
         VoiceRecordingPhase,
     },
 };
@@ -1224,6 +1224,128 @@ mod tests {
         assert!(!text.contains("invite create"));
         assert!(!text.contains("invite redeem"));
         assert!(!text.contains("attach ["));
+    }
+
+    fn group_chat_details_for_test(
+        is_admin: bool,
+        members_can_invite: bool,
+    ) -> TuiChatDetails {
+        TuiChatDetails {
+            chat_id: "group:one".to_string(),
+            peer_id: "peer-1".to_string(),
+            peer_name: "Design Crew".to_string(),
+            peer_alias: None,
+            avatar_url: None,
+            connected: true,
+            remote_addr: None,
+            reconnect_count: 0,
+            sent_total: 0,
+            received_total: 0,
+            pinned: false,
+            focus: ChatDetailsField::GroupRename,
+            pending_delete: false,
+            status: None,
+            error: None,
+            recent_files: Vec::new(),
+            selected_file_index: 0,
+            file_filter: "all".to_string(),
+            file_offset: 0,
+            file_has_more: false,
+            file_status: None,
+            file_error: None,
+            group: Some(TuiGroupDetails {
+                image_hash: None,
+                is_admin,
+                members_can_invite,
+                dissolved: false,
+                automatic_successor_peer_id: (!is_admin).then(|| "peer-2".to_string()),
+                roster: vec![
+                    TuiGroupMember {
+                        peer_id: "peer-1".to_string(),
+                        display_name: "Admin".to_string(),
+                        role: "admin".to_string(),
+                        membership_state: "active".to_string(),
+                    },
+                    TuiGroupMember {
+                        peer_id: "peer-2".to_string(),
+                        display_name: "Member".to_string(),
+                        role: "member".to_string(),
+                        membership_state: "active".to_string(),
+                    },
+                ],
+                selected_member_index: 1,
+                receipts: Vec::new(),
+                pending_count: 0,
+                sync_status: None,
+                input: None,
+                pending_confirmation: None,
+                pending_confirmation_peer_id: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn group_action_routes_use_active_group_and_selected_peer() {
+        let mut details = group_chat_details_for_test(true, false);
+        assert_eq!(
+            group_action_route(&details, ChatDetailsField::GroupPolicy),
+            Some(GroupActionRoute::Policy {
+                group_id: "group:one".to_string(),
+                members_can_invite: true,
+            })
+        );
+        assert_eq!(
+            group_action_route(&details, ChatDetailsField::GroupRemove),
+            Some(GroupActionRoute::Remove {
+                group_id: "group:one".to_string(),
+                peer_id: "peer-2".to_string(),
+            })
+        );
+        assert_eq!(
+            group_action_route(&details, ChatDetailsField::GroupTransferAdmin),
+            Some(GroupActionRoute::TransferAdmin {
+                group_id: "group:one".to_string(),
+                peer_id: "peer-2".to_string(),
+            })
+        );
+
+        details.group.as_mut().unwrap().input = Some(GroupDetailsInput::Invite {
+            peer_id: "peer-3".to_string(),
+        });
+        assert_eq!(
+            group_action_route(&details, ChatDetailsField::GroupInvite),
+            Some(GroupActionRoute::Invite {
+                group_id: "group:one".to_string(),
+                peer_id: "peer-3".to_string(),
+            })
+        );
+
+        let member = group_chat_details_for_test(false, true);
+        assert_eq!(
+            group_action_route(&member, ChatDetailsField::GroupRename),
+            None
+        );
+        assert!(matches!(
+            group_action_route(&member, ChatDetailsField::GroupInvite),
+            Some(GroupActionRoute::Invite { .. })
+        ));
+    }
+
+    #[test]
+    fn active_group_help_and_footer_explain_gui_shortcuts() {
+        let details = group_chat_details_for_test(true, false);
+        let help = group_help_text_lines(&details).join("\n");
+        assert!(help.contains("Design Crew (administrator)"));
+        assert!(help.contains("Left/Right"));
+        assert!(help.contains("in-modal confirmation"));
+        assert!(!help.contains("/ group"));
+
+        let mut state = UiState::new(ProtocolType::Kitty, TuiEventSink::channel(4).0);
+        state.app.chat_details = Some(details);
+        let footer = help_line_text(&state, 80);
+        assert!(footer.contains("Group details"));
+        assert!(footer.contains("Left/Right peer"));
+        assert!(footer.chars().count() <= 80);
     }
 
     #[test]
@@ -3235,11 +3357,11 @@ async fn open_chat_details(
         let is_admin = group::is_local_group_admin(app_state, &chat_id).await?;
         let roster = group::get_group_roster(app_state, &chat_id)?
             .into_iter()
-            .map(|row| {
-                format!(
-                    "{}  {} ({})",
-                    row.display_name, row.role, row.membership_state
-                )
+            .map(|row| TuiGroupMember {
+                peer_id: row.peer_id,
+                display_name: row.display_name,
+                role: row.role,
+                membership_state: row.membership_state,
             })
             .collect::<Vec<_>>();
         let message_id = state.app.selected_message_id.as_deref().unwrap_or_default();
@@ -3280,7 +3402,7 @@ async fn open_chat_details(
             sent_total: 0,
             received_total: 0,
             pinned: state.app.pinned_chat_keys.contains(&chat_id),
-            focus: ChatDetailsField::Pin,
+            focus: ChatDetailsField::GroupRename,
             pending_delete: false,
             status: None,
             error: None,
@@ -3295,10 +3417,16 @@ async fn open_chat_details(
                 image_hash,
                 is_admin,
                 members_can_invite: policy.settings.members_can_invite,
+                dissolved: policy.dissolved,
+                automatic_successor_peer_id: policy.automatic_successor_peer_id.clone(),
                 roster,
+                selected_member_index: 0,
                 receipts,
                 pending_count: pending.count,
                 sync_status: state.app.group_sync_status.get(&chat_id).cloned(),
+                input: None,
+                pending_confirmation: None,
+                pending_confirmation_peer_id: None,
             }),
         });
         state.app.status = "group details".to_string();
@@ -3437,15 +3565,358 @@ async fn refresh_chat_details_files(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GroupActionRoute {
+    Rename { group_id: String, name: String },
+    Policy {
+        group_id: String,
+        members_can_invite: bool,
+    },
+    Invite { group_id: String, peer_id: String },
+    Remove { group_id: String, peer_id: String },
+    TransferAdmin { group_id: String, peer_id: String },
+    Sync { group_id: String },
+    Leave { group_id: String },
+}
+
+fn group_action_route(
+    details: &TuiChatDetails,
+    field: ChatDetailsField,
+) -> Option<GroupActionRoute> {
+    let group = details.group.as_ref()?;
+    let action = GroupAdminAction::ALL
+        .into_iter()
+        .find(|action| action.field() == field)?;
+    if !group.action_state(action).enabled {
+        return None;
+    }
+    let group_id = details.chat_id.clone();
+    match action {
+        GroupAdminAction::Rename => {
+            let name = match group.input.as_ref() {
+                Some(GroupDetailsInput::Rename { value }) => value.trim().to_string(),
+                _ => details.peer_name.clone(),
+            };
+            Some(GroupActionRoute::Rename { group_id, name })
+        }
+        GroupAdminAction::Policy => Some(GroupActionRoute::Policy {
+            group_id,
+            members_can_invite: !group.members_can_invite,
+        }),
+        GroupAdminAction::Invite => {
+            let peer_id = match group.input.as_ref() {
+                Some(GroupDetailsInput::Invite { peer_id }) => peer_id.trim().to_string(),
+                _ => String::new(),
+            };
+            Some(GroupActionRoute::Invite { group_id, peer_id })
+        }
+        GroupAdminAction::Remove => Some(GroupActionRoute::Remove {
+            group_id,
+            peer_id: group
+                .pending_confirmation_peer_id
+                .clone()
+                .or_else(|| group.selected_member().map(|member| member.peer_id.clone()))?,
+        }),
+        GroupAdminAction::TransferAdmin => Some(GroupActionRoute::TransferAdmin {
+            group_id,
+            peer_id: group
+                .pending_confirmation_peer_id
+                .clone()
+                .or_else(|| group.selected_member().map(|member| member.peer_id.clone()))?,
+        }),
+        GroupAdminAction::Sync => Some(GroupActionRoute::Sync { group_id }),
+        GroupAdminAction::Leave => Some(GroupActionRoute::Leave { group_id }),
+    }
+}
+
+async fn request_group_action(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+) -> Result<()> {
+    let Some(details) = state.app.chat_details.as_ref() else {
+        return Ok(());
+    };
+    let field = details.focus;
+    if matches!(field, ChatDetailsField::GroupConfirm | ChatDetailsField::GroupCancel) {
+        let Some(action) = details
+            .group
+            .as_ref()
+            .and_then(|group| group.pending_confirmation)
+        else {
+            return Ok(());
+        };
+        if field == ChatDetailsField::GroupCancel {
+            if let Some(details) = state.app.chat_details.as_mut() {
+                if let Some(group) = details.group.as_mut() {
+                    group.pending_confirmation = None;
+                    group.pending_confirmation_peer_id = None;
+                    details.focus = action.field();
+                    details.status = Some(format!("{} cancelled", action.label()));
+                    details.error = None;
+                }
+            }
+            return Ok(());
+        }
+        return execute_group_action(app_state, network_state, state, action.field()).await;
+    }
+    let Some(route) = group_action_route(details, field) else {
+        if let Some(details) = state.app.chat_details.as_mut() {
+            let reason = details
+                .group
+                .as_ref()
+                .and_then(|group| {
+                    GroupAdminAction::ALL
+                        .into_iter()
+                        .find(|action| action.field() == field)
+                        .and_then(|action| group.action_state(action).disabled_reason)
+                })
+                .unwrap_or_else(|| "action is unavailable".to_string());
+            details.status = Some(reason);
+            details.error = None;
+        }
+        return Ok(());
+    };
+    let pending_peer_id = match &route {
+        GroupActionRoute::Remove { peer_id, .. }
+        | GroupActionRoute::TransferAdmin { peer_id, .. } => Some(peer_id.clone()),
+        _ => None,
+    };
+    match route {
+        GroupActionRoute::Rename { .. } => {
+            let needs_input = state
+                .app
+                .chat_details
+                .as_ref()
+                .and_then(|details| details.group.as_ref())
+                .and_then(|group| group.input.as_ref())
+                .is_none();
+            if needs_input {
+                if let Some(details) = state.app.chat_details.as_mut() {
+                    let name = details.peer_name.clone();
+                    if let Some(group) = details.group.as_mut() {
+                        group.input = Some(GroupDetailsInput::Rename { value: name });
+                        details.status = Some("type the new group name, then press Enter".to_string());
+                        details.error = None;
+                    }
+                }
+            } else {
+                execute_group_action(app_state, network_state, state, field).await?;
+            }
+        }
+        GroupActionRoute::Invite { ref peer_id, .. } if peer_id.is_empty() => {
+            if let Some(details) = state.app.chat_details.as_mut() {
+                if let Some(group) = details.group.as_mut() {
+                    group.input = Some(GroupDetailsInput::Invite {
+                        peer_id: String::new(),
+                    });
+                    details.status = Some("type a peer id, then press Enter".to_string());
+                    details.error = None;
+                }
+            }
+        }
+        GroupActionRoute::Remove { .. }
+        | GroupActionRoute::TransferAdmin { .. }
+        | GroupActionRoute::Leave { .. } => {
+            let action = GroupAdminAction::ALL
+                .into_iter()
+                .find(|action| action.field() == field)
+                .expect("group destructive route has an action");
+            if let Some(details) = state.app.chat_details.as_mut() {
+                if let Some(group) = details.group.as_mut() {
+                    group.pending_confirmation = Some(action);
+                    group.pending_confirmation_peer_id = pending_peer_id;
+                    details.status = Some(format!("confirm {} (Enter)", action.label()));
+                    details.error = None;
+                }
+                details.focus = ChatDetailsField::GroupConfirm;
+            }
+        }
+        _ => execute_group_action(app_state, network_state, state, field).await?,
+    }
+    Ok(())
+}
+
+async fn execute_group_action(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+    field: ChatDetailsField,
+) -> Result<()> {
+    let Some(route) = state
+        .app
+        .chat_details
+        .as_ref()
+        .and_then(|details| group_action_route(details, field))
+    else {
+        return Ok(());
+    };
+    let (message, closes_details) = match route {
+        GroupActionRoute::Rename { group_id, name } => {
+            if name.is_empty() {
+                return Err(anyhow!("Group name cannot be empty"));
+            }
+            group::rename_group(app_state, network_state, group_id, name.clone()).await?;
+            (format!("renamed group to {name}"), false)
+        }
+        GroupActionRoute::Policy {
+            group_id,
+            members_can_invite,
+        } => {
+            group::update_group_settings(
+                app_state,
+                network_state,
+                group_id,
+                rchat_core::network::gossip::GroupSettings { members_can_invite },
+            )
+            .await?;
+            (
+                format!(
+                    "member invites {}",
+                    if members_can_invite { "enabled" } else { "disabled" }
+                ),
+                false,
+            )
+        }
+        GroupActionRoute::Invite { group_id, peer_id } => {
+            if peer_id.is_empty() {
+                return Err(anyhow!("Peer id cannot be empty"));
+            }
+            group::invite_member(app_state, network_state, group_id, peer_id.clone()).await?;
+            (format!("invited {peer_id}"), false)
+        }
+        GroupActionRoute::Remove { group_id, peer_id } => {
+            group::remove_member(app_state, network_state, group_id, peer_id.clone()).await?;
+            (format!("removed {peer_id}"), false)
+        }
+        GroupActionRoute::TransferAdmin { group_id, peer_id } => {
+            group::transfer_group_admin(
+                app_state,
+                network_state,
+                group_id,
+                peer_id.clone(),
+            )
+            .await?;
+            (format!("made {peer_id} group administrator"), false)
+        }
+        GroupActionRoute::Sync { group_id } => {
+            group::sync_group(network_state, group_id.clone()).await?;
+            state
+                .app
+                .group_sync_status
+                .insert(group_id, "requested".to_string());
+            ("group sync requested".to_string(), false)
+        }
+        GroupActionRoute::Leave { group_id } => {
+            let outcome = group::leave_group(app_state, network_state, group_id).await?;
+            let message = match outcome {
+                group::GroupLeaveOutcome::Left => "left group".to_string(),
+                group::GroupLeaveOutcome::TransferredThenLeft { successor_peer_id } => {
+                    format!("left group; administration transferred to {successor_peer_id}")
+                }
+                group::GroupLeaveOutcome::Dissolved => "dissolved group".to_string(),
+            };
+            (message, true)
+        }
+    };
+    refresh_direct_chats(app_state, network_state, state).await?;
+    state.app.status = message.clone();
+    if closes_details {
+        state.app.chat_details = None;
+    } else {
+        let group_id = state
+            .app
+            .chat_details
+            .as_ref()
+            .map(|details| details.chat_id.clone());
+        if let Some(group_id) = group_id {
+            open_chat_details(app_state, network_state, state, &group_id).await?;
+            state.app.chat_details_status(message);
+        }
+    }
+    Ok(())
+}
+
 async fn handle_chat_details_key(
     app_state: &AppState,
     network_state: &NetworkState,
     state: &mut UiState,
     code: KeyCode,
 ) -> Result<()> {
+    let has_group_input = state
+        .app
+        .chat_details
+        .as_ref()
+        .and_then(|details| details.group.as_ref())
+        .is_some_and(|group| group.input.is_some());
+    if !has_group_input && code == KeyCode::Char('?') {
+        state.app.show_help = !state.app.show_help;
+        return Ok(());
+    }
+    if code == KeyCode::Esc && state.app.show_help {
+        state.app.show_help = false;
+        return Ok(());
+    }
+    if has_group_input {
+        match code {
+            KeyCode::Esc => {
+                if let Some(details) = state.app.chat_details.as_mut() {
+                    if let Some(group) = details.group.as_mut() {
+                        group.input = None;
+                        details.status = Some("input cancelled".to_string());
+                    }
+                }
+            }
+            KeyCode::Enter => activate_chat_details_focus(app_state, network_state, state).await?,
+            KeyCode::Backspace => {
+                if let Some(details) = state.app.chat_details.as_mut() {
+                    if let Some(group) = details.group.as_mut() {
+                        match group.input.as_mut() {
+                            Some(GroupDetailsInput::Rename { value }) => {
+                                value.pop();
+                            }
+                            Some(GroupDetailsInput::Invite { peer_id }) => {
+                                peer_id.pop();
+                            }
+                            None => {}
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Some(details) = state.app.chat_details.as_mut() {
+                    if let Some(group) = details.group.as_mut() {
+                        match group.input.as_mut() {
+                            Some(GroupDetailsInput::Rename { value }) => value.push(ch),
+                            Some(GroupDetailsInput::Invite { peer_id }) => peer_id.push(ch),
+                            None => {}
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
     match code {
         KeyCode::Esc => {
-            if state
+            let pending_group_confirmation = state
+                .app
+                .chat_details
+                .as_ref()
+                .and_then(|details| details.group.as_ref())
+                .is_some_and(|group| group.pending_confirmation.is_some());
+            if pending_group_confirmation {
+                if let Some(details) = state.app.chat_details.as_mut() {
+                    if let Some(group) = details.group.as_mut() {
+                        if let Some(action) = group.pending_confirmation.take() {
+                            details.focus = action.field();
+                        }
+                        group.pending_confirmation_peer_id = None;
+                        details.status = Some("group action cancelled".to_string());
+                    }
+                }
+            } else if state
                 .app
                 .chat_details
                 .as_ref()
@@ -3462,6 +3933,12 @@ async fn handle_chat_details_key(
         }
         KeyCode::Up => state.app.move_chat_details_focus(-1),
         KeyCode::Down => state.app.move_chat_details_focus(1),
+        KeyCode::Right if state.app.chat_details.as_ref().is_some_and(|details| details.group.is_some()) => {
+            state.app.move_group_member_selection(1)
+        }
+        KeyCode::Left if state.app.chat_details.as_ref().is_some_and(|details| details.group.is_some()) => {
+            state.app.move_group_member_selection(-1)
+        }
         KeyCode::Right => state.app.move_file_selection(1),
         KeyCode::Left => state.app.move_file_selection(-1),
         KeyCode::Enter => activate_chat_details_focus(app_state, network_state, state).await?,
@@ -3475,6 +3952,28 @@ async fn activate_chat_details_focus(
     network_state: &NetworkState,
     state: &mut UiState,
 ) -> Result<()> {
+    if state
+        .app
+        .chat_details
+        .as_ref()
+        .is_some_and(|details| details.group.is_some())
+        && matches!(
+            state.app.chat_details.as_ref().map(|details| details.focus),
+            Some(
+                ChatDetailsField::GroupRename
+                    | ChatDetailsField::GroupPolicy
+                    | ChatDetailsField::GroupInvite
+                    | ChatDetailsField::GroupRemove
+                    | ChatDetailsField::GroupTransferAdmin
+                    | ChatDetailsField::GroupSync
+                    | ChatDetailsField::GroupLeave
+                    | ChatDetailsField::GroupConfirm
+                    | ChatDetailsField::GroupCancel
+            )
+        )
+    {
+        return request_group_action(app_state, network_state, state).await;
+    }
     let Some((field, chat_id, peer_id)) = state.app.chat_details.as_ref().map(|details| {
         (details.focus, details.chat_id.clone(), details.peer_id.clone())
     }) else {
@@ -3569,6 +4068,15 @@ async fn activate_chat_details_focus(
                 details.status = Some("delete cancelled".to_string());
             }
         }
+        ChatDetailsField::GroupRename
+        | ChatDetailsField::GroupPolicy
+        | ChatDetailsField::GroupInvite
+        | ChatDetailsField::GroupRemove
+        | ChatDetailsField::GroupTransferAdmin
+        | ChatDetailsField::GroupSync
+        | ChatDetailsField::GroupLeave
+        | ChatDetailsField::GroupConfirm
+        | ChatDetailsField::GroupCancel => unreachable!("group actions are routed before chat details actions"),
     }
     Ok(())
 }
@@ -6857,6 +7365,77 @@ async fn end_current_screen_share(network_state: &NetworkState, state: &mut UiSt
     Ok(())
 }
 
+const GROUP_DETAILS_WIDTH: u16 = 90;
+const GROUP_DETAILS_HEIGHT: u16 = 24;
+const GROUP_ROSTER_START_LINE: usize = 4;
+const GROUP_ROSTER_VISIBLE: usize = 4;
+const GROUP_ACTIONS_START_LINE: usize = 9;
+
+fn group_roster_window_start(group: &TuiGroupDetails) -> usize {
+    group
+        .selected_member_index
+        .saturating_sub(GROUP_ROSTER_VISIBLE / 2)
+        .min(group.roster.len().saturating_sub(GROUP_ROSTER_VISIBLE))
+}
+
+async fn handle_group_details_mouse(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+    mouse: MouseEvent,
+    size: Size,
+) -> Result<()> {
+    let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
+        return Ok(());
+    };
+    let popup = centered_rect(
+        GROUP_DETAILS_WIDTH,
+        GROUP_DETAILS_HEIGHT,
+        Rect { x: 0, y: 0, width: size.width, height: size.height },
+    );
+    if !rect_contains(popup, mouse.column, mouse.row) {
+        return Ok(());
+    }
+    let line = mouse.row.saturating_sub(popup.y.saturating_add(1)) as usize;
+    let Some(details) = state.app.chat_details.as_ref() else {
+        return Ok(());
+    };
+    let Some(group) = details.group.as_ref() else {
+        return Ok(());
+    };
+    if group.pending_confirmation.is_none()
+        && (GROUP_ROSTER_START_LINE
+            ..GROUP_ROSTER_START_LINE + group.roster.len().min(GROUP_ROSTER_VISIBLE))
+            .contains(&line)
+    {
+        let index = group_roster_window_start(group) + line - GROUP_ROSTER_START_LINE;
+        if let Some(details) = state.app.chat_details.as_mut() {
+            if let Some(group) = details.group.as_mut() {
+                group.selected_member_index = index;
+            }
+        }
+        return Ok(());
+    }
+    let field = if group.pending_confirmation.is_some() {
+        match line {
+            16 => Some(ChatDetailsField::GroupConfirm),
+            17 => Some(ChatDetailsField::GroupCancel),
+            _ => None,
+        }
+    } else {
+        (GROUP_ACTIONS_START_LINE..GROUP_ACTIONS_START_LINE + GroupAdminAction::ALL.len())
+            .contains(&line)
+            .then(|| GroupAdminAction::ALL[line - GROUP_ACTIONS_START_LINE].field())
+    };
+    let Some(field) = field else {
+        return Ok(());
+    };
+    if let Some(details) = state.app.chat_details.as_mut() {
+        details.focus = field;
+    }
+    activate_chat_details_focus(app_state, network_state, state).await
+}
+
 async fn handle_chat_details_mouse(
     app_state: &AppState,
     network_state: &NetworkState,
@@ -6944,6 +7523,14 @@ async fn handle_mouse_event(
     size: Size,
 ) -> Result<()> {
     if state.app.chat_details.is_some() {
+        if state
+            .app
+            .chat_details
+            .as_ref()
+            .is_some_and(|details| details.group.is_some())
+        {
+            return handle_group_details_mouse(app_state, network_state, state, mouse, size).await;
+        }
         return handle_chat_details_mouse(app_state, network_state, state, mouse, size).await;
     }
 
@@ -9700,11 +10287,11 @@ fn render_app_shell(
     render_composer(frame, layout.composer, state, &theme);
     render_help_line(frame, layout.help_line, state, &theme);
 
-    if state.app.show_help {
-        render_help_overlay(frame, frame.area(), &modal_theme);
-    }
     if state.app.chat_details.is_some() {
         render_chat_details_overlay(frame, frame.area(), state, &modal_theme);
+    }
+    if state.app.show_help {
+        render_help_overlay(frame, frame.area(), state, &modal_theme);
     }
     if state.app.new_person.is_some() {
         render_new_person_overlay(frame, frame.area(), state, kitty_available, &modal_theme);
@@ -11095,6 +11682,12 @@ fn help_line_text(state: &UiState, width: usize) -> String {
             VoiceRecordingPhase::Idle => String::new(),
         };
     }
+    if state.app.chat_details.as_ref().is_some_and(|details| details.group.is_some()) {
+        return fit_segments(
+            &["Group details", "Up/Down action", "Left/Right peer", "Enter activate", "Esc close"],
+            width,
+        );
+    }
     if state.app.new_group.is_some() && state.app.new_person.is_none() {
         return fit_segments(
             &["New Group", "Up/Down move", "Enter activate", "Esc back"],
@@ -11249,15 +11842,22 @@ fn truncate_chars(value: &str, width: usize) -> String {
     value.chars().take(width).collect()
 }
 
-fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-    let popup = centered_rect(76, 24, area);
+fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
+    let popup = centered_rect(76, 32, area);
     draw_shadow(frame, popup);
     frame.render_widget(Clear, popup);
-    let lines = help_overlay_text_lines()
-        .iter()
-        .copied()
-        .map(Line::from)
-        .collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    if let Some(details) = state.app.chat_details.as_ref() {
+        if details.group.is_some() {
+            lines.extend(group_help_text_lines(details).into_iter().map(Line::from));
+        }
+    }
+    lines.extend(
+        help_overlay_text_lines()
+            .iter()
+            .copied()
+            .map(Line::from),
+    );
     let paragraph = Paragraph::new(lines)
         .block(themed_block(" Help ", theme))
         .style(Style::default().bg(theme.surface).fg(theme.text))
@@ -11295,6 +11895,25 @@ fn help_overlay_text_lines() -> &'static [&'static str] {
     ]
 }
 
+fn group_help_text_lines(details: &TuiChatDetails) -> Vec<String> {
+    let Some(group) = details.group.as_ref() else {
+        return Vec::new();
+    };
+    let role = if group.is_admin { "administrator" } else { "member" };
+    vec![
+        String::new(),
+        format!("Active group: {} ({role})", details.peer_name),
+        "Up/Down: choose an administration action".to_string(),
+        "Left/Right: select a roster peer for remove or transfer".to_string(),
+        "Rename/Invite: type a value, then Enter; Esc cancels input".to_string(),
+        "Policy: Enter toggles member invitations for administrators".to_string(),
+        "Remove/Transfer/Leave: Enter shows an in-modal confirmation".to_string(),
+        "Sync: Enter requests current group history".to_string(),
+        "Disabled actions include the reason they cannot be used".to_string(),
+        "?: close this help | Esc: back to Group details".to_string(),
+    ]
+}
+
 fn chat_details_button_line(
     details: &TuiChatDetails,
     field: ChatDetailsField,
@@ -11315,6 +11934,142 @@ fn chat_details_button_line(
 const CHAT_DETAILS_WIDTH: u16 = 76;
 const CHAT_DETAILS_HEIGHT: u16 = 24;
 const CHAT_DETAILS_FILE_VIEW_ROWS: usize = 4;
+fn render_group_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
+    let Some(details) = state.app.chat_details.as_ref() else {
+        return;
+    };
+    let Some(group) = details.group.as_ref() else {
+        return;
+    };
+    let popup = centered_rect(GROUP_DETAILS_WIDTH, GROUP_DETAILS_HEIGHT, area);
+    draw_shadow(frame, popup);
+    frame.render_widget(Clear, popup);
+
+    let role = if group.is_admin { "administrator" } else { "member" };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                display_chat_name(&details.peer_name, &details.chat_id),
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(format!("Your role: {role}"), Style::default().fg(theme.text)),
+        ]),
+        Line::from(format!(
+            "Admin: {} | member invites: {} | pending: {}",
+            short_identifier(&details.peer_id, 32),
+            if group.members_can_invite { "on" } else { "off" },
+            group.pending_count
+        )),
+        Line::from(format!(
+            "Sync: {} | receipts: {} | image: {}",
+            group.sync_status.as_deref().unwrap_or("idle"),
+            group.receipts.len(),
+            group.image_hash.as_deref().map(short_hash).unwrap_or_else(|| "-".to_string())
+        )),
+        Line::from(Span::styled(
+            "Roster (Left/Right selects a peer)",
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        )),
+    ];
+
+    let roster_start = group_roster_window_start(group);
+    for offset in 0..GROUP_ROSTER_VISIBLE {
+        let Some(member) = group.roster.get(roster_start + offset) else {
+            lines.push(Line::from(""));
+            continue;
+        };
+        let selected = roster_start + offset == group.selected_member_index;
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} {} | {} | {} | {}",
+                if selected { ">" } else { " " },
+                truncate_chars(&member.display_name, 18),
+                short_identifier(&member.peer_id, 38),
+                member.role,
+                member.membership_state
+            ),
+            if selected {
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            },
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "Administration",
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+    )));
+    for action_state in group.action_states() {
+        let suffix = if action_state.enabled {
+            String::new()
+        } else {
+            format!(
+                " [disabled: {}]",
+                action_state.disabled_reason.as_deref().unwrap_or("unavailable")
+            )
+        };
+        let label = format!("{}{suffix}", action_state.action.label());
+        lines.push(chat_details_button_line(
+            details,
+            action_state.action.field(),
+            &truncate_chars(&label, 86),
+            theme,
+        ));
+    }
+    match group.input.as_ref() {
+        Some(GroupDetailsInput::Rename { value }) => {
+            lines.push(Line::from(Span::styled(
+                format!("Group name: {value}"),
+                Style::default().fg(theme.accent),
+            )));
+        }
+        Some(GroupDetailsInput::Invite { peer_id }) => {
+            lines.push(Line::from(Span::styled(
+                format!("Peer id: {peer_id}"),
+                Style::default().fg(theme.accent),
+            )));
+        }
+        None => lines.push(Line::from("")),
+    }
+    if let Some(action) = group.pending_confirmation {
+        lines.push(chat_details_button_line(
+            details,
+            ChatDetailsField::GroupConfirm,
+            &format!("Confirm {}", action.label()),
+            theme,
+        ));
+        lines.push(chat_details_button_line(
+            details,
+            ChatDetailsField::GroupCancel,
+            "Cancel",
+            theme,
+        ));
+    } else {
+        lines.push(Line::from(""));
+    }
+    if let Some(error) = details.error.as_ref() {
+        lines.push(Line::from(Span::styled(
+            truncate_chars(error, 86),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            truncate_chars(details.status.as_deref().unwrap_or("Ready"), 86),
+            Style::default().fg(theme.muted),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "Up/Down action | Left/Right peer | Enter activate | ? help | Esc close",
+        Style::default().fg(theme.muted),
+    )));
+
+    let paragraph = Paragraph::new(lines)
+        .block(themed_block(" Group details ", theme))
+        .style(Style::default().bg(theme.surface).fg(theme.text))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, popup);
+}
 
 fn direct_chat_file_start(details: &TuiChatDetails) -> usize {
     13 + if details.pending_delete { 2 } else { 0 }
@@ -11329,6 +12084,10 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
     let Some(details) = state.app.chat_details.as_ref() else {
         return;
     };
+    if details.group.is_some() {
+        render_group_details_overlay(frame, area, state, theme);
+        return;
+    }
 
     let popup = centered_rect(CHAT_DETAILS_WIDTH, CHAT_DETAILS_HEIGHT, area);
     draw_shadow(frame, popup);
@@ -11408,80 +12167,6 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
         "Recent files",
         Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
     )));
-
-    if let Some(group) = details.group.as_ref() {
-        lines = vec![
-            Line::from(Span::styled(
-                "Group",
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(format!(
-                "Founder/admin: {}",
-                short_identifier(&details.peer_id, 42)
-            )),
-            Line::from(format!(
-                "Image: {}",
-                group
-                    .image_hash
-                    .as_deref()
-                    .map(short_hash)
-                    .unwrap_or_else(|| "-".to_string())
-            )),
-            Line::from(format!(
-                "Members can invite: {}",
-                if group.members_can_invite {
-                    "yes"
-                } else {
-                    "no"
-                }
-            )),
-            Line::from(format!("Pending records: {}", group.pending_count)),
-            Line::from(format!(
-                "Sync: {}",
-                group.sync_status.as_deref().unwrap_or("idle")
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Roster",
-                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-            )),
-        ];
-        if group.roster.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "No roster records yet",
-                Style::default().fg(theme.muted),
-            )));
-        }
-        for member in &group.roster {
-            lines.push(Line::from(member.clone()));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Selected message receipts",
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-        )));
-        if group.receipts.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "Select an outgoing message to view receipts",
-                Style::default().fg(theme.muted),
-            )));
-        }
-        for receipt in &group.receipts {
-            lines.push(Line::from(receipt.clone()));
-        }
-        if group.is_admin {
-            lines.push(Line::from(Span::styled(
-                "Admin: use / group rename|policy|invite|remove|admin",
-                Style::default().fg(theme.warning),
-            )));
-        }
-        lines.push(Line::from(Span::styled(
-            "Repair: / group sync <group-id>; leave: / group leave <group-id> confirm",
-            Style::default().fg(theme.muted),
-        )));
-    }
 
     if details.recent_files.is_empty() {
         lines.push(Line::from(Span::styled(
