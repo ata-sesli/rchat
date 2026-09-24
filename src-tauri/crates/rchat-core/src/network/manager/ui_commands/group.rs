@@ -226,11 +226,19 @@ impl NetworkManager {
                 sent += 1;
             }
         }
+        let (state, detail) = if sent == 0 {
+            (
+                "failed",
+                "no connected group peers are available for history sync".to_string(),
+            )
+        } else {
+            ("requested", format!("sent to {sent} peer(s)"))
+        };
         self.emit(crate::events::CoreEvent::GroupSyncStateUpdated(
             crate::events::GroupSyncStateUpdatedEvent {
                 group_id: group_id.to_string(),
-                state: "requested".to_string(),
-                detail: Some(format!("sent to {sent} peer(s)")),
+                state: state.to_string(),
+                detail: Some(detail),
             },
         ));
     }

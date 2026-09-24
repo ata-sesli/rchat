@@ -83,6 +83,73 @@ let initPromise: Promise<UnlistenFn> | null = null;
 let activeUnlisten: UnlistenFn | null = null;
 let chatLoadSeq = 0;
 let pendingStatusCache: Record<string, string> = {};
+const GROUP_SYNC_RESPONSE_TIMEOUT_MS = 30_000;
+const groupSyncTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+
+function clearGroupSyncTimeout(groupId: string) {
+  const timeout = groupSyncTimeouts.get(groupId);
+  if (timeout) clearTimeout(timeout);
+  groupSyncTimeouts.delete(groupId);
+}
+
+function armGroupSyncTimeout(groupId: string) {
+  clearGroupSyncTimeout(groupId);
+  groupSyncTimeouts.set(
+    groupId,
+    setTimeout(() => {
+      groupSyncTimeouts.delete(groupId);
+      chatState.update((state) => {
+        const invite = state.groupInvites[groupId];
+        if (!invite || invite.status !== "syncing") return state;
+        return {
+          ...state,
+          groupSyncStatus: {
+            ...state.groupSyncStatus,
+            [groupId]: "group history sync timed out",
+          },
+          groupInvites: {
+            ...state.groupInvites,
+            [groupId]: {
+              ...invite,
+              status: "failed",
+              detail: "No authenticated group history response was received. Retry when a group peer is available.",
+            },
+          },
+        };
+      });
+    }, GROUP_SYNC_RESPONSE_TIMEOUT_MS),
+  );
+}
+
+async function hydrateGroupInvites() {
+  try {
+    const rows = await api.getGroupInvites();
+    chatState.update((state) => {
+      const groupInvites = { ...state.groupInvites };
+      const groupSyncStatus = { ...state.groupSyncStatus };
+      for (const row of rows) {
+        if (state.groupInvites[row.group_id]) continue;
+        const isReady = row.status === "ready";
+        groupInvites[row.group_id] = {
+          inviteId: row.invite_id,
+          groupId: row.group_id,
+          groupName: row.group_name,
+          inviterPeerId: row.inviter_peer_id,
+          status: isReady ? "ready" : "failed",
+          detail: isReady
+            ? "Group history is authenticated. You can accept this invitation."
+            : "Group history sync was interrupted. Retry before accepting this invitation.",
+        };
+        groupSyncStatus[row.group_id] = isReady
+          ? "ready"
+          : "group history sync interrupted; retry required";
+      }
+      return { ...state, groupInvites, groupSyncStatus };
+    });
+  } catch (error) {
+    console.error("Failed to load persisted group invitations:", error);
+  }
+}
 
 function uiChatId(chatId: string): string {
   return chatId === "self" ? "Me" : chatId;
@@ -454,6 +521,7 @@ export async function initChatStore(): Promise<UnlistenFn> {
             },
           },
         }));
+        armGroupSyncTimeout(payload.group_id);
       }),
     );
 
@@ -471,7 +539,15 @@ export async function initChatStore(): Promise<UnlistenFn> {
             };
           }
           const isReady = payload.state === "complete";
-          const isFailed = payload.state === "failed" || payload.state === "incomplete";
+          const sentToNoPeers =
+            payload.state === "requested" && /sent to 0 peer\(s\)/.test(payload.detail ?? "");
+          const isFailed =
+            payload.state === "failed" ||
+            payload.state === "incomplete" ||
+            sentToNoPeers;
+          if (isReady || isFailed) {
+            clearGroupSyncTimeout(payload.group_id);
+          }
           return {
             ...state,
             groupSyncStatus: { ...state.groupSyncStatus, [payload.group_id]: status },
@@ -482,7 +558,9 @@ export async function initChatStore(): Promise<UnlistenFn> {
                 status: isReady ? "ready" : isFailed ? "failed" : "syncing",
                 detail: isReady
                   ? "Group history is authenticated. You can accept this invitation."
-                  : payload.detail ?? "Authenticating the group history before acceptance.",
+                  : isFailed
+                    ? payload.detail ?? "Group history sync failed. Retry before accepting this invitation."
+                    : payload.detail ?? "Authenticating the group history before acceptance.",
               },
             },
           };
@@ -490,9 +568,14 @@ export async function initChatStore(): Promise<UnlistenFn> {
       }),
     );
 
+    await hydrateGroupInvites();
+
     activeUnlisten = () => {
       while (cleanups.length > 0) {
         cleanups.pop()?.();
+      }
+      for (const groupId of groupSyncTimeouts.keys()) {
+        clearGroupSyncTimeout(groupId);
       }
       activeUnlisten = null;
       initPromise = null;
@@ -512,6 +595,9 @@ export function resetChatStore() {
   }
   chatLoadSeq++;
   pendingStatusCache = {};
+  for (const groupId of groupSyncTimeouts.keys()) {
+    clearGroupSyncTimeout(groupId);
+  }
   chatState.set({ ...defaultChatState, activeConversationIds: new Set() });
   activeUnlisten = null;
   initPromise = null;
@@ -545,9 +631,11 @@ export async function retryGroupInviteSync(invite: GroupInvite): Promise<void> {
       },
     },
   }));
+  armGroupSyncTimeout(invite.groupId);
   try {
     await api.syncGroupChat(invite.groupId);
   } catch (error) {
+    clearGroupSyncTimeout(invite.groupId);
     chatState.update((state) => ({
       ...state,
       groupInvites: {

@@ -47,6 +47,7 @@ export const COMMANDS = {
   getGroupPolicy: "get_group_policy",
   updateGroupSettings: "update_group_settings",
   removeGroupMember: "remove_group_member",
+  getGroupInvites: "get_group_invites",
   acceptGroupInvite: "accept_group_invite",
   rejectGroupInvite: "reject_group_invite",
   renameGroupChat: "rename_group_chat",
@@ -278,6 +279,14 @@ export type GroupChatResult = {
   chat_id: string;
   name: string;
   image_hash?: string | null;
+};
+
+export type GroupInviteRow = {
+  invite_id: string;
+  group_id: string;
+  group_name: string;
+  inviter_peer_id: string;
+  status: "pending" | "ready";
 };
 
 export type GroupPolicy = {
@@ -569,6 +578,10 @@ type CommandSpec = {
   [COMMANDS.acceptGroupInvite]: {
     args: { invite_id: string };
     result: string;
+  };
+  [COMMANDS.getGroupInvites]: {
+    args?: undefined;
+    result: GroupInviteRow[];
   };
   [COMMANDS.rejectGroupInvite]: {
     args: { invite_id: string };
@@ -944,6 +957,7 @@ export const api = {
       group_id: groupId,
       peer_id: peerId,
     }),
+  getGroupInvites: () => invokeCommand(COMMANDS.getGroupInvites),
   acceptGroupInvite: (inviteId: string) =>
     invokeCommand(COMMANDS.acceptGroupInvite, { invite_id: inviteId }),
   rejectGroupInvite: (inviteId: string) =>
