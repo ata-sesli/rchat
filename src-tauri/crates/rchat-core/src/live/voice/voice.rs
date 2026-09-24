@@ -10,7 +10,7 @@ use rubato::{
 };
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -291,6 +291,160 @@ impl Drop for VoiceAudioEngine {
         let _ = self.shutdown_tx.send(());
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
+        }
+    }
+}
+
+pub(crate) fn start_microphone_diagnostic_session(
+    level_percent: Arc<AtomicU16>,
+    peak_percent: Arc<AtomicU16>,
+    captured_frames: Arc<AtomicU64>,
+) -> Result<
+    (
+        (),
+        mpsc::Sender<()>,
+        thread::JoinHandle<()>,
+        crate::media_diagnostics::MicrophoneDiagnosticSnapshot,
+    ),
+    crate::media_diagnostics::MediaDiagnosticError,
+> {
+    use crate::media_diagnostics::{MediaDiagnosticError, MediaDiagnosticErrorKind};
+
+    let (capture_tx, mut capture_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<i16>>();
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    let (init_tx, init_rx) = mpsc::sync_channel(1);
+    let thread_level = Arc::clone(&level_percent);
+    let thread_peak = Arc::clone(&peak_percent);
+    let thread_frames = Arc::clone(&captured_frames);
+    let stats = Arc::new(Mutex::new(VoiceAudioStats::default()));
+    let echo_guard = Arc::new(EchoGuard::new());
+
+    let thread_handle = thread::Builder::new()
+        .name("rchat-microphone-diagnostic".to_string())
+        .spawn(move || {
+            let host = cpal::default_host();
+            let Some(input_device) = host.default_input_device() else {
+                let _ = init_tx.send(Err(MediaDiagnosticError::new(
+                    MediaDiagnosticErrorKind::DeviceUnavailable,
+                    "no default microphone input device",
+                )));
+                return;
+            };
+            let input_supported = match input_device.default_input_config() {
+                Ok(config) => config,
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = init_tx.send(Err(MediaDiagnosticError::new(
+                        crate::media_diagnostics::classify_media_error(
+                            &message,
+                            MediaDiagnosticErrorKind::OpenFailed,
+                        ),
+                        message,
+                    )));
+                    return;
+                }
+            };
+            let input_config = StreamConfig {
+                channels: input_supported.channels(),
+                sample_rate: input_supported.sample_rate(),
+                buffer_size: cpal::BufferSize::Default,
+            };
+            let device_name = input_device
+                .name()
+                .unwrap_or_else(|_| "default microphone".to_string());
+            let snapshot = crate::media_diagnostics::MicrophoneDiagnosticSnapshot {
+                device_name,
+                backend: format!("{:?}", host.id()),
+                sample_rate: input_config.sample_rate.0,
+                channels: input_config.channels,
+                sample_format: format!("{:?}", input_supported.sample_format()),
+                level_percent: 0,
+                peak_percent: 0,
+                captured_frames: 0,
+            };
+
+            let stream = match build_input_stream(
+                &input_device,
+                &input_supported.sample_format(),
+                &input_config,
+                capture_tx,
+                stats,
+                echo_guard,
+                None,
+            ) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let _ = init_tx.send(Err(MediaDiagnosticError::new(
+                        crate::media_diagnostics::classify_media_error(
+                            &error,
+                            MediaDiagnosticErrorKind::OpenFailed,
+                        ),
+                        error,
+                    )));
+                    return;
+                }
+            };
+            if let Err(error) = stream.play() {
+                let message = error.to_string();
+                let _ = init_tx.send(Err(MediaDiagnosticError::new(
+                    crate::media_diagnostics::classify_media_error(
+                        &message,
+                        MediaDiagnosticErrorKind::OpenFailed,
+                    ),
+                    message,
+                )));
+                return;
+            }
+            if init_tx.send(Ok(snapshot)).is_err() {
+                return;
+            }
+
+            while shutdown_rx.recv_timeout(Duration::from_millis(20)).is_err() {
+                let mut frame_peak = 0u16;
+                while let Ok(samples) = capture_rx.try_recv() {
+                    frame_peak = frame_peak.max(
+                        samples
+                            .iter()
+                            .map(|sample| sample.unsigned_abs())
+                            .max()
+                            .unwrap_or(0),
+                    );
+                    thread_frames.fetch_add(1, Ordering::Relaxed);
+                }
+                if frame_peak > 0 {
+                    let previous = thread_level.load(Ordering::Relaxed);
+                    thread_level.store(frame_peak.max(previous), Ordering::Relaxed);
+                    thread_peak.fetch_max(frame_peak, Ordering::Relaxed);
+                } else {
+                    let previous = thread_level.load(Ordering::Relaxed);
+                    thread_level.store(
+                        previous.saturating_sub((previous / 4).max(1)),
+                        Ordering::Relaxed,
+                    );
+                }
+            }
+        })
+        .map_err(|error| {
+            MediaDiagnosticError::new(
+                MediaDiagnosticErrorKind::OpenFailed,
+                format!("failed to start microphone diagnostic thread: {error}"),
+            )
+        })?;
+
+    match init_rx.recv() {
+        Ok(Ok(snapshot)) => Ok(((), shutdown_tx, thread_handle, snapshot)),
+        Ok(Err(error)) => {
+            let _ = shutdown_tx.send(());
+            let _ = thread_handle.join();
+            Err(error)
+        }
+        Err(error) => {
+            let _ = shutdown_tx.send(());
+            let _ = thread_handle.join();
+            Err(MediaDiagnosticError::new(
+                MediaDiagnosticErrorKind::OpenFailed,
+                format!("microphone diagnostic initialization failed: {error}"),
+            ))
         }
     }
 }

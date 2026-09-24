@@ -171,6 +171,8 @@ pub enum VideoCaptureError {
     NoDevice,
     #[error("camera permission denied or device unavailable: {0}")]
     PermissionOrDeviceUnavailable(String),
+    #[error("camera capture open failed: {0}")]
+    OpenFailed(String),
     #[error("camera format unsupported: {0}")]
     UnsupportedFormat(String),
     #[error("camera frame conversion failed: {0}")]
@@ -257,7 +259,7 @@ impl VideoCaptureSession {
                     requested_profile: config.profile.label().to_string(),
                     format: capture_format_info(format),
                 };
-                if let Err(error) = camera.open_stream().map_err(map_nokhwa_error) {
+                if let Err(error) = camera.open_stream().map_err(map_camera_open_error) {
                     let _ = init_tx.send(Err(error));
                     return;
                 }
@@ -826,12 +828,27 @@ fn camera_index_as_u32(index: &CameraIndex) -> Option<u32> {
 fn map_nokhwa_error(error: nokhwa::NokhwaError) -> VideoCaptureError {
     let message = error.to_string();
     let lower = message.to_lowercase();
-    if lower.contains("permission") || lower.contains("denied") || lower.contains("busy") {
+    if lower.contains("permission") || lower.contains("denied") || lower.contains("access") {
         VideoCaptureError::PermissionOrDeviceUnavailable(message)
     } else if lower.contains("not found") || lower.contains("no device") {
         VideoCaptureError::NoDevice
     } else {
         VideoCaptureError::Backend(message)
+    }
+}
+
+fn map_camera_open_error(error: nokhwa::NokhwaError) -> VideoCaptureError {
+    let message = error.to_string();
+    let lower = message.to_lowercase();
+    if lower.contains("permission") || lower.contains("denied") || lower.contains("access") {
+        VideoCaptureError::PermissionOrDeviceUnavailable(message)
+    } else if lower.contains("not found")
+        || lower.contains("no device")
+        || lower.contains("unavailable")
+    {
+        VideoCaptureError::NoDevice
+    } else {
+        VideoCaptureError::OpenFailed(message)
     }
 }
 
