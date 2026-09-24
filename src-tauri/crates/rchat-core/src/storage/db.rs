@@ -966,7 +966,7 @@ pub fn remove_chat_member(conn: &Connection, chat_id: &str, peer_id: &str) -> an
 
 pub fn revoke_group_invites(conn: &Connection, group_id: &str) -> anyhow::Result<()> {
     conn.execute(
-        "UPDATE group_invites SET status = 'revoked', updated_at = ?2 WHERE group_id = ?1 AND status IN ('sent', 'pending')",
+        "UPDATE group_invites SET status = 'revoked', updated_at = ?2 WHERE group_id = ?1 AND status IN ('sent', 'pending', 'ready')",
         rusqlite::params![group_id, unix_now()],
     )?;
     Ok(())
@@ -977,7 +977,7 @@ pub fn get_open_group_invitee_peer_ids(
     group_id: &str,
 ) -> anyhow::Result<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT invitee_peer_id FROM group_invites WHERE group_id = ?1 AND status IN ('sent', 'pending') ORDER BY invitee_peer_id",
+        "SELECT DISTINCT invitee_peer_id FROM group_invites WHERE group_id = ?1 AND status IN ('sent', 'pending', 'ready') ORDER BY invitee_peer_id",
     )?;
     let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1232,7 +1232,11 @@ pub fn upsert_group_invite(
          (invite_id, group_id, group_name, inviter_peer_id, invitee_peer_id, status, payload_json, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(invite_id) DO UPDATE SET
-             status = excluded.status,
+             status = CASE
+                 WHEN group_invites.status IN ('accepted', 'rejected', 'revoked', 'ready')
+                     THEN group_invites.status
+                 ELSE excluded.status
+             END,
              payload_json = excluded.payload_json,
              updated_at = excluded.updated_at",
         (
@@ -1260,6 +1264,46 @@ pub fn update_group_invite_status(
         (status, unix_now(), invite_id),
     )?;
     Ok(())
+}
+
+pub fn get_group_invite_status(
+    conn: &Connection,
+    invite_id: &str,
+) -> anyhow::Result<Option<String>> {
+    conn.query_row(
+        "SELECT status FROM group_invites WHERE invite_id = ?1",
+        [invite_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn get_group_invites_for_group(
+    conn: &Connection,
+    group_id: &str,
+) -> anyhow::Result<Vec<GroupInviteRow>> {
+    let mut statement = conn.prepare(
+        "SELECT invite_id, group_id, group_name, inviter_peer_id, invitee_peer_id,
+                status, payload_json, created_at, updated_at
+         FROM group_invites
+         WHERE group_id = ?1 AND status IN ('sent', 'pending', 'ready')
+         ORDER BY created_at ASC, invite_id ASC",
+    )?;
+    let rows = statement.query_map([group_id], |row| {
+        Ok(GroupInviteRow {
+            invite_id: row.get(0)?,
+            group_id: row.get(1)?,
+            group_name: row.get(2)?,
+            inviter_peer_id: row.get(3)?,
+            invitee_peer_id: row.get(4)?,
+            status: row.get(5)?,
+            payload_json: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 pub fn get_group_invite_payload(

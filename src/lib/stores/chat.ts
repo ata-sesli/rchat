@@ -42,6 +42,7 @@ export type ChatState = {
   peerAlias: string | null;
   activeConversationIds: Set<string>;
   closedChatId: string | null;
+  groupSyncStatus: Record<string, string>;
 };
 
 const defaultChatState: ChatState = {
@@ -62,6 +63,7 @@ const defaultChatState: ChatState = {
   peerAlias: null,
   activeConversationIds: new Set(),
   closedChatId: null,
+  groupSyncStatus: {},
 };
 
 export const chatState = writable<ChatState>({ ...defaultChatState });
@@ -416,6 +418,35 @@ export async function initChatStore(): Promise<UnlistenFn> {
           closedChatId: chatId || state.closedChatId,
         }));
         void refreshChats();
+      }),
+    );
+
+    cleanups.push(
+      await listen("group-invite-received", (event: any) => {
+        const payload = event.payload;
+        if (!payload?.group_id) return;
+        chatState.update((state) => ({
+          ...state,
+          groupSyncStatus: {
+            ...state.groupSyncStatus,
+            [payload.group_id]: `invitation received; syncing authenticated history from ${payload.inviter_peer_id ?? "inviter"}`,
+          },
+        }));
+      }),
+    );
+
+    cleanups.push(
+      await listen("group-sync-state-updated", (event: any) => {
+        const payload = event.payload;
+        if (!payload?.group_id) return;
+        const status = [payload.state, payload.detail].filter(Boolean).join(" ");
+        chatState.update((state) => ({
+          ...state,
+          groupSyncStatus: {
+            ...state.groupSyncStatus,
+            [payload.group_id]: status,
+          },
+        }));
       }),
     );
 
