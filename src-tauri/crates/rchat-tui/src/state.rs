@@ -3,6 +3,9 @@ use rchat_core::{
     chat_identity::extract_peer_id_from_chat_id,
     chat_kind::{self, ChatKind},
     events::LocalPeerEvent,
+    media_diagnostics::{
+        CameraDiagnosticSnapshot, MediaDiagnosticError, MicrophoneDiagnosticSnapshot,
+    },
     settings::camera::CaptureDeviceInfo,
     storage::config::{ConnectivityMode, ConnectivitySettings, ThemeConfig},
     storage::db::{ChatFileRow, Message},
@@ -741,6 +744,9 @@ pub enum SettingsField {
     RattyReset,
     CameraDevice,
     CameraRefresh,
+    CameraTest,
+    MicrophoneTest,
+    MediaDiagnosticsStop,
     ScreenShareTest,
 }
 
@@ -764,6 +770,148 @@ pub struct TuiSticker {
     pub file_hash: String,
     pub name: Option<String>,
     pub size_bytes: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeMediaDiagnosticPhase {
+    Idle,
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+impl NativeMediaDiagnosticPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "Not tested",
+            Self::Starting => "Starting",
+            Self::Running => "Running",
+            Self::Stopping => "Stopping",
+            Self::Stopped => "Stopped",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeMediaDiagnosticState {
+    pub phase: NativeMediaDiagnosticPhase,
+    pub device: Option<String>,
+    pub detail: Option<String>,
+    pub level_percent: Option<u8>,
+    pub frames: Option<u64>,
+    pub error: Option<MediaDiagnosticError>,
+}
+
+impl Default for NativeMediaDiagnosticState {
+    fn default() -> Self {
+        Self {
+            phase: NativeMediaDiagnosticPhase::Idle,
+            device: None,
+            detail: None,
+            level_percent: None,
+            frames: None,
+            error: None,
+        }
+    }
+}
+
+impl NativeMediaDiagnosticState {
+    pub fn start(&mut self, device: impl Into<String>) {
+        *self = Self {
+            phase: NativeMediaDiagnosticPhase::Starting,
+            device: Some(device.into()),
+            ..Self::default()
+        };
+    }
+
+    pub fn camera_running(&mut self, snapshot: &CameraDiagnosticSnapshot) {
+        self.phase = NativeMediaDiagnosticPhase::Running;
+        self.device = Some(if snapshot.device_name.trim().is_empty() {
+            "unknown camera".to_string()
+        } else {
+            snapshot.device_name.clone()
+        });
+        self.detail = Some(format!(
+            "{} · {}x{}@{} · {}{}",
+            snapshot.backend,
+            snapshot.width,
+            snapshot.height,
+            snapshot.fps,
+            snapshot.format,
+            snapshot
+                .warning
+                .as_ref()
+                .map(|warning| format!(" · {warning}"))
+                .unwrap_or_default()
+        ));
+        self.frames = Some(snapshot.stats.captured_frames);
+        self.error = None;
+    }
+
+    pub fn microphone_running(&mut self, snapshot: &MicrophoneDiagnosticSnapshot) {
+        self.phase = NativeMediaDiagnosticPhase::Running;
+        self.device = Some(snapshot.device_name.clone());
+        self.detail = Some(format!(
+            "{} · {} Hz · {} channel(s) · {}",
+            snapshot.backend, snapshot.sample_rate, snapshot.channels, snapshot.sample_format
+        ));
+        self.level_percent = Some(snapshot.level_percent);
+        self.frames = Some(snapshot.captured_frames);
+        self.error = None;
+    }
+
+    pub fn update_camera(&mut self, snapshot: &CameraDiagnosticSnapshot) {
+        if self.phase == NativeMediaDiagnosticPhase::Running {
+            self.frames = Some(snapshot.stats.captured_frames);
+        }
+    }
+
+    pub fn update_microphone(&mut self, snapshot: &MicrophoneDiagnosticSnapshot) {
+        if self.phase == NativeMediaDiagnosticPhase::Running {
+            self.level_percent = Some(snapshot.level_percent);
+            self.frames = Some(snapshot.captured_frames);
+        }
+    }
+
+    pub fn fail(&mut self, error: MediaDiagnosticError) {
+        self.phase = NativeMediaDiagnosticPhase::Failed;
+        self.detail = None;
+        self.level_percent = None;
+        self.frames = None;
+        self.error = Some(error);
+    }
+
+    pub fn stop(&mut self) {
+        self.phase = NativeMediaDiagnosticPhase::Stopped;
+        self.level_percent = None;
+        self.frames = None;
+    }
+
+    pub fn error_summary(&self) -> Option<String> {
+        self.error
+            .as_ref()
+            .map(|error| format!("{}: {}", error.kind.label(), error.message))
+    }
+
+    pub fn status_summary(&self) -> String {
+        let mut parts = vec![self.phase.label().to_string()];
+        if let Some(device) = &self.device {
+            parts.push(format!("device: {device}"));
+        }
+        if let Some(detail) = &self.detail {
+            parts.push(detail.clone());
+        }
+        if let Some(level) = self.level_percent {
+            parts.push(format!("input level: {level}%"));
+        }
+        if let Some(frames) = self.frames {
+            parts.push(format!("frames: {frames}"));
+        }
+        parts.join(" · ")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -806,6 +954,8 @@ pub struct SettingsModalState {
     pub camera_picker_open: bool,
     pub camera_picker_index: usize,
     pub camera_error: Option<String>,
+    pub camera_diagnostic: NativeMediaDiagnosticState,
+    pub microphone_diagnostic: NativeMediaDiagnosticState,
     pub status: Option<String>,
     pub error: Option<String>,
 }
@@ -851,6 +1001,8 @@ impl Default for SettingsModalState {
             camera_picker_open: false,
             camera_picker_index: 0,
             camera_error: None,
+            camera_diagnostic: NativeMediaDiagnosticState::default(),
+            microphone_diagnostic: NativeMediaDiagnosticState::default(),
             status: None,
             error: None,
         }
@@ -942,6 +1094,9 @@ impl SettingsModalState {
             SettingsSection::Media => fields.extend([
                 SettingsField::CameraDevice,
                 SettingsField::CameraRefresh,
+                SettingsField::CameraTest,
+                SettingsField::MicrophoneTest,
+                SettingsField::MediaDiagnosticsStop,
                 SettingsField::RattyPath,
                 SettingsField::RattyPathSave,
                 SettingsField::RattyImportGhostty,
@@ -1164,6 +1319,13 @@ impl SettingsModalState {
             .find(|device| device.id == selected)
             .map(camera_device_label)
             .unwrap_or_else(|| format!("{selected} (unavailable)"))
+    }
+
+    pub fn camera_diagnostic_request(&self) -> (Option<String>, String) {
+        (
+            self.selected_camera_device_id.clone(),
+            self.camera_selection_label(),
+        )
     }
 
     pub fn camera_option_ids(&self) -> Vec<Option<String>> {
@@ -2622,6 +2784,7 @@ fn next_index(current: usize, delta: isize, len: usize) -> usize {
 mod tests {
     use super::*;
     use rchat_core::events::LocalPeerEvent;
+    use rchat_core::media_diagnostics::MediaDiagnosticErrorKind;
     use rchat_core::storage::db::Message;
 
     fn db_message(chat_id: &str, peer_id: &str, text: &str, id: &str) -> Message {
@@ -3530,6 +3693,9 @@ mod tests {
             vec![
                 SettingsField::CameraDevice,
                 SettingsField::CameraRefresh,
+                SettingsField::CameraTest,
+                SettingsField::MicrophoneTest,
+                SettingsField::MediaDiagnosticsStop,
                 SettingsField::RattyPath,
                 SettingsField::RattyPathSave,
                 SettingsField::RattyImportGhostty,
@@ -3592,6 +3758,96 @@ mod tests {
             modal.camera_selection_label(),
             "disconnected-camera (unavailable)"
         );
+    }
+
+    #[test]
+    fn native_camera_diagnostic_state_tracks_selected_device_and_clean_stop() {
+        let mut modal = SettingsModalState::default();
+        modal.camera_devices = vec![
+            CaptureDeviceInfo {
+                id: "camera-a".to_string(),
+                index: 0,
+                name: "Camera A".to_string(),
+                description: String::new(),
+                backend: "v4l2".to_string(),
+            },
+            CaptureDeviceInfo {
+                id: "camera-b".to_string(),
+                index: 1,
+                name: "Camera B".to_string(),
+                description: String::new(),
+                backend: "v4l2".to_string(),
+            },
+        ];
+
+        modal.selected_camera_device_id = Some("camera-a".to_string());
+        modal
+            .camera_diagnostic
+            .start(modal.camera_selection_label());
+        assert_eq!(
+            modal.camera_diagnostic.device.as_deref(),
+            Some("Camera A · v4l2")
+        );
+
+        modal.selected_camera_device_id = Some("camera-b".to_string());
+        assert_eq!(
+            modal.camera_diagnostic_request(),
+            (Some("camera-b".to_string()), "Camera B · v4l2".to_string())
+        );
+        modal
+            .camera_diagnostic
+            .start(modal.camera_selection_label());
+        assert_eq!(
+            modal.camera_diagnostic.device.as_deref(),
+            Some("Camera B · v4l2")
+        );
+        modal.camera_diagnostic.stop();
+        assert_eq!(
+            modal.camera_diagnostic.phase,
+            NativeMediaDiagnosticPhase::Stopped
+        );
+    }
+
+    #[test]
+    fn microphone_diagnostic_state_exposes_device_and_input_level() {
+        let mut diagnostic = NativeMediaDiagnosticState::default();
+        diagnostic.start("default microphone input");
+        diagnostic.microphone_running(&MicrophoneDiagnosticSnapshot {
+            device_name: "Built-in microphone".to_string(),
+            backend: "alsa".to_string(),
+            sample_rate: 48_000,
+            channels: 2,
+            sample_format: "F32".to_string(),
+            level_percent: 37,
+            peak_percent: 64,
+            captured_frames: 12,
+        });
+
+        assert_eq!(diagnostic.phase, NativeMediaDiagnosticPhase::Running);
+        assert_eq!(diagnostic.device.as_deref(), Some("Built-in microphone"));
+        assert_eq!(diagnostic.level_percent, Some(37));
+        assert!(diagnostic.status_summary().contains("input level: 37%"));
+        assert!(diagnostic.status_summary().contains("48000 Hz"));
+    }
+
+    #[test]
+    fn native_media_diagnostic_error_presentation_is_explicit() {
+        for kind in [
+            MediaDiagnosticErrorKind::PermissionDenied,
+            MediaDiagnosticErrorKind::DeviceUnavailable,
+            MediaDiagnosticErrorKind::OpenFailed,
+            MediaDiagnosticErrorKind::Unsupported,
+        ] {
+            let mut diagnostic = NativeMediaDiagnosticState::default();
+            diagnostic.start("selected input");
+            diagnostic.fail(MediaDiagnosticError::new(kind, "test detail"));
+
+            assert_eq!(diagnostic.phase, NativeMediaDiagnosticPhase::Failed);
+            assert_eq!(
+                diagnostic.error_summary().as_deref(),
+                Some(format!("{}: test detail", kind.label()).as_str())
+            );
+        }
     }
 
     #[test]
