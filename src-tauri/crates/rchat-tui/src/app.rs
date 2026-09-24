@@ -5085,7 +5085,9 @@ async fn refresh_settings_modal(app_state: &AppState, state: &mut UiState) -> Re
         .map(|preset| TuiThemePreset {
             key: preset.key,
             name: preset.name,
+            description: preset.description,
             source: preset.source,
+            theme: preset.theme,
         })
         .collect::<Vec<_>>();
     let selected_preset = settings_theme::get_selected_preset(app_state).await?;
@@ -5113,6 +5115,9 @@ async fn refresh_settings_modal(app_state: &AppState, state: &mut UiState) -> Re
         modal.pinned_peers = pinned_peers;
         modal.connectivity = connectivity;
         modal.theme_presets = theme_presets;
+        modal.theme_edit_key = None;
+        modal.theme_delete_key = None;
+        modal.theme_description.clear();
         modal.selected_preset = selected_preset;
         modal.stickers = stickers;
         if modal.selected_sticker_hash().is_none() {
@@ -5470,6 +5475,123 @@ async fn activate_settings_focus(
             refresh_settings_modal(app_state, state).await?;
             set_settings_status(state, "theme applied");
         }
+        SettingsField::ThemeEdit(index) => {
+            let preset = state
+                .app
+                .settings
+                .as_ref()
+                .and_then(|modal| modal.theme_presets.get(index).cloned());
+            let Some(preset) = preset.filter(|preset| preset.key.starts_with("custom:")) else {
+                set_settings_error(state, "only custom themes can be edited");
+                return Ok(());
+            };
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.theme_edit_key = Some(preset.key);
+                modal.theme_custom_name = preset.name;
+                modal.theme_description = preset.description;
+                if let Some(theme) = preset.theme {
+                    modal.theme_primary = theme.primary.c500.clone();
+                    modal.theme_secondary = theme.secondary.c500.clone();
+                    modal.theme_text = theme.error.c400.clone();
+                }
+                modal.status = Some("editing custom theme".to_string());
+                modal.error = None;
+                modal.focus = SettingsField::ThemeName;
+            }
+        }
+        SettingsField::ThemeDelete(index) => {
+            let key = state
+                .app
+                .settings
+                .as_ref()
+                .and_then(|modal| modal.theme_presets.get(index))
+                .map(|preset| preset.key.clone())
+                .filter(|key| key.starts_with("custom:"));
+            if let Some(key) = key {
+                if let Some(modal) = state.app.settings.as_mut() {
+                    modal.theme_delete_key = Some(key);
+                    modal.status = Some("confirm custom theme deletion".to_string());
+                    modal.error = None;
+                    modal.focus = SettingsField::ThemeDeleteConfirm;
+                }
+            } else {
+                set_settings_error(state, "only custom themes can be deleted");
+            }
+        }
+        SettingsField::ThemeSave => {
+            let (key, name, description) = state
+                .app
+                .settings
+                .as_ref()
+                .and_then(|modal| {
+                    Some((
+                        modal.theme_edit_key.clone()?,
+                        modal.theme_custom_name.clone(),
+                        modal.theme_description.clone(),
+                    ))
+                })
+                .ok_or_else(|| anyhow!("no custom theme is being edited"))?;
+            let (primary, secondary, text) = state
+                .app
+                .settings
+                .as_ref()
+                .map(|modal| (modal.theme_primary.clone(), modal.theme_secondary.clone(), modal.theme_text.clone()))
+                .ok_or_else(|| anyhow!("theme editor is closed"))?;
+            let mut theme = state
+                .app
+                .settings
+                .as_ref()
+                .and_then(|modal| {
+                    modal
+                        .theme_presets
+                        .iter()
+                        .find(|preset| preset.key == key)
+                        .and_then(|preset| preset.theme.clone())
+                })
+                .ok_or_else(|| anyhow!("custom theme colors are unavailable"))?;
+            theme.primary.c500 = primary;
+            theme.secondary.c500 = secondary;
+            theme.error.c400 = text;
+            settings_theme::update_custom_theme(
+                app_state,
+                key,
+                name,
+                (!description.trim().is_empty()).then_some(description),
+                theme,
+            )
+            .await?;
+            state.theme = Theme::from_config(&settings_theme::get_theme(app_state).await?);
+            refresh_settings_modal(app_state, state).await?;
+            set_settings_status(state, "custom theme saved");
+        }
+        SettingsField::ThemeCancel => {
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.theme_edit_key = None;
+                modal.theme_custom_name.clear();
+                modal.theme_description.clear();
+                modal.status = Some("theme edit cancelled".to_string());
+                modal.error = None;
+            }
+        }
+        SettingsField::ThemeDeleteConfirm => {
+            let key = state
+                .app
+                .settings
+                .as_ref()
+                .and_then(|modal| modal.theme_delete_key.clone())
+                .ok_or_else(|| anyhow!("no custom theme deletion is pending"))?;
+            settings_theme::delete_custom_theme(app_state, &key).await?;
+            state.theme = Theme::from_config(&settings_theme::get_theme(app_state).await?);
+            refresh_settings_modal(app_state, state).await?;
+            set_settings_status(state, "custom theme deleted");
+        }
+        SettingsField::ThemeDeleteCancel => {
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.theme_delete_key = None;
+                modal.status = Some("theme deletion cancelled".to_string());
+                modal.error = None;
+            }
+        }
         SettingsField::ThemeCreateCustom => {
             let Some((name, primary, secondary, text)) = state.app.settings.as_ref().map(|modal| {
                 (
@@ -5769,6 +5891,7 @@ async fn activate_settings_focus(
         SettingsField::ProfileAlias
         | SettingsField::ProfileAvatar
         | SettingsField::ThemeName
+        | SettingsField::ThemeDescription
         | SettingsField::ThemePrimary
         | SettingsField::ThemeSecondary
         | SettingsField::ThemeText
@@ -12409,7 +12532,7 @@ fn settings_theme_lines(
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from("Presets")];
-    for (index, preset) in modal.theme_presets.iter().take(8).enumerate() {
+    for (index, preset) in modal.theme_presets.iter().enumerate() {
         let selected = modal.selected_preset.as_deref() == Some(preset.key.as_str());
         lines.push(settings_button_line(
             modal,
@@ -12422,6 +12545,20 @@ fn settings_theme_lines(
             ),
             theme,
         ));
+        if preset.key.starts_with("custom:") {
+            lines.push(settings_button_line(
+                modal,
+                SettingsField::ThemeEdit(index),
+                "Edit custom theme",
+                theme,
+            ));
+            lines.push(settings_button_line(
+                modal,
+                SettingsField::ThemeDelete(index),
+                "Delete custom theme",
+                theme,
+            ));
+        }
     }
     lines.push(settings_button_line(
         modal,
@@ -12430,12 +12567,23 @@ fn settings_theme_lines(
         theme,
     ));
     lines.push(Line::from(""));
-    lines.push(Line::from("Custom theme"));
+    lines.push(Line::from(if modal.theme_edit_key.is_some() {
+        "Edit custom theme"
+    } else {
+        "Create custom theme"
+    }));
     lines.push(settings_input_line(
         modal,
         SettingsField::ThemeName,
         "Name",
         &modal.theme_custom_name,
+        theme,
+    ));
+    lines.push(settings_input_line(
+        modal,
+        SettingsField::ThemeDescription,
+        "Description",
+        &modal.theme_description,
         theme,
     ));
     lines.push(settings_input_line(
@@ -12459,12 +12607,31 @@ fn settings_theme_lines(
         &modal.theme_text,
         theme,
     ));
-    lines.push(settings_button_line(
-        modal,
-        SettingsField::ThemeCreateCustom,
-        "Create custom theme",
-        theme,
-    ));
+    if modal.theme_edit_key.is_some() {
+        lines.push(settings_button_line(modal, SettingsField::ThemeSave, "Save theme", theme));
+        lines.push(settings_button_line(modal, SettingsField::ThemeCancel, "Cancel edit", theme));
+    } else {
+        lines.push(settings_button_line(
+            modal,
+            SettingsField::ThemeCreateCustom,
+            "Create custom theme",
+            theme,
+        ));
+    }
+    if modal.theme_delete_key.is_some() {
+        lines.push(settings_button_line(
+            modal,
+            SettingsField::ThemeDeleteConfirm,
+            "Confirm delete",
+            theme,
+        ));
+        lines.push(settings_button_line(
+            modal,
+            SettingsField::ThemeDeleteCancel,
+            "Cancel delete",
+            theme,
+        ));
+    }
     lines
 }
 
