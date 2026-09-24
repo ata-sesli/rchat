@@ -10627,6 +10627,33 @@ fn fit_segments(parts: &[&str], width: usize) -> String {
     }
 }
 
+fn truncate_display_width(value: &str, width: usize) -> String {
+    let mut output = String::new();
+    for character in value.chars() {
+        let mut candidate = output.clone();
+        candidate.push(character);
+        if Line::from(candidate.as_str()).width() > width {
+            break;
+        }
+        output = candidate;
+    }
+    output
+}
+
+fn truncate_line_display_width(line: &Line<'_>, width: usize) -> Line<'static> {
+    let mut remaining = width;
+    let mut spans = Vec::new();
+    for span in &line.spans {
+        if remaining == 0 {
+            break;
+        }
+        let content = truncate_display_width(span.content.as_ref(), remaining);
+        remaining = remaining.saturating_sub(Line::from(content.as_str()).width());
+        spans.push(Span::styled(content, span.style));
+    }
+    Line::from(spans)
+}
+
 fn truncate_chars(value: &str, width: usize) -> String {
     value.chars().take(width).collect()
 }
@@ -10697,7 +10724,6 @@ fn chat_details_button_line(
 const CHAT_DETAILS_WIDTH: u16 = 76;
 const CHAT_DETAILS_HEIGHT: u16 = 24;
 const CHAT_DETAILS_FILE_VIEW_ROWS: usize = 4;
-const CHAT_DETAILS_TEXT_WIDTH: usize = 72;
 
 fn direct_chat_file_start(details: &TuiChatDetails) -> usize {
     13 + if details.pending_delete { 2 } else { 0 }
@@ -10899,7 +10925,7 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
                 short_hash(&file.file_hash),
                 short_identifier(&file.sender, 20),
             );
-            lines.push(Line::from(truncate_chars(&row, CHAT_DETAILS_TEXT_WIDTH)));
+            lines.push(Line::from(row));
         }
     }
     lines.push(chat_details_button_line(
@@ -10921,6 +10947,11 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
         Style::default().fg(theme.muted),
     )));
 
+    let text_width = usize::from(popup.width.saturating_sub(2));
+    let lines: Vec<Line<'static>> = lines
+        .into_iter()
+        .map(|line| truncate_line_display_width(&line, text_width))
+        .collect();
     let paragraph = Paragraph::new(lines)
         .block(themed_block(" Chat details ", theme))
         .style(Style::default().bg(theme.surface).fg(theme.text))
