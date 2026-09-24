@@ -4,6 +4,7 @@ pub mod chat_identity;
 pub mod chat_kind;
 pub mod events;
 pub mod live;
+pub mod media_diagnostics;
 pub mod network;
 pub mod oauth;
 pub mod runtime;

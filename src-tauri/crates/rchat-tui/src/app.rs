@@ -15,8 +15,9 @@ use crate::{
         AttachmentFileEntry, AttachmentModalField, ChatDetailsField, ComposerAction,
         ContextMenuAction,
         ContextMenuState, ContextMenuTarget, FocusPane, MediaViewerAction, MediaViewerKind,
-        NewGroupStep, NewItemChoice, NewPersonField, NewPersonStep, SettingsField, SettingsPane,
-        SettingsSection, StickerPickerMode, StickerPickerState, TuiAppState, TuiChat,
+        NewGroupStep, NewItemChoice, NewPersonField, NewPersonStep, SettingsField,
+        SettingsModalState, SettingsPane, SettingsSection, StickerPickerMode, StickerPickerState,
+        TuiAppState, TuiChat,
         TuiChatDetails, TuiEnvelope, TuiGroupDetails, TuiMessage, TuiSticker, TuiThemePreset,
         VoiceRecordingPhase,
     },
@@ -60,6 +61,10 @@ use rchat_core::{
     events::{CoreEvent, VideoEncodedRemoteFrameEvent},
     live::broadcast::protocol::BroadcastFrameEvent,
     live::video::codec::{i420_to_rgba, VideoProfile, Vp8VideoDecoder, Vp8VideoEncoder},
+    media_diagnostics::{
+        CameraDiagnosticSession, MediaDiagnosticError, MediaDiagnosticErrorKind,
+        MicrophoneDiagnosticSession,
+    },
     network::{command::NetworkCommand, mdns},
     oauth, runtime,
     settings::{
@@ -508,6 +513,18 @@ mod tests {
         assert_eq!(
             settings_media_camera_click_target(area, columns[1].x + 2, columns[1].y + 3,),
             Some(SettingsField::CameraRefresh)
+        );
+        assert_eq!(
+            settings_media_camera_click_target(area, columns[1].x + 2, columns[1].y + 4,),
+            Some(SettingsField::CameraTest)
+        );
+        assert_eq!(
+            settings_media_camera_click_target(area, columns[1].x + 2, columns[1].y + 5,),
+            Some(SettingsField::MicrophoneTest)
+        );
+        assert_eq!(
+            settings_media_camera_click_target(area, columns[1].x + 2, columns[1].y + 6,),
+            Some(SettingsField::MediaDiagnosticsStop)
         );
     }
 
@@ -2216,6 +2233,7 @@ async fn run_interactive() -> Result<()> {
         let mut bitmap_commands = Vec::new();
         let mut refresh_requested = false;
         let mut mark_read_chat_ids = Vec::new();
+        poll_native_media_diagnostics(&mut state).await;
         drain_core_events(
             &mut event_rx,
             &mut state,
@@ -5273,6 +5291,158 @@ async fn refresh_settings_modal(app_state: &AppState, state: &mut UiState) -> Re
     Ok(())
 }
 
+fn stop_camera_diagnostic(state: &mut UiState) {
+    if let Some(task) = state.camera_diagnostic_task.take() {
+        task.abort();
+    }
+    state.camera_diagnostic_session = None;
+    if let Some(settings) = state.app.settings.as_mut() {
+        if matches!(
+            settings.camera_diagnostic.phase,
+            crate::state::NativeMediaDiagnosticPhase::Starting
+                | crate::state::NativeMediaDiagnosticPhase::Running
+        ) {
+            settings.camera_diagnostic.stop();
+        }
+    }
+}
+
+fn stop_microphone_diagnostic(state: &mut UiState) {
+    if let Some(task) = state.microphone_diagnostic_task.take() {
+        task.abort();
+    }
+    state.microphone_diagnostic_session = None;
+    if let Some(settings) = state.app.settings.as_mut() {
+        if matches!(
+            settings.microphone_diagnostic.phase,
+            crate::state::NativeMediaDiagnosticPhase::Starting
+                | crate::state::NativeMediaDiagnosticPhase::Running
+        ) {
+            settings.microphone_diagnostic.stop();
+        }
+    }
+}
+
+fn stop_native_media_diagnostics(state: &mut UiState) {
+    stop_camera_diagnostic(state);
+    stop_microphone_diagnostic(state);
+}
+
+fn start_camera_diagnostic(state: &mut UiState) {
+    stop_camera_diagnostic(state);
+    let Some((selected_device_id, label)) = state
+        .app
+        .settings
+        .as_ref()
+        .map(SettingsModalState::camera_diagnostic_request)
+    else {
+        return;
+    };
+    if let Some(settings) = state.app.settings.as_mut() {
+        settings.camera_diagnostic.start(label);
+        settings.status = Some("starting native camera diagnostic".to_string());
+        settings.error = None;
+    }
+    state.camera_diagnostic_task = Some(tokio::task::spawn_blocking(move || {
+        CameraDiagnosticSession::start(selected_device_id)
+    }));
+}
+
+fn start_microphone_diagnostic(state: &mut UiState) {
+    stop_microphone_diagnostic(state);
+    if let Some(settings) = state.app.settings.as_mut() {
+        settings
+            .microphone_diagnostic
+            .start("default microphone input");
+        settings.status = Some("starting native microphone diagnostic".to_string());
+        settings.error = None;
+    }
+    state.microphone_diagnostic_task = Some(tokio::task::spawn_blocking(|| {
+        MicrophoneDiagnosticSession::start()
+    }));
+}
+
+fn join_error() -> MediaDiagnosticError {
+    MediaDiagnosticError::new(
+        MediaDiagnosticErrorKind::OpenFailed,
+        "native diagnostic worker stopped unexpectedly",
+    )
+}
+
+async fn poll_native_media_diagnostics(state: &mut UiState) {
+    if state
+        .camera_diagnostic_task
+        .as_ref()
+        .is_some_and(tokio::task::JoinHandle::is_finished)
+    {
+        let task = state
+            .camera_diagnostic_task
+            .take()
+            .expect("camera task exists");
+        let result = match task.await {
+            Ok(result) => result,
+            Err(_) => Err(join_error()),
+        };
+        match result {
+            Ok(session) => {
+                let snapshot = session.snapshot();
+                if let Some(settings) = state.app.settings.as_mut() {
+                    settings.camera_diagnostic.camera_running(&snapshot);
+                    if let Some(warning) = &snapshot.warning {
+                        settings.status = Some(warning.clone());
+                    }
+                }
+                state.camera_diagnostic_session = Some(session);
+            }
+            Err(error) => {
+                if let Some(settings) = state.app.settings.as_mut() {
+                    settings.camera_diagnostic.fail(error);
+                }
+            }
+        }
+    }
+    if state
+        .microphone_diagnostic_task
+        .as_ref()
+        .is_some_and(tokio::task::JoinHandle::is_finished)
+    {
+        let task = state
+            .microphone_diagnostic_task
+            .take()
+            .expect("microphone task exists");
+        let result = match task.await {
+            Ok(result) => result,
+            Err(_) => Err(join_error()),
+        };
+        match result {
+            Ok(session) => {
+                let snapshot = session.snapshot();
+                if let Some(settings) = state.app.settings.as_mut() {
+                    settings.microphone_diagnostic.microphone_running(&snapshot);
+                }
+                state.microphone_diagnostic_session = Some(session);
+            }
+            Err(error) => {
+                if let Some(settings) = state.app.settings.as_mut() {
+                    settings.microphone_diagnostic.fail(error);
+                }
+            }
+        }
+    }
+    if let Some(session) = state.camera_diagnostic_session.as_ref() {
+        let snapshot = session.snapshot();
+        if let Some(settings) = state.app.settings.as_mut() {
+            settings.camera_diagnostic.update_camera(&snapshot);
+        }
+    }
+    if let Some(session) = state.microphone_diagnostic_session.as_ref() {
+        let snapshot = session.snapshot();
+        if let Some(settings) = state.app.settings.as_mut() {
+            settings.microphone_diagnostic.update_microphone(&snapshot);
+        }
+    }
+}
+
 fn apply_camera_refresh_result(
     state: &mut UiState,
     result: Result<(Option<String>, Vec<settings_camera::CaptureDeviceInfo>)>,
@@ -5345,6 +5515,7 @@ async fn handle_camera_picker_key(
             refresh_camera_settings(app_state, state).await;
         }
         KeyCode::Enter => {
+            stop_camera_diagnostic(state);
             let Some((device_id, name, unavailable)) = state.app.settings.as_ref().map(|modal| {
                 let device_id = modal.camera_picker_selected_id();
                 let unavailable = device_id.as_ref().is_some_and(|selected| {
@@ -5395,7 +5566,10 @@ async fn handle_settings_key(
     }
 
     match code {
-        KeyCode::Esc => state.app.close_settings(),
+        KeyCode::Esc => {
+            stop_native_media_diagnostics(state);
+            state.app.close_settings();
+        }
         KeyCode::Tab => {
             if let Some(modal) = state.app.settings.as_mut() {
                 modal.cycle_focus();
@@ -5476,6 +5650,12 @@ async fn activate_settings_focus(
             if refresh_camera_settings(app_state, state).await {
                 set_settings_status(state, "native cameras refreshed");
             }
+        }
+        SettingsField::CameraTest => start_camera_diagnostic(state),
+        SettingsField::MicrophoneTest => start_microphone_diagnostic(state),
+        SettingsField::MediaDiagnosticsStop => {
+            stop_native_media_diagnostics(state);
+            set_settings_status(state, "native media diagnostics stopped");
         }
         SettingsField::ProfileSave => {
             let Some((alias, avatar_path)) = state.app.settings.as_ref().map(|modal| {
@@ -7065,6 +7245,9 @@ fn settings_media_camera_click_target(area: Rect, column: u16, row: u16) -> Opti
     match line {
         1 => Some(SettingsField::CameraDevice),
         2 => Some(SettingsField::CameraRefresh),
+        3 => Some(SettingsField::CameraTest),
+        4 => Some(SettingsField::MicrophoneTest),
+        5 => Some(SettingsField::MediaDiagnosticsStop),
         _ => None,
     }
 }
@@ -8806,6 +8989,14 @@ struct UiState {
     viewer_protocol: Option<ProtocolResponse>,
     viewer_protocol_key: Option<MediaViewerKey>,
     local_screen_test_requested: bool,
+    camera_diagnostic_session: Option<CameraDiagnosticSession>,
+    camera_diagnostic_task: Option<
+        tokio::task::JoinHandle<Result<CameraDiagnosticSession, MediaDiagnosticError>>,
+    >,
+    microphone_diagnostic_session: Option<MicrophoneDiagnosticSession>,
+    microphone_diagnostic_task: Option<
+        tokio::task::JoinHandle<Result<MicrophoneDiagnosticSession, MediaDiagnosticError>>,
+    >,
     sidebar_follow_selection: bool,
     show_help: bool,
 }
@@ -8858,6 +9049,10 @@ impl UiState {
             viewer_protocol: None,
             viewer_protocol_key: None,
             local_screen_test_requested: false,
+            camera_diagnostic_session: None,
+            camera_diagnostic_task: None,
+            microphone_diagnostic_session: None,
+            microphone_diagnostic_task: None,
             sidebar_follow_selection: true,
             show_help: true,
         }
@@ -12907,6 +13102,63 @@ fn settings_media_lines(state: &UiState, theme: &Theme) -> Vec<Line<'static>> {
             "Refresh cameras",
             theme,
         ),
+        settings_button_line(
+            modal,
+            SettingsField::CameraTest,
+            "Test selected native camera",
+            theme,
+        ),
+        settings_button_line(
+            modal,
+            SettingsField::MicrophoneTest,
+            "Test microphone input / level",
+            theme,
+        ),
+        settings_button_line(
+            modal,
+            SettingsField::MediaDiagnosticsStop,
+            "Stop native diagnostics",
+            theme,
+        ),
+        Line::from(Span::styled(
+            format!("Camera diagnostic: {}", modal.camera_diagnostic.status_summary()),
+            if modal.camera_diagnostic.error.is_some() {
+                Style::default().fg(theme.error)
+            } else {
+                Style::default().fg(theme.text)
+            },
+        )),
+        modal
+            .camera_diagnostic
+            .error_summary()
+            .map(|error| {
+                Line::from(Span::styled(
+                    format!("Camera error — {error}"),
+                    Style::default().fg(theme.error),
+                ))
+            })
+            .unwrap_or_else(|| Line::from("")),
+        Line::from(Span::styled(
+            format!(
+                "Microphone diagnostic: {}",
+                modal.microphone_diagnostic.status_summary()
+            ),
+            if modal.microphone_diagnostic.error.is_some() {
+                Style::default().fg(theme.error)
+            } else {
+                Style::default().fg(theme.text)
+            },
+        )),
+        modal
+            .microphone_diagnostic
+            .error_summary()
+            .map(|error| {
+                Line::from(Span::styled(
+                    format!("Microphone error — {error}"),
+                    Style::default().fg(theme.error),
+                ))
+            })
+            .unwrap_or_else(|| Line::from("")),
         if modal.camera_loading {
             Line::from(Span::styled(
                 "Loading native cameras…",
