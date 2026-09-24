@@ -12046,8 +12046,6 @@ fn chat_details_button_line(
     ))
 }
 
-const CHAT_DETAILS_WIDTH: u16 = 76;
-const CHAT_DETAILS_HEIGHT: u16 = 24;
 const CHAT_DETAILS_FILE_VIEW_ROWS: usize = 4;
 fn render_group_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
     let Some(details) = state.app.chat_details.as_ref() else {
