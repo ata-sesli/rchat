@@ -145,6 +145,153 @@ pub enum FocusPane {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceRecordingPhase {
+    Idle,
+    Recording,
+    Review,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceRecordingState {
+    pub phase: VoiceRecordingPhase,
+    pub chat_id: Option<String>,
+    pub path: Option<PathBuf>,
+    pub elapsed: std::time::Duration,
+    pub size_bytes: u64,
+    pub error: Option<String>,
+}
+
+impl Default for VoiceRecordingState {
+    fn default() -> Self {
+        Self {
+            phase: VoiceRecordingPhase::Idle,
+            chat_id: None,
+            path: None,
+            elapsed: std::time::Duration::ZERO,
+            size_bytes: 0,
+            error: None,
+        }
+    }
+}
+
+impl VoiceRecordingState {
+    pub fn start(&mut self, chat_id: impl Into<String>) -> Result<(), String> {
+        if self.phase != VoiceRecordingPhase::Idle {
+            return Err("finish or cancel the current voice recording first".to_string());
+        }
+        self.phase = VoiceRecordingPhase::Recording;
+        self.chat_id = Some(chat_id.into());
+        self.path = None;
+        self.elapsed = std::time::Duration::ZERO;
+        self.size_bytes = 0;
+        self.error = None;
+        Ok(())
+    }
+
+    pub fn update_capture(&mut self, elapsed: std::time::Duration, size_bytes: u64) {
+        if self.phase == VoiceRecordingPhase::Recording {
+            self.elapsed = elapsed;
+            self.size_bytes = size_bytes;
+        }
+    }
+
+    pub fn stop(
+        &mut self,
+        path: PathBuf,
+        elapsed: std::time::Duration,
+        size_bytes: u64,
+    ) -> Result<(), String> {
+        if self.phase != VoiceRecordingPhase::Recording {
+            return Err("no voice recording is active".to_string());
+        }
+        self.phase = VoiceRecordingPhase::Review;
+        self.path = Some(path);
+        self.elapsed = elapsed;
+        self.size_bytes = size_bytes;
+        self.error = None;
+        Ok(())
+    }
+
+    pub fn cancel(&mut self) -> Option<PathBuf> {
+        let path = self.path.take();
+        self.phase = VoiceRecordingPhase::Idle;
+        self.chat_id = None;
+        self.elapsed = std::time::Duration::ZERO;
+        self.size_bytes = 0;
+        self.error = None;
+        path
+    }
+
+    pub fn fail(&mut self, message: impl Into<String>) {
+        self.phase = VoiceRecordingPhase::Idle;
+        self.chat_id = None;
+        self.path = None;
+        self.elapsed = std::time::Duration::ZERO;
+        self.size_bytes = 0;
+        self.error = Some(message.into());
+    }
+
+    pub fn review_chat_id(&self) -> Option<&str> {
+        (self.phase == VoiceRecordingPhase::Review)
+            .then_some(self.chat_id.as_deref())
+            .flatten()
+    }
+
+    pub fn review_path(&self) -> Option<&PathBuf> {
+        (self.phase == VoiceRecordingPhase::Review)
+            .then_some(self.path.as_ref())
+            .flatten()
+    }
+
+    pub fn clear(&mut self) {
+        self.phase = VoiceRecordingPhase::Idle;
+        self.chat_id = None;
+        self.path = None;
+        self.elapsed = std::time::Duration::ZERO;
+        self.size_bytes = 0;
+        self.error = None;
+    }
+
+    pub fn status_label(&self) -> Option<String> {
+        match self.phase {
+            VoiceRecordingPhase::Idle => self
+                .error
+                .as_ref()
+                .map(|error| format!("voice recording failed: {error}")),
+            VoiceRecordingPhase::Recording => Some(format!(
+                "recording voice note {}",
+                format_duration(self.elapsed)
+            )),
+            VoiceRecordingPhase::Review => Some(format!(
+                "voice note ready {} ({})",
+                format_duration(self.elapsed),
+                format_size(self.size_bytes)
+            )),
+        }
+    }
+}
+
+fn format_duration(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs();
+    format!("{seconds:02}:{:02}", duration.subsec_millis() / 10)
+}
+
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 3] = ["B", "KB", "MB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComposerAction {
     Attach,
     Stickers,
@@ -152,6 +299,7 @@ pub enum ComposerAction {
     Video,
     Screen,
     Details,
+    Record,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,13 +344,14 @@ impl ContextMenuState {
 }
 
 impl ComposerAction {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Attach,
         Self::Stickers,
         Self::Voice,
         Self::Video,
         Self::Screen,
         Self::Details,
+        Self::Record,
     ];
 
     pub fn label(self) -> &'static str {
@@ -213,6 +362,7 @@ impl ComposerAction {
             Self::Video => "Video",
             Self::Screen => "Screen",
             Self::Details => "Details",
+            Self::Record => "Record",
         }
     }
 }
@@ -1686,6 +1836,7 @@ pub struct TuiAppState {
     pub selected_attachment_message_id: Option<String>,
     pub chat_details: Option<TuiChatDetails>,
     pub group_sync_status: HashMap<String, String>,
+    pub voice_recording: VoiceRecordingState,
     pub last_error: Option<String>,
 }
 
@@ -1729,6 +1880,7 @@ impl Default for TuiAppState {
             selected_attachment_message_id: None,
             chat_details: None,
             group_sync_status: HashMap::new(),
+            voice_recording: VoiceRecordingState::default(),
             last_error: None,
         }
     }
@@ -2567,7 +2719,59 @@ mod tests {
         state.move_composer_action(-1);
         assert_eq!(state.selected_composer_action(), ComposerAction::Attach);
         state.move_composer_action(-1);
-        assert_eq!(state.selected_composer_action(), ComposerAction::Details);
+        assert_eq!(state.selected_composer_action(), ComposerAction::Record);
+    }
+
+    #[test]
+    fn voice_recording_state_is_bound_to_chat_and_transitions_through_review() {
+        let mut state = VoiceRecordingState::default();
+        state.start("group-1").expect("recording starts");
+        state.update_capture(std::time::Duration::from_millis(1_250), 2_400);
+        assert_eq!(state.phase, VoiceRecordingPhase::Recording);
+        assert_eq!(state.chat_id.as_deref(), Some("group-1"));
+
+        state
+            .stop(
+                PathBuf::from("voice.wav"),
+                std::time::Duration::from_millis(1_250),
+                2_400,
+            )
+            .expect("recording stops");
+        assert_eq!(state.phase, VoiceRecordingPhase::Review);
+        assert_eq!(state.review_chat_id(), Some("group-1"));
+        assert_eq!(state.review_path(), Some(&PathBuf::from("voice.wav")));
+
+        assert_eq!(state.cancel(), Some(PathBuf::from("voice.wav")));
+        assert_eq!(state.phase, VoiceRecordingPhase::Idle);
+        assert!(state.chat_id.is_none());
+    }
+
+    #[test]
+    fn voice_recording_send_keeps_original_chat_when_selection_changes() {
+        let mut state = VoiceRecordingState::default();
+        state.start("group-1").expect("recording starts");
+        state
+            .stop(
+                PathBuf::from("voice.wav"),
+                std::time::Duration::from_millis(500),
+                1_000,
+            )
+            .expect("recording stops");
+
+        assert_eq!(state.review_chat_id(), Some("group-1"));
+        assert_eq!(state.review_path(), Some(&PathBuf::from("voice.wav")));
+    }
+
+    #[test]
+    fn voice_recording_failure_clears_capture_but_preserves_error() {
+        let mut state = VoiceRecordingState::default();
+        state.start("peer-1").expect("recording starts");
+        state.fail("permission denied");
+        assert_eq!(state.phase, VoiceRecordingPhase::Idle);
+        assert!(state.chat_id.is_none());
+        assert_eq!(state.status_label().as_deref(), Some("voice recording failed: permission denied"));
+        state.clear();
+        assert!(state.error.is_none());
     }
 
     #[test]

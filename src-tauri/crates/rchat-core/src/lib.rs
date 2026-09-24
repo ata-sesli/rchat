@@ -11,5 +11,6 @@ pub mod settings;
 pub mod storage;
 #[cfg(any(feature = "test-utils", test))]
 pub mod testing;
+pub mod voice_recording;
 
 pub use app_state::{AppState, NetworkState};
