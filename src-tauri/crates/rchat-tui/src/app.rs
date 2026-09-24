@@ -101,6 +101,7 @@ const NEW_PERSON_QR_WIDTH: u16 = 28;
 const NEW_PERSON_QR_HEIGHT: u16 = 12;
 const KITTY_DELETE_VISIBLE_PLACEMENTS: &[u8] = b"\x1b_Ga=d,q=2\x1b\\";
 const RATTY_BITMAP_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const RATTY_BITMAP_PROBE_SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Default)]
 struct RattyRenderTargets {
@@ -187,16 +188,51 @@ fn finalize_media_detection(
     }
 }
 
+fn ratty_bitmap_probe_timeout_for_session(ratty_session: bool) -> Duration {
+    if ratty_session {
+        RATTY_BITMAP_PROBE_SESSION_TIMEOUT
+    } else {
+        RATTY_BITMAP_PROBE_TIMEOUT
+    }
+}
+
+fn ratty_bitmap_probe_timeout() -> Duration {
+    ratty_bitmap_probe_timeout_for_session(
+        std::env::var("RATTY_SESSION").ok().as_deref() == Some("1"),
+    )
+}
+
 fn detect_media_backends() -> MediaBackendDetection {
+    let ratty_session = std::env::var("RATTY_SESSION").ok().as_deref() == Some("1");
+    let ratty_probe = ratty_bitmap::probe_support(ratty_bitmap_probe_timeout());
+    let ratty_bitmap = ratty_probe
+        .as_ref()
+        .map_or(false, |support| support.is_some());
+    if let Err(error) = &ratty_probe {
+        eprintln!("Ratty bitmap capability probe failed: {error:#}");
+    } else if !ratty_bitmap {
+        if ratty_session {
+            eprintln!(
+                "Ratty bitmap capability probe timed out after {} seconds; keeping the session's fallback backend",
+                RATTY_BITMAP_PROBE_SESSION_TIMEOUT.as_secs()
+            );
+        } else {
+            eprintln!(
+                "Ratty bitmap capability probe timed out after {} milliseconds; using Kitty fallback",
+                RATTY_BITMAP_PROBE_TIMEOUT.as_millis()
+            );
+        }
+    }
+
     let (picker, ratty_bitmap) = detect_media_backends_with(
+        || ratty_bitmap,
         || {
-            ratty_bitmap::probe_support(RATTY_BITMAP_PROBE_TIMEOUT)
-                .unwrap_or(None)
-                .is_some()
-        },
-        || {
-            ratatui_image::picker::Picker::from_query_stdio()
-                .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks())
+            if ratty_session && !ratty_bitmap {
+                ratatui_image::picker::Picker::halfblocks()
+            } else {
+                ratatui_image::picker::Picker::from_query_stdio()
+                    .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks())
+            }
         },
     );
     finalize_media_detection(picker, ratty_bitmap)
@@ -504,6 +540,22 @@ mod tests {
         );
 
         assert_eq!(*order.borrow(), ["ratty", "fallback"]);
+    }
+
+    #[test]
+    fn ratty_probe_uses_short_deadline_without_ratty_session() {
+        assert_eq!(
+            ratty_bitmap_probe_timeout_for_session(false),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn ratty_probe_uses_cold_start_deadline_in_ratty_session() {
+        assert_eq!(
+            ratty_bitmap_probe_timeout_for_session(true),
+            Duration::from_secs(3)
+        );
     }
 
     #[test]

@@ -508,7 +508,11 @@ fn probe_support_io(
             return Err(error).context("Ratty bitmap support probe failed");
         }
         if descriptor.revents & libc::POLLIN == 0 {
-            return Ok(None);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "terminal closed while waiting for Ratty bitmap capability reply",
+            ))
+            .context("Ratty bitmap support probe transport failed");
         }
 
         let mut chunk = [0_u8; 512];
@@ -715,6 +719,36 @@ mod tests {
             .unwrap()
             .is_some());
         responder.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delayed_support_reply_is_rejected_by_legacy_deadline_and_accepted_by_session_deadline() {
+        use std::{
+            io::{Read, Write},
+            os::unix::net::UnixStream,
+            thread,
+            time::Duration as StdDuration,
+        };
+
+        fn delayed_probe(timeout: Duration) -> Option<RattyBitmapSupport> {
+            let (client, mut terminal) = UnixStream::pair().unwrap();
+            let mut reader = client.try_clone().unwrap();
+            let mut writer = client;
+            let responder = thread::spawn(move || {
+                let mut query = vec![0; SUPPORT_QUERY.len() + DEVICE_STATUS_QUERY.len()];
+                terminal.read_exact(&mut query).unwrap();
+                thread::sleep(StdDuration::from_millis(750));
+                terminal.write_all(SUPPORT_REPLY).unwrap();
+            });
+
+            let result = probe_support_io(&mut reader, &mut writer, timeout).unwrap();
+            responder.join().unwrap();
+            result
+        }
+
+        assert!(delayed_probe(Duration::from_millis(500)).is_none());
+        assert!(delayed_probe(Duration::from_secs(3)).is_some());
     }
 
     #[test]
