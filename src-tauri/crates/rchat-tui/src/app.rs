@@ -6355,12 +6355,12 @@ async fn handle_chat_details_mouse(
         return Ok(());
     };
     let area = Rect { x: 0, y: 0, width: size.width, height: size.height };
-    let popup = centered_rect(76, 20, area);
+    let popup = centered_rect(CHAT_DETAILS_WIDTH, CHAT_DETAILS_HEIGHT, area);
     let direct_file_row = state.app.chat_details.as_ref().and_then(|details| {
         if details.group.is_some() || !rect_contains(popup, mouse.column, mouse.row) {
             return None;
         }
-        let line = mouse.row.saturating_sub(popup.y.saturating_add(2)) as usize;
+        let line = mouse.row.saturating_sub(popup.y.saturating_add(1)) as usize;
         if !(14..14 + CHAT_DETAILS_FILE_VIEW_ROWS).contains(&line) {
             return None;
         }
@@ -6391,7 +6391,7 @@ fn chat_details_click_target(
     row: u16,
     state: &UiState,
 ) -> Option<ChatDetailsField> {
-    let popup = centered_rect(76, 20, area);
+    let popup = centered_rect(CHAT_DETAILS_WIDTH, CHAT_DETAILS_HEIGHT, area);
     if !rect_contains(popup, column, row) {
         return None;
     }
@@ -6401,7 +6401,7 @@ fn chat_details_click_target(
     if details.group.is_some() {
         return None;
     }
-    let line = row.saturating_sub(popup.y.saturating_add(2)) as usize;
+    let line = row.saturating_sub(popup.y.saturating_add(1)) as usize;
     match line {
         8 => Some(ChatDetailsField::Pin),
         9 => Some(ChatDetailsField::Reconnect),
@@ -10693,6 +10693,8 @@ fn chat_details_button_line(
     ))
 }
 
+const CHAT_DETAILS_WIDTH: u16 = 76;
+const CHAT_DETAILS_HEIGHT: u16 = 24;
 const CHAT_DETAILS_FILE_VIEW_ROWS: usize = 4;
 
 fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
@@ -10700,7 +10702,7 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
         return;
     };
 
-    let popup = centered_rect(76, 20, area);
+    let popup = centered_rect(CHAT_DETAILS_WIDTH, CHAT_DETAILS_HEIGHT, area);
     draw_shadow(frame, popup);
     frame.render_widget(Clear, popup);
 
@@ -10774,13 +10776,10 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
             Style::default().fg(theme.accent),
         )));
     }
-    lines.extend([
-        Line::from(""),
-        Line::from(Span::styled(
-            "Recent files",
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-        )),
-    ]);
+    lines.push(Line::from(Span::styled(
+        "Recent files",
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+    )));
 
     if let Some(group) = details.group.as_ref() {
         lines = vec![
@@ -10869,8 +10868,12 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
             .selected_file_index
             .saturating_sub(CHAT_DETAILS_FILE_VIEW_ROWS - 1)
             .min(details.recent_files.len().saturating_sub(CHAT_DETAILS_FILE_VIEW_ROWS));
-        for index in start..(start + CHAT_DETAILS_FILE_VIEW_ROWS).min(details.recent_files.len()) {
-            let file = &details.recent_files[index];
+        for offset in 0..CHAT_DETAILS_FILE_VIEW_ROWS {
+            let Some(file) = details.recent_files.get(start + offset) else {
+                lines.push(Line::from(""));
+                continue;
+            };
+            let index = start + offset;
             let size = file
                 .size_bytes
                 .filter(|size| *size >= 0)
@@ -10901,8 +10904,6 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
     ));
     lines.push(chat_details_button_line(details, ChatDetailsField::FileOpen, "Open selected file", theme));
     lines.push(chat_details_button_line(details, ChatDetailsField::FileSave, "Save selected file", theme));
-
-    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Up/Down action | Left/Right file | Enter activate | Esc close",
         Style::default().fg(theme.muted),
