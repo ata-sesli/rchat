@@ -3168,6 +3168,30 @@ mod tests {
     }
 
     #[test]
+    fn group_viewport_scrolling_clamps_to_available_offset() {
+        let mut state = TuiAppState::default();
+        state.chat_details = Some(chat_details_with_group(group_details(true, false)));
+        state.scroll_group_details(5, 2);
+        assert_eq!(
+            state
+                .chat_details
+                .as_ref()
+                .and_then(|details| details.group.as_ref())
+                .map(|group| group.viewport_offset),
+            Some(2)
+        );
+        state.scroll_group_details(-5, 2);
+        assert_eq!(
+            state
+                .chat_details
+                .as_ref()
+                .and_then(|details| details.group.as_ref())
+                .map(|group| group.viewport_offset),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn local_peer_discovery_updates_peer_list_without_duplicates() {
         let mut state = TuiAppState::default();
 
