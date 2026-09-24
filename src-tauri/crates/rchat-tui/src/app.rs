@@ -10777,12 +10777,12 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
     }
     if let Some(error) = details.error.as_ref() {
         lines.push(Line::from(Span::styled(
-            error.clone(),
+            truncate_chars(error, 72),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     } else if let Some(status) = details.status.as_ref() {
         lines.push(Line::from(Span::styled(
-            status.clone(),
+            truncate_chars(status, 72),
             Style::default().fg(theme.accent),
         )));
     }
