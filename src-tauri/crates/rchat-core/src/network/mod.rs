@@ -239,14 +239,25 @@ pub async fn refresh_current_public_address(net_state: &NetworkState) -> anyhow:
 
     if let Some(local_port) = local_port {
         let refreshed = stun::discover_on_port(local_port).await;
-        let Some(address) = refreshed.ipv4 else {
-            return Err(anyhow::anyhow!(
-                "Unable to observe a fresh public mapping for QUIC port {local_port}"
-            ));
-        };
-        *net_state.public_address_v4.lock().await = Some(address.ip().to_string());
-        *net_state.stun_external_port.lock().await = Some(address.port());
-        return Ok(format!("/ip4/{}/udp/{}/quic-v1", address.ip(), address.port()));
+        if let Some(address) = refreshed.ipv4 {
+            *net_state.public_address_v4.lock().await = Some(address.ip().to_string());
+            *net_state.stun_external_port.lock().await = Some(address.port());
+            return Ok(format!("/ip4/{}/udp/{}/quic-v1", address.ip(), address.port()));
+        }
+
+        // The live QUIC transport owns this UDP port, so a second ordinary
+        // STUN socket cannot observe it. Keep the last known endpoint rather
+        // than blocking direct/LAN and invitation flows; the bounded punch
+        // worker will report an unreachable mapping if it is no longer valid.
+        eprintln!(
+            "[STUN] Unable to observe a fresh mapping for active QUIC port {}; retaining the last endpoint",
+            local_port
+        );
+        let cached_ip = net_state.public_address_v4.lock().await.clone();
+        let cached_port = *net_state.stun_external_port.lock().await;
+        if let (Some(ip), Some(port)) = (cached_ip, cached_port) {
+            return Ok(format!("/ip4/{ip}/udp/{port}/quic-v1"));
+        }
     }
 
     let addresses = net_state.listening_addresses.lock().await;
