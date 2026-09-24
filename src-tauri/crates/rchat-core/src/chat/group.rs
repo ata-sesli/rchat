@@ -430,6 +430,22 @@ pub async fn accept_invite(
             .ok_or_else(|| anyhow!("Unknown group invite: {invite_id}"))?
     };
     validate_group_invite(&invite)?;
+    let invite_status = {
+        let conn = app_state
+            .db_conn
+            .lock()
+            .map_err(|e| anyhow!(e.to_string()))?;
+        db::get_group_invite_status(&conn, &invite_id)?
+            .ok_or_else(|| anyhow!("Unknown group invite: {invite_id}"))?
+    };
+    if invite_status == "revoked" || invite_status == "rejected" {
+        return Err(anyhow!("Group invitation is no longer valid"));
+    }
+    if invite_status != "ready" {
+        return Err(anyhow!(
+            "Group invitation is still bootstrapping; wait for authenticated group history to finish syncing"
+        ));
+    }
 
     let keypair = load_or_create_local_keypair(app_state).await?;
     let local_peer_id = PeerId::from_public_key(&keypair.public()).to_string();
@@ -498,6 +514,48 @@ pub async fn accept_invite(
     .await?;
 
     Ok(invite.group_id)
+}
+
+pub fn mark_group_invites_ready_if_complete(
+    app_state: &AppState,
+    group_id: &str,
+) -> anyhow::Result<(bool, usize)> {
+    let conn = app_state
+        .db_conn
+        .lock()
+        .map_err(|error| anyhow!(error.to_string()))?;
+    let records = db::get_all_group_records(&conn, group_id)?;
+    let evaluation = crate::chat::group_state::evaluate_group_records(&records);
+    let Some(state) = evaluation.state.as_ref() else {
+        return Ok((false, 0));
+    };
+    if state.dissolved || !evaluation.missing_dependency_ids().is_empty() {
+        return Ok((false, 0));
+    }
+
+    let mut ready = 0usize;
+    for invite in db::get_group_invites_for_group(&conn, group_id)? {
+        if invite.status != "pending" {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_str::<GroupInvitePayload>(&invite.payload_json) else {
+            continue;
+        };
+        let invite_is_effective = evaluation.decisions.get(&payload.invite_id).is_some_and(
+            |decision| {
+                matches!(
+                    decision,
+                    crate::chat::group_state::GroupRecordDecision::Effective
+                        | crate::chat::group_state::GroupRecordDecision::AcceptedNoOp
+                )
+            },
+        );
+        if invite_is_effective && state.invited_members.contains(&payload.invitee_peer_id) {
+            db::update_group_invite_status(&conn, &payload.invite_id, "ready")?;
+            ready += 1;
+        }
+    }
+    Ok((true, ready))
 }
 
 pub fn reject_invite(app_state: &AppState, invite_id: &str) -> anyhow::Result<()> {
@@ -1188,7 +1246,7 @@ fn validate_group_invite(invite: &GroupInvitePayload) -> anyhow::Result<()> {
             invite.version
         ));
     }
-    if invite.related_records.len() > 8 {
+    if invite.related_records.len() > crate::network::gossip::MAX_GROUP_INVITE_RECORDS {
         return Err(anyhow!("Group invite bootstrap exceeds its record limit"));
     }
     invite
@@ -1637,6 +1695,203 @@ mod tests {
         );
         let pending = get_group_pending_record_summary(&app_state, &group_id).expect("pending");
         assert_eq!(pending.count, 1);
+    }
+
+    #[test]
+    fn group_invite_bootstrap_accepts_history_beyond_the_legacy_record_window() {
+        let founder = keypair();
+        let invitee = keypair();
+        let group_id = test_group_id(&founder);
+        let mut related_records = Vec::new();
+        for index in 0..65 {
+            related_records.push(signed(
+                &founder,
+                &group_id,
+                &format!("history-{index}"),
+                index as i64,
+                GroupRecordBody::Message {
+                    content_type: GroupContentType::Text,
+                    text_content: Some(format!("history {index}")),
+                    file_hash: None,
+                    sender_alias: None,
+                },
+            ));
+        }
+        let invite_record = signed(
+            &founder,
+            &group_id,
+            "invite-after-history",
+            65,
+            GroupRecordBody::MemberInvited {
+                peer_id: peer_id(&invitee),
+                role: "member".to_string(),
+            },
+        );
+        let payload = GroupInvitePayload {
+            version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
+            invite_id: invite_record.id().to_string(),
+            group_id: group_id.clone(),
+            group_name: "Test".to_string(),
+            inviter_peer_id: peer_id(&founder),
+            invitee_peer_id: peer_id(&invitee),
+            created_at: 65,
+            invite_record,
+            related_records,
+        };
+
+        validate_group_invite(&payload).expect("history beyond 64 records is valid");
+    }
+
+    #[test]
+    fn incoming_invite_remains_pending_until_bootstrap_is_complete() {
+        let app_state = app_state();
+        let founder = keypair();
+        let invitee = keypair();
+        let group_id = test_group_id(&founder);
+        let genesis = signed(
+            &founder,
+            &group_id,
+            "created",
+            1,
+            GroupRecordBody::GroupCreated {
+                name: "Test".to_string(),
+                settings: None,
+                image_hash: None,
+            },
+        );
+        let invite_record = signed(
+            &founder,
+            &group_id,
+            "invite",
+            3,
+            GroupRecordBody::MemberInvited {
+                peer_id: peer_id(&invitee),
+                role: "member".to_string(),
+            },
+        );
+        let payload = GroupInvitePayload {
+            version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
+            invite_id: invite_record.id().to_string(),
+            group_id: group_id.clone(),
+            group_name: "Test".to_string(),
+            inviter_peer_id: peer_id(&founder),
+            invitee_peer_id: peer_id(&invitee),
+            created_at: 3,
+            invite_record,
+            related_records: vec![genesis],
+        };
+
+        store_incoming_invite(&app_state, None, &payload).expect("store invite");
+        let conn = app_state.db_conn.lock().expect("db");
+        assert_eq!(
+            db::get_group_invite_status(&conn, &payload.invite_id)
+                .expect("status")
+                .as_deref(),
+            Some("pending")
+        );
+    }
+
+    #[test]
+    fn complete_invite_bootstrap_marks_the_invitation_ready() {
+        let app_state = app_state();
+        let founder = keypair();
+        let invitee = keypair();
+        let group_id = test_group_id(&founder);
+        let genesis = signed(
+            &founder,
+            &group_id,
+            "created",
+            1,
+            GroupRecordBody::GroupCreated {
+                name: "Test".to_string(),
+                settings: None,
+                image_hash: None,
+            },
+        );
+        let invite_record = signed(
+            &founder,
+            &group_id,
+            "invite",
+            2,
+            GroupRecordBody::MemberInvited {
+                peer_id: peer_id(&invitee),
+                role: "member".to_string(),
+            },
+        );
+        let payload = GroupInvitePayload {
+            version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
+            invite_id: invite_record.id().to_string(),
+            group_id: group_id.clone(),
+            group_name: "Test".to_string(),
+            inviter_peer_id: peer_id(&founder),
+            invitee_peer_id: peer_id(&invitee),
+            created_at: 2,
+            invite_record,
+            related_records: vec![genesis],
+        };
+
+        store_incoming_invite(&app_state, None, &payload).expect("store invite");
+        let (complete, ready) =
+            mark_group_invites_ready_if_complete(&app_state, &group_id).expect("bootstrap check");
+        assert!(complete);
+        assert_eq!(ready, 1);
+        let conn = app_state.db_conn.lock().expect("db");
+        assert_eq!(
+            db::get_group_invite_status(&conn, &payload.invite_id)
+                .expect("status")
+                .as_deref(),
+            Some("ready")
+        );
+    }
+
+    #[test]
+    fn incoming_invite_rejects_tampered_bootstrap_history() {
+        let founder = keypair();
+        let invitee = keypair();
+        let group_id = test_group_id(&founder);
+        let genesis = signed(
+            &founder,
+            &group_id,
+            "created",
+            1,
+            GroupRecordBody::GroupCreated {
+                name: "Test".to_string(),
+                settings: None,
+                image_hash: None,
+            },
+        );
+        let invite_record = signed(
+            &founder,
+            &group_id,
+            "invite",
+            2,
+            GroupRecordBody::MemberInvited {
+                peer_id: peer_id(&invitee),
+                role: "member".to_string(),
+            },
+        );
+        let mut tampered_genesis = genesis.clone();
+        tampered_genesis.unsigned.body = GroupRecordBody::GroupCreated {
+            name: "Tampered".to_string(),
+            settings: None,
+            image_hash: None,
+        };
+        let payload = GroupInvitePayload {
+            version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
+            invite_id: invite_record.id().to_string(),
+            group_id,
+            group_name: "Test".to_string(),
+            inviter_peer_id: peer_id(&founder),
+            invitee_peer_id: peer_id(&invitee),
+            created_at: 2,
+            invite_record,
+            related_records: vec![tampered_genesis],
+        };
+
+        assert!(validate_group_invite(&payload)
+            .expect_err("tampered history must fail")
+            .to_string()
+            .contains("invalid record"));
     }
 
     #[test]

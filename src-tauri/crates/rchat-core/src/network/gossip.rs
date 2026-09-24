@@ -12,6 +12,7 @@ pub const MAX_GROUP_RECORD_BYTES: usize = 1024 * 1024;
 pub const MAX_GROUP_RECORD_PARENTS: usize = 64;
 pub const MAX_GROUP_SYNC_RECORDS: usize = 256;
 pub const MAX_GROUP_SYNC_WANTED_IDS: usize = 64;
+pub const MAX_GROUP_INVITE_RECORDS: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

@@ -329,14 +329,36 @@ impl NetworkManager {
                 .map_err(|error| error.to_string())?;
             crate::chat::group_state::evaluate_group_records(&records).missing_dependency_ids()
         };
+        let group_id = invite.group_id.clone();
+        let dependency_count = wanted_record_ids.len();
         let sync_request = crate::network::gossip::GroupSyncRequest {
             version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
-            group_id: invite.group_id,
+            group_id: group_id.clone(),
             wanted_record_ids,
             cursor: None,
             limit: 256,
         };
         self.send_group_sync_request_to_peer(&peer, &sync_request)
+            .map_err(|error| {
+                self.emit(crate::events::CoreEvent::GroupSyncStateUpdated(
+                    crate::events::GroupSyncStateUpdatedEvent {
+                        group_id: group_id.clone(),
+                        state: "failed".to_string(),
+                        detail: Some(format!("failed to start invite bootstrap: {error}")),
+                    },
+                ));
+                error
+            })?;
+        self.emit(crate::events::CoreEvent::GroupSyncStateUpdated(
+            crate::events::GroupSyncStateUpdatedEvent {
+                group_id,
+                state: "bootstrapping".to_string(),
+                detail: Some(format!(
+                    "syncing authenticated history; {dependency_count} dependency request(s)"
+                )),
+            },
+        ));
+        Ok(())
     }
 
     async fn handle_group_dissolution(
@@ -503,6 +525,29 @@ impl NetworkManager {
         };
         let should_continue =
             response.has_more || (!response.records.is_empty() && !wanted_record_ids.is_empty());
+        let (bootstrap_complete, ready_invites) = if should_continue {
+            (false, 0)
+        } else {
+            crate::chat::group::mark_group_invites_ready_if_complete(
+                &self.app_state,
+                &response.group_id,
+            )
+            .map_err(|error| error.to_string())?
+        };
+        let state = if should_continue {
+            "applying".to_string()
+        } else if bootstrap_complete {
+            "complete".to_string()
+        } else {
+            "incomplete".to_string()
+        };
+        let detail = if should_continue {
+            format!("{applied} new record(s); requesting next page")
+        } else if bootstrap_complete {
+            format!("{applied} new record(s); {ready_invites} invitation(s) ready")
+        } else {
+            format!("{applied} new record(s); missing dependencies remain")
+        };
         if should_continue {
             let follow_up = crate::network::gossip::GroupSyncRequest {
                 version: crate::network::gossip::GROUP_PROTOCOL_VERSION,
@@ -516,16 +561,8 @@ impl NetworkManager {
         self.emit(CoreEvent::GroupSyncStateUpdated(
             crate::events::GroupSyncStateUpdatedEvent {
                 group_id: response.group_id,
-                state: if should_continue {
-                    "applying".to_string()
-                } else {
-                    "applied".to_string()
-                },
-                detail: Some(if should_continue {
-                    format!("{applied} new record(s); requesting next page")
-                } else {
-                    format!("{applied} new record(s)")
-                }),
+                state,
+                detail: Some(detail),
             },
         ));
         Ok(())
