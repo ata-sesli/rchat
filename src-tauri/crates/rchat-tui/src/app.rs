@@ -202,6 +202,12 @@ fn ratty_bitmap_probe_timeout() -> Duration {
     )
 }
 
+fn ratty_kitty_fallback_picker() -> ratatui_image::picker::Picker {
+    let mut picker = ratatui_image::picker::Picker::halfblocks();
+    picker.set_protocol_type(ProtocolType::Kitty);
+    picker
+}
+
 fn detect_media_backends() -> MediaBackendDetection {
     let ratty_session = std::env::var("RATTY_SESSION").ok().as_deref() == Some("1");
     let ratty_probe = ratty_bitmap::probe_support(ratty_bitmap_probe_timeout());
@@ -213,7 +219,7 @@ fn detect_media_backends() -> MediaBackendDetection {
     } else if !ratty_bitmap {
         if ratty_session {
             eprintln!(
-                "Ratty bitmap capability probe timed out after {} seconds; keeping the session's fallback backend",
+                "Ratty bitmap capability probe timed out after {} seconds; using Kitty fallback without a second stdin query",
                 RATTY_BITMAP_PROBE_SESSION_TIMEOUT.as_secs()
             );
         } else {
@@ -228,7 +234,7 @@ fn detect_media_backends() -> MediaBackendDetection {
         || ratty_bitmap,
         || {
             if ratty_session && !ratty_bitmap {
-                ratatui_image::picker::Picker::halfblocks()
+                ratty_kitty_fallback_picker()
             } else {
                 ratatui_image::picker::Picker::from_query_stdio()
                     .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks())
@@ -565,6 +571,14 @@ mod tests {
         assert_eq!(detection.picker.protocol_type(), ProtocolType::Kitty);
         assert!(detection.ratty_bitmap);
         assert!(detection.kitty_forced);
+    }
+
+    #[test]
+    fn ratty_session_fallback_selects_kitty_without_querying_stdin() {
+        let picker = ratty_kitty_fallback_picker();
+
+        assert_eq!(picker.protocol_type(), ProtocolType::Kitty);
+        assert!(kitty_media_enabled(picker.protocol_type()));
     }
 
     #[test]
