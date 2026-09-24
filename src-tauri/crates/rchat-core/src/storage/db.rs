@@ -1306,6 +1306,33 @@ pub fn get_group_invites_for_group(
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+pub fn get_open_group_invites_for_peer(
+    conn: &Connection,
+    invitee_peer_id: &str,
+) -> anyhow::Result<Vec<GroupInviteRow>> {
+    let mut statement = conn.prepare(
+        "SELECT invite_id, group_id, group_name, inviter_peer_id, invitee_peer_id,
+                status, payload_json, created_at, updated_at
+         FROM group_invites
+         WHERE invitee_peer_id = ?1 AND status IN ('pending', 'ready')
+         ORDER BY created_at ASC, invite_id ASC",
+    )?;
+    let rows = statement.query_map([invitee_peer_id], |row| {
+        Ok(GroupInviteRow {
+            invite_id: row.get(0)?,
+            group_id: row.get(1)?,
+            group_name: row.get(2)?,
+            inviter_peer_id: row.get(3)?,
+            invitee_peer_id: row.get(4)?,
+            status: row.get(5)?,
+            payload_json: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 pub fn get_group_invite_payload(
     conn: &Connection,
     invite_id: &str,
@@ -2196,6 +2223,38 @@ mod tests {
             .expect("check messages");
         assert!(!chat_exists);
         assert!(!msg_exists);
+    }
+
+    #[test]
+    fn open_group_invites_are_scoped_to_the_invitee() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        create_tables(&conn).expect("schema");
+
+        for (invite_id, invitee_peer_id, status) in [
+            ("pending-local", "peer-local", "pending"),
+            ("ready-local", "peer-local", "ready"),
+            ("sent-local", "peer-local", "sent"),
+            ("pending-other", "peer-other", "pending"),
+        ] {
+            conn.execute(
+                "INSERT INTO group_invites
+                 (invite_id, group_id, group_name, inviter_peer_id, invitee_peer_id,
+                  status, payload_json, created_at, updated_at)
+                 VALUES (?1, 'group:test', 'Test', 'peer-admin', ?2, ?3, '{}', 1, 1)",
+                rusqlite::params![invite_id, invitee_peer_id, status],
+            )
+            .expect("insert invite");
+        }
+
+        let invites = get_open_group_invites_for_peer(&conn, "peer-local")
+            .expect("query open local invites");
+        assert_eq!(
+            invites
+                .iter()
+                .map(|invite| invite.invite_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pending-local", "ready-local"]
+        );
     }
 
     #[test]

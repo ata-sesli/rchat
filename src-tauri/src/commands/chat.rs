@@ -382,6 +382,43 @@ pub async fn remove_group_member(
         .map_err(|e| e.to_string())
 }
 
+#[derive(serde::Serialize)]
+pub struct GroupInviteView {
+    pub invite_id: String,
+    pub group_id: String,
+    pub group_name: String,
+    pub inviter_peer_id: String,
+    pub status: String,
+}
+
+#[tauri::command]
+pub async fn get_group_invites(
+    state: State<'_, AppState>,
+) -> Result<Vec<GroupInviteView>, String> {
+    let local_peer_id = state
+        .local_peer_id
+        .read()
+        .map_err(|_| "Failed to read local peer ID".to_string())?
+        .clone();
+    let Some(local_peer_id) = local_peer_id else {
+        return Ok(Vec::new());
+    };
+    let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
+    storage::db::get_open_group_invites_for_peer(&conn, &local_peer_id)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| GroupInviteView {
+                    invite_id: row.invite_id,
+                    group_id: row.group_id,
+                    group_name: row.group_name,
+                    inviter_peer_id: row.inviter_peer_id,
+                    status: row.status,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn accept_group_invite(
     invite_id: String,

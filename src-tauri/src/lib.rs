@@ -22,7 +22,8 @@ use crate::commands::call::{
 };
 use crate::commands::chat::{
     accept_group_invite, create_group_chat, get_chat_history, get_chat_latest_times, get_chat_list,
-    get_group_policy, get_unread_counts, invite_group_member, leave_group_chat, mark_messages_read,
+    get_group_invites, get_group_policy, get_unread_counts, invite_group_member, leave_group_chat,
+    mark_messages_read,
     preview_group_leave, reject_group_invite, remove_group_member, rename_group_chat,
     save_temporary_chat_to_archive, send_message, send_message_to_self,
     sync_group_chat, transfer_group_admin, update_group_settings,
@@ -246,6 +247,7 @@ pub fn run() {
             get_group_policy,
             update_group_settings,
             remove_group_member,
+            get_group_invites,
             accept_group_invite,
             reject_group_invite,
             rename_group_chat,
