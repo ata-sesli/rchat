@@ -1280,6 +1280,7 @@ mod tests {
                 input: None,
                 pending_confirmation: None,
                 pending_confirmation_peer_id: None,
+                viewport_offset: 0,
             }),
         }
     }
@@ -3427,6 +3428,7 @@ async fn open_chat_details(
                 input: None,
                 pending_confirmation: None,
                 pending_confirmation_peer_id: None,
+                viewport_offset: 0,
             }),
         });
         state.app.status = "group details".to_string();
@@ -3948,6 +3950,12 @@ async fn handle_chat_details_key(
             } else {
                 state.app.close_modal();
             }
+        }
+        KeyCode::PageUp if state.app.chat_details.as_ref().is_some_and(|details| details.group.is_some()) => {
+            state.app.scroll_group_details(-5)
+        }
+        KeyCode::PageDown if state.app.chat_details.as_ref().is_some_and(|details| details.group.is_some()) => {
+            state.app.scroll_group_details(5)
         }
         KeyCode::Up => state.app.move_chat_details_focus(-1),
         KeyCode::Down => state.app.move_chat_details_focus(1),
@@ -7389,6 +7397,18 @@ const GROUP_ROSTER_START_LINE: usize = 4;
 const GROUP_ROSTER_VISIBLE: usize = 4;
 const GROUP_ACTIONS_START_LINE: usize = 9;
 
+fn group_file_section_start(details: &TuiChatDetails) -> usize {
+    20 + if details
+        .group
+        .as_ref()
+        .is_some_and(|group| group.receipts.is_empty())
+    {
+        1
+    } else {
+        details.group.as_ref().map_or(0, |group| group.receipts.len())
+    }
+}
+
 fn group_roster_window_start(group: &TuiGroupDetails) -> usize {
     group
         .selected_member_index
@@ -7414,13 +7434,19 @@ async fn handle_group_details_mouse(
     if !rect_contains(popup, mouse.column, mouse.row) {
         return Ok(());
     }
-    let line = mouse.row.saturating_sub(popup.y.saturating_add(1)) as usize;
     let Some(details) = state.app.chat_details.as_ref() else {
         return Ok(());
     };
     let Some(group) = details.group.as_ref() else {
         return Ok(());
     };
+    let visible_lines = usize::from(popup.height.saturating_sub(2));
+    let total_lines = group_file_section_start(details) + 10;
+    let viewport_offset = group
+        .viewport_offset
+        .min(total_lines.saturating_sub(visible_lines));
+    let line = mouse.row.saturating_sub(popup.y.saturating_add(1)) as usize
+        + viewport_offset;
     if group.pending_confirmation.is_none()
         && (GROUP_ROSTER_START_LINE
             ..GROUP_ROSTER_START_LINE + group.roster.len().min(GROUP_ROSTER_VISIBLE))
@@ -7436,14 +7462,41 @@ async fn handle_group_details_mouse(
     }
     let field = if group.pending_confirmation.is_some() {
         match line {
-            16 => Some(ChatDetailsField::GroupConfirm),
-            17 => Some(ChatDetailsField::GroupCancel),
+            17 => Some(ChatDetailsField::GroupConfirm),
+            18 => Some(ChatDetailsField::GroupCancel),
             _ => None,
         }
     } else {
-        (GROUP_ACTIONS_START_LINE..GROUP_ACTIONS_START_LINE + GroupAdminAction::ALL.len())
+        let action_field = (GROUP_ACTIONS_START_LINE
+            ..GROUP_ACTIONS_START_LINE + GroupAdminAction::ALL.len())
             .contains(&line)
-            .then(|| GroupAdminAction::ALL[line - GROUP_ACTIONS_START_LINE].field())
+            .then(|| GroupAdminAction::ALL[line - GROUP_ACTIONS_START_LINE].field());
+        if action_field.is_some() {
+            action_field
+        } else {
+            let file_rows_start = group_file_section_start(details) + 1;
+            let file_start = details
+                .selected_file_index
+                .saturating_sub(CHAT_DETAILS_FILE_VIEW_ROWS - 1)
+                .min(details.recent_files.len().saturating_sub(CHAT_DETAILS_FILE_VIEW_ROWS));
+            if !details.recent_files.is_empty()
+                && (file_rows_start..file_rows_start + CHAT_DETAILS_FILE_VIEW_ROWS).contains(&line)
+            {
+                let index = file_start + line - file_rows_start;
+                if let Some(details) = state.app.chat_details.as_mut() {
+                    details.selected_file_index = index;
+                }
+                return Ok(());
+            }
+            let action_line = file_rows_start + CHAT_DETAILS_FILE_VIEW_ROWS;
+            match line {
+                value if value == action_line => Some(ChatDetailsField::FileFilter),
+                value if value == action_line + 1 => Some(ChatDetailsField::FileNext),
+                value if value == action_line + 2 => Some(ChatDetailsField::FileOpen),
+                value if value == action_line + 3 => Some(ChatDetailsField::FileSave),
+                _ => None,
+            }
+        }
     };
     let Some(field) = field else {
         return Ok(());
@@ -11702,7 +11755,7 @@ fn help_line_text(state: &UiState, width: usize) -> String {
     }
     if state.app.chat_details.as_ref().is_some_and(|details| details.group.is_some()) {
         return fit_segments(
-            &["Group details", "Up/Down action", "Left/Right peer", "Enter activate", "Esc close"],
+            &["Group details", "Up/Down action", "Left/Right peer", "PageUp/PageDown scroll", "Enter activate", "Esc close"],
             width,
         );
     }
@@ -12100,8 +12153,20 @@ fn render_group_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiSta
             "No shared files yet",
             Style::default().fg(theme.muted),
         )));
+        for _ in 1..CHAT_DETAILS_FILE_VIEW_ROWS {
+            lines.push(Line::from(""));
+        }
     } else {
-        for (index, file) in details.recent_files.iter().enumerate() {
+        let start = details
+            .selected_file_index
+            .saturating_sub(CHAT_DETAILS_FILE_VIEW_ROWS - 1)
+            .min(details.recent_files.len().saturating_sub(CHAT_DETAILS_FILE_VIEW_ROWS));
+        for offset in 0..CHAT_DETAILS_FILE_VIEW_ROWS {
+            let Some(file) = details.recent_files.get(start + offset) else {
+                lines.push(Line::from(""));
+                continue;
+            };
+            let index = start + offset;
             lines.push(Line::from(format!(
                 "{} {} · {} · {}",
                 if index == details.selected_file_index { ">" } else { " " },
@@ -12126,13 +12191,18 @@ fn render_group_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiSta
     lines.push(chat_details_button_line(details, ChatDetailsField::FileOpen, "Open selected file", theme));
     lines.push(chat_details_button_line(details, ChatDetailsField::FileSave, "Save selected file", theme));
     lines.push(Line::from(Span::styled(
-        "Up/Down action/file | Left/Right peer | Enter activate | ? help | Esc close",
+        "Up/Down action/file | Left/Right peer | PageUp/PageDown scroll | Enter activate | ? help | Esc close",
         Style::default().fg(theme.muted),
     )));
 
+    let visible_lines = usize::from(popup.height.saturating_sub(2));
+    let scroll_offset = group
+        .viewport_offset
+        .min(lines.len().saturating_sub(visible_lines)) as u16;
     let paragraph = Paragraph::new(lines)
         .block(themed_block(" Group details ", theme))
         .style(Style::default().bg(theme.surface).fg(theme.text))
+        .scroll((scroll_offset, 0))
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, popup);
 }

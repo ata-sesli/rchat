@@ -217,6 +217,7 @@ pub struct TuiGroupDetails {
     pub input: Option<GroupDetailsInput>,
     pub pending_confirmation: Option<GroupAdminAction>,
     pub pending_confirmation_peer_id: Option<String>,
+    pub viewport_offset: usize,
 }
 
 impl TuiGroupDetails {
@@ -2486,6 +2487,16 @@ impl TuiAppState {
         details.focus = fields[next_index(current, delta, fields.len())];
     }
 
+    pub fn scroll_group_details(&mut self, delta: isize) {
+        if let Some(group) = self
+            .chat_details
+            .as_mut()
+            .and_then(|details| details.group.as_mut())
+        {
+            group.viewport_offset = group.viewport_offset.saturating_add_signed(delta);
+        }
+    }
+
     pub fn move_group_member_selection(&mut self, delta: isize) {
         let Some(details) = self.chat_details.as_mut() else {
             return;
@@ -3078,6 +3089,7 @@ mod tests {
             input: None,
             pending_confirmation: None,
             pending_confirmation_peer_id: None,
+            viewport_offset: 0,
         }
     }
 
