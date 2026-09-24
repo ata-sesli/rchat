@@ -2230,6 +2230,9 @@ async fn run_interactive() -> Result<()> {
             if let Some(chat_id) = active_chat_id {
                 let _ = open_chat_list_item(&app_state, &network_state, &mut state, &chat_id).await;
             }
+            if state.app.settings.is_some() {
+                refresh_settings_modal(&app_state, &mut state).await?;
+            }
         }
         for chat_id in mark_read_chat_ids {
             let _ = direct::mark_direct_messages_read(&app_state, &network_state, &chat_id).await;
@@ -4729,7 +4732,15 @@ async fn refresh_runtime_theme(app_state: &AppState, state: &mut UiState) -> Res
 async fn refresh_settings_modal(app_state: &AppState, state: &mut UiState) -> Result<()> {
     refresh_runtime_theme(app_state, state).await?;
     let profile = settings_profile::get_user_profile(app_state).await?;
-    let trusted_peers = settings_peers::get_trusted_peers(app_state)?;
+    let trusted_peer_rows = settings_peers::get_all_peer_rows(app_state)?;
+    let trusted_peers = trusted_peer_rows
+        .iter()
+        .map(|peer| peer.id.clone())
+        .collect::<Vec<_>>();
+    let peer_aliases = trusted_peer_rows
+        .into_iter()
+        .map(|peer| (peer.id, peer.alias))
+        .collect::<std::collections::HashMap<_, _>>();
     let friends = settings_peers::get_friends(app_state)
         .await?
         .into_iter()
@@ -4759,11 +4770,14 @@ async fn refresh_settings_modal(app_state: &AppState, state: &mut UiState) -> Re
     let discovery = crate::ratty_host::resolved_ratty(&app_state.app_dir);
     let imported = ghostty_import::managed_import_status(&app_state.app_dir);
 
+    let incoming_requests = state.app.incoming_peer_requests.clone();
     if let Some(modal) = state.app.settings.as_mut() {
         modal.ratty_warning = None;
         modal.profile_alias = profile.alias.unwrap_or_default();
         modal.profile_avatar_path = profile.avatar_path.unwrap_or_default();
         modal.trusted_peers = trusted_peers;
+        modal.peer_aliases = peer_aliases;
+        modal.incoming_requests = incoming_requests;
         modal.friends = friends;
         modal.pinned_peers = pinned_peers;
         modal.connectivity = connectivity;
@@ -5213,10 +5227,179 @@ async fn activate_settings_focus(
             state.local_screen_test_requested = true;
             set_settings_status(state, "starting local VP8 screen-share test");
         }
+        SettingsField::PeerInput => {
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.status = Some("enter a peer ID".to_string());
+                modal.error = None;
+            }
+        }
+        SettingsField::PeerAddSubmit => {
+            let peer_id = state
+                .app
+                .settings
+                .as_ref()
+                .map(|modal| modal.peer_input.trim().to_string())
+                .unwrap_or_default();
+            match settings_peers::add_trusted_peer(app_state, peer_id.clone(), None) {
+                Ok(()) => {
+                    refresh_settings_modal(app_state, state).await?;
+                    if let Some(modal) = state.app.settings.as_mut() {
+                        modal.peer_input.clear();
+                    }
+                    set_settings_status(state, "peer added");
+                }
+                Err(error) => set_settings_error(state, format!("failed to add peer: {error}")),
+            }
+        }
+        SettingsField::Peer(index) => {
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.select_peer(index);
+                modal.status = Some("peer selected; edit the alias or choose an action".to_string());
+                modal.error = None;
+            }
+        }
+        SettingsField::PeerRename(index) => {
+            let peer_id = state
+                .app
+                .settings
+                .as_mut()
+                .and_then(|modal| {
+                    if modal.selected_peer.as_deref()
+                        != modal.trusted_peers.get(index).map(String::as_str)
+                    {
+                        modal.select_peer(index);
+                    }
+                    modal.selected_peer.clone()
+                });
+            let alias = state
+                .app
+                .settings
+                .as_ref()
+                .map(|modal| modal.peer_input.trim().to_string())
+                .unwrap_or_default();
+            if let Some(peer_id) = peer_id {
+                match settings_peers::rename_peer(app_state, &peer_id, alias.clone()) {
+                    Ok(()) => {
+                        refresh_settings_modal(app_state, state).await?;
+                        set_settings_status(state, "peer renamed");
+                    }
+                    Err(error) => set_settings_error(state, format!("failed to rename peer: {error}")),
+                }
+            } else {
+                set_settings_error(state, "select a peer before renaming");
+            }
+        }
+        SettingsField::PeerRemove(index) => {
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.select_peer(index);
+                modal.pending_remove_peer = modal.selected_peer.clone();
+                modal.status = Some("confirm peer removal".to_string());
+                modal.error = None;
+            }
+        }
+        SettingsField::PeerRemoveConfirm => {
+            let peer_id = state
+                .app
+                .settings
+                .as_ref()
+                .and_then(|modal| modal.pending_remove_peer.clone());
+            if let Some(peer_id) = peer_id {
+                match settings_peers::delete_peer(app_state, &peer_id) {
+                    Ok(()) => {
+                        refresh_settings_modal(app_state, state).await?;
+                        set_settings_status(state, "peer removed");
+                    }
+                    Err(error) => set_settings_error(state, format!("failed to remove peer: {error}")),
+                }
+            } else {
+                set_settings_error(state, "no peer removal is pending");
+            }
+        }
+        SettingsField::PeerRemoveCancel => {
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.pending_remove_peer = None;
+                modal.status = Some("peer removal cancelled".to_string());
+                modal.error = None;
+            }
+        }
+        SettingsField::RequestAccept(index) => {
+            let peer_id = state
+                .app
+                .settings
+                .as_ref()
+                .and_then(|modal| modal.request_peer(index));
+            if let Some(peer_id) = peer_id {
+                match send_network_command(
+                    network_state,
+                    NetworkCommand::AcceptConnectionRequest { peer_id: peer_id.clone() },
+                )
+                .await
+                {
+                    Ok(()) => {
+                        state.app.incoming_peer_requests.retain(|value| value != &peer_id);
+                        if let Some(modal) = state.app.settings.as_mut() {
+                            modal.incoming_requests.retain(|value| value != &peer_id);
+                        }
+                        set_settings_status(state, format!("accepted request from {peer_id}"));
+                    }
+                    Err(error) => set_settings_error(state, format!("failed to accept request: {error}")),
+                }
+            } else {
+                set_settings_error(state, "no incoming request selected");
+            }
+        }
+        SettingsField::RequestReject(index) => {
+            let peer_id = state
+                .app
+                .settings
+                .as_ref()
+                .and_then(|modal| modal.request_peer(index));
+            if let Some(peer_id) = peer_id {
+                match send_network_command(
+                    network_state,
+                    NetworkCommand::RejectConnectionRequest { peer_id: peer_id.clone() },
+                )
+                .await
+                {
+                    Ok(()) => {
+                        state.app.incoming_peer_requests.retain(|value| value != &peer_id);
+                        if let Some(modal) = state.app.settings.as_mut() {
+                            modal.incoming_requests.retain(|value| value != &peer_id);
+                        }
+                        set_settings_status(state, format!("rejected request from {peer_id}"));
+                    }
+                    Err(error) => set_settings_error(state, format!("failed to reject request: {error}")),
+                }
+            } else {
+                set_settings_error(state, "no incoming request selected");
+            }
+        }
+        SettingsField::Friend(index) => {
+            let username = state
+                .app
+                .settings
+                .as_ref()
+                .and_then(|modal| modal.select_friend(index));
+            if let Some(username) = username {
+                match settings_peers::toggle_pin_peer(app_state, username.clone()).await {
+                    Ok(pinned) => {
+                        refresh_settings_modal(app_state, state).await?;
+                        set_settings_status(
+                            state,
+                            if pinned {
+                                format!("pinned {username}")
+                            } else {
+                                format!("unpinned {username}")
+                            },
+                        );
+                    }
+                    Err(error) => set_settings_error(state, format!("failed to update pin: {error}")),
+                }
+            }
+        }
+        SettingsField::FriendTogglePin => {}
         SettingsField::ProfileAlias
         | SettingsField::ProfileAvatar
-        | SettingsField::Peer(_)
-        | SettingsField::Friend(_)
         | SettingsField::ThemeName
         | SettingsField::ThemePrimary
         | SettingsField::ThemeSecondary
@@ -5980,6 +6163,21 @@ async fn handle_settings_mouse(
     let Some(section) = state.app.settings.as_ref().map(|modal| modal.section) else {
         return Ok(());
     };
+    if section == SettingsSection::Peers {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: size.width,
+            height: size.height,
+        };
+        let Some(field) = settings_peer_click_target(area, mouse.column, mouse.row, state) else {
+            return Ok(());
+        };
+        if let Some(modal) = state.app.settings.as_mut() {
+            modal.focus = field;
+        }
+        return activate_settings_focus(app_state, network_state, state).await;
+    }
     if section != SettingsSection::Media {
         return Ok(());
     }
@@ -5996,6 +6194,74 @@ async fn handle_settings_mouse(
         modal.focus = field;
     }
     activate_settings_focus(app_state, network_state, state).await
+}
+
+fn settings_peer_click_target(
+    area: Rect,
+    column: u16,
+    row: u16,
+    state: &UiState,
+) -> Option<SettingsField> {
+    let popup = centered_rect(92, 30, area);
+    let inner = inset_rect(popup, 2);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(22), Constraint::Min(20)])
+        .split(inner);
+    if !rect_contains(columns[1], column, row) {
+        return None;
+    }
+    let modal = state.app.settings.as_ref()?;
+    let line = row.saturating_sub(columns[1].y.saturating_add(1)) as usize;
+    let mut cursor = 0usize;
+    if line == cursor + 1 {
+        return Some(SettingsField::PeerInput);
+    }
+    if line == cursor + 2 {
+        return Some(SettingsField::PeerAddSubmit);
+    }
+    cursor += 3;
+    for index in 0..modal.incoming_requests.len().min(6) {
+        if line == cursor + 2 {
+            return Some(SettingsField::RequestAccept(index));
+        }
+        if line == cursor + 3 {
+            return Some(SettingsField::RequestReject(index));
+        }
+        cursor += 4;
+    }
+    if line == cursor {
+        return None; // trusted peers heading
+    }
+    cursor += 1;
+    for index in 0..modal.trusted_peers.len().min(6) {
+        match line.saturating_sub(cursor) {
+            0 => return Some(SettingsField::Peer(index)),
+            1 => return Some(SettingsField::PeerRename(index)),
+            2 => return Some(SettingsField::PeerRemove(index)),
+            _ => {}
+        }
+        cursor += 3;
+    }
+    if modal.pending_remove_peer.is_some() {
+        match line.saturating_sub(cursor) {
+            0 => return Some(SettingsField::PeerRemoveConfirm),
+            1 => return Some(SettingsField::PeerRemoveCancel),
+            _ => {}
+        }
+        cursor += 2;
+    }
+    cursor += 1; // blank
+    if line == cursor + 1 {
+        return None; // friends heading
+    }
+    cursor += 1;
+    modal
+        .friends
+        .iter()
+        .take(6)
+        .enumerate()
+        .find_map(|(index, _)| (line == cursor + index + 1).then_some(SettingsField::Friend(index)))
 }
 
 fn settings_media_camera_click_target(area: Rect, column: u16, row: u16) -> Option<SettingsField> {
@@ -7430,10 +7696,28 @@ fn drain_core_events(
                 state.app.status = format!("connecting to {peer_id}");
             }
             TuiEvent::Core(CoreEvent::ConnectionRequestReceived(peer_id)) => {
+                if !state
+                    .app
+                    .incoming_peer_requests
+                    .iter()
+                    .any(|existing| existing == &peer_id)
+                {
+                    state.app.incoming_peer_requests.push(peer_id.clone());
+                }
                 state.app.status = format!("connection request from {peer_id}");
+                if let Some(settings) = state.app.settings.as_mut() {
+                    settings.incoming_requests = state.app.incoming_peer_requests.clone();
+                    settings.status = Some(format!("request from {peer_id}: accept or reject"));
+                    settings.error = None;
+                }
+                *refresh_requested = true;
             }
             TuiEvent::Core(CoreEvent::PeerConnected(peer_id)) => {
                 state.app.status = format!("connected to {peer_id}");
+                state.app.incoming_peer_requests.retain(|value| value != &peer_id);
+                if let Some(settings) = state.app.settings.as_mut() {
+                    settings.incoming_requests.retain(|value| value != &peer_id);
+                }
                 if state
                     .app
                     .new_person
@@ -11347,7 +11631,31 @@ fn settings_peer_lines(
     modal: &crate::state::SettingsModalState,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from("Trusted peers")];
+    let mut lines = vec![
+        Line::from("Peer management"),
+        settings_input_line(modal, SettingsField::PeerInput, "Peer ID", &modal.peer_input, theme),
+        settings_button_line(modal, SettingsField::PeerAddSubmit, "Add peer", theme),
+    ];
+    if !modal.incoming_requests.is_empty() {
+        lines.push(Line::from("Incoming requests"));
+        for (index, peer_id) in modal.incoming_requests.iter().take(6).enumerate() {
+            lines.push(Line::from(format!("  {}", short_identifier(peer_id, 32))));
+            lines.push(settings_button_line(
+                modal,
+                SettingsField::RequestAccept(index),
+                "Accept",
+                theme,
+            ));
+            lines.push(settings_button_line(
+                modal,
+                SettingsField::RequestReject(index),
+                "Reject",
+                theme,
+            ));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("Trusted peers"));
     if modal.trusted_peers.is_empty() {
         lines.push(Line::from(Span::styled(
             "No trusted peers",
@@ -11355,15 +11663,46 @@ fn settings_peer_lines(
         )));
     } else {
         for (index, peer) in modal.trusted_peers.iter().take(6).enumerate() {
+            let alias = modal.peer_aliases.get(peer).map(String::as_str).unwrap_or(peer);
+            let selected = if modal.selected_peer.as_deref() == Some(peer) {
+                " selected"
+            } else {
+                ""
+            };
             lines.push(settings_button_line(
                 modal,
                 SettingsField::Peer(index),
-                &short_identifier(peer, 48),
+                &format!("{}{selected}", short_identifier(alias, 40)),
+                theme,
+            ));
+            lines.push(settings_button_line(
+                modal,
+                SettingsField::PeerRename(index),
+                "Rename selected peer",
+                theme,
+            ));
+            lines.push(settings_button_line(
+                modal,
+                SettingsField::PeerRemove(index),
+                "Remove selected peer",
                 theme,
             ));
         }
     }
-
+    if modal.pending_remove_peer.is_some() {
+        lines.push(settings_button_line(
+            modal,
+            SettingsField::PeerRemoveConfirm,
+            "Confirm removal",
+            theme,
+        ));
+        lines.push(settings_button_line(
+            modal,
+            SettingsField::PeerRemoveCancel,
+            "Cancel removal",
+            theme,
+        ));
+    }
     lines.push(Line::from(""));
     lines.push(Line::from("Friends"));
     if modal.friends.is_empty() {
@@ -11381,7 +11720,7 @@ fn settings_peer_lines(
             lines.push(settings_button_line(
                 modal,
                 SettingsField::Friend(index),
-                &format!("{friend}{pinned}"),
+                &format!("{friend}{pinned} (toggle pin)"),
                 theme,
             ));
         }

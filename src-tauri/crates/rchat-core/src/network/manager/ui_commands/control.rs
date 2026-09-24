@@ -348,6 +348,27 @@ impl NetworkManager {
         }
     }
 
+    pub(super) fn accept_connection_request(&mut self, peer_id_str: &str) {
+        let Ok(peer_id) = peer_id_str.parse() else {
+            eprintln!("[Handshake] Invalid peer id in accept request: {peer_id_str}");
+            return;
+        };
+        if self.incoming_requests.remove(&peer_id) || self.pending_requests.contains(&peer_id) {
+            self.complete_handshake(peer_id);
+        } else {
+            eprintln!("[Handshake] No incoming connection request from {peer_id}");
+        }
+    }
+
+    pub(super) fn reject_connection_request(&mut self, peer_id_str: &str) {
+        let Ok(peer_id) = peer_id_str.parse() else {
+            eprintln!("[Handshake] Invalid peer id in reject request: {peer_id_str}");
+            return;
+        };
+        self.incoming_requests.remove(&peer_id);
+        self.pending_requests.remove(&peer_id);
+    }
+
     pub(super) async fn handle_drop_connection(&mut self, peer_id_str: &str) {
         let Some(peer_id) = self.resolve_peer_id(peer_id_str, "Disconnect").await else {
             return;
