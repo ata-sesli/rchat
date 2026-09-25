@@ -2,7 +2,7 @@
 set -eu
 
 # Core/TUI deps are kept separate so CI need not install the GUI toolchain.
-CORE_TUI_DEPS="libasound2-dev libssl-dev libopus-dev libvpx-dev libpipewire-0.3-dev libavahi-compat-libdnssd-dev clang libclang-dev pkg-config build-essential shellcheck"
+CORE_TUI_DEPS="libasound2-dev libssl-dev libopus-dev libvpx-dev libpipewire-0.3-dev libwayland-dev libavahi-compat-libdnssd-dev clang libclang-dev pkg-config build-essential shellcheck"
 GUI_DEPS="libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev patchelf curl wget file"
 DEBIAN_BUILD_DEPS="$CORE_TUI_DEPS $GUI_DEPS"
 

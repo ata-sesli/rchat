@@ -1,10 +1,10 @@
 #!/usr/bin/env sh
 set -eu
 
-FEDORA_BUILD_DEPS="webkit2gtk4.1-devel gtk3-devel libayatana-appindicator-gtk3-devel librsvg2-devel alsa-lib-devel openssl-devel opus-devel libvpx-devel pipewire-devel avahi-compat-libdns_sd-devel clang clang-devel pkgconf-pkg-config gcc gcc-c++ make patchelf rpm-build git"
+FEDORA_BUILD_DEPS="webkit2gtk4.1-devel gtk3-devel libayatana-appindicator-gtk3-devel librsvg2-devel alsa-lib-devel openssl-devel opus-devel libvpx-devel pipewire-devel wayland-devel avahi-compat-libdns_sd-devel clang clang-devel pkgconf-pkg-config gcc gcc-c++ make patchelf rpm-build git"
 FEDORA_DEV_RUNTIME_DEPS="pipewire xdg-desktop-portal xdg-desktop-portal-gtk"
 FEDORA_SOURCE_DEPS="$FEDORA_BUILD_DEPS $FEDORA_DEV_RUNTIME_DEPS"
-FEDORA_PKG_CONFIG_MODULES="libpipewire-0.3"
+FEDORA_PKG_CONFIG_MODULES="libpipewire-0.3 wayland-client"
 
 usage() {
   cat <<USAGE
@@ -99,8 +99,8 @@ check_pkg_config_modules() {
     missing_trimmed=$(echo "$missing_modules" | xargs)
     echo "Missing Fedora/RHEL pkg-config modules:" >&2
     echo "  $missing_trimmed" >&2
-    echo "Install the PipeWire development package and pkg-config helper:" >&2
-    echo "  $(sudo_prefix) $(package_manager) install -y pipewire-devel pkgconf-pkg-config" >&2
+    echo "Install the missing development packages and pkg-config helper:" >&2
+    echo "  $(sudo_prefix) $(package_manager) install -y pipewire-devel wayland-devel pkgconf-pkg-config" >&2
     exit 1
   fi
 }

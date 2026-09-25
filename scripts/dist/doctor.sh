@@ -38,6 +38,7 @@ require_module vpx "libvpx development package"
 case "$(uname -s)" in
   Linux)
     require_module libpipewire-0.3 "PipeWire development package"
+    require_module wayland-client "Wayland development package (needed by TUI file dialogs)"
     if [ "$mode" = --check-gui ]; then
       require_module webkit2gtk-4.1 "WebKitGTK 4.1 development package"
       require_module gtk+-3.0 "GTK 3 development package"

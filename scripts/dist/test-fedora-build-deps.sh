@@ -27,6 +27,7 @@ assert_contains openssl-devel
 assert_contains opus-devel
 assert_contains libvpx-devel
 assert_contains pipewire-devel
+assert_contains wayland-devel
 assert_contains avahi-compat-libdns_sd-devel
 assert_contains clang
 assert_contains clang-devel
@@ -43,6 +44,10 @@ assert_contains xdg-desktop-portal-gtk
 
 if ! grep -q "libpipewire-0.3" "$INSTALLER"; then
   echo "Expected Fedora helper to verify pkg-config module: libpipewire-0.3" >&2
+  exit 1
+fi
+if ! grep -q "wayland-client" "$INSTALLER"; then
+  echo "Expected Fedora helper to verify pkg-config module: wayland-client" >&2
   exit 1
 fi
 
