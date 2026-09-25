@@ -1,0 +1,66 @@
+name: Source build checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+          components: rustfmt
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: taiki-e/install-action@nextest
+      - name: Install native dependencies for core and TUI
+        run: scripts/dist/install-debian-build-deps.sh --core-tui
+      - name: Check source-build prerequisites
+        run: scripts/dist/doctor.sh --check-core-tui
+      - name: Check build setup scripts
+        run: |
+          sh scripts/dist/test-fedora-build-deps.sh
+          sh scripts/dist/test-source-build-setup.sh
+          shellcheck scripts/dist/bootstrap-source.sh scripts/dist/doctor.sh scripts/dist/install-debian-build-deps.sh scripts/dist/install-macos-build-deps.sh scripts/dist/test-source-build-setup.sh
+      - name: Frontend checks
+        run: |
+          bun install --frozen-lockfile
+          bun run check
+          bun run build
+      - name: Compile core and TUI
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml -p rchat-core -p rchat-tui
+      - name: Core and TUI tests
+        run: cargo nextest run --locked --manifest-path src-tauri/Cargo.toml -p rchat-core -p rchat-tui
+
+  macos:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+      - name: Install native dependencies
+        run: scripts/dist/install-macos-build-deps.sh
+      - name: Check source-build prerequisites
+        run: scripts/dist/doctor.sh --check-core-tui
+      - name: Compile core and TUI
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml -p rchat-core -p rchat-tui

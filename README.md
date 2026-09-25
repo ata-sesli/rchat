@@ -405,59 +405,24 @@ Routes consume stores. They should not each independently subscribe to backend e
 
 ## Development
 
-### Fedora/RHEL Source Build
+Install [Rust](https://rustup.rs/) and [Bun](https://bun.sh/) first. On macOS, install Xcode Command Line Tools (`xcode-select --install`) and [Homebrew](https://brew.sh/). Debian/Ubuntu and Fedora/RHEL need a working `sudo` account (or root) to install system packages. Windows source builds are not supported by these scripts.
 
-Install native build dependencies first:
+From a fresh clone on macOS, Debian/Ubuntu, or Fedora/RHEL, run:
 
 ```bash
-scripts/dist/install-fedora-build-deps.sh
+scripts/dist/bootstrap-source.sh
 ```
 
-This includes `pipewire-devel` and `pkgconf-pkg-config`, which provide the `libpipewire-0.3.pc` metadata required by the PipeWire Rust bindings. It also installs the GTK portal backend used by Fedora XFCE/GTK dev sessions.
+This **explicitly installs native build dependencies**, checks the toolchain, installs locked Bun dependencies, checks/builds the frontend, and compiles `rchat-core` and `rchat-tui` with `cargo check`. It does not launch the app or build a Tauri installer. Preview its commands with `scripts/dist/bootstrap-source.sh --dry-run`. The platform installers are also available separately: `install-macos-build-deps.sh`, `install-debian-build-deps.sh`, and `install-fedora-build-deps.sh` under `scripts/dist/`. Run `scripts/dist/doctor.sh --check-gui` to diagnose missing build prerequisites without installing anything.
 
-Then install the JavaScript dependencies and run RChat:
+After bootstrap, launch the GUI with `bun run tauri dev` or compile a local installer with `bun run tauri build`. The TUI is a separate Rust binary; its intended media host is Ratty, which is not installed by the source bootstrap.
 
-```bash
-bun install
-bun run tauri dev
-```
+The lightweight CI workflow runs on pushes and pull requests. Ubuntu runs the setup checks, frontend checks, core/TUI compile check, and core/TUI tests; macOS runs a core/TUI compile check on pushes to `master`. CI does not build Tauri installers or exercise camera, microphone, screen-sharing, GPU, or real peer-to-peer networking.
 
-For a release-style local build:
+For local Rust tests, install `cargo-nextest` and run:
 
 ```bash
-bun run tauri build
-```
-
-The Fedora helper installs native libraries, compilers, and Linux dev-runtime portal packages. If `cargo`, `rustc`, or `bun` are missing, install Rust with `rustup` and Bun from the official Bun installer before building.
-
-Install JavaScript dependencies:
-
-```bash
-bun install
-```
-
-Run the frontend/Tauri development flow:
-
-```bash
-bun run tauri dev
-```
-
-Run frontend checks:
-
-```bash
-bun run check
-```
-
-Run Rust tests:
-
-```bash
-cargo test --manifest-path src-tauri/Cargo.toml
-```
-
-Run focused call-validation tests:
-
-```bash
-cargo test --manifest-path src-tauri/Cargo.toml call_validation
+cargo nextest run --locked --manifest-path src-tauri/Cargo.toml -p rchat-core -p rchat-tui
 ```
 
 ## Native Dependencies
