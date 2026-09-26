@@ -702,6 +702,7 @@ impl NetworkManager {
                 .is_err()
             {
                 self.voice_network_stats.outbound_failures += 1;
+                self.send_call_signal(peer, DirectMessageKind::CallEnd, &call_id);
                 self.transition_to_idle(Some("stream_failure".to_string()))
                     .await;
                 return;
@@ -793,12 +794,6 @@ impl NetworkManager {
             } => {
                 eprintln!("[Voice] Outbound stream failure to {}: {}", peer, error);
                 self.voice_network_stats.outbound_failures += 1;
-                if self.voice_stream_call_id.as_deref() == Some(call_id.as_str()) {
-                    self.log_voice_network_summary("writer_failure", &peer);
-                    self.voice_stream_tx = None;
-                    self.voice_stream_call_id = None;
-                    self.voice_stream_writer_handle = None;
-                }
                 if self
                     .active_call
                     .as_ref()
@@ -809,6 +804,7 @@ impl NetworkManager {
                     })
                     .unwrap_or(false)
                 {
+                    self.send_call_signal(peer, DirectMessageKind::CallEnd, &call_id);
                     self.transition_to_idle(Some("stream_failure".to_string()))
                         .await;
                 }

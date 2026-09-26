@@ -12,6 +12,127 @@ use crate::network::gossip::{GroupContentType, GroupMessageEnvelope};
 use libp2p::{Multiaddr, PeerId};
 use std::collections::HashMap;
 
+async fn voice_lifecycle_manager() -> (tempfile::TempDir, super::NetworkManager) {
+    let (dir, app) = crate::testing::test_app_state().await;
+    let (network, commands) = crate::testing::test_network_state();
+    let swarm = libp2p::SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_quic()
+        .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)
+        .unwrap()
+        .with_behaviour(|key: &libp2p::identity::Keypair, relay| {
+            super::RChatBehaviour::new(key.clone(), relay)
+        })
+        .unwrap()
+        .build();
+    let (_, discovery) = tokio::sync::mpsc::channel(1);
+    let (mdns_tx, mdns_rx) = tokio::sync::mpsc::channel(1);
+    (
+        dir,
+        super::NetworkManager::new(
+            swarm,
+            commands,
+            discovery,
+            mdns_rx,
+            mdns_tx,
+            app,
+            network,
+            std::sync::Arc::new(crate::events::NoopEventSink),
+        ),
+    )
+}
+
+#[tokio::test]
+async fn voice_writer_failure_ends_both_endpoints() {
+    use futures::StreamExt;
+    use libp2p::{
+        request_response::{Event, Message},
+        swarm::SwarmEvent,
+    };
+    let (_left_dir, mut left) = voice_lifecycle_manager().await;
+    let (_right_dir, mut right) = voice_lifecycle_manager().await;
+    let left_peer = *left.swarm.local_peer_id();
+    let right_peer = *right.swarm.local_peer_id();
+    right
+        .swarm
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+        .unwrap();
+    let address = loop {
+        if let SwarmEvent::NewListenAddr { address, .. } = right.swarm.select_next_some().await {
+            break address;
+        }
+    };
+    left.swarm.dial(address).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (mut l, mut r) = (false, false);
+        while !l || !r {
+            tokio::select! {
+                event = left.swarm.select_next_some() => { if matches!(event, SwarmEvent::ConnectionEstablished { .. }) { l = true; } }
+                event = right.swarm.select_next_some() => { if matches!(event, SwarmEvent::ConnectionEstablished { .. }) { r = true; } }
+            }
+        }
+    }).await.unwrap();
+    for (kind, closed_queue) in [
+        (CallKind::Voice, false),
+        (CallKind::Video, false),
+        (CallKind::Video, true),
+    ] {
+        let mut local = active_call("timeout-call", kind.clone(), ActiveCallPhase::Active);
+        local.remote_peer_id = right_peer;
+        let mut remote = active_call("timeout-call", kind, ActiveCallPhase::Active);
+        remote.remote_peer_id = left_peer;
+        left.active_call = Some(local);
+        right.active_call = Some(remote);
+        // Late events from another peer or call must not terminate this call.
+        for (peer, id) in [(PeerId::random(), "timeout-call"), (right_peer, "old-call")] {
+            left.handle_voice_stream_event(VoiceStreamEvent::OutboundFailure {
+                peer,
+                call_id: id.into(),
+                error: "voice frame write timed out".into(),
+            })
+            .await;
+            assert!(left.active_call.is_some());
+        }
+        if closed_queue {
+            let (capture_tx, capture_rx) = crate::live::voice::queue::voice_queue();
+            capture_tx
+                .push(vec![0; crate::live::voice::codec::VOICE_FRAME_SAMPLES])
+                .unwrap();
+            left.voice_capture_rx = Some(capture_rx);
+            left.voice_opus_encoder =
+                Some(crate::live::voice::codec::VoiceOpusEncoder::new().unwrap());
+            let (writer_tx, writer_rx) = crate::live::voice::queue::voice_queue();
+            drop(writer_rx);
+            left.voice_stream_tx = Some(writer_tx);
+            left.voice_stream_call_id = Some("timeout-call".into());
+            left.tick_voice_call().await;
+        } else {
+            left.handle_voice_stream_event(VoiceStreamEvent::OutboundFailure {
+                peer: right_peer,
+                call_id: "timeout-call".into(),
+                error: "voice frame write timed out".into(),
+            })
+            .await;
+        }
+        assert!(left.active_call.is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    _ = left.swarm.select_next_some() => {}
+                    event = right.swarm.select_next_some() => {
+                        if let SwarmEvent::Behaviour(super::RChatBehaviourEvent::DirectMessage(Event::Message { peer, message: Message::Request { request, .. }, .. })) = event {
+                            assert_eq!(request.msg_type, DirectMessageKind::CallEnd);
+                            right.handle_call_signal(peer, &request).await.unwrap();
+                            break;
+                        }
+                    }
+                }
+            }
+        }).await.expect("remote must receive CallEnd after writer timeout");
+        assert!(right.active_call.is_none());
+    }
+}
+
 fn incoming_request(
     kind: DirectMessageKind,
     text_content: Option<&str>,
