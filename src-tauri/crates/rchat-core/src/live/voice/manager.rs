@@ -756,7 +756,7 @@ impl NetworkManager {
                                 return;
                             }
                         };
-                        let ordered_frames = self.voice_jitter_buffer.push(seq, pcm);
+                        let ordered_frames = self.voice_jitter_buffer.push_ordered(seq, pcm);
                         if let Some(engine) = self.voice_audio_engine.as_ref() {
                             for frame in ordered_frames {
                                 engine.push_remote_frame(frame);

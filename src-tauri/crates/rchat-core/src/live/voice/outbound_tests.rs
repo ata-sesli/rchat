@@ -135,6 +135,68 @@ struct SlowWriter {
     inner: Writer,
     delay: Option<Pin<Box<tokio::time::Sleep>>>,
 }
+
+#[tokio::test]
+async fn outbound_overflow_does_not_stall_receiver_playback() {
+    use super::codec::{VoiceOpusDecoder, VoiceOpusEncoder, VOICE_FRAME_SAMPLES};
+    use super::jitter::VoiceJitterBuffer;
+    use super::protocol::{read_voice_stream_frame, read_voice_stream_header};
+
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer = Writer {
+        bytes: bytes.clone(),
+        limit: usize::MAX,
+        stall_flush: None,
+        dropped: Default::default(),
+    };
+    let (tx, rx) = voice_queue();
+    let mut encoder = VoiceOpusEncoder::new().unwrap();
+    let payload = encoder.encode_frame(&vec![0; VOICE_FRAME_SAMPLES]).unwrap();
+    let request = |seq| VoiceFrameRequest {
+        call_id: "c".into(),
+        seq,
+        timestamp: 0,
+        payload: payload.clone(),
+    };
+    for seq in 0..3 {
+        tx.push(request(seq)).unwrap();
+    }
+    let task = tokio::spawn(run_voice_writer(writer, "c", rx));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while bytes.lock().unwrap().len() < 3 + 3 * (14 + payload.len()) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // No yield: the five-frame queue must evict sequence 3.
+    for seq in 3..9 {
+        tx.push(request(seq)).unwrap();
+    }
+    assert_eq!(tx.stats().overflow, 1);
+    drop(tx);
+    task.await.unwrap().unwrap();
+
+    let mut wire = futures::io::Cursor::new(bytes.lock().unwrap().clone());
+    assert_eq!(read_voice_stream_header(&mut wire).await.unwrap(), "c");
+    let mut decoder = VoiceOpusDecoder::new().unwrap();
+    let mut jitter = VoiceJitterBuffer::new();
+    for (index, seq) in [0, 1, 2, 4, 5, 6, 7, 8].into_iter().enumerate() {
+        let frame = read_voice_stream_frame(&mut wire).await.unwrap();
+        assert_eq!(frame.seq, seq);
+        let pcm = decoder.decode_packet(&frame.payload).unwrap();
+        let ready = jitter.push_ordered(frame.seq, pcm);
+        assert_eq!(
+            ready.len(),
+            match index {
+                0 | 1 => 0,
+                2 => 3,
+                _ => 1,
+            },
+            "sequence {seq} must not wait for dropped audio"
+        );
+    }
+}
 impl AsyncWrite for SlowWriter {
     fn poll_write(
         mut self: Pin<&mut Self>,
