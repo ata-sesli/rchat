@@ -228,9 +228,8 @@ impl TuiGroupDetails {
     pub fn action_states(&self) -> Vec<GroupAdminActionState> {
         let selected = self.selected_member();
         let selected_non_admin = selected.is_some_and(|member| !member.is_admin());
-        let selected_active_non_admin = selected.is_some_and(|member| {
-            !member.is_admin() && member.is_active()
-        });
+        let selected_active_non_admin =
+            selected.is_some_and(|member| !member.is_admin() && member.is_active());
         let gate = |action, enabled: bool, reason: &str| GroupAdminActionState {
             action,
             enabled,
@@ -934,10 +933,8 @@ pub enum SettingsField {
     StickerPath,
     StickerImport,
     StickerDelete,
-    RattyPath,
-    RattyPathSave,
-    RattyImportGhostty,
-    RattyReset,
+    KittyPath,
+    KittyPathSave,
     CameraDevice,
     CameraRefresh,
     CameraTest,
@@ -1138,11 +1135,10 @@ pub struct SettingsModalState {
     pub stickers: Vec<TuiSticker>,
     pub selected_sticker_hash: Option<String>,
     pub sticker_path: String,
-    pub ratty_path: String,
-    pub ratty_resolved_path: Option<String>,
-    pub ratty_path_source: Option<String>,
-    pub ratty_config_source: String,
-    pub ratty_warning: Option<String>,
+    pub kitty_path: String,
+    pub kitty_resolved_path: Option<String>,
+    pub kitty_path_source: Option<String>,
+    pub kitty_warning: Option<String>,
     pub selected_camera_device_id: Option<String>,
     pub camera_devices: Vec<CaptureDeviceInfo>,
     pub camera_loading: bool,
@@ -1185,11 +1181,10 @@ impl Default for SettingsModalState {
             stickers: Vec::new(),
             selected_sticker_hash: None,
             sticker_path: String::new(),
-            ratty_path: String::new(),
-            ratty_resolved_path: None,
-            ratty_path_source: None,
-            ratty_config_source: "Ratty default/config discovery".to_string(),
-            ratty_warning: None,
+            kitty_path: String::new(),
+            kitty_resolved_path: None,
+            kitty_path_source: None,
+            kitty_warning: None,
             selected_camera_device_id: None,
             camera_devices: Vec::new(),
             camera_loading: false,
@@ -1293,10 +1288,8 @@ impl SettingsModalState {
                 SettingsField::CameraTest,
                 SettingsField::MicrophoneTest,
                 SettingsField::MediaDiagnosticsStop,
-                SettingsField::RattyPath,
-                SettingsField::RattyPathSave,
-                SettingsField::RattyImportGhostty,
-                SettingsField::RattyReset,
+                SettingsField::KittyPath,
+                SettingsField::KittyPathSave,
                 SettingsField::ScreenShareTest,
             ]),
             SettingsSection::About => {}
@@ -1452,7 +1445,7 @@ impl SettingsModalState {
             SettingsField::ThemeSecondary => self.theme_secondary.push(ch),
             SettingsField::ThemeText => self.theme_text.push(ch),
             SettingsField::StickerPath => self.sticker_path.push(ch),
-            SettingsField::RattyPath => self.ratty_path.push(ch),
+            SettingsField::KittyPath => self.kitty_path.push(ch),
             SettingsField::PeerInput => self.peer_input.push(ch),
             _ => {}
         }
@@ -1484,8 +1477,8 @@ impl SettingsModalState {
             SettingsField::StickerPath => {
                 self.sticker_path.pop();
             }
-            SettingsField::RattyPath => {
-                self.ratty_path.pop();
+            SettingsField::KittyPath => {
+                self.kitty_path.pop();
             }
             SettingsField::PeerInput => {
                 self.peer_input.pop();
@@ -4073,7 +4066,7 @@ mod tests {
     }
 
     #[test]
-    fn media_settings_expose_ratty_path_import_and_reset_controls() {
+    fn media_settings_expose_kitty_path_controls() {
         let mut modal = SettingsModalState::default();
         modal.activate_section(SettingsSection::Media);
 
@@ -4085,10 +4078,8 @@ mod tests {
                 SettingsField::CameraTest,
                 SettingsField::MicrophoneTest,
                 SettingsField::MediaDiagnosticsStop,
-                SettingsField::RattyPath,
-                SettingsField::RattyPathSave,
-                SettingsField::RattyImportGhostty,
-                SettingsField::RattyReset,
+                SettingsField::KittyPath,
+                SettingsField::KittyPathSave,
                 SettingsField::ScreenShareTest,
             ]
         );
@@ -4240,20 +4231,20 @@ mod tests {
     }
 
     #[test]
-    fn only_ratty_path_accepts_text_input() {
+    fn only_kitty_path_accepts_text_input() {
         let mut modal = SettingsModalState::default();
         modal.activate_section(SettingsSection::Media);
-        modal.focus = SettingsField::RattyPath;
+        modal.focus = SettingsField::KittyPath;
         modal.push_char('/');
         modal.push_char('x');
-        assert_eq!(modal.ratty_path, "/x");
+        assert_eq!(modal.kitty_path, "/x");
 
-        modal.focus = SettingsField::RattyImportGhostty;
+        modal.focus = SettingsField::KittyPathSave;
         modal.push_char('z');
-        assert_eq!(modal.ratty_path, "/x");
-        modal.focus = SettingsField::RattyPath;
+        assert_eq!(modal.kitty_path, "/x");
+        modal.focus = SettingsField::KittyPath;
         modal.pop_char();
-        assert_eq!(modal.ratty_path, "/");
+        assert_eq!(modal.kitty_path, "/");
     }
 
     #[test]

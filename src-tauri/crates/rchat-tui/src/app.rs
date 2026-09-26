@@ -1,26 +1,23 @@
 use crate::{
     bridge::{TuiEvent, TuiEventSink},
-    ghostty_import,
+    image_geometry::{Destination, ViewerView},
+    kitty_live::{self, KittyLiveManager, LiveSurface},
     kitty_viewer::KittyViewerManager,
     media::{
         decode_inline_media_preview, DecodedRgbaFrame, InlineMediaCache, InlineMediaKey,
         InlineMediaState, LatestFrameSlot, MediaViewerKey, ProtocolRequest, ProtocolRequestId,
         ProtocolResponse, ProtocolWorker, RemoteVideoFrameDecoder, ScreenFrameDecoder,
     },
-    ratty_bitmap::{
-        self, Destination as RattyDestination, LiveSurface, RattyBitmapManager, ViewerView,
-    },
     smoke::SmokeFrameGenerator,
     state::{
         db_chat_id, message_is_attachment, AppSessionPhase, AttachmentActionField,
         AttachmentFileEntry, AttachmentModalField, ChatDetailsField, ComposerAction,
-        ContextMenuAction,
-        ContextMenuState, ContextMenuTarget, FocusPane, MediaViewerAction, MediaViewerKind,
-        GroupAdminAction, GroupDetailsInput, NewGroupStep, NewItemChoice, NewPersonField,
-        NewPersonStep, SettingsField, SettingsModalState, SettingsPane, SettingsSection,
-        StickerPickerMode, StickerPickerState, TuiAppState, TuiChat, TuiChatDetails, TuiEnvelope,
-        TuiGroupDetails, TuiGroupMember, TuiMessage, TuiSticker, TuiThemePreset,
-        VoiceRecordingPhase,
+        ContextMenuAction, ContextMenuState, ContextMenuTarget, FocusPane, GroupAdminAction,
+        GroupDetailsInput, MediaViewerAction, MediaViewerKind, NewGroupStep, NewItemChoice,
+        NewPersonField, NewPersonStep, SettingsField, SettingsModalState, SettingsPane,
+        SettingsSection, StickerPickerMode, StickerPickerState, TuiAppState, TuiChat,
+        TuiChatDetails, TuiEnvelope, TuiGroupDetails, TuiGroupMember, TuiMessage, TuiSticker,
+        TuiThemePreset, VoiceRecordingPhase,
     },
 };
 use anyhow::{anyhow, Context, Result};
@@ -109,25 +106,23 @@ const PASSWORD_MASK_SYMBOL: &str = "•";
 const NEW_PERSON_QR_WIDTH: u16 = 28;
 const NEW_PERSON_QR_HEIGHT: u16 = 12;
 const KITTY_DELETE_VISIBLE_PLACEMENTS: &[u8] = b"\x1b_Ga=d,q=2\x1b\\";
-const RATTY_BITMAP_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
-const RATTY_BITMAP_PROBE_SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Default)]
-struct RattyRenderTargets {
-    screen: Option<RattyDestination>,
-    remote_video: Option<RattyDestination>,
-    viewer: Option<RattyDestination>,
+struct MediaRenderTargets {
+    screen: Option<Destination>,
+    remote_video: Option<Destination>,
+    viewer: Option<Destination>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct RattyViewerViewSnapshot {
+struct ViewerViewSnapshot {
     file_hash: String,
     zoom_percent: u16,
     pan_x: i32,
     pan_y: i32,
 }
 
-impl RattyViewerViewSnapshot {
+impl ViewerViewSnapshot {
     fn from_viewer(viewer: &crate::state::MediaViewerState) -> Self {
         Self {
             file_hash: viewer.file_hash.clone(),
@@ -138,23 +133,23 @@ impl RattyViewerViewSnapshot {
     }
 }
 
-fn ratty_viewer_snapshot(state: &UiState) -> Option<RattyViewerViewSnapshot> {
+fn viewer_snapshot(state: &UiState) -> Option<ViewerViewSnapshot> {
     state
         .app
         .media_viewer
         .as_ref()
-        .map(RattyViewerViewSnapshot::from_viewer)
+        .map(ViewerViewSnapshot::from_viewer)
 }
 
-fn trace_ratty_viewer_latency(stage: &str, started: std::time::Instant, command_count: usize) {
-    if std::env::var_os("RCHAT_RATTY_TRACE").is_none() {
+fn trace_viewer_latency(stage: &str, started: std::time::Instant, command_count: usize) {
+    if std::env::var_os("RCHAT_KITTY_TRACE").is_none() {
         return;
     }
     let timestamp_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_micros());
     eprintln!(
-        "[ratty-viewer] stage={stage} timestamp_us={timestamp_us} elapsed_us={} commands={command_count}",
+        "[kitty-viewer] stage={stage} timestamp_us={timestamp_us} elapsed_us={} commands={command_count}",
         started.elapsed().as_micros()
     );
 }
@@ -162,111 +157,41 @@ fn trace_ratty_viewer_latency(stage: &str, started: std::time::Instant, command_
 #[derive(Debug, Clone, Copy)]
 struct MediaCapabilities {
     kitty: bool,
-    ratty_bitmap: bool,
     fast_kitty_viewer: bool,
 }
 
-fn fast_kitty_viewer_enabled(kitty: bool, ratty_bitmap: bool, term_program: Option<&str>) -> bool {
-    kitty
-        && !ratty_bitmap
-        && term_program.is_some_and(|program| program.eq_ignore_ascii_case("rio"))
-}
-
-fn detect_media_backends_with<P>(
-    probe_ratty: impl FnOnce() -> bool,
-    detect_fallback: impl FnOnce() -> P,
-) -> (P, bool) {
-    // Probe Ratty before ratatui-image starts its timeout-backed stdin reader. On terminals that
-    // do not answer ratatui-image's sizing queries, that reader can otherwise consume this reply.
-    let ratty_bitmap_available = probe_ratty();
-    let picker = detect_fallback();
-    (picker, ratty_bitmap_available)
+fn fast_kitty_viewer_enabled(kitty: bool, term_program: Option<&str>) -> bool {
+    kitty && term_program.is_some_and(|program| program.eq_ignore_ascii_case("kitty"))
 }
 
 struct MediaBackendDetection {
     picker: ratatui_image::picker::Picker,
-    ratty_bitmap: bool,
+    live_frames: bool,
     kitty_forced: bool,
 }
 
-fn finalize_media_detection(
-    mut picker: ratatui_image::picker::Picker,
-    ratty_bitmap: bool,
-) -> MediaBackendDetection {
-    let kitty_forced = ratty_bitmap && picker.protocol_type() != ProtocolType::Kitty;
+fn detect_media_backends() -> MediaBackendDetection {
+    let mut picker = ratatui_image::picker::Picker::from_query_stdio()
+        .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
+    let hosted = crate::kitty_host::is_kitty_session();
+    let kitty_forced = hosted && picker.protocol_type() != ProtocolType::Kitty;
     if kitty_forced {
         picker.set_protocol_type(ProtocolType::Kitty);
     }
     MediaBackendDetection {
         picker,
-        ratty_bitmap,
+        live_frames: hosted,
         kitty_forced,
     }
-}
-
-fn ratty_bitmap_probe_timeout_for_session(ratty_session: bool) -> Duration {
-    if ratty_session {
-        RATTY_BITMAP_PROBE_SESSION_TIMEOUT
-    } else {
-        RATTY_BITMAP_PROBE_TIMEOUT
-    }
-}
-
-fn ratty_bitmap_probe_timeout() -> Duration {
-    ratty_bitmap_probe_timeout_for_session(
-        std::env::var("RATTY_SESSION").ok().as_deref() == Some("1"),
-    )
-}
-
-fn ratty_kitty_fallback_picker() -> ratatui_image::picker::Picker {
-    let mut picker = ratatui_image::picker::Picker::halfblocks();
-    picker.set_protocol_type(ProtocolType::Kitty);
-    picker
-}
-
-fn detect_media_backends() -> MediaBackendDetection {
-    let ratty_session = std::env::var("RATTY_SESSION").ok().as_deref() == Some("1");
-    let ratty_probe = ratty_bitmap::probe_support(ratty_bitmap_probe_timeout());
-    let ratty_bitmap = ratty_probe
-        .as_ref()
-        .map_or(false, |support| support.is_some());
-    if let Err(error) = &ratty_probe {
-        eprintln!("Ratty bitmap capability probe failed: {error:#}");
-    } else if !ratty_bitmap {
-        if ratty_session {
-            eprintln!(
-                "Ratty bitmap capability probe timed out after {} seconds; using Kitty fallback without a second stdin query",
-                RATTY_BITMAP_PROBE_SESSION_TIMEOUT.as_secs()
-            );
-        } else {
-            eprintln!(
-                "Ratty bitmap capability probe timed out after {} milliseconds; using Kitty fallback",
-                RATTY_BITMAP_PROBE_TIMEOUT.as_millis()
-            );
-        }
-    }
-
-    let (picker, ratty_bitmap) = detect_media_backends_with(
-        || ratty_bitmap,
-        || {
-            if ratty_session && !ratty_bitmap {
-                ratty_kitty_fallback_picker()
-            } else {
-                ratatui_image::picker::Picker::from_query_stdio()
-                    .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks())
-            }
-        },
-    );
-    finalize_media_detection(picker, ratty_bitmap)
 }
 
 fn kitty_media_enabled(protocol_type: ProtocolType) -> bool {
     protocol_type == ProtocolType::Kitty
 }
 
-fn ratty_destination(area: Rect) -> Option<RattyDestination> {
+fn media_destination(area: Rect) -> Option<Destination> {
     (area.width > 0 && area.height > 0).then(|| {
-        RattyDestination::new(
+        Destination::new(
             area.y,
             area.x,
             u32::from(area.width),
@@ -280,7 +205,7 @@ fn ratty_destination(area: Rect) -> Option<RattyDestination> {
 #[command(about = "Terminal RChat client media spike")]
 pub struct Cli {
     #[arg(long, global = true, hide = true)]
-    no_ratty: bool,
+    no_host: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -393,7 +318,6 @@ fn should_request_qr_protocol(
 mod tests {
     use super::*;
     use rchat_core::events::CoreEventSink;
-    use std::cell::RefCell;
 
     fn camera_test_network_state() -> (NetworkState, mpsc::Receiver<NetworkCommand>) {
         let (sender, receiver) = mpsc::channel(1);
@@ -543,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn ratty_view_snapshot_changes_only_for_render_geometry() {
+    fn kitty_view_snapshot_changes_only_for_render_geometry() {
         let mut viewer = crate::state::MediaViewerState::new(
             "m1".to_string(),
             "hash-1".to_string(),
@@ -551,108 +475,31 @@ mod tests {
             "image/png".to_string(),
             None,
         );
-        let initial = RattyViewerViewSnapshot::from_viewer(&viewer);
+        let initial = ViewerViewSnapshot::from_viewer(&viewer);
 
         viewer.target_path.push_str("/tmp/image.png");
         viewer.status = Some("saved".to_string());
-        assert_eq!(initial, RattyViewerViewSnapshot::from_viewer(&viewer));
+        assert_eq!(initial, ViewerViewSnapshot::from_viewer(&viewer));
 
         viewer.zoom_in();
-        assert_ne!(initial, RattyViewerViewSnapshot::from_viewer(&viewer));
-        let zoomed = RattyViewerViewSnapshot::from_viewer(&viewer);
+        assert_ne!(initial, ViewerViewSnapshot::from_viewer(&viewer));
+        let zoomed = ViewerViewSnapshot::from_viewer(&viewer);
 
         viewer.pan_by(64, 0);
-        assert_ne!(zoomed, RattyViewerViewSnapshot::from_viewer(&viewer));
-    }
-
-    #[test]
-    fn media_detection_probes_ratty_before_starting_fallback_reader() {
-        let order = RefCell::new(Vec::new());
-
-        let _ = detect_media_backends_with(
-            || {
-                order.borrow_mut().push("ratty");
-                true
-            },
-            || {
-                order.borrow_mut().push("fallback");
-            },
-        );
-
-        assert_eq!(*order.borrow(), ["ratty", "fallback"]);
-    }
-
-    #[test]
-    fn ratty_probe_uses_short_deadline_without_ratty_session() {
-        assert_eq!(
-            ratty_bitmap_probe_timeout_for_session(false),
-            Duration::from_millis(500)
-        );
-    }
-
-    #[test]
-    fn ratty_probe_uses_cold_start_deadline_in_ratty_session() {
-        assert_eq!(
-            ratty_bitmap_probe_timeout_for_session(true),
-            Duration::from_secs(3)
-        );
-    }
-
-    #[test]
-    fn ratty_bitmap_support_forces_kitty_for_inline_previews() {
-        let detection = finalize_media_detection(ratatui_image::picker::Picker::halfblocks(), true);
-
-        assert_eq!(detection.picker.protocol_type(), ProtocolType::Kitty);
-        assert!(detection.ratty_bitmap);
-        assert!(detection.kitty_forced);
-    }
-
-    #[test]
-    fn ratty_session_fallback_selects_kitty_without_querying_stdin() {
-        let picker = ratty_kitty_fallback_picker();
-
-        assert_eq!(picker.protocol_type(), ProtocolType::Kitty);
-        assert!(kitty_media_enabled(picker.protocol_type()));
-    }
-
-    #[test]
-    fn non_ratty_terminal_keeps_detected_fallback_protocol() {
-        let detection =
-            finalize_media_detection(ratatui_image::picker::Picker::halfblocks(), false);
-
-        assert_eq!(detection.picker.protocol_type(), ProtocolType::Halfblocks);
-        assert!(!detection.ratty_bitmap);
-        assert!(!detection.kitty_forced);
-    }
-
-    #[test]
-    fn native_ratty_kitty_detection_is_not_marked_forced() {
-        let mut picker = ratatui_image::picker::Picker::halfblocks();
-        picker.set_protocol_type(ProtocolType::Kitty);
-
-        let detection = finalize_media_detection(picker, true);
-
-        assert_eq!(detection.picker.protocol_type(), ProtocolType::Kitty);
-        assert!(!detection.kitty_forced);
-    }
-
-    #[test]
-    fn ratty_detection_enables_inline_media_worker() {
-        let detection = finalize_media_detection(ratatui_image::picker::Picker::halfblocks(), true);
-        assert!(kitty_media_enabled(detection.picker.protocol_type()));
+        assert_ne!(zoomed, ViewerViewSnapshot::from_viewer(&viewer));
     }
 
     #[test]
     fn parses_default_interactive_shell() {
         let cli = Cli::try_parse_from(["rchat-tui"]).unwrap();
         assert!(cli.command.is_none());
-        assert!(!cli.no_ratty);
+        assert!(!cli.no_host);
     }
 
     #[test]
-    fn parses_hidden_ratty_host_bypass() {
-        let cli = Cli::try_parse_from(["rchat-tui", "--no-ratty"]).unwrap();
-        assert!(cli.no_ratty);
+    fn parses_hidden_kitty_host_bypass() {
+        let cli = Cli::try_parse_from(["rchat-tui", "--no-host"]).unwrap();
+        assert!(cli.no_host);
         assert!(cli.command.is_none());
     }
 
@@ -2345,9 +2192,12 @@ pub fn run() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("failed to start tokio runtime")?;
     runtime.block_on(async move {
         match cli.command {
-            Some(Command::MediaSmoke { fps, seconds, path, kitty_frames }) => {
-                run_media_smoke(fps, seconds, path, kitty_frames).await
-            }
+            Some(Command::MediaSmoke {
+                fps,
+                seconds,
+                path,
+                kitty_frames,
+            }) => run_media_smoke(fps, seconds, path, kitty_frames).await,
             Some(Command::LocalScreenSmoke {
                 profile,
                 path,
@@ -2369,13 +2219,13 @@ async fn run_interactive() -> Result<()> {
     }
 
     let detection = detect_media_backends();
-    let ratty_bitmap_available = detection.ratty_bitmap;
+    let kitty_frames_available = detection.live_frames;
     let kitty_detection_forced = detection.kitty_forced;
     let picker = detection.picker;
     let kitty_font_size = picker.font_size();
     let protocol_type = picker.protocol_type();
     let kitty_available = kitty_media_enabled(protocol_type);
-    terminal.set_ratty_bitmap_active(ratty_bitmap_available);
+    terminal.set_kitty_graphics_active(kitty_frames_available);
     let protocol_worker = kitty_available.then(|| ProtocolWorker::spawn(picker));
     let inline_loader = kitty_available.then(|| InlineMediaLoader::spawn(app_state.clone()));
     let _output_redirect = OutputRedirect::redirect(&tui_log_path)?;
@@ -2385,12 +2235,15 @@ async fn run_interactive() -> Result<()> {
         .context("failed to start rchat-core network")?;
 
     let mut state = UiState::new(protocol_type, event_sink);
-    state.ratty_hosted = std::env::var("RATTY_SESSION").ok().as_deref() == Some("1");
-    state.ratty_bitmap_available = ratty_bitmap_available;
+    state.kitty_hosted = crate::kitty_host::is_kitty_session();
+    state.kitty_frames_available = kitty_frames_available;
     state.fast_kitty_viewer = fast_kitty_viewer_enabled(
         kitty_available,
-        ratty_bitmap_available,
-        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        if crate::kitty_host::is_kitty_session() {
+            Some("kitty")
+        } else {
+            None
+        },
     );
     state.kitty_detection_forced = kitty_detection_forced;
     state.app.session_phase = AppSessionPhase::Unlocked;
@@ -2408,11 +2261,11 @@ async fn run_interactive() -> Result<()> {
     let mut decoder = ScreenFrameDecoder::default();
     let mut remote_video_decoder = RemoteVideoFrameDecoder::default();
     let mut last_graphics_clear_generation = graphics_clear_generation(&state);
-    let mut ratty_bitmaps = RattyBitmapManager::default();
+    let mut live_media = KittyLiveManager::new(kitty_font_size);
     let mut kitty_viewer = KittyViewerManager::new(kitty_font_size);
-    let mut pending_ratty_screen_frame = None;
-    let mut pending_ratty_remote_video_frame = None;
-    let mut last_ratty_viewer_destination = None;
+    let mut pending_screen_frame = None;
+    let mut pending_remote_video_frame = None;
+    let mut last_viewer_destination = None;
 
     loop {
         let mut bitmap_commands = Vec::new();
@@ -2457,13 +2310,13 @@ async fn run_interactive() -> Result<()> {
         state.remote_video_decoder_errors = remote_video_decoder.decode_errors();
         state.remote_video_delta_drops = remote_video_decoder.dropped_delta_before_keyframe();
 
-        if ratty_bitmap_available || protocol_worker.is_some() {
+        if kitty_frames_available || protocol_worker.is_some() {
             if let Some(event) = pending_frames.take() {
                 if let Some(frame) = decoder.decode_event(&event) {
                     state.decoded_frames = state.decoded_frames.saturating_add(1);
-                    if ratty_bitmap_available {
+                    if kitty_frames_available {
                         state.last_protocol_seq = Some(frame.seq);
-                        pending_ratty_screen_frame = Some(frame);
+                        pending_screen_frame = Some(frame);
                     } else if let Some(worker) = protocol_worker.as_ref() {
                         match ProtocolRequest::screen(frame, state.media_size) {
                             Ok(request) => worker.request(request),
@@ -2476,8 +2329,8 @@ async fn run_interactive() -> Result<()> {
                 if let Some(frame) = remote_video_decoder.decode_event(&event) {
                     state.remote_video_decoded_frames =
                         state.remote_video_decoded_frames.saturating_add(1);
-                    if ratty_bitmap_available {
-                        pending_ratty_remote_video_frame = Some(frame);
+                    if kitty_frames_available {
+                        pending_remote_video_frame = Some(frame);
                     } else if let Some(worker) = protocol_worker.as_ref() {
                         match ProtocolRequest::remote_video(frame, state.remote_video_size) {
                             Ok(request) => worker.request(request),
@@ -2564,7 +2417,7 @@ async fn run_interactive() -> Result<()> {
                         continue;
                     }
                     let viewer_key_started = std::time::Instant::now();
-                    let previous_view = ratty_viewer_snapshot(&state);
+                    let previous_view = viewer_snapshot(&state);
                     if handle_interactive_key(
                         &app_state,
                         &network_state,
@@ -2576,28 +2429,17 @@ async fn run_interactive() -> Result<()> {
                     {
                         return Ok(());
                     }
-                    let next_view = ratty_viewer_snapshot(&state);
-                    if (ratty_bitmap_available || state.fast_kitty_viewer)
-                        && previous_view != next_view
-                    {
+                    let next_view = viewer_snapshot(&state);
+                    if state.fast_kitty_viewer && previous_view != next_view {
                         let mut viewer_commands = Vec::new();
-                        if ratty_bitmap_available {
-                            reconcile_ratty_viewer(
-                                &mut state,
-                                &mut ratty_bitmaps,
-                                last_ratty_viewer_destination,
-                                &mut viewer_commands,
-                            );
-                        } else {
-                            reconcile_kitty_viewer(
-                                &mut state,
-                                &mut kitty_viewer,
-                                last_ratty_viewer_destination,
-                                &mut viewer_commands,
-                            );
-                        }
+                        reconcile_kitty_viewer(
+                            &mut state,
+                            &mut kitty_viewer,
+                            last_viewer_destination,
+                            &mut viewer_commands,
+                        );
                         terminal.write_bitmap_commands(&viewer_commands)?;
-                        trace_ratty_viewer_latency(
+                        trace_viewer_latency(
                             "immediate_flush",
                             viewer_key_started,
                             viewer_commands.len(),
@@ -2615,21 +2457,21 @@ async fn run_interactive() -> Result<()> {
         if std::mem::take(&mut state.local_screen_test_requested) {
             let result = run_local_screen_preview(
                 &mut terminal,
-                &mut ratty_bitmaps,
+                &mut live_media,
                 ScreenCaptureProfile::P720F15,
                 LocalScreenPath::Vp8,
                 None,
                 LocalScreenPreviewRuntime {
                     protocol_type: state.protocol_type,
-                    ratty_hosted: state.ratty_hosted,
-                    ratty_bitmap_available,
+                    kitty_hosted: state.kitty_hosted,
+                    kitty_frames_available,
                     kitty_detection_forced,
                     kitty_available,
                     protocol_worker: protocol_worker.as_ref(),
                 },
             )
             .await;
-            pending_ratty_screen_frame = None;
+            pending_screen_frame = None;
             match result {
                 Ok(()) => set_settings_status(&mut state, "local screen-share test stopped"),
                 Err(error) => set_settings_error(
@@ -2649,6 +2491,7 @@ async fn run_interactive() -> Result<()> {
             if transition.clear_kitty_graphics {
                 terminal.write_bitmap_commands(&kitty_viewer.clear_viewer())?;
                 terminal.clear_terminal_graphics()?;
+                live_media.invalidate_placements();
             }
             if transition.invalidate_protocols {
                 invalidate_terminal_graphics_protocols(&mut state);
@@ -2659,7 +2502,7 @@ async fn run_interactive() -> Result<()> {
             last_graphics_clear_generation = graphics_clear_generation;
         }
 
-        let mut next_ratty_targets = RattyRenderTargets::default();
+        let mut next_media_targets = MediaRenderTargets::default();
         terminal.draw(|frame| {
             render_app_shell(
                 frame,
@@ -2667,16 +2510,16 @@ async fn run_interactive() -> Result<()> {
                 inline_loader.as_ref(),
                 protocol_worker.as_ref(),
                 kitty_available,
-                ratty_bitmap_available,
-                &mut next_ratty_targets,
+                kitty_frames_available,
+                &mut next_media_targets,
             )
         })?;
-        if ratty_bitmap_available {
+        if kitty_frames_available {
             if should_render_screen_share_panel(&state) {
-                match ratty_bitmaps.reconcile_pending_live_frame(
+                match live_media.reconcile_pending_live_frame(
                     LiveSurface::Screen,
-                    &mut pending_ratty_screen_frame,
-                    next_ratty_targets.screen,
+                    &mut pending_screen_frame,
+                    next_media_targets.screen,
                 ) {
                     Ok(commands) => {
                         bitmap_commands.extend(commands);
@@ -2685,18 +2528,18 @@ async fn run_interactive() -> Result<()> {
                     Err(error) => state.media_error = Some(error.to_string()),
                 }
                 bitmap_commands.extend(
-                    ratty_bitmaps
-                        .reconcile_live_placement(LiveSurface::Screen, next_ratty_targets.screen)?,
+                    live_media
+                        .reconcile_live_placement(LiveSurface::Screen, next_media_targets.screen)?,
                 );
             } else {
-                pending_ratty_screen_frame = None;
-                bitmap_commands.extend(ratty_bitmaps.clear_live(LiveSurface::Screen));
+                pending_screen_frame = None;
+                bitmap_commands.extend(live_media.clear_live(LiveSurface::Screen));
             }
             if should_render_remote_video_panel(&state) {
-                match ratty_bitmaps.reconcile_pending_live_frame(
+                match live_media.reconcile_pending_live_frame(
                     LiveSurface::RemoteVideo,
-                    &mut pending_ratty_remote_video_frame,
-                    next_ratty_targets.remote_video,
+                    &mut pending_remote_video_frame,
+                    next_media_targets.remote_video,
                 ) {
                     Ok(commands) => {
                         bitmap_commands.extend(commands);
@@ -2704,35 +2547,28 @@ async fn run_interactive() -> Result<()> {
                     }
                     Err(error) => state.remote_video_error = Some(error.to_string()),
                 }
-                bitmap_commands.extend(ratty_bitmaps.reconcile_live_placement(
+                bitmap_commands.extend(live_media.reconcile_live_placement(
                     LiveSurface::RemoteVideo,
-                    next_ratty_targets.remote_video,
+                    next_media_targets.remote_video,
                 )?);
             } else {
-                pending_ratty_remote_video_frame = None;
-                bitmap_commands.extend(ratty_bitmaps.clear_live(LiveSurface::RemoteVideo));
+                pending_remote_video_frame = None;
+                bitmap_commands.extend(live_media.clear_live(LiveSurface::RemoteVideo));
             }
-            reconcile_ratty_viewer(
-                &mut state,
-                &mut ratty_bitmaps,
-                next_ratty_targets.viewer,
-                &mut bitmap_commands,
-            );
-            terminal.write_bitmap_commands(&bitmap_commands)?;
-            last_ratty_viewer_destination = next_ratty_targets.viewer;
-        } else if state.fast_kitty_viewer {
+        }
+        if state.fast_kitty_viewer {
             reconcile_kitty_viewer(
                 &mut state,
                 &mut kitty_viewer,
-                next_ratty_targets.viewer,
+                next_media_targets.viewer,
                 &mut bitmap_commands,
             );
             if bitmap_commands.is_empty() {
                 bitmap_commands.extend(kitty_viewer.repaint());
             }
-            terminal.write_bitmap_commands(&bitmap_commands)?;
-            last_ratty_viewer_destination = next_ratty_targets.viewer;
+            last_viewer_destination = next_media_targets.viewer;
         }
+        terminal.write_bitmap_commands(&bitmap_commands)?;
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
 }
@@ -2741,12 +2577,16 @@ async fn run_media_smoke(fps: u32, seconds: u64, path: LocalScreenPath, kitty_fr
     if !(1..=60).contains(&fps) {
         return Err(anyhow!("fps must be between 1 and 60"));
     }
-    if kitty_frames && std::env::var_os("KITTY_WINDOW_ID").is_none() {
-        return Err(anyhow!("--kitty-frames requires the Kitty terminal; launch with --no-ratty"));
+    if kitty_frames && !crate::kitty_host::is_kitty_session() {
+        return Err(anyhow!(
+            "--kitty-frames requires the Kitty terminal; launch with --no-host"
+        ));
     }
 
     let mut encoder = (path == LocalScreenPath::Vp8)
-        .then(|| Vp8VideoEncoder::new_with_dimensions(VideoProfile::P360, SMOKE_WIDTH, SMOKE_HEIGHT))
+        .then(|| {
+            Vp8VideoEncoder::new_with_dimensions(VideoProfile::P360, SMOKE_WIDTH, SMOKE_HEIGHT)
+        })
         .transpose()
         .map_err(|error| anyhow!("failed to start smoke VP8 encoder: {error}"))?;
     let mut decoder = (path == LocalScreenPath::Vp8)
@@ -2756,17 +2596,17 @@ async fn run_media_smoke(fps: u32, seconds: u64, path: LocalScreenPath, kitty_fr
 
     let mut terminal = TerminalSession::enter()?;
     let detection = detect_media_backends();
-    let ratty_bitmap_available = detection.ratty_bitmap;
+    let kitty_frames_available = detection.live_frames;
     let kitty_detection_forced = detection.kitty_forced;
     let picker = detection.picker;
     let protocol_type = picker.protocol_type();
     let kitty_available = kitty_media_enabled(protocol_type);
-    terminal.set_ratty_bitmap_active(ratty_bitmap_available);
+    terminal.set_kitty_graphics_active(kitty_frames_available);
     let kitty_font_size = picker.font_size();
     let protocol_worker = (kitty_available && !kitty_frames).then(|| ProtocolWorker::spawn(picker));
     let mut state = UiState::new(protocol_type, TuiEventSink::channel(1).0);
-    state.ratty_hosted = std::env::var("RATTY_SESSION").ok().as_deref() == Some("1");
-    state.ratty_bitmap_available = ratty_bitmap_available;
+    state.kitty_hosted = crate::kitty_host::is_kitty_session();
+    state.kitty_frames_available = kitty_frames_available;
     state.kitty_detection_forced = kitty_detection_forced;
     state.status = format!("media smoke / {} / {fps} fps / 640x360{}", path.label(),
         if kitty_frames { " / Kitty frame updates" } else { "" });
@@ -2775,8 +2615,8 @@ async fn run_media_smoke(fps: u32, seconds: u64, path: LocalScreenPath, kitty_fr
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(fps));
     let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
     let mut next_frame_at = std::time::Instant::now();
-    let mut ratty_bitmaps = RattyBitmapManager::default();
-    let mut pending_ratty_screen_frame = None;
+    let mut live_media = KittyLiveManager::new(kitty_font_size);
+    let mut pending_screen_frame = None;
 
     let mut kitty_video = crate::kitty_video::KittyVideo::default();
     'smoke: while std::time::Instant::now() < deadline {
@@ -2802,11 +2642,15 @@ async fn run_media_smoke(fps: u32, seconds: u64, path: LocalScreenPath, kitty_fr
             if kitty_frames {
                 state.decoded_frames = state.decoded_frames.saturating_add(1);
                 state.last_protocol_seq = Some(frame.seq);
-                bitmap_commands.extend(kitty_video.update(&frame.rgba, frame.width, frame.height)?);
-            } else if ratty_bitmap_available {
+                bitmap_commands.extend(kitty_video.update(
+                    &frame.rgba,
+                    frame.width,
+                    frame.height,
+                )?);
+            } else if kitty_frames_available {
                 state.decoded_frames = state.decoded_frames.saturating_add(1);
                 state.last_protocol_seq = Some(frame.seq);
-                pending_ratty_screen_frame = Some(frame);
+                pending_screen_frame = Some(frame);
             } else if let Some(worker) = protocol_worker.as_ref() {
                 worker.request(ProtocolRequest::screen(frame, state.media_size)?);
             }
@@ -2815,7 +2659,7 @@ async fn run_media_smoke(fps: u32, seconds: u64, path: LocalScreenPath, kitty_fr
         }
 
         if let Some(worker) = protocol_worker.as_ref() {
-            if !ratty_bitmap_available {
+            if !kitty_frames_available {
                 if let Some(response) = worker.try_recv_latest() {
                     match response {
                         Ok(protocol) => {
@@ -2839,39 +2683,41 @@ async fn run_media_smoke(fps: u32, seconds: u64, path: LocalScreenPath, kitty_fr
             }
         }
 
-        let mut next_ratty_targets = RattyRenderTargets::default();
+        let mut next_media_targets = MediaRenderTargets::default();
         terminal.draw(|frame| {
             if kitty_frames {
                 let root = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Length(34), Constraint::Min(20)])
                     .split(frame.area());
-                render_status(frame, root[0], &state, kitty_available, false);
+                render_status(frame, root[0], &state, kitty_available, kitty_frames_available);
                 let block = Block::bordered().title("Kitty persistent-frame video");
-                next_ratty_targets.screen = ratty_destination(block.inner(root[1]));
+                next_media_targets.screen = media_destination(block.inner(root[1]));
                 frame.render_widget(block, root[1]);
-            } else { render_media_shell(
-                frame,
-                &mut state,
-                kitty_available,
-                ratty_bitmap_available,
-                &mut next_ratty_targets,
-            ) }
+            } else {
+                render_media_shell(
+                    frame,
+                    &mut state,
+                    kitty_available,
+                    kitty_frames_available,
+                    &mut next_media_targets,
+                )
+            }
         })?;
         if kitty_frames {
-            if let Some(destination) = next_ratty_targets.screen {
+            if let Some(destination) = next_media_targets.screen {
                 bitmap_commands.extend(kitty_video.place(destination, kitty_font_size));
             }
             terminal.write_bitmap_commands(&bitmap_commands)?;
-        } else if ratty_bitmap_available {
-            bitmap_commands.extend(ratty_bitmaps.reconcile_pending_live_frame(
+        } else if kitty_frames_available {
+            bitmap_commands.extend(live_media.reconcile_pending_live_frame(
                 LiveSurface::Screen,
-                &mut pending_ratty_screen_frame,
-                next_ratty_targets.screen,
+                &mut pending_screen_frame,
+                next_media_targets.screen,
             )?);
             bitmap_commands.extend(
-                ratty_bitmaps
-                    .reconcile_live_placement(LiveSurface::Screen, next_ratty_targets.screen)?,
+                live_media
+                    .reconcile_live_placement(LiveSurface::Screen, next_media_targets.screen)?,
             );
             terminal.write_bitmap_commands(&bitmap_commands)?;
         }
@@ -2889,25 +2735,26 @@ async fn run_local_screen_smoke(
 ) -> Result<()> {
     let mut terminal = TerminalSession::enter()?;
     let detection = detect_media_backends();
-    let ratty_bitmap_available = detection.ratty_bitmap;
+    let kitty_frames_available = detection.live_frames;
     let kitty_detection_forced = detection.kitty_forced;
     let picker = detection.picker;
     let protocol_type = picker.protocol_type();
     let kitty_available = kitty_media_enabled(protocol_type);
-    terminal.set_ratty_bitmap_active(ratty_bitmap_available);
+    terminal.set_kitty_graphics_active(kitty_frames_available);
+    let kitty_font_size = picker.font_size();
     let protocol_worker = kitty_available.then(|| ProtocolWorker::spawn(picker));
-    let mut ratty_bitmaps = RattyBitmapManager::default();
+    let mut live_media = KittyLiveManager::new(kitty_font_size);
 
     run_local_screen_preview(
         &mut terminal,
-        &mut ratty_bitmaps,
+        &mut live_media,
         profile,
         path,
         Some(Duration::from_secs(seconds)),
         LocalScreenPreviewRuntime {
             protocol_type,
-            ratty_hosted: std::env::var("RATTY_SESSION").ok().as_deref() == Some("1"),
-            ratty_bitmap_available,
+            kitty_hosted: crate::kitty_host::is_kitty_session(),
+            kitty_frames_available,
             kitty_detection_forced,
             kitty_available,
             protocol_worker: protocol_worker.as_ref(),
@@ -2918,8 +2765,8 @@ async fn run_local_screen_smoke(
 
 struct LocalScreenPreviewRuntime<'a> {
     protocol_type: ProtocolType,
-    ratty_hosted: bool,
-    ratty_bitmap_available: bool,
+    kitty_hosted: bool,
+    kitty_frames_available: bool,
     kitty_detection_forced: bool,
     kitty_available: bool,
     protocol_worker: Option<&'a ProtocolWorker>,
@@ -2927,7 +2774,7 @@ struct LocalScreenPreviewRuntime<'a> {
 
 async fn run_local_screen_preview(
     terminal: &mut TerminalSession,
-    ratty_bitmaps: &mut RattyBitmapManager,
+    live_media: &mut KittyLiveManager,
     profile: ScreenCaptureProfile,
     path: LocalScreenPath,
     duration: Option<Duration>,
@@ -2940,8 +2787,8 @@ async fn run_local_screen_preview(
     let capture_info = capture_session.info().clone();
 
     let mut state = UiState::new(runtime.protocol_type, TuiEventSink::channel(1).0);
-    state.ratty_hosted = runtime.ratty_hosted;
-    state.ratty_bitmap_available = runtime.ratty_bitmap_available;
+    state.kitty_hosted = runtime.kitty_hosted;
+    state.kitty_frames_available = runtime.kitty_frames_available;
     state.kitty_detection_forced = runtime.kitty_detection_forced;
     state.status = format!("local screen smoke {} {}", profile.label(), path.label());
     state.active_session_id = Some(format!(
@@ -2971,14 +2818,14 @@ async fn run_local_screen_preview(
     let deadline = duration.map(|duration| std::time::Instant::now() + duration);
     let mut next_seq = 0_u32;
     let mut encoded_frames = 0_u64;
-    let mut pending_ratty_screen_frame = None;
+    let mut pending_screen_frame = None;
 
     while deadline
         .map(|deadline| std::time::Instant::now() < deadline)
         .unwrap_or(true)
     {
         let mut bitmap_commands = Vec::new();
-        if runtime.ratty_bitmap_available || runtime.protocol_worker.is_some() {
+        if runtime.kitty_frames_available || runtime.protocol_worker.is_some() {
             if let Some(frame) = capture_session.try_recv_latest_i420() {
                 state.received_frames = state.received_frames.saturating_add(1);
                 match local_screen_frame_to_rgba(
@@ -2992,9 +2839,9 @@ async fn run_local_screen_preview(
                     Ok(Some((frame, encoded_count))) => {
                         encoded_frames = encoded_frames.saturating_add(encoded_count);
                         state.decoded_frames = state.decoded_frames.saturating_add(1);
-                        if runtime.ratty_bitmap_available {
+                        if runtime.kitty_frames_available {
                             state.last_protocol_seq = Some(frame.seq);
-                            pending_ratty_screen_frame = Some(frame);
+                            pending_screen_frame = Some(frame);
                         } else if let Some(worker) = runtime.protocol_worker {
                             worker.request(ProtocolRequest::screen(frame, state.media_size)?);
                         }
@@ -3008,7 +2855,7 @@ async fn run_local_screen_preview(
                 }
             }
 
-            if !runtime.ratty_bitmap_available {
+            if !runtime.kitty_frames_available {
                 if let Some(worker) = runtime.protocol_worker {
                     if let Some(response) = worker.try_recv_latest() {
                         match response {
@@ -3034,39 +2881,39 @@ async fn run_local_screen_preview(
             if key.kind == KeyEventKind::Press
                 && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
             {
-                let cleanup = ratty_bitmaps.clear_live(LiveSurface::Screen);
+                let cleanup = live_media.clear_live(LiveSurface::Screen);
                 terminal.write_bitmap_commands(&cleanup)?;
                 terminal.clear()?;
                 return Ok(());
             }
         }
 
-        let mut next_ratty_targets = RattyRenderTargets::default();
+        let mut next_media_targets = MediaRenderTargets::default();
         terminal.draw(|frame| {
             render_media_shell(
                 frame,
                 &mut state,
                 runtime.kitty_available,
-                runtime.ratty_bitmap_available,
-                &mut next_ratty_targets,
+                runtime.kitty_frames_available,
+                &mut next_media_targets,
             )
         })?;
-        if runtime.ratty_bitmap_available {
-            bitmap_commands.extend(ratty_bitmaps.reconcile_pending_live_frame(
+        if runtime.kitty_frames_available {
+            bitmap_commands.extend(live_media.reconcile_pending_live_frame(
                 LiveSurface::Screen,
-                &mut pending_ratty_screen_frame,
-                next_ratty_targets.screen,
+                &mut pending_screen_frame,
+                next_media_targets.screen,
             )?);
             bitmap_commands.extend(
-                ratty_bitmaps
-                    .reconcile_live_placement(LiveSurface::Screen, next_ratty_targets.screen)?,
+                live_media
+                    .reconcile_live_placement(LiveSurface::Screen, next_media_targets.screen)?,
             );
             terminal.write_bitmap_commands(&bitmap_commands)?;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    let cleanup = ratty_bitmaps.clear_live(LiveSurface::Screen);
+    let cleanup = live_media.clear_live(LiveSurface::Screen);
     terminal.write_bitmap_commands(&cleanup)?;
     terminal.clear()?;
     Ok(())
@@ -4119,7 +3966,10 @@ async fn handle_chat_details_key(
                             | ChatDetailsField::FileOpen
                             | ChatDetailsField::FileSave
                     )
-            }) => state.app.move_file_selection(1),
+            }) =>
+        {
+            state.app.move_file_selection(1)
+        }
         KeyCode::Left
             if state.app.chat_details.as_ref().is_some_and(|details| {
                 details.group.is_some()
@@ -4130,8 +3980,17 @@ async fn handle_chat_details_key(
                             | ChatDetailsField::FileOpen
                             | ChatDetailsField::FileSave
                     )
-            }) => state.app.move_file_selection(-1),
-        KeyCode::Right if state.app.chat_details.as_ref().is_some_and(|details| details.group.is_some()) => {
+            }) =>
+        {
+            state.app.move_file_selection(-1)
+        }
+        KeyCode::Right
+            if state
+                .app
+                .chat_details
+                .as_ref()
+                .is_some_and(|details| details.group.is_some()) =>
+        {
             state.app.move_group_member_selection(1)
         }
         KeyCode::Left if state.app.chat_details.as_ref().is_some_and(|details| details.group.is_some()) => {
@@ -4274,7 +4133,9 @@ async fn activate_chat_details_focus(
         | ChatDetailsField::GroupSync
         | ChatDetailsField::GroupLeave
         | ChatDetailsField::GroupConfirm
-        | ChatDetailsField::GroupCancel => unreachable!("group actions are routed before chat details actions"),
+        | ChatDetailsField::GroupCancel => {
+            unreachable!("group actions are routed before chat details actions")
+        }
     }
     Ok(())
 }
@@ -5928,13 +5789,12 @@ async fn refresh_settings_modal(app_state: &AppState, state: &mut UiState) -> Re
             size_bytes: sticker.size_bytes,
         })
         .collect::<Vec<_>>();
-    let host_preferences = crate::ratty_host::load_preferences(&app_state.app_dir);
-    let discovery = crate::ratty_host::resolved_ratty(&app_state.app_dir);
-    let imported = ghostty_import::managed_import_status(&app_state.app_dir);
+    let host_preferences = crate::kitty_host::load_preferences(&app_state.app_dir);
+    let discovery = crate::kitty_host::resolved_kitty(&app_state.app_dir);
 
     let incoming_requests = state.app.incoming_peer_requests.clone();
     if let Some(modal) = state.app.settings.as_mut() {
-        modal.ratty_warning = None;
+        modal.kitty_warning = None;
         modal.profile_alias = profile.alias.unwrap_or_default();
         modal.profile_avatar_path = profile.avatar_path.unwrap_or_default();
         modal.trusted_peers = trusted_peers;
@@ -5951,46 +5811,34 @@ async fn refresh_settings_modal(app_state: &AppState, state: &mut UiState) -> Re
         }
         match host_preferences {
             Ok(preferences) => {
-                modal.ratty_path = preferences
+                modal.kitty_path = preferences
                     .executable_path
                     .map(|path| path.display().to_string())
                     .unwrap_or_default();
             }
             Err(error) => {
-                modal.ratty_path.clear();
-                modal.ratty_warning = Some(format!("failed to load Ratty path: {error}"));
+                modal.kitty_path.clear();
+                modal.kitty_warning = Some(format!("failed to load Kitty path: {error}"));
             }
         }
         match discovery {
             Ok(discovery) => {
-                modal.ratty_resolved_path = discovery
+                modal.kitty_resolved_path = discovery
                     .resolved
                     .as_ref()
                     .map(|value| value.path.display().to_string());
-                modal.ratty_path_source = discovery
+                modal.kitty_path_source = discovery
                     .resolved
                     .as_ref()
                     .map(|value| value.source.label().to_string());
                 if discovery.warning.is_some() {
-                    modal.ratty_warning = discovery.warning;
+                    modal.kitty_warning = discovery.warning;
                 }
             }
             Err(error) => {
-                modal.ratty_resolved_path = None;
-                modal.ratty_path_source = None;
-                modal.ratty_warning = Some(format!("failed to discover Ratty: {error}"));
-            }
-        }
-        match imported {
-            Ok(Some(_)) => {
-                modal.ratty_config_source = "Imported from Ghostty".to_string();
-            }
-            Ok(None) => {
-                modal.ratty_config_source = "Ratty default/config discovery".to_string();
-            }
-            Err(error) => {
-                modal.ratty_config_source = "Ratty import status unavailable".to_string();
-                modal.ratty_warning = Some(format!("failed to read Ratty import status: {error}"));
+                modal.kitty_resolved_path = None;
+                modal.kitty_path_source = None;
+                modal.kitty_warning = Some(format!("failed to discover Kitty: {error}"));
             }
         }
     }
@@ -6523,7 +6371,13 @@ async fn activate_settings_focus(
                 .app
                 .settings
                 .as_ref()
-                .map(|modal| (modal.theme_primary.clone(), modal.theme_secondary.clone(), modal.theme_text.clone()))
+                .map(|modal| {
+                    (
+                        modal.theme_primary.clone(),
+                        modal.theme_secondary.clone(),
+                        modal.theme_text.clone(),
+                    )
+                })
                 .ok_or_else(|| anyhow!("theme editor is closed"))?;
             let mut theme = state
                 .app
@@ -6638,17 +6492,17 @@ async fn activate_settings_focus(
             refresh_settings_modal(app_state, state).await?;
             set_settings_status(state, "sticker deleted");
         }
-        SettingsField::RattyPathSave => {
+        SettingsField::KittyPathSave => {
             let value = state
                 .app
                 .settings
                 .as_ref()
-                .map(|modal| modal.ratty_path.trim().to_string())
+                .map(|modal| modal.kitty_path.trim().to_string())
                 .unwrap_or_default();
-            let mut preferences = match crate::ratty_host::load_preferences(&app_state.app_dir) {
+            let mut preferences = match crate::kitty_host::load_preferences(&app_state.app_dir) {
                 Ok(preferences) => preferences,
                 Err(error) => {
-                    set_settings_error(state, format!("failed to load Ratty path: {error}"));
+                    set_settings_error(state, format!("failed to load Kitty path: {error}"));
                     return Ok(());
                 }
             };
@@ -6659,55 +6513,20 @@ async fn activate_settings_focus(
                 if !path.is_file() {
                     set_settings_error(
                         state,
-                        format!("Ratty executable not found: {}", path.display()),
+                        format!("Kitty executable not found: {}", path.display()),
                     );
                     return Ok(());
                 }
                 Some(path)
             };
             if let Err(error) =
-                crate::ratty_host::save_preferences(&app_state.app_dir, &preferences)
+                crate::kitty_host::save_preferences(&app_state.app_dir, &preferences)
             {
-                set_settings_error(state, format!("failed to save Ratty path: {error}"));
+                set_settings_error(state, format!("failed to save Kitty path: {error}"));
                 return Ok(());
             }
             refresh_settings_modal(app_state, state).await?;
-            set_settings_status(state, "Ratty path saved; restart RChat to apply");
-        }
-        SettingsField::RattyImportGhostty => {
-            let imported = match ghostty_import::import_from_ghostty(&app_state.app_dir) {
-                Ok(imported) => imported,
-                Err(error) => {
-                    set_settings_error(state, format!("Ghostty import failed: {error}"));
-                    return Ok(());
-                }
-            };
-            refresh_settings_modal(app_state, state).await?;
-            set_settings_status(
-                state,
-                format!(
-                    "Ghostty settings imported to {}; restart RChat to apply",
-                    imported.config_path.display()
-                ),
-            );
-        }
-        SettingsField::RattyReset => {
-            let changed = match ghostty_import::reset_managed_ratty_config(&app_state.app_dir) {
-                Ok(changed) => changed,
-                Err(error) => {
-                    set_settings_error(state, format!("failed to reset Ratty settings: {error}"));
-                    return Ok(());
-                }
-            };
-            refresh_settings_modal(app_state, state).await?;
-            set_settings_status(
-                state,
-                if changed {
-                    "Ratty import reset; restart RChat to use Ratty defaults"
-                } else {
-                    "Ratty is already using its defaults"
-                },
-            );
+            set_settings_status(state, "Kitty path saved; restart RChat to apply");
         }
         SettingsField::ScreenShareTest => {
             state.local_screen_test_requested = true;
@@ -6769,7 +6588,9 @@ async fn activate_settings_focus(
                         refresh_settings_modal(app_state, state).await?;
                         set_settings_status(state, "peer renamed");
                     }
-                    Err(error) => set_settings_error(state, format!("failed to rename peer: {error}")),
+                    Err(error) => {
+                        set_settings_error(state, format!("failed to rename peer: {error}"))
+                    }
                 }
             } else {
                 set_settings_error(state, "select a peer before renaming");
@@ -6795,7 +6616,9 @@ async fn activate_settings_focus(
                         refresh_settings_modal(app_state, state).await?;
                         set_settings_status(state, "peer removed");
                     }
-                    Err(error) => set_settings_error(state, format!("failed to remove peer: {error}")),
+                    Err(error) => {
+                        set_settings_error(state, format!("failed to remove peer: {error}"))
+                    }
                 }
             } else {
                 set_settings_error(state, "no peer removal is pending");
@@ -6828,7 +6651,9 @@ async fn activate_settings_focus(
                         }
                         set_settings_status(state, format!("accepted request from {peer_id}"));
                     }
-                    Err(error) => set_settings_error(state, format!("failed to accept request: {error}")),
+                    Err(error) => {
+                        set_settings_error(state, format!("failed to accept request: {error}"))
+                    }
                 }
             } else {
                 set_settings_error(state, "no incoming request selected");
@@ -6854,7 +6679,9 @@ async fn activate_settings_focus(
                         }
                         set_settings_status(state, format!("rejected request from {peer_id}"));
                     }
-                    Err(error) => set_settings_error(state, format!("failed to reject request: {error}")),
+                    Err(error) => {
+                        set_settings_error(state, format!("failed to reject request: {error}"))
+                    }
                 }
             } else {
                 set_settings_error(state, "no incoming request selected");
@@ -6879,7 +6706,9 @@ async fn activate_settings_focus(
                             },
                         );
                     }
-                    Err(error) => set_settings_error(state, format!("failed to update pin: {error}")),
+                    Err(error) => {
+                        set_settings_error(state, format!("failed to update pin: {error}"))
+                    }
                 }
             }
         }
@@ -6892,7 +6721,7 @@ async fn activate_settings_focus(
         | SettingsField::ThemeSecondary
         | SettingsField::ThemeText
         | SettingsField::StickerPath
-        | SettingsField::RattyPath => {}
+        | SettingsField::KittyPath => {}
         SettingsField::Sticker(index) => {
             if let Some(modal) = state.app.settings.as_mut() {
                 modal.select_sticker(index);
@@ -9691,7 +9520,7 @@ impl Drop for OutputRedirect {
 
 struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Box<dyn Write>>>,
-    ratty_bitmap_active: bool,
+    kitty_graphics_active: bool,
 }
 
 impl TerminalSession {
@@ -9704,7 +9533,7 @@ impl TerminalSession {
         let terminal = Terminal::new(backend).context("failed to start terminal")?;
         let mut session = Self {
             terminal,
-            ratty_bitmap_active: false,
+            kitty_graphics_active: false,
         };
         session.clear()?;
         Ok(session)
@@ -9756,8 +9585,8 @@ impl TerminalSession {
             .context("failed to flush terminal media commands")
     }
 
-    fn set_ratty_bitmap_active(&mut self, active: bool) {
-        self.ratty_bitmap_active = active;
+    fn set_kitty_graphics_active(&mut self, active: bool) {
+        self.kitty_graphics_active = active;
     }
 }
 
@@ -9768,8 +9597,8 @@ fn force_full_redraw_after_external_clear<B: Backend>(terminal: &mut Terminal<B>
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        if self.ratty_bitmap_active {
-            let _ = self.write_bitmap_commands(&ratty_bitmap::cleanup_all_commands());
+        if self.kitty_graphics_active {
+            let _ = self.write_bitmap_commands(&kitty_live::cleanup_all_commands());
         }
         let _ = disable_raw_mode();
         if let Ok(mut output) = terminal_output() {
@@ -9798,8 +9627,8 @@ struct UiState {
     app: TuiAppState,
     status: String,
     protocol_type: ProtocolType,
-    ratty_hosted: bool,
-    ratty_bitmap_available: bool,
+    kitty_hosted: bool,
+    kitty_frames_available: bool,
     fast_kitty_viewer: bool,
     kitty_detection_forced: bool,
     event_sink: TuiEventSink,
@@ -9859,8 +9688,8 @@ impl UiState {
             app: TuiAppState::default(),
             status: "network running".to_string(),
             protocol_type,
-            ratty_hosted: false,
-            ratty_bitmap_available: false,
+            kitty_hosted: false,
+            kitty_frames_available: false,
             fast_kitty_viewer: false,
             kitty_detection_forced: false,
             event_sink,
@@ -10440,8 +10269,8 @@ fn render_media_shell(
     frame: &mut Frame<'_>,
     state: &mut UiState,
     kitty_available: bool,
-    ratty_bitmap_available: bool,
-    ratty_targets: &mut RattyRenderTargets,
+    kitty_frames_available: bool,
+    media_targets: &mut MediaRenderTargets,
 ) {
     let root = Layout::default()
         .direction(Direction::Horizontal)
@@ -10452,15 +10281,15 @@ fn render_media_shell(
         root[0],
         state,
         kitty_available,
-        ratty_bitmap_available,
+        kitty_frames_available,
     );
     render_media(
         frame,
         root[1],
         state,
         kitty_available,
-        ratty_bitmap_available,
-        ratty_targets,
+        kitty_frames_available,
+        media_targets,
     );
 }
 
@@ -10470,14 +10299,14 @@ fn render_app_shell(
     inline_loader: Option<&InlineMediaLoader>,
     protocol_worker: Option<&ProtocolWorker>,
     kitty_available: bool,
-    ratty_bitmap_available: bool,
-    ratty_targets: &mut RattyRenderTargets,
+    kitty_frames_available: bool,
+    media_targets: &mut MediaRenderTargets,
 ) {
     let theme = app_background_theme(state);
     let modal_theme = modal_overlay_theme(state);
     let background_kitty_available = background_kitty_media_enabled(state, kitty_available);
-    let background_ratty_bitmap_available =
-        ratty_bitmap_available && !graphics_obscuring_overlay_active(state);
+    let background_kitty_frames_available =
+        kitty_frames_available && !graphics_obscuring_overlay_active(state);
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.bg)),
         frame.area(),
@@ -10507,8 +10336,8 @@ fn render_app_shell(
             panels[panel_index],
             state,
             background_kitty_available,
-            background_ratty_bitmap_available,
-            ratty_targets,
+            background_kitty_frames_available,
+            media_targets,
             &theme,
         );
         panel_index += 1;
@@ -10519,8 +10348,8 @@ fn render_app_shell(
             panels[panel_index],
             state,
             background_kitty_available,
-            background_ratty_bitmap_available,
-            ratty_targets,
+            background_kitty_frames_available,
+            media_targets,
             &theme,
         );
         panel_index += 1;
@@ -10601,10 +10430,9 @@ fn render_app_shell(
             protocol_worker,
             MediaCapabilities {
                 kitty: kitty_available,
-                ratty_bitmap: ratty_bitmap_available,
                 fast_kitty_viewer: state.fast_kitty_viewer,
             },
-            ratty_targets,
+            media_targets,
             &modal_theme,
         );
     }
@@ -10774,8 +10602,8 @@ fn render_screen_share_panel(
     area: Rect,
     state: &mut UiState,
     kitty_available: bool,
-    ratty_bitmap_available: bool,
-    ratty_targets: &mut RattyRenderTargets,
+    kitty_frames_available: bool,
+    media_targets: &mut MediaRenderTargets,
     theme: &Theme,
 ) {
     let peer = state.broadcast_state.peer_id.as_deref().unwrap_or("peer");
@@ -10784,8 +10612,8 @@ fn render_screen_share_panel(
     frame.render_widget(block, area);
     state.media_size = Size::new(inner.width, inner.height);
 
-    if !ratty_bitmap_available && !kitty_available {
-        let message = Paragraph::new("Screen share requires Ratty bitmap or Kitty image support.")
+    if !kitty_frames_available && !kitty_available {
+        let message = Paragraph::new("Screen share requires Kitty graphics support.")
             .style(Style::default().bg(theme.bg).fg(theme.muted))
             .wrap(Wrap { trim: true });
         frame.render_widget(message, inner);
@@ -10798,8 +10626,8 @@ fn render_screen_share_panel(
         frame.render_widget(message, inner);
         return;
     }
-    if ratty_bitmap_available {
-        ratty_targets.screen = ratty_destination(inner);
+    if kitty_frames_available {
+        media_targets.screen = media_destination(inner);
         if state.decoded_frames == 0 {
             let message = Paragraph::new("Waiting for screen-share frames...")
                 .style(Style::default().bg(theme.bg).fg(theme.muted))
@@ -10823,8 +10651,8 @@ fn render_remote_video_panel(
     area: Rect,
     state: &mut UiState,
     kitty_available: bool,
-    ratty_bitmap_available: bool,
-    ratty_targets: &mut RattyRenderTargets,
+    kitty_frames_available: bool,
+    media_targets: &mut MediaRenderTargets,
     theme: &Theme,
 ) {
     let block = themed_block(" Remote video ", theme);
@@ -10832,8 +10660,8 @@ fn render_remote_video_panel(
     frame.render_widget(block, area);
     state.remote_video_size = Size::new(inner.width, inner.height);
 
-    if !ratty_bitmap_available && !kitty_available {
-        let message = Paragraph::new("Remote video requires Ratty bitmap or Kitty image support.")
+    if !kitty_frames_available && !kitty_available {
+        let message = Paragraph::new("Remote video requires Kitty graphics support.")
             .style(Style::default().bg(theme.bg).fg(theme.muted))
             .wrap(Wrap { trim: true });
         frame.render_widget(message, inner);
@@ -10856,8 +10684,8 @@ fn render_remote_video_panel(
         return;
     }
 
-    if ratty_bitmap_available {
-        ratty_targets.remote_video = ratty_destination(inner);
+    if kitty_frames_available {
+        media_targets.remote_video = media_destination(inner);
         if state.remote_video_decoded_frames == 0 {
             let message = Paragraph::new("Waiting for remote video frames...")
                 .style(Style::default().bg(theme.bg).fg(theme.muted))
@@ -11927,9 +11755,10 @@ fn render_help_line(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &
 fn help_line_text(state: &UiState, width: usize) -> String {
     if state.app.voice_recording.phase != VoiceRecordingPhase::Idle {
         return match state.app.voice_recording.phase {
-            VoiceRecordingPhase::Recording => {
-                fit_segments(&["Recording", "Enter stop", "Esc cancel", "duration + size"], width)
-            }
+            VoiceRecordingPhase::Recording => fit_segments(
+                &["Recording", "Enter stop", "Esc cancel", "duration + size"],
+                width,
+            ),
             VoiceRecordingPhase::Review => fit_segments(
                 &["Voice note", "p preview", "s send", "c cancel", "Esc cancel"],
                 width,
@@ -12367,11 +12196,25 @@ fn render_group_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiSta
     lines.push(chat_details_button_line(
         details,
         ChatDetailsField::FileNext,
-        if details.file_has_more { "Load more files" } else { "No more files" },
+        if details.file_has_more {
+            "Load more files"
+        } else {
+            "No more files"
+        },
         theme,
     ));
-    lines.push(chat_details_button_line(details, ChatDetailsField::FileOpen, "Open selected file", theme));
-    lines.push(chat_details_button_line(details, ChatDetailsField::FileSave, "Save selected file", theme));
+    lines.push(chat_details_button_line(
+        details,
+        ChatDetailsField::FileOpen,
+        "Open selected file",
+        theme,
+    ));
+    lines.push(chat_details_button_line(
+        details,
+        ChatDetailsField::FileSave,
+        "Save selected file",
+        theme,
+    ));
     lines.push(Line::from(Span::styled(
         "Up/Down action/file | Left/Right peer/file | PageUp/PageDown scroll | Enter activate | ? help | Esc close",
         Style::default().fg(theme.muted),
@@ -12536,11 +12379,25 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
     lines.push(chat_details_button_line(
         details,
         ChatDetailsField::FileNext,
-        if details.file_has_more { "Load more files" } else { "No more files" },
+        if details.file_has_more {
+            "Load more files"
+        } else {
+            "No more files"
+        },
         theme,
     ));
-    lines.push(chat_details_button_line(details, ChatDetailsField::FileOpen, "Open selected file", theme));
-    lines.push(chat_details_button_line(details, ChatDetailsField::FileSave, "Save selected file", theme));
+    lines.push(chat_details_button_line(
+        details,
+        ChatDetailsField::FileOpen,
+        "Open selected file",
+        theme,
+    ));
+    lines.push(chat_details_button_line(
+        details,
+        ChatDetailsField::FileSave,
+        "Save selected file",
+        theme,
+    ));
     lines.push(Line::from(Span::styled(
         "Up/Down action | Left/Right file | Enter activate | Esc close",
         Style::default().fg(theme.muted),
@@ -12838,7 +12695,7 @@ fn render_attachment_preview_box(
                 theme,
                 "image preview unavailable",
                 path,
-                Some("Kitty/Ratty image support is not active"),
+                Some("Kitty image support is not active"),
             );
         }
         MediaKind::Video => {
@@ -13171,7 +13028,7 @@ fn render_media_viewer_overlay(
     state: &mut UiState,
     protocol_worker: Option<&ProtocolWorker>,
     capabilities: MediaCapabilities,
-    ratty_targets: &mut RattyRenderTargets,
+    media_targets: &mut MediaRenderTargets,
     theme: &Theme,
 ) {
     let Some(viewer) = state.app.media_viewer.clone() else {
@@ -13199,7 +13056,7 @@ fn render_media_viewer_overlay(
             state,
             protocol_worker,
             capabilities,
-            ratty_targets,
+            media_targets,
             theme,
         ),
         MediaViewerKind::Video => render_media_viewer_placeholder(
@@ -13225,50 +13082,10 @@ fn render_media_viewer_overlay(
     render_media_viewer_details(frame, layout[1], &viewer, theme);
 }
 
-fn reconcile_ratty_viewer(
-    state: &mut UiState,
-    manager: &mut RattyBitmapManager,
-    destination: Option<RattyDestination>,
-    commands: &mut Vec<Vec<u8>>,
-) {
-    let desired = destination.and_then(|destination| {
-        let viewer = state.app.media_viewer.clone()?;
-        let loaded = state
-            .viewer_image
-            .as_ref()
-            .filter(|loaded| loaded.file_hash == viewer.file_hash)?;
-        Some((viewer, Arc::clone(&loaded.image), destination))
-    });
-
-    let Some((viewer, image, destination)) = desired else {
-        commands.extend(manager.clear_viewer());
-        return;
-    };
-    match manager.update_viewer(
-        &viewer.file_hash,
-        image.as_ref(),
-        ViewerView::new(viewer.zoom_percent, viewer.pan_x, viewer.pan_y),
-        destination,
-    ) {
-        Ok(next) => {
-            commands.extend(next);
-            if let Some(viewer) = state.app.media_viewer.as_mut() {
-                viewer.error = None;
-            }
-        }
-        Err(error) => {
-            commands.extend(manager.clear_viewer());
-            if let Some(viewer) = state.app.media_viewer.as_mut() {
-                viewer.error = Some(error.to_string());
-            }
-        }
-    }
-}
-
 fn reconcile_kitty_viewer(
     state: &mut UiState,
     manager: &mut KittyViewerManager,
-    destination: Option<RattyDestination>,
+    destination: Option<Destination>,
     commands: &mut Vec<Vec<u8>>,
 ) {
     let desired = destination.and_then(|destination| {
@@ -13311,7 +13128,7 @@ fn render_media_viewer_image(
     state: &mut UiState,
     protocol_worker: Option<&ProtocolWorker>,
     capabilities: MediaCapabilities,
-    ratty_targets: &mut RattyRenderTargets,
+    media_targets: &mut MediaRenderTargets,
     theme: &Theme,
 ) {
     let Some(viewer) = state.app.media_viewer.clone() else {
@@ -13321,11 +13138,11 @@ fn render_media_viewer_image(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if !capabilities.ratty_bitmap && !capabilities.kitty {
+    if !capabilities.kitty {
         render_media_viewer_placeholder(
             frame,
             inner,
-            "Ratty bitmap and Kitty image protocols are unavailable. Metadata and file actions are still available.",
+            "Kitty graphics are unavailable. Metadata and file actions are still available.",
             theme,
         );
         return;
@@ -13340,8 +13157,8 @@ fn render_media_viewer_image(
         return;
     };
 
-    if capabilities.ratty_bitmap || capabilities.fast_kitty_viewer {
-        ratty_targets.viewer = ratty_destination(inner);
+    if capabilities.fast_kitty_viewer {
+        media_targets.viewer = media_destination(inner);
         return;
     }
 
@@ -14240,37 +14057,24 @@ fn settings_media_lines(state: &UiState, theme: &Theme) -> Vec<Line<'static>> {
             ))
         },
         Line::from(""),
-        Line::from("Ratty terminal host"),
+        Line::from("Kitty terminal host"),
         Line::from(format!(
             "Resolved: {} ({})",
-            modal.ratty_resolved_path.as_deref().unwrap_or("not found"),
-            modal.ratty_path_source.as_deref().unwrap_or("none")
+            modal.kitty_resolved_path.as_deref().unwrap_or("not found"),
+            modal.kitty_path_source.as_deref().unwrap_or("none")
         )),
-        Line::from(format!("Configuration: {}", modal.ratty_config_source)),
-        Line::from(modal.ratty_warning.clone().unwrap_or_default()),
+        Line::from(modal.kitty_warning.clone().unwrap_or_default()),
         settings_input_line(
             modal,
-            SettingsField::RattyPath,
+            SettingsField::KittyPath,
             "Executable path",
-            &modal.ratty_path,
+            &modal.kitty_path,
             theme,
         ),
         settings_button_line(
             modal,
-            SettingsField::RattyPathSave,
-            "Save Ratty path",
-            theme,
-        ),
-        settings_button_line(
-            modal,
-            SettingsField::RattyImportGhostty,
-            "Import from Ghostty",
-            theme,
-        ),
-        settings_button_line(
-            modal,
-            SettingsField::RattyReset,
-            "Reset imported Ratty settings",
+            SettingsField::KittyPathSave,
+            "Save Kitty path",
             theme,
         ),
         Line::from(""),
@@ -14288,12 +14092,12 @@ fn settings_media_lines(state: &UiState, theme: &Theme) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from("Media diagnostics"),
         Line::from(format!(
-            "Hosted by Ratty: {}",
-            if state.ratty_hosted { "yes" } else { "no" }
+            "Hosted by Kitty: {}",
+            if state.kitty_hosted { "yes" } else { "no" }
         )),
         Line::from(format!(
-            "Ratty bitmap v1: {}",
-            if state.ratty_bitmap_available {
+            "Kitty frame updates: {}",
+            if state.kitty_frames_available {
                 "yes"
             } else {
                 "no"
@@ -15265,7 +15069,7 @@ fn render_status(
     area: Rect,
     state: &UiState,
     kitty_available: bool,
-    ratty_bitmap_available: bool,
+    kitty_frames_available: bool,
 ) {
     let mut lines = vec![
         Line::from(Span::styled(
@@ -15280,8 +15084,8 @@ fn render_status(
             if kitty_available { "yes" } else { "no" }
         )),
         Line::from(format!(
-            "Ratty bitmap v1: {}",
-            if ratty_bitmap_available { "yes" } else { "no" }
+            "Kitty frame updates: {}",
+            if kitty_frames_available { "yes" } else { "no" }
         )),
         Line::from(format!(
             "Connected chats: {}",
@@ -15347,24 +15151,24 @@ fn render_media(
     area: Rect,
     state: &mut UiState,
     kitty_available: bool,
-    ratty_bitmap_available: bool,
-    ratty_targets: &mut RattyRenderTargets,
+    kitty_frames_available: bool,
+    media_targets: &mut MediaRenderTargets,
 ) {
     let block = Block::default().title("Screen").borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     state.media_size = Size::new(inner.width, inner.height);
 
-    if !ratty_bitmap_available && !kitty_available {
-        let message = Paragraph::new("Ratty bitmap and Kitty image protocols are unavailable.")
+    if !kitty_frames_available && !kitty_available {
+        let message = Paragraph::new("Kitty graphics are unavailable.")
             .style(Style::default().fg(Color::Yellow))
             .wrap(Wrap { trim: true });
         frame.render_widget(message, inner);
         return;
     }
 
-    if ratty_bitmap_available {
-        ratty_targets.screen = ratty_destination(inner);
+    if kitty_frames_available {
+        media_targets.screen = media_destination(inner);
         if state.decoded_frames == 0 {
             let message = Paragraph::new("Waiting for screen-share frames...")
                 .style(Style::default().fg(Color::DarkGray));
@@ -15393,14 +15197,12 @@ fn screen_protocol_seq(response: &ProtocolResponse) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod rio_viewer_route_tests {
+mod kitty_viewer_route_tests {
     use super::fast_kitty_viewer_enabled;
-
     #[test]
-    fn rio_uses_fast_kitty_viewer_when_kitty_is_available() {
-        assert!(fast_kitty_viewer_enabled(true, false, Some("Rio")));
-        assert!(!fast_kitty_viewer_enabled(false, false, Some("Rio")));
-        assert!(!fast_kitty_viewer_enabled(true, true, Some("Rio")));
-        assert!(!fast_kitty_viewer_enabled(true, false, Some("Ghostty")));
+    fn kitty_uses_fast_viewer() {
+        assert!(fast_kitty_viewer_enabled(true, Some("kitty")));
+        assert!(!fast_kitty_viewer_enabled(false, Some("kitty")));
+        assert!(!fast_kitty_viewer_enabled(true, None));
     }
 }

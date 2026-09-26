@@ -5,7 +5,7 @@ use base64::Engine as _;
 use image::{DynamicImage, ImageEncoder as _};
 use ratatui_image::FontSize;
 
-use crate::ratty_bitmap::{viewer_geometry, Destination, SourceRect, ViewerView};
+use crate::image_geometry::{viewer_geometry, Destination, SourceRect, ViewerView};
 
 const VIEWER_IMAGE_ID: u32 = 0x5243_0003;
 const VIEWER_PLACEMENT_ID: u32 = 0x5243_1003;

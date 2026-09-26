@@ -1,22 +1,45 @@
-//! Experimental Kitty animation-frame output for the media smoke test.
+//! Persistent Kitty frame output for live media.
 use anyhow::{ensure, Result};
 use base64::Engine as _;
 use ratatui_image::FontSize;
 
 use crate::{
+    image_geometry::{Destination, ViewerView},
     kitty_viewer::kitty_viewer_geometry,
-    ratty_bitmap::{Destination, ViewerView},
 };
 
 const IMAGE_ID: u32 = 0x5243_0020;
 
-#[derive(Default)]
+#[derive(Debug)]
 pub struct KittyVideo {
+    image_id: u32,
     dimensions: Option<(u32, u32)>,
     destination: Option<Destination>,
 }
 
+impl Default for KittyVideo {
+    fn default() -> Self {
+        Self::new(IMAGE_ID)
+    }
+}
+
 impl KittyVideo {
+    pub fn new(image_id: u32) -> Self {
+        Self {
+            image_id,
+            dimensions: None,
+            destination: None,
+        }
+    }
+
+    pub fn hide(&mut self) -> Vec<Vec<u8>> {
+        if self.destination.take().is_some() {
+            vec![format!("\x1b_Ga=d,d=i,i={},q=2\x1b\\", self.image_id).into_bytes()]
+        } else {
+            Vec::new()
+        }
+    }
+
     pub fn update(&mut self, rgba: &[u8], width: u32, height: u32) -> Result<Vec<Vec<u8>>> {
         ensure!(width > 0 && height > 0, "empty video frame");
         let expected = u64::from(width) * u64::from(height) * 4;
@@ -28,6 +51,7 @@ impl KittyVideo {
         if self.dimensions.is_some_and(|size| size != (width, height)) {
             commands.extend(self.clear());
         }
+        let image_id = self.image_id;
         let action = if self.dimensions.is_some() {
             "a=f,r=1,X=1"
         } else {
@@ -41,7 +65,7 @@ impl KittyVideo {
             // Kitty releases cannot interpret a frame continuation as a new image.
             let more = u8::from(index + 1 < count);
             let mut command =
-                format!("\x1b_G{action},i={IMAGE_ID},f=32,s={width},v={height},t=d,q=2,m={more};")
+                format!("\x1b_G{action},i={image_id},f=32,s={width},v={height},t=d,q=2,m={more};")
                     .into_bytes();
             command.extend_from_slice(chunk);
             command.extend_from_slice(b"\x1b\\");
@@ -66,8 +90,9 @@ impl KittyVideo {
             return Vec::new();
         }
         self.destination = Some(destination);
+        let image_id = self.image_id;
         vec![format!(
-            "\x1b7\x1b[{};{}H\x1b_Ga=p,i={IMAGE_ID},p=1,c={},r={},C=1,q=2\x1b\\\x1b8",
+            "\x1b7\x1b[{};{}H\x1b_Ga=p,i={image_id},p=1,c={},r={},C=1,q=2\x1b\\\x1b8",
             u32::from(destination.row) + 1,
             u32::from(destination.col) + 1,
             destination.width,
@@ -78,8 +103,9 @@ impl KittyVideo {
 
     pub fn clear(&mut self) -> Vec<Vec<u8>> {
         self.destination = None;
+        let image_id = self.image_id;
         if self.dimensions.take().is_some() {
-            vec![format!("\x1b_Ga=d,d=I,i={IMAGE_ID},q=2\x1b\\").into_bytes()]
+            vec![format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\").into_bytes()]
         } else {
             Vec::new()
         }
@@ -89,6 +115,25 @@ impl KittyVideo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_video_surfaces_hide_and_restore_without_reupload() {
+        let mut screen = KittyVideo::new(101);
+        let mut camera = KittyVideo::new(102);
+        let a = String::from_utf8(screen.update(&[0; 16], 2, 2).unwrap().concat()).unwrap();
+        let b = String::from_utf8(camera.update(&[0; 16], 2, 2).unwrap().concat()).unwrap();
+        assert!(a.contains("i=101,"));
+        assert!(b.contains("i=102,"));
+        let viewport = Destination::new(0, 0, 20, 10);
+        screen.place(viewport, FontSize::new(8, 16));
+        let hidden = String::from_utf8(screen.hide().concat()).unwrap();
+        assert!(hidden.contains("d=i,"));
+        assert!(!hidden.contains("d=I,"));
+        let restored =
+            String::from_utf8(screen.place(viewport, FontSize::new(8, 16)).concat()).unwrap();
+        assert!(restored.contains("a=p,"));
+        assert!(!restored.contains("a=t,"));
+    }
 
     #[test]
     fn kitty_video_updates_root_frame_without_retransmit_or_delete() {
