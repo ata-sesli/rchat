@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import { baselineFor, packageName } from './package-linux.mjs';
+assert.deepEqual(baselineFor('ubuntu', '24.04'), { format: 'deb', glibc: '2.39', tag: 'ubuntu24.04' });
+assert.deepEqual(baselineFor('fedora', '44'), { format: 'rpm', glibc: '2.43', tag: 'fedora44' });
+assert.throws(() => baselineFor('ubuntu', '26.04'));
+assert.throws(() => baselineFor('fedora', '43'));
+assert.equal(packageName('tui'), 'rchat-tui');
+assert.equal(packageName('gui'), 'rchat');
+assert.throws(() => packageName('other'));
+console.log('Linux package baseline tests passed');

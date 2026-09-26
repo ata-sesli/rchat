@@ -33,6 +33,7 @@
   },
   "bundle": {
     "active": true,
+    "resources": ["licenses/libvpx-LICENSE"],
     "targets": "all",
     "windows": {
       "webviewInstallMode": {
@@ -42,7 +43,6 @@
     },
     "linux": {
       "deb": {
-        "preInstallScript": "scripts/deb-preinstall.sh",
         "postInstallScript": "scripts/deb-postinstall.sh",
         "preRemoveScript": "scripts/deb-preremove.sh",
         "postRemoveScript": "scripts/deb-postremove.sh",
@@ -54,7 +54,7 @@
           "libasound2",
           "libssl3",
           "libopus0",
-          "libvpx9 | libvpx8 | libvpx7",
+          "libvpx9",
           "libavahi-client3",
           "libavahi-compat-libdnssd1",
           "pipewire",
@@ -62,7 +62,6 @@
         ]
       },
       "rpm": {
-        "preInstallScript": "scripts/rpm-preinstall.sh",
         "postInstallScript": "scripts/rpm-postinstall.sh",
         "preRemoveScript": "scripts/rpm-preremove.sh",
         "postRemoveScript": "scripts/rpm-postremove.sh",
