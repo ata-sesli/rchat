@@ -25,6 +25,12 @@ impl NetworkManager {
     }
 
     pub(super) async fn push_idle_call_state(&mut self, reason: Option<String>) {
+        if self.active_call.is_none() {
+            self.media_admission
+                .set(crate::network::media_admission::MediaKind::Voice, None);
+            self.media_admission
+                .set(crate::network::media_admission::MediaKind::Video, None);
+        }
         self.set_voice_call_state(VoiceCallState::default(), reason)
             .await;
     }
@@ -35,6 +41,16 @@ impl NetworkManager {
         phase: VoiceCallPhase,
         reason: Option<String>,
     ) {
+        use crate::network::media_admission::MediaKind;
+        // Accept and stream negotiation travel independently. Associate ringing
+        // sessions too so streams arriving before CallAccept are not discarded.
+        let session =
+            (phase != VoiceCallPhase::Ending).then(|| (call.remote_peer_id, call.call_id.clone()));
+        self.media_admission.set(MediaKind::Voice, session.clone());
+        self.media_admission.set(
+            MediaKind::Video,
+            session.filter(|_| call.kind == CallKind::Video),
+        );
         self.set_voice_call_state(
             VoiceCallState {
                 phase,
@@ -816,31 +832,17 @@ impl NetworkManager {
 pub(super) fn start_voice_stream_accept_loop(
     incoming: crate::network::voice_stream::IncomingStreams,
     event_tx: tokio::sync::mpsc::Sender<VoiceStreamEvent>,
-) {
-    tokio::spawn(async move {
-        futures::pin_mut!(incoming);
-        while let Some((peer, mut stream)) = incoming.next().await {
-            let event_tx = event_tx.clone();
-            tokio::spawn(async move {
-                eprintln!("[Voice][Stream] inbound stream accepted peer={}", peer);
-                let call_id = match read_voice_stream_header(&mut stream).await {
-                    Ok(call_id) => call_id,
-                    Err(e) => {
-                        let _ = event_tx
-                            .send(VoiceStreamEvent::InboundFailure {
-                                peer,
-                                call_id: None,
-                                error: e.to_string(),
-                            })
-                            .await;
-                        return;
-                    }
-                };
-                eprintln!(
-                    "[Voice][Stream] inbound header read peer={} call_id={}",
-                    peer, call_id
-                );
-
+) -> tokio::task::JoinHandle<()> {
+    crate::network::media_admission::spawn_readers(incoming, move |peer, mut stream, mut permit| {
+        let event_tx = event_tx.clone();
+        async move {
+            let Some(call_id) = permit.header(read_voice_stream_header(&mut stream)).await else {
+                return;
+            };
+            if !permit.authorize(&call_id) {
+                return;
+            }
+            permit.run(async {
                 let mut first_frame_read = false;
                 loop {
                     match read_voice_stream_frame(&mut stream).await {
@@ -881,7 +883,8 @@ pub(super) fn start_voice_stream_accept_loop(
                         }
                     }
                 }
-            });
+
+            }).await;
         }
-    });
+    })
 }

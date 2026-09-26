@@ -75,19 +75,26 @@ impl RChatBehaviour {
             request_response::Config::default(),
         );
 
+        let admission = super::media_admission::MediaAdmission::default();
         // 6b. Stream protocol (Voice Frames)
-        let voice_call = crate::network::voice_stream::Behaviour::new(libp2p::StreamProtocol::new(
-            crate::live::voice::protocol::VOICE_PROTOCOL,
-        ));
+        let voice_call = crate::network::voice_stream::Behaviour::new(
+            libp2p::StreamProtocol::new(crate::live::voice::protocol::VOICE_PROTOCOL),
+            super::media_admission::MediaKind::Voice,
+            admission.clone(),
+        );
 
         // 6c. Stream protocol (Video Frames)
-        let video_call = crate::network::voice_stream::Behaviour::new(libp2p::StreamProtocol::new(
-            crate::live::video::video::VIDEO_PROTOCOL,
-        ));
+        let video_call = crate::network::voice_stream::Behaviour::new(
+            libp2p::StreamProtocol::new(crate::live::video::video::VIDEO_PROTOCOL),
+            super::media_admission::MediaKind::Video,
+            admission.clone(),
+        );
 
         // 6d. Stream protocol (Screen Broadcast Frames)
         let broadcast_stream = crate::network::voice_stream::Behaviour::new(
             libp2p::StreamProtocol::new(crate::live::broadcast::broadcast::BROADCAST_PROTOCOL),
+            super::media_admission::MediaKind::Broadcast,
+            admission,
         );
 
         // 6e. Request-Response (legacy Broadcast Frames)

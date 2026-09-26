@@ -10,7 +10,6 @@ use crate::live::broadcast::protocol::{
 };
 use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
 use futures::io::AsyncWriteExt;
-use futures::StreamExt;
 use libp2p::request_response;
 use std::time::{Duration, Instant};
 
@@ -469,31 +468,20 @@ fn maybe_emit_worker_stats(
 pub(super) fn start_screen_broadcast_stream_accept_loop(
     incoming: crate::network::voice_stream::IncomingStreams,
     event_tx: tokio::sync::mpsc::Sender<ScreenBroadcastStreamEvent>,
-) {
-    tokio::spawn(async move {
-        futures::pin_mut!(incoming);
-        while let Some((peer, mut stream)) = incoming.next().await {
-            let event_tx = event_tx.clone();
-            tokio::spawn(async move {
-                eprintln!("[Broadcast][Stream] inbound stream accepted peer={}", peer);
-                let session_id = match read_broadcast_stream_header(&mut stream).await {
-                    Ok(session_id) => session_id,
-                    Err(error) => {
-                        let _ = event_tx
-                            .send(ScreenBroadcastStreamEvent::InboundFailure {
-                                peer,
-                                session_id: None,
-                                error: error.to_string(),
-                            })
-                            .await;
-                        return;
-                    }
-                };
-                eprintln!(
-                    "[Broadcast][Stream] inbound header read peer={} session_id={}",
-                    peer, session_id
-                );
-
+) -> tokio::task::JoinHandle<()> {
+    crate::network::media_admission::spawn_readers(incoming, move |peer, mut stream, mut permit| {
+        let event_tx = event_tx.clone();
+        async move {
+            let Some(session_id) = permit
+                .header(read_broadcast_stream_header(&mut stream))
+                .await
+            else {
+                return;
+            };
+            if !permit.authorize(&session_id) {
+                return;
+            }
+            permit.run(async {
                 let mut first_frame_read = false;
                 loop {
                     match read_broadcast_stream_record(&mut stream).await {
@@ -536,11 +524,11 @@ pub(super) fn start_screen_broadcast_stream_accept_loop(
                         }
                     }
                 }
-            });
-        }
-    });
-}
 
+            }).await;
+        }
+    })
+}
 impl NetworkManager {
     fn broadcast_session_id_from_signal(request: &DirectMessageRequest) -> String {
         request
@@ -571,6 +559,10 @@ impl NetworkManager {
     }
 
     async fn push_idle_broadcast_state(&mut self, reason: Option<String>) {
+        if self.active_broadcast.is_none() {
+            self.media_admission
+                .set(crate::network::media_admission::MediaKind::Broadcast, None);
+        }
         self.set_broadcast_state(crate::app_state::BroadcastState::default(), reason)
             .await;
     }
@@ -581,6 +573,11 @@ impl NetworkManager {
         phase: BroadcastPhase,
         reason: Option<String>,
     ) {
+        self.media_admission.set(
+            crate::network::media_admission::MediaKind::Broadcast,
+            (phase != BroadcastPhase::Ending)
+                .then(|| (session.remote_peer_id, session.session_id.clone())),
+        );
         self.set_broadcast_state(
             crate::app_state::BroadcastState {
                 phase,
@@ -597,6 +594,8 @@ impl NetworkManager {
     }
 
     async fn transition_broadcast_to_idle(&mut self, reason: Option<String>) {
+        self.media_admission
+            .set(crate::network::media_admission::MediaKind::Broadcast, None);
         self.stop_screen_broadcast_media("final");
         self.active_broadcast = None;
         self.push_idle_broadcast_state(reason).await;

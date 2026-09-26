@@ -8,6 +8,7 @@ pub mod hks;
 pub mod invite;
 mod manager;
 pub mod mdns;
+pub(crate) mod media_admission;
 pub mod stun;
 pub(crate) mod voice_stream;
 use anyhow::Result;
