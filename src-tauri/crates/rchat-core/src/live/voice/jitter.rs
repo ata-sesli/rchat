@@ -27,6 +27,29 @@ impl VoiceJitterBuffer {
         self.pending.clear();
     }
 
+    /// Receive a frame from a reliable ordered stream. Sequence gaps represent
+    /// discarded audio, not packets that can arrive later. Retain the initial
+    /// three-frame prebuffer, then release each frame without waiting on gaps.
+    /// Use this instead of `push` for the whole stream, resetting between calls.
+    pub fn push_ordered(&mut self, seq: u32, frame: Vec<i16>) -> Vec<Vec<i16>> {
+        let first = *self.expected_seq.get_or_insert(seq);
+        // Serial-number arithmetic also rejects duplicates/late frames after
+        // playback crosses u32::MAX. Gaps must be less than half the sequence space.
+        if seq.wrapping_sub(first) >= (1 << 31) {
+            return Vec::new();
+        }
+        self.pending.entry(seq).or_insert(frame);
+        if self.prebuffering && self.pending.len() < START_PREBUFFER_FRAMES {
+            return Vec::new();
+        }
+        self.prebuffering = false;
+        // At most three entries. Numeric BTreeMap order alone is wrong at wrap.
+        let mut ready: Vec<_> = std::mem::take(&mut self.pending).into_iter().collect();
+        ready.sort_by_key(|(seq, _)| seq.wrapping_sub(first));
+        self.expected_seq = ready.last().map(|(seq, _)| seq.wrapping_add(1));
+        ready.into_iter().map(|(_, frame)| frame).collect()
+    }
+
     pub fn push(&mut self, seq: u32, frame: Vec<i16>) -> Vec<Vec<i16>> {
         if self.expected_seq.is_none() {
             self.expected_seq = Some(seq);
@@ -143,5 +166,30 @@ mod tests {
         let out = jitter.push(44, frame(44));
         assert_eq!(out.len(), 3);
         assert_eq!(out[0][0], 42);
+    }
+
+    #[test]
+    fn ordered_startup_counts_received_frames_not_contiguous_sequences() {
+        let mut jitter = VoiceJitterBuffer::new();
+        assert!(jitter.push_ordered(0, frame(0)).is_empty());
+        assert!(jitter.push_ordered(2, frame(2)).is_empty());
+        let out = jitter.push_ordered(4, frame(4));
+        assert_eq!(out.iter().map(|f| f[0]).collect::<Vec<_>>(), vec![0, 2, 4]);
+        assert_eq!(jitter.push_ordered(100, frame(100))[0][0], 100);
+        assert!(jitter.push_ordered(100, frame(100)).is_empty());
+        assert!(jitter.push_ordered(99, frame(99)).is_empty());
+        jitter.reset();
+        assert!(jitter.push_ordered(0, frame(0)).is_empty());
+    }
+
+    #[test]
+    fn ordered_startup_and_gaps_handle_sequence_wrap() {
+        let mut jitter = VoiceJitterBuffer::new();
+        assert!(jitter.push_ordered(u32::MAX - 1, frame(1)).is_empty());
+        assert!(jitter.push_ordered(u32::MAX, frame(2)).is_empty());
+        let out = jitter.push_ordered(0, frame(3));
+        assert_eq!(out.iter().map(|f| f[0]).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(jitter.push_ordered(2, frame(4))[0][0], 4);
+        assert!(jitter.push_ordered(u32::MAX, frame(5)).is_empty());
     }
 }

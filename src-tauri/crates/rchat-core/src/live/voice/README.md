@@ -30,6 +30,12 @@ missing-writer cases. Packet sequence numbers are not renumbered after outbound
 drops, so receivers can observe gaps. These counters are local diagnostics;
 the wire format is unchanged.
 
+The receive path uses ordered-stream jitter buffering: after the initial three
+received frames, each decoded frame is immediately playable even across sequence
+gaps. Missing sequence numbers cannot arrive later on the same reliable ordered
+stream, so the receiver does not build a stale backlog waiting for them. Startup
+also counts received frames rather than requiring three contiguous sequences.
+
 These are application-queue budgets, not an end-to-end network latency promise.
 QUIC, device, and playback buffers have separate behavior. Tests exercise the
 queues and framed writer without microphones, including saturation, old frames,
