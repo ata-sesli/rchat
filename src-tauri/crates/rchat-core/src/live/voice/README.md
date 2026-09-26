@@ -20,6 +20,9 @@ can hold a three-frame processing snapshot.
   deadline. A failed or timed-out write drops the owned stream; no subsequent
   record is written on that potentially partial stream. The existing call
   failure handling ends the call rather than silently restarting framing.
+  Matching writer failures and closed writer queues send the existing `CallEnd`
+  control signal before local teardown so the peer also stops its call. Stale
+  failure events from another peer or call do not tear down the current writer.
 - Call teardown aborts the writer and releases both queues. Dropping the network
   manager also aborts its writer instead of detaching the task.
 
