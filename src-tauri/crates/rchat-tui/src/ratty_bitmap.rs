@@ -352,7 +352,7 @@ fn validate_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn viewer_geometry(
+pub(crate) fn viewer_geometry(
     width: u32,
     height: u32,
     view: ViewerView,

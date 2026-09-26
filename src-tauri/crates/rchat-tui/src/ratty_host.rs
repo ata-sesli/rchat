@@ -102,6 +102,27 @@ fn ratty_file_name() -> &'static str {
     }
 }
 
+fn rio_executable() -> Option<PathBuf> {
+    let rio_name = if cfg!(windows) { "rio.exe" } else { "rio" };
+    env::var_os("RCHAT_RIO_PATH")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            let path = env::var_os("PATH")?;
+            env::split_paths(&path)
+                .map(|directory| directory.join(rio_name))
+                .find(|path| path.is_file())
+        })
+        .or_else(|| {
+            [
+                PathBuf::from("/Applications/Rio.app/Contents/MacOS/rio"),
+                PathBuf::from("/Applications/rio.app/Contents/MacOS/rio"),
+            ]
+            .into_iter()
+            .find(|path| path.is_file())
+        })
+}
+
 fn file_candidate(path: PathBuf, source: RattyPathSource) -> Option<ResolvedRatty> {
     path.is_file().then_some(ResolvedRatty { path, source })
 }
@@ -181,8 +202,16 @@ pub fn resolved_ratty(app_dir: &Path) -> Result<DiscoveryResult> {
     ))
 }
 
-fn should_run_here(ratty_session: Option<&str>, no_ratty_arg: bool, no_ratty_env: bool) -> bool {
-    ratty_session == Some("1") || no_ratty_arg || no_ratty_env
+fn should_run_here(
+    ratty_session: Option<&str>,
+    no_ratty_arg: bool,
+    no_ratty_env: bool,
+    term_program: Option<&str>,
+) -> bool {
+    ratty_session == Some("1")
+        || no_ratty_arg
+        || no_ratty_env
+        || term_program.is_some_and(|program| program.eq_ignore_ascii_case("rio"))
 }
 
 pub fn build_ratty_args(
@@ -230,18 +259,48 @@ where
 
 pub fn launch_if_needed(args: &[OsString]) -> Result<LaunchOutcome> {
     let no_ratty_arg = args.iter().any(|arg| arg == OsStr::new("--no-ratty"));
-    if should_run_here(
-        env::var("RATTY_SESSION").ok().as_deref(),
-        no_ratty_arg,
-        env::var("RCHAT_NO_RATTY").ok().as_deref() == Some("1"),
-    ) {
+    if env::var("RCHAT_RIO_SESSION").ok().as_deref() == Some("1")
+        || should_run_here(
+            env::var("RATTY_SESSION").ok().as_deref(),
+            no_ratty_arg,
+            env::var("RCHAT_NO_RATTY").ok().as_deref() == Some("1"),
+            env::var("TERM_PROGRAM").ok().as_deref(),
+        )
+    {
         return Ok(LaunchOutcome::RunHere { warning: None });
+    }
+
+    let current_exe =
+        env::current_exe().context("failed to resolve the current RChat executable")?;
+    let current_dir = env::current_dir().context("failed to resolve the current directory")?;
+    let child_args = args.iter().skip(1).cloned().collect::<Vec<_>>();
+    if let Some(rio) = rio_executable() {
+        let mut rio_args = vec![
+            OsString::from("--title-placeholder"),
+            OsString::from("RChat"),
+            OsString::from("--command"),
+            current_exe.as_os_str().to_owned(),
+        ];
+        rio_args.extend_from_slice(&child_args);
+        match Command::new(&rio)
+            .args(&rio_args)
+            .current_dir(&current_dir)
+            .env("RCHAT_RIO_SESSION", "1")
+            .status()
+        {
+            Ok(status) => return Ok(LaunchOutcome::HostedExited(status)),
+            Err(error) => eprintln!(
+                "failed to start Rio at {}: {error}; trying Ratty",
+                rio.display()
+            ),
+        }
     }
 
     let app_dir = rchat_core::runtime::default_app_data_dir()?;
     let discovery = resolved_ratty(&app_dir)?;
     let Some(resolved) = discovery.resolved else {
-        let fallback = "Ratty was not found; using the current terminal with Kitty fallback";
+        let fallback =
+            "Rio and Ratty were not found; using the current terminal with Kitty fallback";
         return Ok(LaunchOutcome::RunHere {
             warning: Some(match discovery.warning {
                 Some(warning) => format!("{warning}; {fallback}"),
@@ -253,10 +312,6 @@ pub fn launch_if_needed(args: &[OsString]) -> Result<LaunchOutcome> {
         eprintln!("{warning}");
     }
 
-    let current_exe =
-        env::current_exe().context("failed to resolve the current RChat executable")?;
-    let current_dir = env::current_dir().context("failed to resolve the current directory")?;
-    let child_args = args.iter().skip(1).cloned().collect::<Vec<_>>();
     let managed_config = managed_ratty_config_path(&app_dir);
     let config = managed_config.is_file().then_some(managed_config.as_path());
     Ok(launch_resolved_with(
@@ -354,10 +409,15 @@ mod tests {
 
     #[test]
     fn ratty_host_hosted_or_bypassed_process_runs_in_current_terminal() {
-        assert!(should_run_here(Some("1"), false, false));
-        assert!(should_run_here(None, true, false));
-        assert!(should_run_here(None, false, true));
-        assert!(!should_run_here(None, false, false));
+        assert!(should_run_here(Some("1"), false, false, None));
+        assert!(should_run_here(None, true, false, None));
+        assert!(should_run_here(None, false, true, None));
+        assert!(!should_run_here(None, false, false, None));
+    }
+
+    #[test]
+    fn rio_session_does_not_launch_nested_ratty() {
+        assert!(should_run_here(None, false, false, Some("rio")));
     }
 
     #[test]

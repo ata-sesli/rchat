@@ -54,6 +54,33 @@ impl SmokeFrameGenerator {
             rgba,
         }
     }
+
+    /// Synthetic native-video input: a moving bright square over a luma gradient.
+    pub fn next_i420_frame(&mut self, fps: u32) -> rchat_screen_capture::I420ScreenFrame {
+        let seq = self.seq;
+        self.seq = self.seq.wrapping_add(1);
+        let y_len = self.width as usize * self.height as usize;
+        let mut data =
+            vec![128_u8; y_len + 2 * (self.width as usize / 2) * (self.height as usize / 2)];
+        let marker_x = seq.wrapping_mul(7) % self.width.max(1);
+        let marker_y = seq.wrapping_mul(5) % self.height.max(1);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                data[(y * self.width + x) as usize] =
+                    if x.abs_diff(marker_x) < 24 && y.abs_diff(marker_y) < 24 {
+                        235
+                    } else {
+                        (16 + x * 180 / self.width.max(1)) as u8
+                    };
+            }
+        }
+        rchat_screen_capture::I420ScreenFrame {
+            timestamp_us: i64::from(seq) * 1_000_000 / i64::from(fps.max(1)),
+            width: self.width,
+            height: self.height,
+            data,
+        }
+    }
 }
 
 #[cfg(test)]

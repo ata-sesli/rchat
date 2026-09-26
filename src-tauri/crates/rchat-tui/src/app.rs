@@ -1,6 +1,7 @@
 use crate::{
     bridge::{TuiEvent, TuiEventSink},
     ghostty_import,
+    kitty_viewer::KittyViewerManager,
     media::{
         decode_inline_media_preview, DecodedRgbaFrame, InlineMediaCache, InlineMediaKey,
         InlineMediaState, LatestFrameSlot, MediaViewerKey, ProtocolRequest, ProtocolRequestId,
@@ -162,6 +163,13 @@ fn trace_ratty_viewer_latency(stage: &str, started: std::time::Instant, command_
 struct MediaCapabilities {
     kitty: bool,
     ratty_bitmap: bool,
+    fast_kitty_viewer: bool,
+}
+
+fn fast_kitty_viewer_enabled(kitty: bool, ratty_bitmap: bool, term_program: Option<&str>) -> bool {
+    kitty
+        && !ratty_bitmap
+        && term_program.is_some_and(|program| program.eq_ignore_ascii_case("rio"))
 }
 
 fn detect_media_backends_with<P>(
@@ -284,6 +292,12 @@ enum Command {
         fps: u32,
         #[arg(long, default_value_t = DEFAULT_SMOKE_SECONDS)]
         seconds: u64,
+        /// Exercise native VP8 encode/decode before terminal image rendering.
+        #[arg(long, value_enum, default_value = "direct")]
+        path: LocalScreenPath,
+        /// Use Kitty animation updates on one persistent image (Kitty terminal only).
+        #[arg(long)]
+        kitty_frames: bool,
     },
     LocalScreenSmoke {
         #[arg(long, value_parser = parse_screen_profile, default_value = "720p15")]
@@ -824,6 +838,45 @@ mod tests {
         assert!(inline_preview_capable(&sticker));
         assert!(!inline_preview_capable(&image_without_hash));
         assert!(!inline_preview_capable(&video));
+    }
+
+    #[test]
+    fn parses_media_smoke_vp8_path() {
+        assert!(Cli::try_parse_from([
+            "rchat-tui", "media-smoke", "--path", "vp8", "--fps", "15", "--seconds", "60"
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn media_smoke_vp8_frames_round_trip() {
+        let mut generator = SmokeFrameGenerator::new(64, 32);
+        let mut encoder = Some(
+            Vp8VideoEncoder::new_with_dimensions(VideoProfile::P360, 64, 32).unwrap(),
+        );
+        let mut decoder = Some(Vp8VideoDecoder::new().unwrap());
+        let mut previous_pixels = None;
+        for seq in 0..3 {
+            let input = generator.next_i420_frame(15);
+            assert_eq!(input.timestamp_us, i64::from(seq) * 1_000_000 / 15);
+            let (frame, count) = local_screen_frame_to_rgba(
+                LocalScreenPath::Vp8,
+                ScreenCaptureProfile::P480F15,
+                &mut encoder,
+                &mut decoder,
+                seq,
+                input,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(count > 0);
+            assert_eq!((frame.width, frame.height), (64, 32));
+            assert_eq!(frame.rgba.len(), 64 * 32 * 4);
+            if let Some(previous) = previous_pixels {
+                assert_ne!(frame.rgba, previous);
+            }
+            previous_pixels = Some(frame.rgba);
+        }
     }
 
     #[test]
@@ -2292,7 +2345,9 @@ pub fn run() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("failed to start tokio runtime")?;
     runtime.block_on(async move {
         match cli.command {
-            Some(Command::MediaSmoke { fps, seconds }) => run_media_smoke(fps, seconds).await,
+            Some(Command::MediaSmoke { fps, seconds, path, kitty_frames }) => {
+                run_media_smoke(fps, seconds, path, kitty_frames).await
+            }
             Some(Command::LocalScreenSmoke {
                 profile,
                 path,
@@ -2317,6 +2372,7 @@ async fn run_interactive() -> Result<()> {
     let ratty_bitmap_available = detection.ratty_bitmap;
     let kitty_detection_forced = detection.kitty_forced;
     let picker = detection.picker;
+    let kitty_font_size = picker.font_size();
     let protocol_type = picker.protocol_type();
     let kitty_available = kitty_media_enabled(protocol_type);
     terminal.set_ratty_bitmap_active(ratty_bitmap_available);
@@ -2331,6 +2387,11 @@ async fn run_interactive() -> Result<()> {
     let mut state = UiState::new(protocol_type, event_sink);
     state.ratty_hosted = std::env::var("RATTY_SESSION").ok().as_deref() == Some("1");
     state.ratty_bitmap_available = ratty_bitmap_available;
+    state.fast_kitty_viewer = fast_kitty_viewer_enabled(
+        kitty_available,
+        ratty_bitmap_available,
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+    );
     state.kitty_detection_forced = kitty_detection_forced;
     state.app.session_phase = AppSessionPhase::Unlocked;
     state.app.app_ready = true;
@@ -2348,6 +2409,7 @@ async fn run_interactive() -> Result<()> {
     let mut remote_video_decoder = RemoteVideoFrameDecoder::default();
     let mut last_graphics_clear_generation = graphics_clear_generation(&state);
     let mut ratty_bitmaps = RattyBitmapManager::default();
+    let mut kitty_viewer = KittyViewerManager::new(kitty_font_size);
     let mut pending_ratty_screen_frame = None;
     let mut pending_ratty_remote_video_frame = None;
     let mut last_ratty_viewer_destination = None;
@@ -2515,14 +2577,25 @@ async fn run_interactive() -> Result<()> {
                         return Ok(());
                     }
                     let next_view = ratty_viewer_snapshot(&state);
-                    if ratty_bitmap_available && previous_view != next_view {
+                    if (ratty_bitmap_available || state.fast_kitty_viewer)
+                        && previous_view != next_view
+                    {
                         let mut viewer_commands = Vec::new();
-                        reconcile_ratty_viewer(
-                            &mut state,
-                            &mut ratty_bitmaps,
-                            last_ratty_viewer_destination,
-                            &mut viewer_commands,
-                        );
+                        if ratty_bitmap_available {
+                            reconcile_ratty_viewer(
+                                &mut state,
+                                &mut ratty_bitmaps,
+                                last_ratty_viewer_destination,
+                                &mut viewer_commands,
+                            );
+                        } else {
+                            reconcile_kitty_viewer(
+                                &mut state,
+                                &mut kitty_viewer,
+                                last_ratty_viewer_destination,
+                                &mut viewer_commands,
+                            );
+                        }
                         terminal.write_bitmap_commands(&viewer_commands)?;
                         trace_ratty_viewer_latency(
                             "immediate_flush",
@@ -2574,6 +2647,7 @@ async fn run_interactive() -> Result<()> {
                 kitty_available,
             );
             if transition.clear_kitty_graphics {
+                terminal.write_bitmap_commands(&kitty_viewer.clear_viewer())?;
                 terminal.clear_terminal_graphics()?;
             }
             if transition.invalidate_protocols {
@@ -2646,15 +2720,39 @@ async fn run_interactive() -> Result<()> {
             );
             terminal.write_bitmap_commands(&bitmap_commands)?;
             last_ratty_viewer_destination = next_ratty_targets.viewer;
+        } else if state.fast_kitty_viewer {
+            reconcile_kitty_viewer(
+                &mut state,
+                &mut kitty_viewer,
+                next_ratty_targets.viewer,
+                &mut bitmap_commands,
+            );
+            if bitmap_commands.is_empty() {
+                bitmap_commands.extend(kitty_viewer.repaint());
+            }
+            terminal.write_bitmap_commands(&bitmap_commands)?;
+            last_ratty_viewer_destination = next_ratty_targets.viewer;
         }
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
 }
 
-async fn run_media_smoke(fps: u32, seconds: u64) -> Result<()> {
-    if fps == 0 {
-        return Err(anyhow!("fps must be greater than zero"));
+async fn run_media_smoke(fps: u32, seconds: u64, path: LocalScreenPath, kitty_frames: bool) -> Result<()> {
+    if !(1..=60).contains(&fps) {
+        return Err(anyhow!("fps must be between 1 and 60"));
     }
+    if kitty_frames && std::env::var_os("KITTY_WINDOW_ID").is_none() {
+        return Err(anyhow!("--kitty-frames requires the Kitty terminal; launch with --no-ratty"));
+    }
+
+    let mut encoder = (path == LocalScreenPath::Vp8)
+        .then(|| Vp8VideoEncoder::new_with_dimensions(VideoProfile::P360, SMOKE_WIDTH, SMOKE_HEIGHT))
+        .transpose()
+        .map_err(|error| anyhow!("failed to start smoke VP8 encoder: {error}"))?;
+    let mut decoder = (path == LocalScreenPath::Vp8)
+        .then(Vp8VideoDecoder::new)
+        .transpose()
+        .map_err(|error| anyhow!("failed to start smoke VP8 decoder: {error}"))?;
 
     let mut terminal = TerminalSession::enter()?;
     let detection = detect_media_backends();
@@ -2664,32 +2762,56 @@ async fn run_media_smoke(fps: u32, seconds: u64) -> Result<()> {
     let protocol_type = picker.protocol_type();
     let kitty_available = kitty_media_enabled(protocol_type);
     terminal.set_ratty_bitmap_active(ratty_bitmap_available);
-    let protocol_worker = kitty_available.then(|| ProtocolWorker::spawn(picker));
+    let kitty_font_size = picker.font_size();
+    let protocol_worker = (kitty_available && !kitty_frames).then(|| ProtocolWorker::spawn(picker));
     let mut state = UiState::new(protocol_type, TuiEventSink::channel(1).0);
     state.ratty_hosted = std::env::var("RATTY_SESSION").ok().as_deref() == Some("1");
     state.ratty_bitmap_available = ratty_bitmap_available;
     state.kitty_detection_forced = kitty_detection_forced;
-    state.status = "media smoke".to_string();
+    state.status = format!("media smoke / {} / {fps} fps / 640x360{}", path.label(),
+        if kitty_frames { " / Kitty frame updates" } else { "" });
 
     let mut generator = SmokeFrameGenerator::new(SMOKE_WIDTH, SMOKE_HEIGHT);
-    let frame_interval = Duration::from_millis(1_000 / u64::from(fps));
+    let frame_interval = Duration::from_secs_f64(1.0 / f64::from(fps));
     let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
     let mut next_frame_at = std::time::Instant::now();
     let mut ratty_bitmaps = RattyBitmapManager::default();
     let mut pending_ratty_screen_frame = None;
 
-    while std::time::Instant::now() < deadline {
+    let mut kitty_video = crate::kitty_video::KittyVideo::default();
+    'smoke: while std::time::Instant::now() < deadline {
         let mut bitmap_commands = Vec::new();
         if std::time::Instant::now() >= next_frame_at {
-            let frame = generator.next_frame();
-            if ratty_bitmap_available {
+            let frame = if path == LocalScreenPath::Vp8 {
+                let seq = state.received_frames as u32;
+                state.received_frames = state.received_frames.saturating_add(1);
+                let (frame, encoded_count) = local_screen_frame_to_rgba(
+                    path,
+                    ScreenCaptureProfile::P480F15,
+                    &mut encoder,
+                    &mut decoder,
+                    seq,
+                    generator.next_i420_frame(fps),
+                )?
+                .ok_or_else(|| anyhow!("smoke VP8 encoder produced no decoded frame"))?;
+                state.encoded_frames = state.encoded_frames.saturating_add(encoded_count);
+                frame
+            } else {
+                generator.next_frame()
+            };
+            if kitty_frames {
+                state.decoded_frames = state.decoded_frames.saturating_add(1);
+                state.last_protocol_seq = Some(frame.seq);
+                bitmap_commands.extend(kitty_video.update(&frame.rgba, frame.width, frame.height)?);
+            } else if ratty_bitmap_available {
                 state.decoded_frames = state.decoded_frames.saturating_add(1);
                 state.last_protocol_seq = Some(frame.seq);
                 pending_ratty_screen_frame = Some(frame);
             } else if let Some(worker) = protocol_worker.as_ref() {
                 worker.request(ProtocolRequest::screen(frame, state.media_size)?);
             }
-            next_frame_at += frame_interval;
+            // Do not enqueue catch-up bursts if rendering falls behind.
+            next_frame_at = std::time::Instant::now() + frame_interval;
         }
 
         if let Some(worker) = protocol_worker.as_ref() {
@@ -2713,21 +2835,35 @@ async fn run_media_smoke(fps: u32, seconds: u64) -> Result<()> {
                 continue;
             };
             if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
-                return Ok(());
+                break 'smoke;
             }
         }
 
         let mut next_ratty_targets = RattyRenderTargets::default();
         terminal.draw(|frame| {
-            render_media_shell(
+            if kitty_frames {
+                let root = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Length(34), Constraint::Min(20)])
+                    .split(frame.area());
+                render_status(frame, root[0], &state, kitty_available, false);
+                let block = Block::bordered().title("Kitty persistent-frame video");
+                next_ratty_targets.screen = ratty_destination(block.inner(root[1]));
+                frame.render_widget(block, root[1]);
+            } else { render_media_shell(
                 frame,
                 &mut state,
                 kitty_available,
                 ratty_bitmap_available,
                 &mut next_ratty_targets,
-            )
+            ) }
         })?;
-        if ratty_bitmap_available {
+        if kitty_frames {
+            if let Some(destination) = next_ratty_targets.screen {
+                bitmap_commands.extend(kitty_video.place(destination, kitty_font_size));
+            }
+            terminal.write_bitmap_commands(&bitmap_commands)?;
+        } else if ratty_bitmap_available {
             bitmap_commands.extend(ratty_bitmaps.reconcile_pending_live_frame(
                 LiveSurface::Screen,
                 &mut pending_ratty_screen_frame,
@@ -2742,6 +2878,7 @@ async fn run_media_smoke(fps: u32, seconds: u64) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
 
+    terminal.write_bitmap_commands(&kitty_video.clear())?;
     Ok(())
 }
 
@@ -9613,10 +9750,10 @@ impl TerminalSession {
             self.terminal
                 .backend_mut()
                 .write_all(command)
-                .context("failed to write Ratty bitmap command")?;
+                .context("failed to write terminal media command")?;
         }
         std::io::Write::flush(self.terminal.backend_mut())
-            .context("failed to flush Ratty bitmap commands")
+            .context("failed to flush terminal media commands")
     }
 
     fn set_ratty_bitmap_active(&mut self, active: bool) {
@@ -9663,6 +9800,7 @@ struct UiState {
     protocol_type: ProtocolType,
     ratty_hosted: bool,
     ratty_bitmap_available: bool,
+    fast_kitty_viewer: bool,
     kitty_detection_forced: bool,
     event_sink: TuiEventSink,
     voice_call_state: VoiceCallState,
@@ -9723,6 +9861,7 @@ impl UiState {
             protocol_type,
             ratty_hosted: false,
             ratty_bitmap_available: false,
+            fast_kitty_viewer: false,
             kitty_detection_forced: false,
             event_sink,
             voice_call_state: VoiceCallState::default(),
@@ -10463,6 +10602,7 @@ fn render_app_shell(
             MediaCapabilities {
                 kitty: kitty_available,
                 ratty_bitmap: ratty_bitmap_available,
+                fast_kitty_viewer: state.fast_kitty_viewer,
             },
             ratty_targets,
             &modal_theme,
@@ -13125,6 +13265,46 @@ fn reconcile_ratty_viewer(
     }
 }
 
+fn reconcile_kitty_viewer(
+    state: &mut UiState,
+    manager: &mut KittyViewerManager,
+    destination: Option<RattyDestination>,
+    commands: &mut Vec<Vec<u8>>,
+) {
+    let desired = destination.and_then(|destination| {
+        let viewer = state.app.media_viewer.clone()?;
+        let loaded = state
+            .viewer_image
+            .as_ref()
+            .filter(|loaded| loaded.file_hash == viewer.file_hash)?;
+        Some((viewer, Arc::clone(&loaded.image), destination))
+    });
+
+    let Some((viewer, image, destination)) = desired else {
+        commands.extend(manager.clear_viewer());
+        return;
+    };
+    match manager.update_viewer(
+        &viewer.file_hash,
+        image.as_ref(),
+        ViewerView::new(viewer.zoom_percent, viewer.pan_x, viewer.pan_y),
+        destination,
+    ) {
+        Ok(next) => {
+            commands.extend(next);
+            if let Some(viewer) = state.app.media_viewer.as_mut() {
+                viewer.error = None;
+            }
+        }
+        Err(error) => {
+            commands.extend(manager.clear_viewer());
+            if let Some(viewer) = state.app.media_viewer.as_mut() {
+                viewer.error = Some(error.to_string());
+            }
+        }
+    }
+}
+
 fn render_media_viewer_image(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -13160,7 +13340,7 @@ fn render_media_viewer_image(
         return;
     };
 
-    if capabilities.ratty_bitmap {
+    if capabilities.ratty_bitmap || capabilities.fast_kitty_viewer {
         ratty_targets.viewer = ratty_destination(inner);
         return;
     }
@@ -15209,5 +15389,18 @@ fn screen_protocol_seq(response: &ProtocolResponse) -> Option<u32> {
         ProtocolRequestId::RemoteVideo { .. }
         | ProtocolRequestId::Inline(_)
         | ProtocolRequestId::Viewer(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod rio_viewer_route_tests {
+    use super::fast_kitty_viewer_enabled;
+
+    #[test]
+    fn rio_uses_fast_kitty_viewer_when_kitty_is_available() {
+        assert!(fast_kitty_viewer_enabled(true, false, Some("Rio")));
+        assert!(!fast_kitty_viewer_enabled(false, false, Some("Rio")));
+        assert!(!fast_kitty_viewer_enabled(true, true, Some("Rio")));
+        assert!(!fast_kitty_viewer_enabled(true, false, Some("Ghostty")));
     }
 }

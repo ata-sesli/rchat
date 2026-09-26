@@ -1,6 +1,8 @@
 pub mod app;
 pub mod bridge;
 pub mod ghostty_import;
+pub mod kitty_viewer;
+pub mod kitty_video;
 pub mod media;
 pub mod ratty_bitmap;
 pub mod ratty_host;

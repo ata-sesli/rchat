@@ -9,7 +9,7 @@ fn main() -> anyhow::Result<()> {
         }
         rchat_tui::ratty_host::LaunchOutcome::HostedExited(status) if status.success() => Ok(()),
         rchat_tui::ratty_host::LaunchOutcome::HostedExited(status) => {
-            Err(anyhow::anyhow!("Ratty exited with {status}"))
+            Err(anyhow::anyhow!("terminal host exited with {status}"))
         }
     }
 }
