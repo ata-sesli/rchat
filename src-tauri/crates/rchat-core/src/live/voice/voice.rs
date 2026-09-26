@@ -18,6 +18,71 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const TARGET_RATE: u32 = VOICE_SAMPLE_RATE;
+
+/// Fixed-size summary: counts every assembled 20ms frame, including silence.
+/// A delayed UI receives the maximum peak since its last poll, not old PCM.
+#[derive(Default)]
+struct DiagnosticMeter {
+    peak: AtomicU16,
+    frames: AtomicU64,
+}
+
+impl DiagnosticMeter {
+    fn record(&self, samples: &[i16]) {
+        self.peak.fetch_max(
+            samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        self.frames.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn take_peak(&self) -> u16 {
+        self.peak.swap(0, Ordering::Relaxed)
+    }
+
+    fn monitor(
+        &self,
+        shutdown: &mpsc::Receiver<()>,
+        level: &AtomicU16,
+        peak: &AtomicU16,
+        frames: &AtomicU64,
+    ) {
+        while matches!(
+            shutdown.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            let frame_peak = self.take_peak();
+            frames.store(self.frames.load(Ordering::Relaxed), Ordering::Relaxed);
+            let previous = level.load(Ordering::Relaxed);
+            if frame_peak > 0 {
+                level.store(frame_peak.max(previous), Ordering::Relaxed);
+                peak.fetch_max(frame_peak, Ordering::Relaxed);
+            } else {
+                level.store(
+                    previous.saturating_sub((previous / 4).max(1)),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
+}
+
+enum CaptureSink {
+    Frames(VoiceSender<Vec<i16>>),
+    Meter(Arc<DiagnosticMeter>),
+}
+
+impl CaptureSink {
+    fn push(&self, frame: Vec<i16>) {
+        match self {
+            Self::Frames(sender) => {
+                let _ = sender.push(frame);
+            }
+            Self::Meter(meter) => meter.record(&frame),
+        }
+    }
+}
+
 const FRAME_SAMPLES: usize = VOICE_FRAME_SAMPLES; // 20ms @ 48kHz mono
 const VOICE_DIAGNOSTICS_INTERVAL: Duration = Duration::from_secs(5);
 const PLAYBACK_TARGET_QUEUE_SAMPLES: usize = FRAME_SAMPLES * 8; // 160ms
@@ -311,7 +376,7 @@ pub(crate) fn start_microphone_diagnostic_session(
 > {
     use crate::media_diagnostics::{MediaDiagnosticError, MediaDiagnosticErrorKind};
 
-    let (capture_tx, mut capture_rx) = voice_queue::<Vec<i16>>();
+    let meter = Arc::new(DiagnosticMeter::default());
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
     let (init_tx, init_rx) = mpsc::sync_channel(1);
     let thread_level = Arc::clone(&level_percent);
@@ -368,7 +433,7 @@ pub(crate) fn start_microphone_diagnostic_session(
                 &input_device,
                 &input_supported.sample_format(),
                 &input_config,
-                capture_tx,
+                CaptureSink::Meter(Arc::clone(&meter)),
                 stats,
                 echo_guard,
                 None,
@@ -400,31 +465,7 @@ pub(crate) fn start_microphone_diagnostic_session(
                 return;
             }
 
-            while shutdown_rx.recv_timeout(Duration::from_millis(20)).is_err() {
-                let mut frame_peak = 0u16;
-                for frame in capture_rx.capture_tick(true) {
-                    let samples = frame.value;
-                    frame_peak = frame_peak.max(
-                        samples
-                            .iter()
-                            .map(|sample| sample.unsigned_abs())
-                            .max()
-                            .unwrap_or(0),
-                    );
-                    thread_frames.fetch_add(1, Ordering::Relaxed);
-                }
-                if frame_peak > 0 {
-                    let previous = thread_level.load(Ordering::Relaxed);
-                    thread_level.store(frame_peak.max(previous), Ordering::Relaxed);
-                    thread_peak.fetch_max(frame_peak, Ordering::Relaxed);
-                } else {
-                    let previous = thread_level.load(Ordering::Relaxed);
-                    thread_level.store(
-                        previous.saturating_sub((previous / 4).max(1)),
-                        Ordering::Relaxed,
-                    );
-                }
-            }
+            meter.monitor(&shutdown_rx, &thread_level, &thread_peak, &thread_frames);
         })
         .map_err(|error| {
             MediaDiagnosticError::new(
@@ -553,7 +594,7 @@ fn run_audio_thread(
         &input_device,
         &input_supported.sample_format(),
         &input_config,
-        capture_tx,
+        CaptureSink::Frames(capture_tx),
         stats.clone(),
         echo_guard.clone(),
         aec_processor.clone(),
@@ -748,7 +789,7 @@ fn build_input_stream(
     input_device: &cpal::Device,
     sample_format: &SampleFormat,
     config: &StreamConfig,
-    capture_tx: VoiceSender<Vec<i16>>,
+    capture_tx: CaptureSink,
     stats: Arc<Mutex<VoiceAudioStats>>,
     echo_guard: Arc<EchoGuard>,
     aec_processor: Option<SharedVoiceAecProcessor>,
@@ -833,7 +874,7 @@ fn build_input_stream(
 }
 
 fn handle_capture_callback(
-    capture_tx: &VoiceSender<Vec<i16>>,
+    capture_tx: &CaptureSink,
     assembler: &mut VoiceFrameAssembler,
     mono: &mut [i16],
     stats: &Arc<Mutex<VoiceAudioStats>>,
@@ -975,7 +1016,7 @@ fn build_output_stream(
 }
 
 fn send_captured_frames(
-    capture_tx: &VoiceSender<Vec<i16>>,
+    capture_tx: &CaptureSink,
     assembler: &mut VoiceFrameAssembler,
     samples: &[i16],
     stats: &Arc<Mutex<VoiceAudioStats>>,
@@ -1002,7 +1043,7 @@ fn send_captured_frames(
     });
     for frame in frames {
         let frame = process_aec_capture_frame(aec_processor, frame, stats, echo_guard);
-        let _ = capture_tx.push(frame);
+        capture_tx.push(frame);
     }
 }
 
@@ -1997,5 +2038,52 @@ mod tests {
         let measured = assembler.measured_input_rate_hz().expect("measured rate");
         assert!((measured - 13_000.0).abs() < 50.0);
         assert_eq!(assembler.resampler_ratio(), Some(before));
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_meter_tests {
+    use super::*;
+
+    #[test]
+    fn delayed_consumer_keeps_all_frame_counts_and_window_peak_without_pcm() {
+        let meter = DiagnosticMeter::default();
+        for _ in 0..10_000 {
+            meter.record(&[0, -100, 42]);
+        }
+        meter.record(&[i16::MIN]);
+        assert_eq!(meter.frames.load(Ordering::Relaxed), 10_001);
+        assert_eq!(meter.take_peak(), 32_768);
+        assert_eq!(meter.take_peak(), 0);
+        meter.record(&[7]);
+        assert_eq!(meter.take_peak(), 7);
+        assert_eq!(DiagnosticMeter::default().frames.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn diagnostic_monitor_stops_with_pending_samples_or_disconnected_owner() {
+        for explicit_stop in [true, false] {
+            let meter = DiagnosticMeter::default();
+            meter.record(&[123]);
+            let (tx, rx) = mpsc::channel();
+            if explicit_stop {
+                tx.send(()).unwrap();
+            }
+            drop(tx);
+            let (done_tx, done_rx) = mpsc::channel();
+            let handle = thread::spawn(move || {
+                meter.monitor(
+                    &rx,
+                    &AtomicU16::new(0),
+                    &AtomicU16::new(0),
+                    &AtomicU64::new(0),
+                );
+                done_tx.send(()).unwrap();
+            });
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("diagnostic shutdown must not wait for PCM consumption");
+            handle.join().unwrap();
+        }
     }
 }

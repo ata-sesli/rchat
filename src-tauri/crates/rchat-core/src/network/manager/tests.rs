@@ -43,6 +43,48 @@ async fn voice_lifecycle_manager() -> (tempfile::TempDir, super::NetworkManager)
 }
 
 #[tokio::test]
+async fn media_readers_follow_ringing_active_end_and_manager_lifetimes() {
+    use crate::app_state::VoiceCallPhase;
+    use crate::network::media_admission::MediaKind;
+    let (_dir, mut manager) = voice_lifecycle_manager().await;
+    let call = active_call("admission", CallKind::Video, ActiveCallPhase::Active);
+    manager.active_call = Some(call.clone());
+    manager
+        .push_active_call_state(&call, VoiceCallPhase::OutgoingRinging, None)
+        .await;
+    let admission = manager.media_admission.clone();
+    let mut voice = admission
+        .admit(MediaKind::Voice, call.remote_peer_id)
+        .unwrap();
+    let mut video = admission
+        .admit(MediaKind::Video, call.remote_peer_id)
+        .unwrap();
+    assert!(voice.authorize(&call.call_id));
+    assert!(video.authorize(&call.call_id));
+    manager
+        .push_active_call_state(&call, VoiceCallPhase::Active, None)
+        .await;
+    assert_eq!(voice.run(async { 42 }).await, Some(42));
+    manager
+        .push_active_call_state(&call, VoiceCallPhase::Ending, None)
+        .await;
+    assert!(voice.run(std::future::pending::<()>()).await.is_none());
+    assert!(video.run(std::future::pending::<()>()).await.is_none());
+    drop((voice, video));
+    manager
+        .push_active_call_state(&call, VoiceCallPhase::Active, None)
+        .await;
+    let permit = admission
+        .admit(MediaKind::Voice, call.remote_peer_id)
+        .unwrap();
+    drop(manager);
+    assert!(permit.run(std::future::pending::<()>()).await.is_none());
+    assert!(admission
+        .admit(MediaKind::Voice, call.remote_peer_id)
+        .is_none());
+}
+
+#[tokio::test]
 async fn voice_writer_failure_ends_both_endpoints() {
     use futures::StreamExt;
     use libp2p::{

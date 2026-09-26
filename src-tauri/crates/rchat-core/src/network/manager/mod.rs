@@ -483,6 +483,8 @@ fn classify_outgoing_error_source(
 }
 
 pub struct NetworkManager {
+    pub(crate) media_admission: crate::network::media_admission::MediaAdmission,
+    media_accept_handles: Vec<tokio::task::JoinHandle<()>>,
     // The P2P Node itself
     swarm: Swarm<RChatBehaviour>,
     // The channel to receive commands FROM the UI
@@ -872,25 +874,33 @@ impl NetworkManager {
             persistence_worker_handles,
         ) = persistence::start_persistence_workers(app_state.clone());
 
+        let media_admission = swarm.behaviour().voice_call.admission.clone();
+        let mut media_accept_handles = Vec::new();
         let (voice_stream_event_tx, voice_stream_event_rx) = tokio::sync::mpsc::channel(512);
         if let Some(incoming) = swarm.behaviour_mut().voice_call.take_incoming() {
-            voice_call::start_voice_stream_accept_loop(incoming, voice_stream_event_tx.clone());
+            media_accept_handles.push(voice_call::start_voice_stream_accept_loop(
+                incoming,
+                voice_stream_event_tx.clone(),
+            ));
         } else {
             eprintln!("[Voice] Voice stream incoming receiver was already taken");
         }
         let (video_stream_event_tx, video_stream_event_rx) = tokio::sync::mpsc::channel(512);
         if let Some(incoming) = swarm.behaviour_mut().video_call.take_incoming() {
-            video_call::start_video_stream_accept_loop(incoming, video_stream_event_tx.clone());
+            media_accept_handles.push(video_call::start_video_stream_accept_loop(
+                incoming,
+                video_stream_event_tx.clone(),
+            ));
         } else {
             eprintln!("[Video] Video stream incoming receiver was already taken");
         }
         let (screen_broadcast_stream_event_tx, screen_broadcast_stream_event_rx) =
             tokio::sync::mpsc::channel(512);
         if let Some(incoming) = swarm.behaviour_mut().broadcast_stream.take_incoming() {
-            broadcast::start_screen_broadcast_stream_accept_loop(
+            media_accept_handles.push(broadcast::start_screen_broadcast_stream_accept_loop(
                 incoming,
                 screen_broadcast_stream_event_tx.clone(),
-            );
+            ));
         } else {
             eprintln!("[Broadcast] Screen broadcast stream incoming receiver was already taken");
         }
@@ -900,6 +910,8 @@ impl NetworkManager {
             video_call::start_outbound_video_encode_worker();
 
         Self {
+            media_admission,
+            media_accept_handles,
             swarm,
             crx,
             disc_rx,
@@ -1696,6 +1708,10 @@ impl NetworkManager {
 
 impl Drop for NetworkManager {
     fn drop(&mut self) {
+        self.media_admission.shutdown();
+        for handle in self.media_accept_handles.drain(..) {
+            handle.abort();
+        }
         // JoinHandle drop alone detaches a writer blocked on network I/O.
         if let Some(handle) = self.voice_stream_writer_handle.take() {
             handle.abort();

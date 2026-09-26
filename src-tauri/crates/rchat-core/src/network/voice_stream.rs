@@ -6,7 +6,8 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::channel::{mpsc, oneshot};
+use super::media_admission::{MediaAdmission, MediaKind, ReaderPermit, GLOBAL_LIMIT};
+use futures::channel::oneshot;
 use libp2p::{
     core::{InboundUpgrade, OutboundUpgrade, UpgradeInfo},
     swarm::{
@@ -15,6 +16,7 @@ use libp2p::{
     },
     Multiaddr, PeerId,
 };
+use tokio::sync::mpsc;
 
 #[derive(Debug)]
 pub enum OpenStreamError {
@@ -51,20 +53,28 @@ impl From<io::Error> for OpenStreamError {
 }
 
 pub type OpenStreamReceiver = oneshot::Receiver<Result<Stream, OpenStreamError>>;
-pub type IncomingStreams = mpsc::UnboundedReceiver<(PeerId, Stream)>;
+pub type IncomingStreams = mpsc::Receiver<(PeerId, Stream, ReaderPermit)>;
 
 pub struct Behaviour {
+    pub(crate) admission: MediaAdmission,
+    kind: MediaKind,
     protocol: StreamProtocol,
-    incoming_sender: mpsc::UnboundedSender<(PeerId, Stream)>,
+    incoming_sender: mpsc::Sender<(PeerId, Stream, ReaderPermit)>,
     incoming_receiver: Option<IncomingStreams>,
     established: HashMap<ConnectionId, PeerId>,
     pending_opens: VecDeque<(PeerId, ConnectionId, HandlerIn)>,
 }
 
 impl Behaviour {
-    pub fn new(protocol: StreamProtocol) -> Self {
-        let (incoming_sender, incoming_receiver) = mpsc::unbounded();
+    pub(crate) fn new(
+        protocol: StreamProtocol,
+        kind: MediaKind,
+        admission: MediaAdmission,
+    ) -> Self {
+        let (incoming_sender, incoming_receiver) = mpsc::channel(GLOBAL_LIMIT);
         Self {
+            admission,
+            kind,
             protocol,
             incoming_sender,
             incoming_receiver: Some(incoming_receiver),
@@ -106,22 +116,32 @@ impl NetworkBehaviour for Behaviour {
     fn handle_established_inbound_connection(
         &mut self,
         _connection_id: ConnectionId,
-        _peer: PeerId,
+        peer: PeerId,
         _local_addr: &Multiaddr,
         _remote_addr: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        Ok(Handler::new(self.protocol.clone()))
+        Ok(Handler::new(
+            self.protocol.clone(),
+            peer,
+            self.kind,
+            self.admission.clone(),
+        ))
     }
 
     fn handle_established_outbound_connection(
         &mut self,
         _connection_id: ConnectionId,
-        _peer: PeerId,
+        peer: PeerId,
         _addr: &Multiaddr,
         _role_override: libp2p::core::Endpoint,
         _port_use: libp2p::core::transport::PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        Ok(Handler::new(self.protocol.clone()))
+        Ok(Handler::new(
+            self.protocol.clone(),
+            peer,
+            self.kind,
+            self.admission.clone(),
+        ))
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
@@ -143,8 +163,8 @@ impl NetworkBehaviour for Behaviour {
         event: THandlerOutEvent<Self>,
     ) {
         match event {
-            HandlerOut::Inbound(stream) => {
-                let _ = self.incoming_sender.unbounded_send((peer_id, stream));
+            HandlerOut::Inbound(stream, permit) => {
+                let _ = self.incoming_sender.try_send((peer_id, stream, permit));
             }
         }
     }
@@ -166,15 +186,26 @@ impl NetworkBehaviour for Behaviour {
 }
 
 pub struct Handler {
+    peer: PeerId,
+    kind: MediaKind,
+    admission: MediaAdmission,
     supported_protocol: StreamProtocol,
     pending_open: Option<PendingOpen>,
     queued_opens: VecDeque<PendingOpen>,
-    queued_inbound: VecDeque<Stream>,
+    queued_inbound: VecDeque<(Stream, ReaderPermit)>,
 }
 
 impl Handler {
-    fn new(protocol: StreamProtocol) -> Self {
+    fn new(
+        protocol: StreamProtocol,
+        peer: PeerId,
+        kind: MediaKind,
+        admission: MediaAdmission,
+    ) -> Self {
         Self {
+            peer,
+            kind,
+            admission,
             supported_protocol: protocol,
             pending_open: None,
             queued_opens: VecDeque::new(),
@@ -198,7 +229,7 @@ pub enum HandlerIn {
 
 #[derive(Debug)]
 pub enum HandlerOut {
-    Inbound(Stream),
+    Inbound(Stream, ReaderPermit),
 }
 
 impl ConnectionHandler for Handler {
@@ -231,9 +262,9 @@ impl ConnectionHandler for Handler {
         &mut self,
         _cx: &mut Context<'_>,
     ) -> Poll<swarm::ConnectionHandlerEvent<Self::OutboundProtocol, (), Self::ToBehaviour>> {
-        if let Some(stream) = self.queued_inbound.pop_front() {
+        if let Some((stream, permit)) = self.queued_inbound.pop_front() {
             return Poll::Ready(swarm::ConnectionHandlerEvent::NotifyBehaviour(
-                HandlerOut::Inbound(stream),
+                HandlerOut::Inbound(stream, permit),
             ));
         }
 
@@ -266,7 +297,9 @@ impl ConnectionHandler for Handler {
         match event {
             ConnectionEvent::FullyNegotiatedInbound(negotiated) => {
                 let (stream, _protocol) = negotiated.protocol;
-                self.queued_inbound.push_back(stream);
+                if let Some(permit) = self.admission.admit(self.kind, self.peer) {
+                    self.queued_inbound.push_back((stream, permit));
+                }
             }
             ConnectionEvent::FullyNegotiatedOutbound(negotiated) => {
                 if let Some(open) = self.pending_open.take() {

@@ -1637,31 +1637,17 @@ impl NetworkManager {
 pub(super) fn start_video_stream_accept_loop(
     incoming: crate::network::voice_stream::IncomingStreams,
     event_tx: tokio::sync::mpsc::Sender<VideoStreamEvent>,
-) {
-    tokio::spawn(async move {
-        futures::pin_mut!(incoming);
-        while let Some((peer, mut stream)) = incoming.next().await {
-            let event_tx = event_tx.clone();
-            tokio::spawn(async move {
-                eprintln!("[Video][Stream] inbound stream accepted peer={}", peer);
-                let call_id = match read_video_stream_header(&mut stream).await {
-                    Ok(call_id) => call_id,
-                    Err(e) => {
-                        let _ = event_tx
-                            .send(VideoStreamEvent::InboundFailure {
-                                peer,
-                                call_id: None,
-                                error: e.to_string(),
-                            })
-                            .await;
-                        return;
-                    }
-                };
-                eprintln!(
-                    "[Video][Stream] inbound header read peer={} call_id={}",
-                    peer, call_id
-                );
-
+) -> tokio::task::JoinHandle<()> {
+    crate::network::media_admission::spawn_readers(incoming, move |peer, mut stream, mut permit| {
+        let event_tx = event_tx.clone();
+        async move {
+            let Some(call_id) = permit.header(read_video_stream_header(&mut stream)).await else {
+                return;
+            };
+            if !permit.authorize(&call_id) {
+                return;
+            }
+            permit.run(async {
                 let mut first_frame_read = false;
                 loop {
                     match read_video_stream_record(&mut stream).await {
@@ -1704,11 +1690,11 @@ pub(super) fn start_video_stream_accept_loop(
                         }
                     }
                 }
-            });
-        }
-    });
-}
 
+            }).await;
+        }
+    })
+}
 fn capture_profile_from_video_profile(profile: VideoProfile) -> CaptureProfile {
     match profile {
         VideoProfile::P360 => CaptureProfile::P360,
