@@ -635,14 +635,15 @@ pub struct NetworkManager {
     // Backend audio engine for current active call.
     voice_audio_engine: Option<crate::live::voice::voice::VoiceAudioEngine>,
     // Captured local PCM16 frames from audio engine.
-    voice_capture_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>>,
+    voice_capture_rx: Option<crate::live::voice::queue::VoiceReceiver<Vec<i16>>>,
     // Voice stream task events returned to the network manager loop.
     voice_stream_event_rx: tokio::sync::mpsc::Receiver<VoiceStreamEvent>,
     // Voice stream task event sender cloned into accept/writer tasks.
     voice_stream_event_tx: tokio::sync::mpsc::Sender<VoiceStreamEvent>,
     // Current active outbound voice stream writer queue.
-    voice_stream_tx:
-        Option<tokio::sync::mpsc::UnboundedSender<crate::live::voice::protocol::VoiceFrameRequest>>,
+    voice_stream_tx: Option<
+        crate::live::voice::queue::VoiceSender<crate::live::voice::protocol::VoiceFrameRequest>,
+    >,
     // Call id currently owned by the outbound voice stream writer.
     voice_stream_call_id: Option<String>,
     // Current active outbound voice stream writer task.
@@ -1617,6 +1618,19 @@ impl NetworkManager {
     }
 
     pub(super) fn log_voice_network_summary(&mut self, label: &str, peer_id: &PeerId) {
+        let capture = self
+            .voice_capture_rx
+            .as_ref()
+            .map(|rx| rx.stats())
+            .unwrap_or_default();
+        let outbound = self
+            .voice_stream_tx
+            .as_ref()
+            .map(|tx| tx.stats())
+            .unwrap_or_default();
+        eprintln!("[Voice][Queues][{}] capture_overflow={} capture_stale={} capture_contention={} capture_discarded={} outbound_overflow={} outbound_stale={} outbound_contention={}",
+            label, capture.overflow, capture.stale, capture.contention, capture.discarded,
+            outbound.overflow, outbound.stale, outbound.contention);
         let (quic_count, tcp_count) = self.peer_transport_counts(peer_id);
         let avg_opus_out_bytes = if self.voice_network_stats.outbound_frames == 0 {
             0.0
@@ -1682,6 +1696,10 @@ impl NetworkManager {
 
 impl Drop for NetworkManager {
     fn drop(&mut self) {
+        // JoinHandle drop alone detaches a writer blocked on network I/O.
+        if let Some(handle) = self.voice_stream_writer_handle.take() {
+            handle.abort();
+        }
         self.video_encode_worker_handle.abort();
         self.shutdown_transfer_workers_gracefully(std::time::Duration::from_secs(5));
         self.shutdown_persistence_workers_gracefully(std::time::Duration::from_secs(5));
