@@ -1,4 +1,5 @@
 use super::codec::{VOICE_FRAME_SAMPLES, VOICE_SAMPLE_RATE};
+use super::queue::{voice_queue, VoiceReceiver, VoiceSender};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig,
@@ -254,8 +255,8 @@ pub struct VoiceAudioEngine {
 }
 
 impl VoiceAudioEngine {
-    pub fn start() -> Result<(Self, tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>), String> {
-        let (capture_tx, capture_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<i16>>();
+    pub(crate) fn start() -> Result<(Self, VoiceReceiver<Vec<i16>>), String> {
+        let (capture_tx, capture_rx) = voice_queue::<Vec<i16>>();
         let (playback_tx, playback_rx) = mpsc::channel::<Vec<i16>>();
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
         let stats = Arc::new(Mutex::new(VoiceAudioStats {
@@ -310,7 +311,7 @@ pub(crate) fn start_microphone_diagnostic_session(
 > {
     use crate::media_diagnostics::{MediaDiagnosticError, MediaDiagnosticErrorKind};
 
-    let (capture_tx, mut capture_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<i16>>();
+    let (capture_tx, mut capture_rx) = voice_queue::<Vec<i16>>();
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
     let (init_tx, init_rx) = mpsc::sync_channel(1);
     let thread_level = Arc::clone(&level_percent);
@@ -401,7 +402,8 @@ pub(crate) fn start_microphone_diagnostic_session(
 
             while shutdown_rx.recv_timeout(Duration::from_millis(20)).is_err() {
                 let mut frame_peak = 0u16;
-                while let Ok(samples) = capture_rx.try_recv() {
+                for frame in capture_rx.capture_tick(true) {
+                    let samples = frame.value;
                     frame_peak = frame_peak.max(
                         samples
                             .iter()
@@ -450,7 +452,7 @@ pub(crate) fn start_microphone_diagnostic_session(
 }
 
 fn run_audio_thread(
-    capture_tx: tokio::sync::mpsc::UnboundedSender<Vec<i16>>,
+    capture_tx: VoiceSender<Vec<i16>>,
     playback_rx: mpsc::Receiver<Vec<i16>>,
     shutdown_rx: mpsc::Receiver<()>,
     stats: Arc<Mutex<VoiceAudioStats>>,
@@ -746,7 +748,7 @@ fn build_input_stream(
     input_device: &cpal::Device,
     sample_format: &SampleFormat,
     config: &StreamConfig,
-    capture_tx: tokio::sync::mpsc::UnboundedSender<Vec<i16>>,
+    capture_tx: VoiceSender<Vec<i16>>,
     stats: Arc<Mutex<VoiceAudioStats>>,
     echo_guard: Arc<EchoGuard>,
     aec_processor: Option<SharedVoiceAecProcessor>,
@@ -831,7 +833,7 @@ fn build_input_stream(
 }
 
 fn handle_capture_callback(
-    capture_tx: &tokio::sync::mpsc::UnboundedSender<Vec<i16>>,
+    capture_tx: &VoiceSender<Vec<i16>>,
     assembler: &mut VoiceFrameAssembler,
     mono: &mut [i16],
     stats: &Arc<Mutex<VoiceAudioStats>>,
@@ -973,7 +975,7 @@ fn build_output_stream(
 }
 
 fn send_captured_frames(
-    capture_tx: &tokio::sync::mpsc::UnboundedSender<Vec<i16>>,
+    capture_tx: &VoiceSender<Vec<i16>>,
     assembler: &mut VoiceFrameAssembler,
     samples: &[i16],
     stats: &Arc<Mutex<VoiceAudioStats>>,
@@ -1000,7 +1002,7 @@ fn send_captured_frames(
     });
     for frame in frames {
         let frame = process_aec_capture_frame(aec_processor, frame, stats, echo_guard);
-        let _ = capture_tx.send(frame);
+        let _ = capture_tx.push(frame);
     }
 }
 

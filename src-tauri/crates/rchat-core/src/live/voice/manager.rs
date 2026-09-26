@@ -1,11 +1,10 @@
 use super::*;
 use crate::app_state::{CallKind, VoiceCallPhase, VoiceCallState};
 use crate::live::voice::protocol::{
-    read_voice_stream_frame, read_voice_stream_header, write_voice_stream_frame,
-    write_voice_stream_header, VoiceFrameRequest,
+    read_voice_stream_frame, read_voice_stream_header, VoiceFrameRequest,
 };
+use crate::live::voice::queue::{voice_queue, TimedFrame};
 use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
-use futures::AsyncWriteExt as _;
 
 const CALL_RING_TIMEOUT_SECS: u64 = 30;
 
@@ -55,10 +54,8 @@ impl NetworkManager {
 
     pub(super) fn stop_voice_audio(&mut self) {
         if let Some(call) = self.active_call.as_ref() {
-            if call.kind == CallKind::Voice {
-                let peer = call.remote_peer_id;
-                self.log_voice_network_summary("final", &peer);
-            }
+            let peer = call.remote_peer_id;
+            self.log_voice_network_summary("final", &peer);
         }
         self.voice_audio_engine = None;
         self.voice_capture_rx = None;
@@ -116,7 +113,7 @@ impl NetworkManager {
             peer, call_id, connection_id
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<VoiceFrameRequest>();
+        let (tx, rx) = voice_queue::<VoiceFrameRequest>();
         let stream_rx = match self
             .swarm
             .behaviour_mut()
@@ -135,11 +132,8 @@ impl NetworkManager {
         let event_tx = self.voice_stream_event_tx.clone();
         let writer_call_id = call_id.clone();
         let handle = tokio::spawn(async move {
-            let mut stream = match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                stream_rx,
-            )
-            .await
+            let stream = match tokio::time::timeout(std::time::Duration::from_secs(5), stream_rx)
+                .await
             {
                 Ok(Ok(Ok(stream))) => {
                     eprintln!(
@@ -180,54 +174,17 @@ impl NetworkManager {
                 }
             };
 
-            if let Err(e) = write_voice_stream_header(&mut stream, &writer_call_id).await {
+            if let Err(error) =
+                crate::live::voice::outbound::run_voice_writer(stream, &writer_call_id, rx).await
+            {
                 let _ = event_tx
                     .send(VoiceStreamEvent::OutboundFailure {
                         peer,
-                        call_id: writer_call_id.clone(),
-                        error: e.to_string(),
+                        call_id: writer_call_id,
+                        error: error.to_string(),
                     })
                     .await;
-                return;
             }
-            eprintln!(
-                "[Voice][Stream] outbound header written peer={} call_id={} connection_id={:?}",
-                peer, writer_call_id, connection_id
-            );
-
-            let mut first_frame_written = false;
-            while let Some(frame) = rx.recv().await {
-                if let Err(e) = write_voice_stream_frame(
-                    &mut stream,
-                    frame.seq,
-                    frame.timestamp,
-                    &frame.payload,
-                )
-                .await
-                {
-                    let _ = event_tx
-                        .send(VoiceStreamEvent::OutboundFailure {
-                            peer,
-                            call_id: frame.call_id.clone(),
-                            error: e.to_string(),
-                        })
-                        .await;
-                    return;
-                }
-                if !first_frame_written {
-                    eprintln!(
-                        "[Voice][Stream] outbound first frame written peer={} call_id={} seq={} bytes={} connection_id={:?}",
-                        peer,
-                        frame.call_id,
-                        frame.seq,
-                        frame.payload.len(),
-                        connection_id
-                    );
-                    first_frame_written = true;
-                }
-            }
-
-            let _ = stream.close().await;
         });
 
         self.voice_stream_tx = Some(tx);
@@ -705,26 +662,17 @@ impl NetworkManager {
             let _ = self.start_voice_stream_writer(peer, call_id.clone());
         }
 
-        let Some(voice_stream_tx) = self.voice_stream_tx.as_ref().cloned() else {
+        let frames = match self.voice_capture_rx.as_mut() {
+            Some(rx) => rx.capture_tick(!muted && self.voice_stream_tx.is_some()),
+            None => return,
+        };
+        let Some(voice_stream_tx) = self.voice_stream_tx.as_ref() else {
             return;
         };
 
-        loop {
-            let frame = match self.voice_capture_rx.as_mut() {
-                Some(capture_rx) => match capture_rx.try_recv() {
-                    Ok(frame) => frame,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-                },
-                None => return,
-            };
-
-            if muted {
-                continue;
-            }
-
+        for frame in frames {
             let payload = match self.voice_opus_encoder.as_mut() {
-                Some(encoder) => match encoder.encode_frame(&frame) {
+                Some(encoder) => match encoder.encode_frame(&frame.value) {
                     Ok(packet) => packet,
                     Err(_) => {
                         self.voice_network_stats.opus_encode_errors += 1;
@@ -746,14 +694,17 @@ impl NetworkManager {
             self.voice_next_seq = self.voice_next_seq.wrapping_add(1);
             self.voice_network_stats.outbound_frames += 1;
             self.voice_network_stats.opus_out_bytes += req.payload.len() as u64;
-            if voice_stream_tx.send(req).is_err() {
+            if voice_stream_tx
+                .push_frame(TimedFrame {
+                    value: req,
+                    captured_at: frame.captured_at,
+                })
+                .is_err()
+            {
                 self.voice_network_stats.outbound_failures += 1;
-                if self.voice_stream_call_id.as_deref() == Some(call_id.as_str()) {
-                    self.voice_stream_tx = None;
-                    self.voice_stream_call_id = None;
-                    self.voice_stream_writer_handle = None;
-                }
-                break;
+                self.transition_to_idle(Some("stream_failure".to_string()))
+                    .await;
+                return;
             }
         }
     }
@@ -843,6 +794,7 @@ impl NetworkManager {
                 eprintln!("[Voice] Outbound stream failure to {}: {}", peer, error);
                 self.voice_network_stats.outbound_failures += 1;
                 if self.voice_stream_call_id.as_deref() == Some(call_id.as_str()) {
+                    self.log_voice_network_summary("writer_failure", &peer);
                     self.voice_stream_tx = None;
                     self.voice_stream_call_id = None;
                     self.voice_stream_writer_handle = None;
