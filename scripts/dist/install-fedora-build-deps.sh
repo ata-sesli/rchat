@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-FEDORA_BUILD_DEPS="webkit2gtk4.1-devel gtk3-devel libayatana-appindicator-gtk3-devel librsvg2-devel alsa-lib-devel openssl-devel opus-devel libvpx-devel pipewire-devel wayland-devel avahi-compat-libdns_sd-devel clang clang-devel pkgconf-pkg-config gcc gcc-c++ make patchelf rpm-build git"
+FEDORA_BUILD_DEPS="webkit2gtk4.1-devel gtk3-devel libayatana-appindicator-gtk3-devel librsvg2-devel alsa-lib-devel openssl-devel opus-devel libvpx-devel pipewire-devel wayland-devel avahi-compat-libdns_sd-devel clang clang-devel pkgconf-pkg-config gcc gcc-c++ make patchelf rpm-build git sqlite"
 FEDORA_DEV_RUNTIME_DEPS="pipewire xdg-desktop-portal xdg-desktop-portal-gtk"
 FEDORA_SOURCE_DEPS="$FEDORA_BUILD_DEPS $FEDORA_DEV_RUNTIME_DEPS"
 FEDORA_PKG_CONFIG_MODULES="libpipewire-0.3 wayland-client"

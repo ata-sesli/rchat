@@ -259,7 +259,7 @@ fn update_file_mime_type(app_state: &AppState, file_hash: &str, mime_type: &str)
     if let Ok(conn) = app_state.db_conn.lock() {
         let _ = conn.execute(
             "UPDATE files SET mime_type = ?2 WHERE file_hash = ?1",
-            rusqlite::params![file_hash, mime_type],
+            rchat_storage::params![file_hash, mime_type],
         );
     }
 }
@@ -582,7 +582,7 @@ async fn dispatch_stored_media(
     }
 }
 
-fn ensure_group_chat_rows(conn: &rusqlite::Connection, chat_id: &str) -> Result<()> {
+fn ensure_group_chat_rows(conn: &rchat_storage::Connection, chat_id: &str) -> Result<()> {
     if !storage::db::chat_exists(conn, chat_id) {
         storage::db::upsert_chat(
             conn,

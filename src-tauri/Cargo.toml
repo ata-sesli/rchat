@@ -11,6 +11,7 @@ members = [
     "crates/apple-metal-shim",
     "crates/rchat-audio-processing",
     "crates/rchat-core",
+    "crates/rchat-storage",
     "crates/rchat-libvpx",
     "crates/rchat-screen-capture",
     "crates/rchat-tui",
@@ -18,6 +19,7 @@ members = [
     "crates/sonora-aec3",
 ]
 resolver = "2"
+exclude = ["vendor/rvault-core"]
 
 [patch.crates-io]
 libp2p-quic = { path = "vendor/libp2p-quic" }
@@ -47,7 +49,7 @@ debug = 1
 
 [dependencies]
 
-rvault-core = { git = "https://github.com/ata-sesli/rvault", rev = "7dda2de45ac31eccb17dad7d1a4f1ebdd893e99c" }
+rvault-core = { path = "vendor/rvault-core", default-features = false }
 tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -58,7 +60,6 @@ libp2p = { version = "0.56.0", features = [
     "macros", "request-response", "tokio", "cbor", "quic",
     "relay", "dcutr"
 ] }
-rusqlite = { version = "0.31.0", features = ["bundled"] }
 tokio = { version = "1.48.0", features = [
     "rt-multi-thread", "macros", "net", "time", "sync", "io-util"
 ] }

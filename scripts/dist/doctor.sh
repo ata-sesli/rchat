@@ -31,6 +31,7 @@ require_module() {
 require_tool cargo "install Rust from https://rustup.rs/"
 require_tool rustc "install Rust from https://rustup.rs/"
 require_tool clang "install Clang or Xcode Command Line Tools"
+require_tool sqlite3 "SQLite CLI is required for legacy migration tests, not runtime storage"
 require_tool pkg-config "run the platform native-dependency installer"
 require_module opus "libopus development package"
 require_module vpx "libvpx development package"

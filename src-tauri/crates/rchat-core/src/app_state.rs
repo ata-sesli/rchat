@@ -1073,7 +1073,7 @@ pub struct NetworkState {
 #[derive(Clone)]
 pub struct AppState {
     pub config_manager: Arc<tokio::sync::Mutex<ConfigManager>>,
-    pub db_conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    pub db_conn: Arc<std::sync::Mutex<rchat_storage::Connection>>,
     pub local_peer_id: Arc<std::sync::RwLock<Option<String>>>,
     pub app_dir: std::path::PathBuf,
 }

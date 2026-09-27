@@ -4,10 +4,9 @@
 //! using content-defined chunking for deduplication.
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use fastcdc::v2020::FastCDC;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rchat_storage::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
@@ -16,21 +15,6 @@ use std::path::PathBuf;
 const MIN_CHUNK_SIZE: u32 = 2 * 1024; // 2 KB
 const AVG_CHUNK_SIZE: u32 = 8 * 1024; // 8 KB
 const MAX_CHUNK_SIZE: u32 = 64 * 1024; // 64 KB
-
-/// Get the chunks directory path.
-fn get_chunks_dir(root_dir: Option<PathBuf>) -> Result<PathBuf> {
-    let base_dir = if let Some(d) = root_dir {
-        d
-    } else {
-        let project_dirs = ProjectDirs::from("io.github", "ata-sesli", "RChat")
-            .context("Failed to determine project directories")?;
-        project_dirs.data_dir().to_path_buf()
-    };
-
-    let chunks_dir = base_dir.join("chunks");
-    fs::create_dir_all(&chunks_dir).context("Failed to create chunks directory")?;
-    Ok(chunks_dir)
-}
 
 /// Calculate SHA256 hash and return as hex string.
 fn sha256_hex(data: &[u8]) -> String {
@@ -48,31 +32,10 @@ pub fn create(
     data: &[u8],
     file_name: Option<&str>,
     mime_type: Option<&str>,
-    root_dir: Option<PathBuf>,
+    _root_dir: Option<PathBuf>,
 ) -> Result<String> {
     let file_hash = sha256_hex(data);
     let size_bytes = data.len() as i64;
-
-    let existing = conn
-        .query_row(
-            "SELECT size_bytes, is_complete FROM files WHERE file_hash = ?1",
-            [&file_hash],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
-        )
-        .optional()?;
-
-    if let Some((existing_size, is_complete)) = existing {
-        let chunk_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM file_chunks WHERE file_hash = ?1",
-            [&file_hash],
-            |row| row.get(0),
-        )?;
-        if is_complete && existing_size == size_bytes && (size_bytes == 0 || chunk_count > 0) {
-            return Ok(file_hash);
-        }
-    }
-
-    let chunks_dir = get_chunks_dir(root_dir)?;
 
     // Chunk the data using FastCDC
     let chunker = FastCDC::new(data, MIN_CHUNK_SIZE, AVG_CHUNK_SIZE, MAX_CHUNK_SIZE);
@@ -84,16 +47,21 @@ pub fn create(
         let chunk_hash = sha256_hex(chunk_data);
         let chunk_size = chunk.length as i64;
 
-        // Store chunk to disk if it doesn't exist (deduplication)
-        let chunk_path = chunks_dir.join(&chunk_hash);
-        if !chunk_path.exists() {
-            fs::write(&chunk_path, chunk_data)
-                .with_context(|| format!("Failed to write chunk {}", chunk_hash))?;
-        }
+        conn.put_chunk(&chunk_hash, chunk_data)?;
 
         chunk_records.push((chunk_hash, chunk_order, chunk_size));
         chunk_order += 1;
     }
+
+    // Zova object writes cannot participate in a SQL transaction. Stage and verify
+    // first; a metadata rollback can leave only unreferenced, reusable chunks.
+    conn.assemble_object(
+        &file_hash,
+        &chunk_records
+            .iter()
+            .map(|(hash, _, size)| (hash.clone(), *size as u64))
+            .collect::<Vec<_>>(),
+    )?;
 
     // Begin transaction
     let tx = conn.unchecked_transaction()?;
@@ -109,12 +77,7 @@ pub fn create(
             mime_type = COALESCE(excluded.mime_type, files.mime_type),
             size_bytes = excluded.size_bytes,
             is_complete = 1",
-        params![
-            &file_hash,
-            file_name,
-            mime_type,
-            size_bytes,
-        ],
+        params![&file_hash, file_name, mime_type, size_bytes,],
     )?;
 
     // Insert into file_chunks table
@@ -133,10 +96,10 @@ pub fn create(
 /// Load an object (file) by reassembling its chunks.
 ///
 /// Returns the complete file data.
-pub fn load(conn: &Connection, file_hash: &str, root_dir: Option<PathBuf>) -> Result<Vec<u8>> {
+pub fn load(conn: &Connection, file_hash: &str, _root_dir: Option<PathBuf>) -> Result<Vec<u8>> {
     // Verify file exists
     let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM files WHERE file_hash = ?1)",
+        "SELECT EXISTS(SELECT 1 FROM files WHERE file_hash = ?1 AND is_complete=1)",
         [file_hash],
         |row| row.get(0),
     )?;
@@ -145,32 +108,104 @@ pub fn load(conn: &Connection, file_hash: &str, root_dir: Option<PathBuf>) -> Re
         anyhow::bail!("File not found: {}", file_hash);
     }
 
-    let chunks_dir = get_chunks_dir(root_dir)?;
+    conn.get_object(file_hash)
+        .context("Media unavailable; retry the attachment")
+}
 
-    // Get chunks in order
-    let mut stmt = conn.prepare(
-        "SELECT chunk_hash FROM file_chunks WHERE file_hash = ?1 ORDER BY chunk_order ASC",
+/// Assemble only a complete, ordered, size- and hash-verified transport manifest.
+pub(crate) fn assemble_received(conn: &Connection, file_hash: &str) -> Result<bool> {
+    let size: i64 = conn.query_row(
+        "SELECT size_bytes FROM files WHERE file_hash=?1",
+        [file_hash],
+        |r| r.get(0),
     )?;
-
-    let chunk_hashes: Vec<String> = stmt
-        .query_map([file_hash], |row| row.get(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Read and concatenate chunks
-    let mut result = Vec::new();
-    for chunk_hash in chunk_hashes {
-        let chunk_path = chunks_dir.join(&chunk_hash);
-        let chunk_data = fs::read(&chunk_path)
-            .with_context(|| format!("Failed to read chunk {}", chunk_hash))?;
-        result.extend_from_slice(&chunk_data);
+    let mut statement = conn.prepare("SELECT chunk_order, chunk_hash, chunk_size FROM file_chunks WHERE file_hash=?1 ORDER BY chunk_order")?;
+    let rows = statement.query_map([file_hash], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut chunks = Vec::new();
+    let mut total = 0i64;
+    let mut hasher = Sha256::new();
+    for row in rows {
+        let (order, hash, length) = row?;
+        if order != chunks.len() as i64
+            || !(1..=i64::from(MAX_CHUNK_SIZE)).contains(&length)
+            || hash.len() != 64
+            || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Ok(false);
+        }
+        if !conn.has_chunk(&hash)? {
+            return Ok(false);
+        }
+        let bytes = conn.get_chunk(&hash)?;
+        if bytes.len() as i64 != length {
+            return Ok(false);
+        }
+        total = total
+            .checked_add(length)
+            .context("manifest size overflow")?;
+        hasher.update(&bytes);
+        chunks.push((hash, length as u64));
     }
+    if total != size || hex::encode(hasher.finalize()) != file_hash {
+        return Ok(false);
+    }
+    conn.assemble_object(file_hash, &chunks)?;
+    conn.execute(
+        "UPDATE files SET is_complete=1 WHERE file_hash=?1",
+        [file_hash],
+    )?;
+    Ok(true)
+}
 
-    Ok(result)
+/// Import legacy files in bounded chunk-sized reads; never delete the originals.
+pub(crate) fn import_legacy_chunks(conn: &Connection, root: &std::path::Path) -> Result<()> {
+    use std::io::Read;
+    // Keyset traversal finalizes each SQL statement before object writes. A live
+    // read cursor also counts as a transaction to Zova's object API.
+    let mut previous: Option<String> = None;
+    while let Some(file) = conn.query_row(
+        "SELECT file_hash FROM files WHERE ?1 IS NULL OR file_hash>?1 ORDER BY file_hash LIMIT 1",
+        params![previous], |r| r.get::<_,String>(0)).optional()? {
+        previous = Some(file.clone());
+        conn.execute("UPDATE files SET is_complete=0 WHERE file_hash=?1", [&file])?;
+        let mut previous_order: Option<i64> = None;
+        while let Some((order,hash)) = conn.query_row(
+            "SELECT chunk_order,chunk_hash FROM file_chunks WHERE file_hash=?1 AND (?2 IS NULL OR chunk_order>?2) ORDER BY chunk_order LIMIT 1",
+            params![file,previous_order], |r| Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).optional()? {
+            previous_order = Some(order);
+            // A legacy database is input, not a trusted filesystem path.
+            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let path = root.join("chunks").join(&hash);
+            let input = match fs::File::open(path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let mut bytes = Vec::new();
+            input
+                .take(u64::from(MAX_CHUNK_SIZE) + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_CHUNK_SIZE as usize || sha256_hex(&bytes) != hash {
+                continue;
+            }
+            conn.put_chunk(&hash, &bytes)?;
+        }
+        assemble_received(conn, &file)?;
+    }
+    Ok(())
 }
 
 /// Delete an object (file) from the database.
 ///
-/// Note: Chunks are NOT deleted from disk to avoid race conditions with deduplication.
+/// Note: Zova bytes are retained to avoid invalidating other references.
 /// A separate garbage collection process can clean up orphaned chunks.
 #[cfg(test)]
 pub fn delete(conn: &Connection, file_hash: &str) -> Result<()> {
@@ -194,8 +229,54 @@ pub fn delete(conn: &Connection, file_hash: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
+    use rchat_storage::Connection;
     use tempfile::tempdir;
+
+    #[test]
+    fn legacy_import_preserves_manifest_and_missing_media_is_retryable() {
+        let conn = setup_test_db();
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("chunks")).unwrap();
+        let data = b"legacy attachment";
+        let hash = sha256_hex(data);
+        let missing = sha256_hex(b"missing");
+        let corrupt = sha256_hex(b"corrupt");
+        for (id, size) in [(&hash, data.len()), (&missing, 7), (&corrupt, 7)] {
+            conn.execute(
+                "INSERT INTO files VALUES(?1,'file','application/octet-stream',?2,1)",
+                params![id, size],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_chunks VALUES(?1,0,?1,?2)",
+                params![id, size],
+            )
+            .unwrap();
+        }
+        fs::write(root.path().join("chunks").join(&hash), data).unwrap();
+        fs::write(root.path().join("chunks").join(&corrupt), b"WRONG!!").unwrap();
+        import_legacy_chunks(&conn, root.path()).unwrap();
+        assert_eq!(load(&conn, &hash, None).unwrap(), data);
+        assert!(load(&conn, &missing, None).is_err());
+        assert!(load(&conn, &corrupt, None).is_err());
+        assert_eq!(
+            fs::read(root.path().join("chunks").join(&hash)).unwrap(),
+            data
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM file_chunks", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM files WHERE is_complete=1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+    }
 
     fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

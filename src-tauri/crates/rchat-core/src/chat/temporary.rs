@@ -1120,7 +1120,7 @@ async fn preserve_restore_state(
 /// Persist a set of messages into an archive chat, rewriting their chat id
 /// and marking them read, and registering any remote peer that owns them.
 fn persist_archive_messages(
-    conn: &rusqlite::Connection,
+    conn: &rchat_storage::Connection,
     archive_chat_id: &str,
     messages: Vec<Message>,
 ) -> Result<()> {
@@ -1240,7 +1240,7 @@ mod tests {
         let mut config = manager.init("password").await.expect("init config");
         config.system.github_username = Some("local-user".to_string());
         manager.save(&config).await.expect("save config");
-        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        let conn = rchat_storage::Connection::open_in_memory().expect("in-memory db");
 
         (
             temp,

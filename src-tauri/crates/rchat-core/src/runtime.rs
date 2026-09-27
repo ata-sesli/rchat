@@ -15,7 +15,14 @@ pub fn default_app_data_dir() -> Result<PathBuf> {
 pub fn create_app_state(app_dir: PathBuf) -> Result<AppState> {
     std::fs::create_dir_all(&app_dir).context("failed to create app data dir")?;
     let config_manager = ConfigManager::new(app_dir.clone());
-    let db_conn = db::connect_to_db().context("failed to initialize database")?;
+    // Preserve the historical shared GUI/TUI location for the default profile,
+    // but keep explicitly isolated profiles (including tests) isolated.
+    let db_conn = if app_dir == default_app_data_dir()? {
+        db::connect_to_db()
+    } else {
+        db::connect_to_storage_root(&app_dir)
+    }
+    .context("failed to initialize database")?;
 
     Ok(AppState {
         config_manager: Arc::new(tokio::sync::Mutex::new(config_manager)),

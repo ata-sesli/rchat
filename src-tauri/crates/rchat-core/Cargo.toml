@@ -7,7 +7,7 @@ edition = "2021"
 name = "rchat_core"
 
 [dependencies]
-rvault-core = { git = "https://github.com/ata-sesli/rvault", rev = "7dda2de45ac31eccb17dad7d1a4f1ebdd893e99c" }
+rvault-core = { path = "../../vendor/rvault-core", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libp2p = { version = "0.56.0", features = [
@@ -18,7 +18,7 @@ libp2p = { version = "0.56.0", features = [
 ] }
 futures = "0.3.31"
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio"] }
-rusqlite = { version = "0.31.0", features = ["bundled"] }
+rchat-storage = { path = "../rchat-storage" }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 tokio = { version = "1.48.0", features = [
     "rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs"

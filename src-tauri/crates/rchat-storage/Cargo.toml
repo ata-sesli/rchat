@@ -1,0 +1,12 @@
+[package]
+name = "rchat-storage"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zova = "=1.1.0"
+hex = "0.4"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

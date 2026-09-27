@@ -3,7 +3,7 @@ use crate::{
     AppState,
 };
 use anyhow::{anyhow, Context};
-use rusqlite::Connection;
+use rchat_storage::Connection;
 
 pub fn create_envelope(
     state: &AppState,

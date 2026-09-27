@@ -1,0 +1,32 @@
+[package]
+name = "rvault-core"
+version = "0.0.5"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ata Sesli"]
+repository = "https://github.com/atasesli/rvault"
+
+[lib]
+name = "rvault_core"
+path = "lib.rs"
+
+[dependencies]
+arboard = "3.6.0"
+argon2 = "0.5.3"
+base64 = "0.22.1"
+chacha20poly1305 = "0.10.1"
+directories = "6.0.0"
+rand = "0.9.1"
+rusqlite = { version = "0.31.0", features = ["bundled"], optional = true }
+serde = { version = "1.0.219", features = ["derive"]}
+serde_json = "1.0.140"
+thiserror = "2.0.12"
+toml = "0.9.2"
+zeroize = "1.8.1"
+clap = { version = "4.5.4", features = ["derive"] }
+crc32fast = "1.4.0"
+memchr = "2.7.2"
+
+[features]
+default = ["storage"]
+storage = ["dep:rusqlite"]
