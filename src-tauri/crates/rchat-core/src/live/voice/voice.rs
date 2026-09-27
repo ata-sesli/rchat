@@ -127,7 +127,6 @@ struct VoiceAudioStats {
     playback_frames_received: u64,
     playback_samples_consumed: u64,
     playback_samples_dropped: u64,
-    playback_ingress_dropped_frames: u64,
     playback_queue_trim_events: u64,
     playback_concealed_samples: u64,
     playback_underruns: u64,
@@ -192,14 +191,93 @@ impl VoiceAudioStats {
     }
 }
 
-fn with_audio_stats(
-    stats: &Arc<Mutex<VoiceAudioStats>>,
-    update: impl FnOnce(&mut VoiceAudioStats),
-) {
-    // Diagnostics must never stall capture or playback behind a reporting thread.
-    if let Ok(mut guard) = stats.try_lock() {
-        update(&mut guard);
+// All callback diagnostics are lock-free. Reporting takes an approximate
+// snapshot: individual counters are exact, but fields need not share an instant.
+#[derive(Default)]
+struct AudioStats {
+    started_at: Option<Instant>,
+    capture_callbacks: AtomicU64,
+    capture_input_frames: AtomicU64,
+    measured_capture_rate_hz: AtomicU64,
+    capture_resample_ratio: AtomicU64,
+    capture_panics: AtomicU64,
+    capture_echo_suppressed_samples: AtomicU64,
+    aec_enabled: AtomicU64,
+    aec_render_frames: AtomicU64,
+    aec_capture_frames: AtomicU64,
+    aec_errors: AtomicU64,
+    aec_fallback_active: AtomicU64,
+    generated_frames: AtomicU64,
+    resampler_errors: AtomicU64,
+    playback_callbacks: AtomicU64,
+    output_device_frames: AtomicU64,
+    playback_declared_rate_hz: AtomicU64,
+    playback_measured_rate_hz: AtomicU64,
+    playback_effective_rate_hz: AtomicU64,
+    output_clock_unstable: AtomicU64,
+    playback_frames_received: AtomicU64,
+    playback_samples_consumed: AtomicU64,
+    playback_samples_dropped: AtomicU64,
+    playback_ingress_dropped_frames: AtomicU64,
+    playback_queue_trim_events: AtomicU64,
+    playback_concealed_samples: AtomicU64,
+    playback_underruns: AtomicU64,
+    current_playback_queue_samples: AtomicU64,
+    max_playback_queue_samples: AtomicU64,
+}
+
+impl AudioStats {
+    fn snapshot(&self) -> VoiceAudioStats {
+        VoiceAudioStats {
+            started_at: self.started_at,
+            capture_callbacks: self.capture_callbacks.load(Ordering::Relaxed),
+            capture_input_frames: self.capture_input_frames.load(Ordering::Relaxed),
+            measured_capture_rate_hz: f64::from_bits(
+                self.measured_capture_rate_hz.load(Ordering::Relaxed),
+            ),
+            capture_resample_ratio: f64::from_bits(
+                self.capture_resample_ratio.load(Ordering::Relaxed),
+            ),
+            capture_panics: self.capture_panics.load(Ordering::Relaxed),
+            capture_echo_suppressed_samples: self
+                .capture_echo_suppressed_samples
+                .load(Ordering::Relaxed),
+            aec_enabled: self.aec_enabled.load(Ordering::Relaxed) != 0,
+            aec_render_frames: self.aec_render_frames.load(Ordering::Relaxed),
+            aec_capture_frames: self.aec_capture_frames.load(Ordering::Relaxed),
+            aec_errors: self.aec_errors.load(Ordering::Relaxed),
+            aec_fallback_active: self.aec_fallback_active.load(Ordering::Relaxed) != 0,
+            generated_frames: self.generated_frames.load(Ordering::Relaxed),
+            resampler_errors: self.resampler_errors.load(Ordering::Relaxed),
+            playback_callbacks: self.playback_callbacks.load(Ordering::Relaxed),
+            output_device_frames: self.output_device_frames.load(Ordering::Relaxed),
+            playback_declared_rate_hz: f64::from_bits(
+                self.playback_declared_rate_hz.load(Ordering::Relaxed),
+            ),
+            playback_measured_rate_hz: f64::from_bits(
+                self.playback_measured_rate_hz.load(Ordering::Relaxed),
+            ),
+            playback_effective_rate_hz: f64::from_bits(
+                self.playback_effective_rate_hz.load(Ordering::Relaxed),
+            ),
+            output_clock_unstable: self.output_clock_unstable.load(Ordering::Relaxed) != 0,
+            playback_frames_received: self.playback_frames_received.load(Ordering::Relaxed),
+            playback_samples_consumed: self.playback_samples_consumed.load(Ordering::Relaxed),
+            playback_samples_dropped: self.playback_samples_dropped.load(Ordering::Relaxed),
+            playback_queue_trim_events: self.playback_queue_trim_events.load(Ordering::Relaxed),
+            playback_concealed_samples: self.playback_concealed_samples.load(Ordering::Relaxed),
+            playback_underruns: self.playback_underruns.load(Ordering::Relaxed),
+            current_playback_queue_samples: self
+                .current_playback_queue_samples
+                .load(Ordering::Relaxed) as usize,
+            max_playback_queue_samples: self.max_playback_queue_samples.load(Ordering::Relaxed)
+                as usize,
+        }
     }
+}
+
+fn with_audio_stats(stats: &Arc<AudioStats>, update: impl FnOnce(&AudioStats)) {
+    update(stats);
 }
 
 struct EchoGuard {
@@ -317,7 +395,7 @@ type SharedVoiceAecProcessor = Arc<Mutex<VoiceAecProcessor>>;
 
 pub struct VoiceAudioEngine {
     playback_tx: VoiceSender<[i16; FRAME_SAMPLES]>,
-    stats: Arc<Mutex<VoiceAudioStats>>,
+    stats: Arc<AudioStats>,
     shutdown_tx: mpsc::Sender<()>,
     thread_handle: Option<thread::JoinHandle<()>>,
 }
@@ -327,10 +405,10 @@ impl VoiceAudioEngine {
         let (capture_tx, capture_rx) = voice_queue::<Vec<i16>>();
         let (playback_tx, playback_rx) = voice_queue::<[i16; FRAME_SAMPLES]>();
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
-        let stats = Arc::new(Mutex::new(VoiceAudioStats {
+        let stats = Arc::new(AudioStats {
             started_at: Some(Instant::now()),
-            ..VoiceAudioStats::default()
-        }));
+            ..AudioStats::default()
+        });
         let thread_stats = stats.clone();
 
         let thread_handle = thread::Builder::new()
@@ -355,9 +433,8 @@ impl VoiceAudioEngine {
         // Only one 20ms mono frame may enter the queue: cap bytes as well as entries.
         let Ok(frame) = <[i16; FRAME_SAMPLES]>::try_from(samples.as_slice()) else {
             with_audio_stats(&self.stats, |s| {
-                s.playback_samples_dropped = s
-                    .playback_samples_dropped
-                    .saturating_add(samples.len() as u64);
+                s.playback_samples_dropped
+                    .fetch_add(samples.len() as u64, Ordering::Relaxed);
             });
             return;
         };
@@ -396,7 +473,7 @@ pub(crate) fn start_microphone_diagnostic_session(
     let thread_level = Arc::clone(&level_percent);
     let thread_peak = Arc::clone(&peak_percent);
     let thread_frames = Arc::clone(&captured_frames);
-    let stats = Arc::new(Mutex::new(VoiceAudioStats::default()));
+    let stats = Arc::new(AudioStats::default());
     let echo_guard = Arc::new(EchoGuard::new());
 
     let thread_handle = thread::Builder::new()
@@ -510,7 +587,7 @@ fn run_audio_thread(
     capture_tx: VoiceSender<Vec<i16>>,
     playback_rx: VoiceReceiver<[i16; FRAME_SAMPLES]>,
     shutdown_rx: mpsc::Receiver<()>,
-    stats: Arc<Mutex<VoiceAudioStats>>,
+    stats: Arc<AudioStats>,
 ) {
     let host = cpal::default_host();
     let Some(input_device) = host.default_input_device() else {
@@ -587,8 +664,9 @@ fn run_audio_thread(
             let _ = canceller.set_stream_delay_ms(delay_ms);
             eprintln!("[Voice][Audio] acoustic_echo_cancellation=enabled");
             with_audio_stats(&stats, |s| {
-                s.aec_enabled = true;
-                s.aec_fallback_active = false;
+                s.aec_enabled.store((true) as u64, Ordering::Relaxed);
+                s.aec_fallback_active
+                    .store((false) as u64, Ordering::Relaxed);
             });
             Some(Arc::new(Mutex::new(VoiceAecProcessor::new(canceller))))
         }
@@ -598,8 +676,9 @@ fn run_audio_thread(
                 e
             );
             with_audio_stats(&stats, |s| {
-                s.aec_enabled = false;
-                s.aec_fallback_active = true;
+                s.aec_enabled.store((false) as u64, Ordering::Relaxed);
+                s.aec_fallback_active
+                    .store((true) as u64, Ordering::Relaxed);
             });
             None
         }
@@ -651,17 +730,13 @@ fn run_audio_thread(
             break;
         }
         if last_summary.elapsed() >= VOICE_DIAGNOSTICS_INTERVAL {
-            if let Ok(guard) = stats.lock() {
-                guard.log_summary("summary");
-            }
+            stats.snapshot().log_summary("summary");
             last_summary = Instant::now();
         }
         thread::sleep(Duration::from_millis(50));
     }
 
-    if let Ok(guard) = stats.lock() {
-        guard.log_summary("final");
-    }
+    stats.snapshot().log_summary("final");
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -804,7 +879,7 @@ fn build_input_stream(
     sample_format: &SampleFormat,
     config: &StreamConfig,
     capture_tx: CaptureSink,
-    stats: Arc<Mutex<VoiceAudioStats>>,
+    stats: Arc<AudioStats>,
     echo_guard: Arc<EchoGuard>,
     aec_processor: Option<SharedVoiceAecProcessor>,
 ) -> Result<Stream, String> {
@@ -821,7 +896,9 @@ fn build_input_stream(
                 .build_input_stream(
                     config,
                     move |data: &[f32], _| {
-                        with_audio_stats(&stats, |s| s.capture_callbacks += 1);
+                        with_audio_stats(&stats, |s| {
+                            s.capture_callbacks.fetch_add(1, Ordering::Relaxed);
+                        });
                         let mut mono = input_to_mono_i16_f32(data, channels);
                         handle_capture_callback(
                             &capture_tx,
@@ -844,7 +921,9 @@ fn build_input_stream(
                 .build_input_stream(
                     config,
                     move |data: &[i16], _| {
-                        with_audio_stats(&stats, |s| s.capture_callbacks += 1);
+                        with_audio_stats(&stats, |s| {
+                            s.capture_callbacks.fetch_add(1, Ordering::Relaxed);
+                        });
                         let mut mono = input_to_mono_i16_i16(data, channels);
                         handle_capture_callback(
                             &capture_tx,
@@ -867,7 +946,9 @@ fn build_input_stream(
                 .build_input_stream(
                     config,
                     move |data: &[u16], _| {
-                        with_audio_stats(&stats, |s| s.capture_callbacks += 1);
+                        with_audio_stats(&stats, |s| {
+                            s.capture_callbacks.fetch_add(1, Ordering::Relaxed);
+                        });
                         let mut mono = input_to_mono_i16_u16(data, channels);
                         handle_capture_callback(
                             &capture_tx,
@@ -891,16 +972,15 @@ fn handle_capture_callback(
     capture_tx: &CaptureSink,
     assembler: &mut VoiceFrameAssembler,
     mono: &mut [i16],
-    stats: &Arc<Mutex<VoiceAudioStats>>,
+    stats: &Arc<AudioStats>,
     echo_guard: &EchoGuard,
     aec_processor: Option<&SharedVoiceAecProcessor>,
 ) {
     if catch_unwind(AssertUnwindSafe(|| {
         if aec_fallback_active(aec_processor) && echo_guard.apply_to_capture(mono, Instant::now()) {
             with_audio_stats(stats, |s| {
-                s.capture_echo_suppressed_samples = s
-                    .capture_echo_suppressed_samples
-                    .saturating_add(mono.len() as u64);
+                s.capture_echo_suppressed_samples
+                    .fetch_add(mono.len() as u64, Ordering::Relaxed);
             });
         }
         send_captured_frames(
@@ -915,8 +995,8 @@ fn handle_capture_callback(
     .is_err()
     {
         with_audio_stats(stats, |s| {
-            s.capture_panics = s.capture_panics.saturating_add(1);
-            s.resampler_errors = s.resampler_errors.saturating_add(1);
+            s.capture_panics.fetch_add(1, Ordering::Relaxed);
+            s.resampler_errors.fetch_add(1, Ordering::Relaxed);
         });
         eprintln!("[Voice] Capture processing panicked; skipping callback frame");
     }
@@ -927,7 +1007,7 @@ fn build_output_stream(
     sample_format: &SampleFormat,
     config: &StreamConfig,
     mut playback_rx: VoiceReceiver<[i16; FRAME_SAMPLES]>,
-    stats: Arc<Mutex<VoiceAudioStats>>,
+    stats: Arc<AudioStats>,
     echo_guard: Arc<EchoGuard>,
     aec_processor: Option<SharedVoiceAecProcessor>,
 ) -> Result<Stream, String> {
@@ -1036,7 +1116,7 @@ fn send_captured_frames(
     capture_tx: &CaptureSink,
     assembler: &mut VoiceFrameAssembler,
     samples: &[i16],
-    stats: &Arc<Mutex<VoiceAudioStats>>,
+    stats: &Arc<AudioStats>,
     echo_guard: &EchoGuard,
     aec_processor: Option<&SharedVoiceAecProcessor>,
 ) {
@@ -1048,15 +1128,19 @@ fn send_captured_frames(
     let measured_capture_rate_hz = assembler.measured_input_rate_hz().unwrap_or(0.0);
     let capture_resample_ratio = assembler.resampler_ratio().unwrap_or(0.0);
     with_audio_stats(stats, |s| {
-        s.capture_input_frames = s.capture_input_frames.saturating_add(samples.len() as u64);
+        s.capture_input_frames
+            .fetch_add(samples.len() as u64, Ordering::Relaxed);
         if measured_capture_rate_hz > 0.0 {
-            s.measured_capture_rate_hz = measured_capture_rate_hz;
+            s.measured_capture_rate_hz
+                .store((measured_capture_rate_hz).to_bits(), Ordering::Relaxed);
         }
         if capture_resample_ratio > 0.0 {
-            s.capture_resample_ratio = capture_resample_ratio;
+            s.capture_resample_ratio
+                .store((capture_resample_ratio).to_bits(), Ordering::Relaxed);
         }
-        s.generated_frames += frames.len() as u64;
-        s.resampler_errors += error_delta;
+        s.generated_frames
+            .fetch_add(frames.len() as u64, Ordering::Relaxed);
+        s.resampler_errors.fetch_add(error_delta, Ordering::Relaxed);
     });
     for frame in frames {
         let frame = process_aec_capture_frame(aec_processor, frame, stats, echo_guard);
@@ -1067,7 +1151,7 @@ fn send_captured_frames(
 fn process_aec_capture_frame(
     aec_processor: Option<&SharedVoiceAecProcessor>,
     mut frame: Vec<i16>,
-    stats: &Arc<Mutex<VoiceAudioStats>>,
+    stats: &Arc<AudioStats>,
     echo_guard: &EchoGuard,
 ) -> Vec<i16> {
     let Some(aec_processor) = aec_processor else {
@@ -1093,7 +1177,7 @@ fn process_aec_capture_frame(
 
 fn apply_echo_guard_to_capture_frame(
     frame: &mut [i16],
-    stats: &Arc<Mutex<VoiceAudioStats>>,
+    stats: &Arc<AudioStats>,
     echo_guard: &EchoGuard,
     now: Instant,
 ) {
@@ -1102,9 +1186,8 @@ fn apply_echo_guard_to_capture_frame(
     }
     if echo_guard.apply_to_capture(frame, now) {
         with_audio_stats(stats, |s| {
-            s.capture_echo_suppressed_samples = s
-                .capture_echo_suppressed_samples
-                .saturating_add(frame.len() as u64);
+            s.capture_echo_suppressed_samples
+                .fetch_add(frame.len() as u64, Ordering::Relaxed);
         });
     }
 }
@@ -1112,7 +1195,7 @@ fn apply_echo_guard_to_capture_frame(
 fn process_aec_render_frame(
     aec_processor: Option<&SharedVoiceAecProcessor>,
     frame: &[i16],
-    stats: &Arc<Mutex<VoiceAudioStats>>,
+    stats: &Arc<AudioStats>,
 ) {
     let Some(aec_processor) = aec_processor else {
         return;
@@ -1135,12 +1218,15 @@ fn aec_fallback_active(aec_processor: Option<&SharedVoiceAecProcessor>) -> bool 
     guard.fallback_active()
 }
 
-fn sync_aec_stats(stats: &Arc<Mutex<VoiceAudioStats>>, aec_stats: VoiceAecStats) {
+fn sync_aec_stats(stats: &Arc<AudioStats>, aec_stats: VoiceAecStats) {
     with_audio_stats(stats, |s| {
-        s.aec_render_frames = aec_stats.render_frames;
-        s.aec_capture_frames = aec_stats.capture_frames;
-        s.aec_errors = aec_stats.errors;
-        s.aec_fallback_active = aec_stats.fallback_active;
+        s.aec_render_frames
+            .store(aec_stats.render_frames, Ordering::Relaxed);
+        s.aec_capture_frames
+            .store(aec_stats.capture_frames, Ordering::Relaxed);
+        s.aec_errors.store(aec_stats.errors, Ordering::Relaxed);
+        s.aec_fallback_active
+            .store((aec_stats.fallback_active) as u64, Ordering::Relaxed);
     });
 }
 
@@ -1376,7 +1462,7 @@ fn input_to_mono_i16_u16(data: &[u16], channels: usize) -> Vec<i16> {
 fn drain_playback_frames(
     playback_rx: &mut VoiceReceiver<[i16; FRAME_SAMPLES]>,
     queue: &mut VecDeque<i16>,
-    stats: &Arc<Mutex<VoiceAudioStats>>,
+    stats: &Arc<AudioStats>,
     state: &mut PlaybackState,
 ) {
     let now = Instant::now();
@@ -1394,8 +1480,8 @@ fn drain_playback_frames(
     }
     state.last_drain_at = now;
     let mut received = 0u64;
-    // One bounded snapshot: at most three frames, even while producers refill.
-    for frame in playback_rx.capture_tick(true) {
+    // One bounded snapshot: at most five frames, even while producers refill.
+    for frame in playback_rx.playback_tick() {
         received += 1;
         queue.extend(frame.value);
     }
@@ -1404,32 +1490,40 @@ fn drain_playback_frames(
     if received > 0 {
         let queue_len = queue.len();
         with_audio_stats(stats, |s| {
-            s.playback_frames_received += received;
-            s.current_playback_queue_samples = queue_len;
-            s.max_playback_queue_samples = s.max_playback_queue_samples.max(queue_len);
+            s.playback_frames_received
+                .fetch_add(received, Ordering::Relaxed);
+            s.current_playback_queue_samples
+                .store((queue_len) as u64, Ordering::Relaxed);
+            s.max_playback_queue_samples
+                .fetch_max((queue_len) as u64, Ordering::Relaxed);
         });
     }
     if dropped > 0 {
         with_audio_stats(stats, |s| {
-            s.playback_samples_dropped = s.playback_samples_dropped.saturating_add(dropped as u64);
-            s.playback_queue_trim_events = s.playback_queue_trim_events.saturating_add(1);
-            s.current_playback_queue_samples = queue.len();
+            s.playback_samples_dropped
+                .fetch_add(dropped as u64, Ordering::Relaxed);
+            s.playback_queue_trim_events.fetch_add(1, Ordering::Relaxed);
+            s.current_playback_queue_samples
+                .store((queue.len()) as u64, Ordering::Relaxed);
         });
     }
 }
 
-fn record_playback_ingress_drops(stats: &Arc<Mutex<VoiceAudioStats>>, drops: QueueStats) {
+fn record_playback_ingress_drops(stats: &Arc<AudioStats>, drops: QueueStats) {
     let total = drops
         .overflow
         .saturating_add(drops.stale)
         .saturating_add(drops.contention)
         .saturating_add(drops.discarded);
     with_audio_stats(stats, |s| {
-        let additional = total.saturating_sub(s.playback_ingress_dropped_frames);
-        s.playback_ingress_dropped_frames = total;
-        s.playback_samples_dropped = s
-            .playback_samples_dropped
-            .saturating_add(additional.saturating_mul(FRAME_SAMPLES as u64));
+        let previous = s
+            .playback_ingress_dropped_frames
+            .fetch_max(total, Ordering::Relaxed);
+        let additional = total.saturating_sub(previous);
+        s.playback_samples_dropped.fetch_add(
+            additional.saturating_mul(FRAME_SAMPLES as u64),
+            Ordering::Relaxed,
+        );
     });
 }
 
@@ -1450,7 +1544,7 @@ struct PlaybackAecRender {
     frame: [i16; FRAME_SAMPLES],
     used: usize,
     processor: SharedVoiceAecProcessor,
-    stats: Arc<Mutex<VoiceAudioStats>>,
+    stats: Arc<AudioStats>,
 }
 
 impl PlaybackAecRender {
@@ -1635,7 +1729,7 @@ fn write_output_frames_i16(
     queue: &mut VecDeque<i16>,
     playback_state: &mut PlaybackState,
     mono: &mut Vec<i16>,
-    stats: &Arc<Mutex<VoiceAudioStats>>,
+    stats: &Arc<AudioStats>,
     echo_guard: &EchoGuard,
 ) {
     if channels == 0 {
@@ -1654,21 +1748,35 @@ fn write_output_frames_i16(
         }
     }
     with_audio_stats(stats, |s| {
-        s.playback_callbacks += 1;
-        s.output_device_frames = s.output_device_frames.saturating_add(frame_count as u64);
-        s.playback_declared_rate_hz = playback_state.declared_output_rate_hz();
-        s.playback_measured_rate_hz = playback_state.measured_output_rate_hz().unwrap_or(0.0);
-        s.playback_effective_rate_hz = playback_state.effective_output_rate_hz();
-        s.output_clock_unstable = playback_state.output_clock_unstable();
-        s.playback_samples_consumed = s
-            .playback_samples_consumed
-            .saturating_add(render_stats.consumed_samples as u64);
-        s.playback_underruns += render_stats.underruns;
-        s.playback_concealed_samples = s
-            .playback_concealed_samples
-            .saturating_add(render_stats.underruns);
-        s.current_playback_queue_samples = queue.len();
-        s.max_playback_queue_samples = s.max_playback_queue_samples.max(queue.len());
+        s.playback_callbacks.fetch_add(1, Ordering::Relaxed);
+        s.output_device_frames
+            .fetch_add(frame_count as u64, Ordering::Relaxed);
+        s.playback_declared_rate_hz.store(
+            (playback_state.declared_output_rate_hz()).to_bits(),
+            Ordering::Relaxed,
+        );
+        s.playback_measured_rate_hz.store(
+            (playback_state.measured_output_rate_hz().unwrap_or(0.0)).to_bits(),
+            Ordering::Relaxed,
+        );
+        s.playback_effective_rate_hz.store(
+            (playback_state.effective_output_rate_hz()).to_bits(),
+            Ordering::Relaxed,
+        );
+        s.output_clock_unstable.store(
+            (playback_state.output_clock_unstable()) as u64,
+            Ordering::Relaxed,
+        );
+        s.playback_samples_consumed
+            .fetch_add(render_stats.consumed_samples as u64, Ordering::Relaxed);
+        s.playback_underruns
+            .fetch_add(render_stats.underruns, Ordering::Relaxed);
+        s.playback_concealed_samples
+            .fetch_add(render_stats.underruns, Ordering::Relaxed);
+        s.current_playback_queue_samples
+            .store((queue.len()) as u64, Ordering::Relaxed);
+        s.max_playback_queue_samples
+            .fetch_max((queue.len()) as u64, Ordering::Relaxed);
     });
 }
 
@@ -1678,7 +1786,7 @@ fn write_output_frames_f32(
     queue: &mut VecDeque<i16>,
     playback_state: &mut PlaybackState,
     mono: &mut Vec<i16>,
-    stats: &Arc<Mutex<VoiceAudioStats>>,
+    stats: &Arc<AudioStats>,
     echo_guard: &EchoGuard,
 ) {
     if channels == 0 {
@@ -1697,21 +1805,35 @@ fn write_output_frames_f32(
         }
     }
     with_audio_stats(stats, |s| {
-        s.playback_callbacks += 1;
-        s.output_device_frames = s.output_device_frames.saturating_add(frame_count as u64);
-        s.playback_declared_rate_hz = playback_state.declared_output_rate_hz();
-        s.playback_measured_rate_hz = playback_state.measured_output_rate_hz().unwrap_or(0.0);
-        s.playback_effective_rate_hz = playback_state.effective_output_rate_hz();
-        s.output_clock_unstable = playback_state.output_clock_unstable();
-        s.playback_samples_consumed = s
-            .playback_samples_consumed
-            .saturating_add(render_stats.consumed_samples as u64);
-        s.playback_underruns += render_stats.underruns;
-        s.playback_concealed_samples = s
-            .playback_concealed_samples
-            .saturating_add(render_stats.underruns);
-        s.current_playback_queue_samples = queue.len();
-        s.max_playback_queue_samples = s.max_playback_queue_samples.max(queue.len());
+        s.playback_callbacks.fetch_add(1, Ordering::Relaxed);
+        s.output_device_frames
+            .fetch_add(frame_count as u64, Ordering::Relaxed);
+        s.playback_declared_rate_hz.store(
+            (playback_state.declared_output_rate_hz()).to_bits(),
+            Ordering::Relaxed,
+        );
+        s.playback_measured_rate_hz.store(
+            (playback_state.measured_output_rate_hz().unwrap_or(0.0)).to_bits(),
+            Ordering::Relaxed,
+        );
+        s.playback_effective_rate_hz.store(
+            (playback_state.effective_output_rate_hz()).to_bits(),
+            Ordering::Relaxed,
+        );
+        s.output_clock_unstable.store(
+            (playback_state.output_clock_unstable()) as u64,
+            Ordering::Relaxed,
+        );
+        s.playback_samples_consumed
+            .fetch_add(render_stats.consumed_samples as u64, Ordering::Relaxed);
+        s.playback_underruns
+            .fetch_add(render_stats.underruns, Ordering::Relaxed);
+        s.playback_concealed_samples
+            .fetch_add(render_stats.underruns, Ordering::Relaxed);
+        s.current_playback_queue_samples
+            .store((queue.len()) as u64, Ordering::Relaxed);
+        s.max_playback_queue_samples
+            .fetch_max((queue.len()) as u64, Ordering::Relaxed);
     });
 }
 
@@ -1721,7 +1843,7 @@ fn write_output_frames_u16(
     queue: &mut VecDeque<i16>,
     playback_state: &mut PlaybackState,
     mono: &mut Vec<i16>,
-    stats: &Arc<Mutex<VoiceAudioStats>>,
+    stats: &Arc<AudioStats>,
     echo_guard: &EchoGuard,
 ) {
     if channels == 0 {
@@ -1740,21 +1862,35 @@ fn write_output_frames_u16(
         }
     }
     with_audio_stats(stats, |s| {
-        s.playback_callbacks += 1;
-        s.output_device_frames = s.output_device_frames.saturating_add(frame_count as u64);
-        s.playback_declared_rate_hz = playback_state.declared_output_rate_hz();
-        s.playback_measured_rate_hz = playback_state.measured_output_rate_hz().unwrap_or(0.0);
-        s.playback_effective_rate_hz = playback_state.effective_output_rate_hz();
-        s.output_clock_unstable = playback_state.output_clock_unstable();
-        s.playback_samples_consumed = s
-            .playback_samples_consumed
-            .saturating_add(render_stats.consumed_samples as u64);
-        s.playback_underruns += render_stats.underruns;
-        s.playback_concealed_samples = s
-            .playback_concealed_samples
-            .saturating_add(render_stats.underruns);
-        s.current_playback_queue_samples = queue.len();
-        s.max_playback_queue_samples = s.max_playback_queue_samples.max(queue.len());
+        s.playback_callbacks.fetch_add(1, Ordering::Relaxed);
+        s.output_device_frames
+            .fetch_add(frame_count as u64, Ordering::Relaxed);
+        s.playback_declared_rate_hz.store(
+            (playback_state.declared_output_rate_hz()).to_bits(),
+            Ordering::Relaxed,
+        );
+        s.playback_measured_rate_hz.store(
+            (playback_state.measured_output_rate_hz().unwrap_or(0.0)).to_bits(),
+            Ordering::Relaxed,
+        );
+        s.playback_effective_rate_hz.store(
+            (playback_state.effective_output_rate_hz()).to_bits(),
+            Ordering::Relaxed,
+        );
+        s.output_clock_unstable.store(
+            (playback_state.output_clock_unstable()) as u64,
+            Ordering::Relaxed,
+        );
+        s.playback_samples_consumed
+            .fetch_add(render_stats.consumed_samples as u64, Ordering::Relaxed);
+        s.playback_underruns
+            .fetch_add(render_stats.underruns, Ordering::Relaxed);
+        s.playback_concealed_samples
+            .fetch_add(render_stats.underruns, Ordering::Relaxed);
+        s.current_playback_queue_samples
+            .store((queue.len()) as u64, Ordering::Relaxed);
+        s.max_playback_queue_samples
+            .fetch_max((queue.len()) as u64, Ordering::Relaxed);
     });
 }
 
@@ -1852,22 +1988,22 @@ mod tests {
         for n in 0..1000 {
             tx.push([n as i16; FRAME_SAMPLES]).unwrap();
         }
-        let stats = Arc::new(Mutex::new(VoiceAudioStats::default()));
+        let stats = Arc::new(AudioStats::default());
         let mut queue = VecDeque::new();
         let mut state = PlaybackState::new(48_000);
         drain_playback_frames(&mut rx, &mut queue, &stats, &mut state);
-        assert_eq!(queue.len(), 3 * FRAME_SAMPLES);
-        assert_eq!(queue.front(), Some(&997));
-        let stats = stats.lock().unwrap();
-        assert_eq!(stats.playback_frames_received, 3);
-        assert_eq!(stats.playback_samples_dropped, 997 * FRAME_SAMPLES as u64);
+        assert_eq!(queue.len(), 5 * FRAME_SAMPLES);
+        assert_eq!(queue.front(), Some(&995));
+        let stats = stats.snapshot();
+        assert_eq!(stats.playback_frames_received, 5);
+        assert_eq!(stats.playback_samples_dropped, 995 * FRAME_SAMPLES as u64);
     }
 
     #[test]
     fn playback_rejects_oversized_frames_and_teardown_releases_pending_audio() {
         let (playback_tx, mut rx) = voice_queue();
         let (shutdown_tx, _shutdown_rx) = mpsc::channel();
-        let stats = Arc::new(Mutex::new(VoiceAudioStats::default()));
+        let stats = Arc::new(AudioStats::default());
         let engine = VoiceAudioEngine {
             playback_tx,
             stats: stats.clone(),
@@ -1877,7 +2013,7 @@ mod tests {
         engine.push_remote_frame(vec![42; FRAME_SAMPLES * 100]);
         assert!(rx.capture_tick(true).is_empty());
         assert_eq!(
-            stats.lock().unwrap().playback_samples_dropped,
+            stats.snapshot().playback_samples_dropped,
             (FRAME_SAMPLES * 100) as u64
         );
         engine.push_remote_frame(vec![42; FRAME_SAMPLES]);
@@ -1891,7 +2027,7 @@ mod tests {
         let processor = Arc::new(Mutex::new(VoiceAecProcessor::new(
             rchat_audio_processing::RchatEchoCanceller::new_48khz_mono().unwrap(),
         )));
-        let stats = Arc::new(Mutex::new(VoiceAudioStats::default()));
+        let stats = Arc::new(AudioStats::default());
         let mut state = PlaybackState::new(48_000);
         state.aec_render = Some(PlaybackAecRender {
             frame: [0; FRAME_SAMPLES],
@@ -1905,7 +2041,7 @@ mod tests {
         drain_playback_frames(&mut rx, &mut queue, &stats, &mut state);
         assert_eq!(processor.lock().unwrap().stats().render_frames, 0);
         assert_eq!(
-            stats.lock().unwrap().playback_samples_dropped,
+            stats.snapshot().playback_samples_dropped,
             FRAME_SAMPLES as u64
         );
         let mut output = Vec::new();
@@ -1923,19 +2059,87 @@ mod tests {
     }
 
     #[test]
+    fn playback_large_callbacks_keep_pace_with_input() {
+        let (tx, mut rx) = voice_queue();
+        let stats = Arc::new(AudioStats::default());
+        let mut queue = VecDeque::from(vec![123; FRAME_SAMPLES]);
+        let mut state = PlaybackState::new(48_000);
+        let mut output = Vec::new();
+        let mut produced = 0;
+        for tick in 1..=100 {
+            // 20ms network frames accumulated over each 4096/48000s callback.
+            let due = tick * 4096 / FRAME_SAMPLES;
+            for _ in produced..due {
+                tx.push([123; FRAME_SAMPLES]).unwrap();
+            }
+            produced = due;
+            drain_playback_frames(&mut rx, &mut queue, &stats, &mut state);
+            let rendered = render_playback_mono_samples(4096, &mut queue, &mut state, &mut output);
+            assert_eq!(rendered.underruns, 0, "callback {tick}");
+            assert!(queue.len() <= MAX_PLAYBACK_QUEUE_SAMPLES);
+        }
+    }
+
+    #[test]
     fn playback_stats_never_block_the_audio_callback() {
-        let stats = Arc::new(Mutex::new(VoiceAudioStats::default()));
-        let guard = stats.lock().unwrap();
+        let stats = Arc::new(AudioStats::default());
+        // A reporter may hold its snapshot indefinitely without owning shared state.
+        let report = stats.snapshot();
         let callback_stats = stats.clone();
         let (done, result) = mpsc::channel();
         let worker = thread::spawn(move || {
-            with_audio_stats(&callback_stats, |_| {});
+            with_audio_stats(&callback_stats, |s| {
+                s.playback_samples_dropped.fetch_add(960, Ordering::Relaxed);
+                s.playback_callbacks.fetch_add(1, Ordering::Relaxed);
+                s.playback_underruns.fetch_add(5, Ordering::Relaxed);
+            });
             done.send(()).unwrap();
         });
         let completed = result.recv_timeout(Duration::from_millis(100)).is_ok();
-        drop(guard);
         worker.join().unwrap();
         assert!(completed, "stats contention must not block audio callbacks");
+        assert_eq!(report.playback_callbacks, 0);
+        let stats = stats.snapshot();
+        assert_eq!(stats.playback_samples_dropped, 960);
+        assert_eq!(stats.playback_callbacks, 1);
+        assert_eq!(stats.playback_underruns, 5);
+    }
+
+    #[test]
+    fn playback_stats_preserve_concurrent_updates_and_ingress_totals() {
+        let stats = Arc::new(AudioStats::default());
+        thread::scope(|scope| {
+            for _ in 0..4 {
+                let stats = &stats;
+                scope.spawn(move || {
+                    for n in 1..=1000 {
+                        with_audio_stats(stats, |s| {
+                            s.playback_samples_dropped.fetch_add(7, Ordering::Relaxed);
+                            s.playback_callbacks.fetch_add(1, Ordering::Relaxed);
+                            s.playback_underruns.fetch_add(5, Ordering::Relaxed);
+                        });
+                        record_playback_ingress_drops(
+                            stats,
+                            QueueStats {
+                                overflow: n,
+                                ..QueueStats::default()
+                            },
+                        );
+                    }
+                });
+            }
+            // Reporting reads must not consume or prevent concurrent increments.
+            for _ in 0..1000 {
+                let _ = stats.snapshot();
+            }
+        });
+        let stats = stats.snapshot();
+        assert_eq!(stats.playback_callbacks, 4000);
+        assert_eq!(stats.playback_underruns, 20_000);
+        assert_eq!(
+            stats.playback_samples_dropped,
+            28_000 + 1000 * FRAME_SAMPLES as u64
+        );
     }
 
     #[test]
@@ -1946,7 +2150,7 @@ mod tests {
             captured_at: Instant::now() - super::super::queue::VOICE_MAX_AGE,
         })
         .unwrap();
-        let stats = Arc::new(Mutex::new(VoiceAudioStats::default()));
+        let stats = Arc::new(AudioStats::default());
         let mut queue = VecDeque::from(vec![123; FRAME_SAMPLES]);
         let mut state = PlaybackState::new(48_000);
         state.last_drain_at -= super::super::queue::VOICE_MAX_AGE;
@@ -1955,7 +2159,7 @@ mod tests {
         assert!(queue.is_empty());
         assert_eq!(state.last_sample, 0);
         assert_eq!(
-            stats.lock().unwrap().playback_samples_dropped,
+            stats.snapshot().playback_samples_dropped,
             2 * FRAME_SAMPLES as u64
         );
         drop(rx);
@@ -2064,7 +2268,7 @@ mod tests {
             rchat_audio_processing::RchatEchoCanceller::new_48khz_mono().expect("aec starts"),
         )));
         let _held = processor.lock().expect("processor lock held");
-        let stats = Arc::new(Mutex::new(VoiceAudioStats::default()));
+        let stats = Arc::new(AudioStats::default());
         let echo_guard = EchoGuard::new();
         let now = Instant::now();
         echo_guard.mark_playback_activity(&vec![2_000; FRAME_SAMPLES], now);
@@ -2080,10 +2284,7 @@ mod tests {
 
         assert!(processed.iter().all(|sample| *sample == 0));
         assert_eq!(
-            stats
-                .lock()
-                .expect("stats available")
-                .capture_echo_suppressed_samples,
+            stats.snapshot().capture_echo_suppressed_samples,
             FRAME_SAMPLES as u64
         );
     }
