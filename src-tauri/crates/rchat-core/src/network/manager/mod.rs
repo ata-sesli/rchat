@@ -494,6 +494,8 @@ pub struct NetworkManager {
     app_state: AppState,
     network_state: NetworkState,
     endpoint_refresh_task: Option<tokio::task::JoinHandle<Result<std::net::SocketAddr, String>>>,
+    endpoint_publication_task: Option<tokio::task::JoinHandle<()>>,
+    endpoint_publication_pending: Option<Vec<String>>,
     endpoint_pending_commands: std::collections::VecDeque<NetworkCommand>,
     advertised_public_endpoint: Option<Multiaddr>,
     // The boundary used to send events to the adapter.
@@ -926,6 +928,8 @@ impl NetworkManager {
             app_state,
             network_state,
             endpoint_refresh_task: None,
+            endpoint_publication_task: None,
+            endpoint_publication_pending: None,
             endpoint_pending_commands: Default::default(),
             advertised_public_endpoint: None,
             event_sink,
@@ -1716,6 +1720,7 @@ impl NetworkManager {
 impl Drop for NetworkManager {
     fn drop(&mut self) {
         if let Some(task) = self.endpoint_refresh_task.take() { task.abort(); }
+        if let Some(task) = self.endpoint_publication_task.take() { task.abort(); }
         self.media_admission.shutdown();
         for handle in self.media_accept_handles.drain(..) {
             handle.abort();

@@ -94,6 +94,15 @@ impl NetworkManager {
                 _ = publish_interval.tick() => {
                     self.publish_listeners().await;
                 }
+                _ = async {
+                    match self.endpoint_publication_task.as_mut() {
+                        Some(task) => { let _ = task.await; }
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.endpoint_publication_task.take();
+                    self.finish_endpoint_publication().await;
+                }
                 _ = heartbeat_interval.tick() => {
                     let connected_count = self.swarm.connected_peers().count();
                     let discovered_count = self.local_peers.len();
@@ -186,30 +195,6 @@ impl NetworkManager {
             std::time::Instant::now(),
         );
 
-        let state = &self.app_state;
-        let (token, is_online) = {
-            let mgr = state.config_manager.lock().await;
-            if let Ok(config) = mgr.load().await {
-                (
-                    config.system.github_token.clone(),
-                    config.user.connectivity.github_sync_enabled,
-                )
-            } else {
-                (None, false)
-            }
-        };
-
-        if !is_online {
-            return;
-        }
-
-        if let Some(token) = token {
-            println!("Publishing listeners to Gist...");
-            if let Err(e) =
-                crate::network::discovery::publish_peer_info(&token, listeners, state).await
-            {
-                eprintln!("Failed to publish peer info: {}", e);
-            }
-        }
+        self.start_endpoint_publication(listeners);
     }
 }

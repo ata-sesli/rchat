@@ -97,6 +97,14 @@ pub async fn publish_peer_info(
     addrs: Vec<String>,
     app_state: &AppState,
 ) -> anyhow::Result<()> {
+    gist::serialized_mutation(publish_peer_info_inner(token, addrs, app_state)).await
+}
+
+async fn publish_peer_info_inner(
+    token: &str,
+    addrs: Vec<String>,
+    app_state: &AppState,
+) -> anyhow::Result<()> {
     // 1. Prepare Content (HKS Blob) and extract pending invitations
     let (blob_content, pending_invites) = {
         let mgr = app_state.config_manager.lock().await;
@@ -181,18 +189,7 @@ pub async fn publish_peer_info(
         blob_content
     };
 
-    // 3. Check for existing Gist
-    let existing_gist = gist::find_rchat_gist(token).await?;
-
-    if let Some(existing) = existing_gist {
-        // Update
-        let _ = gist::update_peer_info(token, &existing.id, final_blob_content).await?;
-    } else {
-        // Create
-        let _ = gist::create_peer_info(token, final_blob_content).await?;
-    }
-
-    Ok(())
+    gist::publish_preserving_shadows(token, final_blob_content).await
 }
 
 pub async fn fetch_friend_peers(

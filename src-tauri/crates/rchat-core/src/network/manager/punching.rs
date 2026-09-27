@@ -93,6 +93,9 @@ impl NetworkManager {
             return;
         }
         self.sync_public_endpoint().await;
+        if self.endpoint_publication_task.is_some() {
+            return;
+        }
 
         let now = std::time::Instant::now();
         let names = self

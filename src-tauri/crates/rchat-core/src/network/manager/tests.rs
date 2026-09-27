@@ -61,6 +61,93 @@ async fn punches_wait_for_endpoint_refresh_and_pending_work_is_bounded() {
 }
 
 #[tokio::test]
+async fn endpoint_publication_is_background_and_coalesces_replacements() {
+    let (_dir, mut manager) = voice_lifecycle_manager().await;
+    manager.network_state.connectivity.lock().await.github_sync_enabled = true;
+    let app = manager.app_state.clone();
+    // Stall the real publication task before it can read config or perform HTTP.
+    let guard = app.config_manager.lock().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), manager.publish_listeners())
+        .await.expect("publication must return without awaiting its work");
+    assert!(manager.endpoint_publication_task.is_some());
+    for n in 0..40 {
+        manager.start_endpoint_publication(vec![format!("snapshot-{n}")]);
+    }
+    assert_eq!(manager.endpoint_publication_pending, Some(vec!["snapshot-39".into()]));
+    manager.tick_voice_call().await;
+    manager.tick_video_call().await;
+    assert!(!manager.endpoint_publication_task.as_ref().unwrap().is_finished());
+    drop(guard);
+    manager.endpoint_publication_task.take().unwrap().await.unwrap();
+    manager.finish_endpoint_publication().await;
+    assert!(manager.endpoint_publication_pending.is_none());
+    manager.endpoint_publication_task.take().unwrap().await.unwrap();
+    manager.finish_endpoint_publication().await;
+}
+
+#[tokio::test]
+async fn slow_endpoint_publication_gates_punches_not_media_or_session_lifecycle() {
+    let (_dir, mut manager) = voice_lifecycle_manager().await;
+    let (done, wait) = tokio::sync::oneshot::channel::<()>();
+    manager.endpoint_publication_task = Some(tokio::spawn(async move {
+        let _ = wait.await;
+    }));
+    manager.dispatch_command(NetworkCommand::StartPunch {
+        multiaddr: "/ip4/192.168.1.4/udp/8000/quic-v1".into(),
+        target_username: "friend".into(), target_peer_id: None, my_username: "me".into(),
+    }).await;
+    assert!(manager.active_punch_targets.is_empty());
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        manager.tick_voice_call().await;
+        manager.tick_video_call().await;
+        manager.dispatch_command(NetworkCommand::RegisterTemporarySession {
+            chat_id: "temp:session".into(), peer_id: PeerId::random().to_string(),
+            multiaddr: "/ip4/192.168.1.5/udp/8000/quic-v1".into(), is_group: true,
+        }).await;
+    }).await.expect("publication must not block media ticks or unrelated commands");
+    assert!(manager.temp_peer_by_chat_id.contains_key("temp:session"));
+    done.send(()).unwrap();
+    manager.endpoint_publication_task.take().unwrap().await.unwrap();
+    manager.finish_endpoint_publication().await;
+    assert!(manager.active_punch_targets.contains_key("friend"));
+}
+
+#[tokio::test]
+async fn temporary_registration_does_not_replay_after_archive_during_refresh() {
+    use crate::app_state::{TemporaryChatSession, TemporaryChatKind, FreezeResolution};
+    let (_dir, mut manager) = voice_lifecycle_manager().await;
+    let chat = "temp-group:550e8400-e29b-41d4-a716-446655440000";
+    let peer = PeerId::random().to_string();
+    manager.network_state.temporary_state.lock().await.chats.insert(chat.into(), TemporaryChatSession {
+        chat_id: chat.into(), name: "Archive".into(), kind: TemporaryChatKind::Group,
+        expires_at: u64::MAX, peer_id: Some(peer.clone()), members: vec![],
+        member_op_winners: HashMap::new(), next_member_op_counter: 0,
+        archived: true, pending_send_count: 0, admitted_invite: None,
+        admission_evidence: HashMap::new(), creator_peer_id: peer.clone(),
+    });
+    manager.endpoint_refresh_task = Some(tokio::spawn(async { Err("offline".into()) }));
+    manager.dispatch_command(NetworkCommand::RegisterTemporarySession {
+        chat_id: chat.into(), peer_id: peer, multiaddr: "/ip4/192.168.1.5/udp/8000/quic-v1".into(), is_group: true,
+    }).await;
+    let (alive, _) = tokio::sync::watch::channel(FreezeResolution::Pending);
+    // Exercise teardown of an existing subscription as well as routing.
+    let topic = crate::network::gossip::topic_for_group_id(chat).unwrap();
+    manager.swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
+    manager.subscribed_group_ids.insert(chat.into());
+    assert!(manager.active_punch_targets.contains_key(chat));
+    manager.dispatch_command(NetworkCommand::FreezeTemporaryArchive {
+        chat_id: chat.into(), kind: TemporaryChatKind::Group, farewell_winners: vec![],
+        min_add_counter: 0, alive: alive.clone(), ack: None,
+    }).await;
+    manager.dispatch_command(NetworkCommand::CommitTemporaryArchive { chat_id: chat.into() }).await;
+    manager.endpoint_refresh_task.take().unwrap().await.unwrap().unwrap_err();
+    manager.finish_endpoint_refresh().await;
+    assert!(!manager.temp_peer_by_chat_id.contains_key(chat));
+    assert!(!manager.subscribed_group_ids.contains(chat));
+    assert!(!manager.active_punch_targets.contains_key(chat));
+}
+
+#[tokio::test]
 async fn media_readers_follow_ringing_active_end_and_manager_lifetimes() {
     use crate::app_state::VoiceCallPhase;
     use crate::network::media_admission::MediaKind;
