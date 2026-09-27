@@ -99,14 +99,23 @@ impl<T> VoiceSender<T> {
 }
 
 impl<T> VoiceReceiver<T> {
-    /// Snapshot at most three recent frames for one manager tick/output callback. Muted or
+    /// Snapshot at most three recent frames for one manager tick. Muted or
     /// disconnected calls discard the snapshot; no backlog survives recovery.
     pub fn capture_tick(&mut self, enabled: bool) -> Vec<TimedFrame<T>> {
+        self.snapshot(if enabled { VOICE_FRAMES_PER_TICK } else { 0 })
+    }
+
+    /// Playback must retain the full bounded ingress window: a 4096-frame
+    /// output callback at 48kHz consumes more than four 20ms network frames.
+    pub fn playback_tick(&mut self) -> Vec<TimedFrame<T>> {
+        self.snapshot(VOICE_QUEUE_FRAMES)
+    }
+
+    fn snapshot(&mut self, keep: usize) -> Vec<TimedFrame<T>> {
         let Ok(mut frames) = self.0.frames.try_lock() else {
             return Vec::new();
         };
-        let mut result = Vec::with_capacity(VOICE_FRAMES_PER_TICK);
-        let keep = if enabled { VOICE_FRAMES_PER_TICK } else { 0 };
+        let mut result = Vec::with_capacity(keep);
         while let Some(frame) = frames.pop_front() {
             if frame.captured_at.elapsed() >= VOICE_MAX_AGE {
                 self.0.stale.fetch_add(1, Ordering::Relaxed);
