@@ -18,11 +18,19 @@ No promise of instantaneous gateway-change detection is made.
 GUI/TUI invitation creation and GitHub shadow-invite redemption use the same
 freshness-aware selector. Stale observations are refreshed before use. LAN and
 direct public listener addresses remain fallback candidates; they are not
-claimed to be STUN-verified. The manager defers up to 32 punch/reconnect/session
+claimed to be STUN-verified. The manager defers up to 32 punch/reconnect
 commands while a background refresh runs, updates libp2p's external address and
 publishes discovery addresses before releasing them. On failure it removes the
 old public advertisement and permits ordinary direct/LAN attempts. Existing
 bounded punch attempts remain bounded; refreshing does not reset their budget.
+
+Discovery publication runs off the network event loop with a 15-second deadline,
+one active task, and one coalesced replacement snapshot. Only dependent punch
+work waits for it; media ticks and session lifecycle commands continue. Session
+registration remains ordered with archive freeze/commit, while its actual punch
+is gated separately. Discovery and shadow writes serialize their complete local
+Gist read/modify/write transactions and retain unexpired shadows. A failed Gist
+read aborts the update instead of replacing existing data with an empty blob.
 
 STUN observes the mapping toward its server, **not universal reachability**.
 Destination-dependent NAT, blocked UDP, or two restrictive NATs may still defeat

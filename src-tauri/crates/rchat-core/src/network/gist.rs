@@ -14,6 +14,58 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const RCHAT_GIST_DESC: &str = "rchat-peer-info";
 const RCHAT_FILE_NAME: &str = "peers.txt";
 
+// All local read/modify/write operations share this lock, including UI shadow
+// writes and background discovery publication. Never replace a fetched blob
+// from a snapshot taken before acquiring the lock.
+static GIST_MUTATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub(crate) async fn serialized_mutation<T>(
+    mutation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let _guard = GIST_MUTATION.lock().await;
+        mutation.await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Gist update timed out"))?
+}
+
+async fn read_own_blob(gist: &Gist) -> Result<PublishedBlob> {
+    let file = gist
+        .files
+        .get(RCHAT_FILE_NAME)
+        .ok_or_else(|| anyhow::anyhow!("RChat Gist is missing peers.txt"))?;
+    let content = reqwest::get(file.raw_url.clone())
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    // A failed read must not turn into an empty replacement, losing shadows.
+    parse_blob(&content)
+}
+
+fn merge_live_shadows(replacement: &mut PublishedBlob, current: PublishedBlob, now: u64) {
+    replacement.shadow_invites = current
+        .shadow_invites
+        .into_iter()
+        .filter(|shadow| now.saturating_sub(shadow.created_at) < INVITE_TTL_SECS)
+        .collect();
+}
+
+/// Caller holds GIST_MUTATION across content generation and this update.
+pub(crate) async fn publish_preserving_shadows(token: &str, content: String) -> Result<()> {
+    let mut replacement = parse_blob(&content)?;
+    if let Some(existing) = find_rchat_gist(token).await? {
+        let current = read_own_blob(&existing).await?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        merge_live_shadows(&mut replacement, current, now);
+        update_peer_info(token, &existing.id, serialize_blob(&replacement)?).await?;
+    } else {
+        create_peer_info(token, content).await?;
+    }
+    Ok(())
+}
+
 /// Find the user's existing rchat gist
 pub async fn find_rchat_gist(token: &str) -> Result<Option<Gist>> {
     let octocrab = Octocrab::builder()
@@ -202,20 +254,14 @@ pub async fn get_friend_invitations(username: &str) -> Result<Vec<EncryptedInvit
 /// Publish a shadow invite to the user's own Gist
 /// This is called by the invitee after accepting an invite
 pub async fn publish_shadow_invite(token: &str, shadow: super::hks::ShadowInvite) -> Result<()> {
+    serialized_mutation(publish_shadow_invite_inner(token, shadow)).await
+}
+
+async fn publish_shadow_invite_inner(token: &str, shadow: super::hks::ShadowInvite) -> Result<()> {
     // 1. Find or create existing Gist
-    let mut blob = if let Some(gist) = find_rchat_gist(token).await? {
-        // Get existing content
-        if let Some(file) = gist.files.get(RCHAT_FILE_NAME) {
-            let resp = reqwest::get(file.raw_url.clone()).await?;
-            if resp.status().is_success() {
-                let content = resp.text().await?;
-                parse_blob(&content).unwrap_or_else(|_| default_blob())
-            } else {
-                default_blob()
-            }
-        } else {
-            default_blob()
-        }
+    let existing = find_rchat_gist(token).await?;
+    let mut blob = if let Some(gist) = &existing {
+        read_own_blob(gist).await?
     } else {
         default_blob()
     };
@@ -239,7 +285,7 @@ pub async fn publish_shadow_invite(token: &str, shadow: super::hks::ShadowInvite
     // 3. Serialize and update Gist
     let blob_b64 = serialize_blob(&blob)?;
 
-    if let Some(gist) = find_rchat_gist(token).await? {
+    if let Some(gist) = existing {
         update_peer_info(token, &gist.id, blob_b64).await?;
     } else {
         create_peer_info(token, blob_b64).await?;
@@ -271,16 +317,97 @@ pub async fn get_friend_shadows(username: &str) -> Result<Vec<super::hks::Shadow
                 .unwrap()
                 .as_secs();
 
-            // Filter expired shadows
             let valid_shadows: Vec<_> = blob
                 .shadow_invites
                 .into_iter()
                 .filter(|s| now.saturating_sub(s.created_at) < INVITE_TTL_SECS)
                 .collect();
-
             return Ok(valid_shadows);
         }
     }
-
     Ok(vec![])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_publication_preserves_live_shadow_for_inviter() {
+        let mut current = default_blob();
+        current
+            .shadow_invites
+            .push(super::super::hks::ShadowInvite {
+                target_username: "inviter".into(),
+                salt: "salt".into(),
+                nonce: "nonce".into(),
+                ciphertext: "encrypted-shadow".into(),
+                created_at: 100,
+            });
+        let mut replacement = default_blob();
+        replacement.payload = "new endpoint".into();
+        merge_live_shadows(&mut replacement, current, 150);
+        let retrieved = parse_blob(&serialize_blob(&replacement).unwrap()).unwrap();
+        assert_eq!(retrieved.shadow_invites.len(), 1);
+        assert_eq!(retrieved.shadow_invites[0].target_username, "inviter");
+        assert_eq!(retrieved.shadow_invites[0].ciphertext, "encrypted-shadow");
+        let mut expired = default_blob();
+        merge_live_shadows(&mut expired, retrieved, 220);
+        assert!(expired.shadow_invites.is_empty());
+    }
+
+    #[tokio::test]
+    async fn endpoint_publication_waits_for_concurrent_shadow_mutation() {
+        let stored = std::sync::Arc::new(tokio::sync::Mutex::new(default_blob()));
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let shadow_store = stored.clone();
+        let shadow = tokio::spawn(async move {
+            serialized_mutation(async {
+                let mut snapshot = shadow_store.lock().await.clone();
+                entered.send(()).unwrap();
+                wait.await.unwrap();
+                snapshot
+                    .shadow_invites
+                    .push(super::super::hks::ShadowInvite {
+                        target_username: "inviter".into(),
+                        salt: "salt".into(),
+                        nonce: "nonce".into(),
+                        ciphertext: "shadow".into(),
+                        created_at: 100,
+                    });
+                *shadow_store.lock().await = snapshot;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        });
+        started.await.unwrap();
+        let endpoint_store = stored.clone();
+        let (read, mut read_rx) = tokio::sync::oneshot::channel();
+        let endpoint = tokio::spawn(async move {
+            serialized_mutation(async {
+                let current = endpoint_store.lock().await.clone();
+                read.send(()).unwrap();
+                let mut replacement = default_blob();
+                replacement.payload = "refreshed".into();
+                merge_live_shadows(&mut replacement, current, 150);
+                *endpoint_store.lock().await = replacement;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut read_rx)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        shadow.await.unwrap();
+        endpoint.await.unwrap();
+        let result = stored.lock().await;
+        assert_eq!(result.payload, "refreshed");
+        assert_eq!(result.shadow_invites[0].target_username, "inviter");
+    }
 }
