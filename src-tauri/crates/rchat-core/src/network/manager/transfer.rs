@@ -1,7 +1,6 @@
 use super::*;
 use crate::network::direct_message::{ChunkInfo, DirectMessageKind, DirectMessageRequest};
 use base64::Engine;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -205,13 +204,14 @@ fn process_transfer_task(
             file_hash,
             chunk_hash,
         } => {
-            let chunk_path = chunks_dir().join(&chunk_hash);
-            let chunk_data = match std::fs::read(&chunk_path) {
+            let chunk_data = match with_db_conn(app_state, |conn| {
+                conn.get_chunk(&chunk_hash).map_err(|e| e.to_string())
+            }) {
                 Ok(data) => data,
                 Err(err) => {
                     eprintln!(
-                        "[ChunkTransfer] ❌ Chunk not found {} at {:?}: {}",
-                        chunk_hash, chunk_path, err
+                        "[ChunkTransfer] ❌ Chunk unavailable {}: {}",
+                        chunk_hash, err
                     );
                     return Ok(None);
                 }
@@ -258,7 +258,9 @@ fn process_transfer_task(
                 .decode(chunk_b64)
                 .map_err(|e| format!("Failed to decode chunk data: {}", e))?;
 
-            let chunk_size = store_chunk_file(&chunks_dir(), &chunk_hash, &chunk_data)?;
+            let chunk_size = with_db_conn(app_state, |conn| {
+                store_chunk_file(conn, &chunk_hash, &chunk_data)
+            })?;
 
             Ok(Some(TransferResult::ChunkStored {
                 file_hash,
@@ -272,19 +274,13 @@ fn process_transfer_task(
 
 fn with_db_conn<T>(
     app_state: &crate::AppState,
-    op: impl FnOnce(&rusqlite::Connection) -> Result<T, String>,
+    op: impl FnOnce(&rchat_storage::Connection) -> Result<T, String>,
 ) -> Result<T, String> {
     let conn = app_state
         .db_conn
         .lock()
         .map_err(|e| format!("db lock poisoned: {}", e))?;
     op(&conn)
-}
-
-fn chunks_dir() -> PathBuf {
-    directories::ProjectDirs::from("io.github", "ata-sesli", "RChat")
-        .map(|p| p.data_dir().join("chunks"))
-        .unwrap_or_else(|| PathBuf::from("chunks"))
 }
 
 fn unix_timestamp_secs() -> i64 {
@@ -295,7 +291,7 @@ fn unix_timestamp_secs() -> i64 {
 }
 
 fn load_chunk_manifest(
-    conn: &rusqlite::Connection,
+    conn: &rchat_storage::Connection,
     file_hash: &str,
 ) -> Result<Vec<ChunkInfo>, String> {
     let mut stmt = conn
@@ -322,14 +318,14 @@ fn load_chunk_manifest(
 }
 
 fn persist_chunk_manifest(
-    conn: &rusqlite::Connection,
+    conn: &rchat_storage::Connection,
     file_hash: &str,
     chunks: &[ChunkInfo],
 ) -> Result<(), String> {
     for chunk_info in chunks {
         conn.execute(
             "INSERT OR IGNORE INTO file_chunks (file_hash, chunk_order, chunk_hash, chunk_size) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
+            rchat_storage::params![
                 file_hash,
                 chunk_info.chunk_order,
                 chunk_info.chunk_hash,
@@ -342,61 +338,24 @@ fn persist_chunk_manifest(
 }
 
 fn store_chunk_file(
-    chunks_dir: &Path,
+    conn: &rchat_storage::Connection,
     chunk_hash: &str,
     chunk_data: &[u8],
 ) -> Result<usize, String> {
-    std::fs::create_dir_all(chunks_dir)
-        .map_err(|e| format!("failed to create chunk dir {:?}: {}", chunks_dir, e))?;
-
-    let chunk_path = chunks_dir.join(chunk_hash);
-    std::fs::write(&chunk_path, chunk_data)
-        .map_err(|e| format!("failed to write chunk {}: {}", chunk_hash, e))?;
+    if chunk_data.len() > 64 * 1024 {
+        return Err("chunk exceeds transport limit".into());
+    }
+    conn.put_chunk(chunk_hash, chunk_data)
+        .map_err(|e| format!("failed to store verified chunk {chunk_hash}: {e}"))?;
 
     Ok(chunk_data.len())
 }
 
 fn evaluate_file_completion(
-    conn: &rusqlite::Connection,
-    chunks_dir: &Path,
+    conn: &rchat_storage::Connection,
     file_hash: &str,
 ) -> Result<bool, String> {
-    let expected: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM file_chunks WHERE file_hash = ?1",
-            [file_hash],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("expected chunk count query failed: {}", e))?;
-
-    let mut received = 0i64;
-    let mut stmt = conn
-        .prepare("SELECT chunk_hash FROM file_chunks WHERE file_hash = ?1")
-        .map_err(|e| format!("prepare received chunk query failed: {}", e))?;
-    let rows = stmt
-        .query_map([file_hash], |row| row.get::<_, String>(0))
-        .map_err(|e| format!("received chunk query failed: {}", e))?;
-
-    for hash_result in rows {
-        let hash = hash_result.map_err(|e| format!("received chunk decode failed: {}", e))?;
-        if chunks_dir.join(hash).exists() {
-            received += 1;
-        }
-    }
-
-    println!("[ChunkTransfer] Progress: {}/{} chunks", received, expected);
-
-    if received == expected && expected > 0 {
-        conn.execute(
-            "UPDATE files SET is_complete = 1 WHERE file_hash = ?1",
-            [file_hash],
-        )
-        .map_err(|e| format!("file completion update failed: {}", e))?;
-        println!("[ChunkTransfer] ✅ File {} complete!", file_hash);
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    crate::storage::object::assemble_received(conn, file_hash).map_err(|e| e.to_string())
 }
 
 impl NetworkManager {
@@ -495,7 +454,7 @@ impl NetworkManager {
 
                 if should_finalize {
                     match with_db_conn(&self.app_state, |conn| {
-                        evaluate_file_completion(conn, &chunks_dir(), &file_hash)
+                        evaluate_file_completion(conn, &file_hash)
                     }) {
                         Ok(true) => {
                             if let Some(state) = self.transfer_states.get_mut(&file_hash) {
@@ -549,7 +508,10 @@ impl NetworkManager {
         {
             Ok(keypair) => keypair,
             Err(err) => {
-                eprintln!("[Group] Failed to load keypair for file availability: {}", err);
+                eprintln!(
+                    "[Group] Failed to load keypair for file availability: {}",
+                    err
+                );
                 return;
             }
         };
@@ -745,10 +707,7 @@ impl NetworkManager {
             while self.transfer_result_rx.try_recv().is_ok() {}
             if self.transfer_pending_tasks.load(Ordering::SeqCst) == 0
                 && self.transfer_inflight_tasks.load(Ordering::SeqCst) == 0
-                && self
-                    .transfer_worker_handles
-                    .iter()
-                    .all(|h| h.is_finished())
+                && self.transfer_worker_handles.iter().all(|h| h.is_finished())
             {
                 break;
             }
@@ -770,7 +729,7 @@ impl NetworkManager {
 mod tests {
     use super::*;
 
-    fn setup_transfer_tables(conn: &rusqlite::Connection) {
+    fn setup_transfer_tables(conn: &rchat_storage::Connection) {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS files (
                 file_hash TEXT PRIMARY KEY,
@@ -798,7 +757,7 @@ mod tests {
 
     #[test]
     fn persist_and_load_chunk_manifest_roundtrip() {
-        let conn = rusqlite::Connection::open_in_memory().expect("open memory db");
+        let conn = rchat_storage::Connection::open_in_memory().expect("open memory db");
         setup_transfer_tables(&conn);
 
         let chunks = vec![
@@ -824,47 +783,46 @@ mod tests {
 
     #[test]
     fn evaluate_completion_requires_all_chunks() {
-        let conn = rusqlite::Connection::open_in_memory().expect("open memory db");
+        use sha2::{Digest, Sha256};
+        let a = hex::encode(Sha256::digest(b"1234567890"));
+        let b = hex::encode(Sha256::digest(b"123456789012"));
+        let file = hex::encode(Sha256::digest(b"1234567890123456789012"));
+        let conn = rchat_storage::Connection::open_in_memory().expect("open memory db");
         setup_transfer_tables(&conn);
 
         conn.execute(
             "INSERT INTO files (file_hash, file_name, mime_type, size_bytes, is_complete) VALUES (?1, ?2, ?3, ?4, 0)",
-            rusqlite::params!["file-b", "f", "application/octet-stream", 22_i64],
+            rchat_storage::params![file, "f", "application/octet-stream", 22_i64],
         )
         .expect("insert file");
 
         let chunks = vec![
             ChunkInfo {
-                chunk_hash: "ca".to_string(),
+                chunk_hash: a.clone(),
                 chunk_order: 0,
                 chunk_size: 10,
             },
             ChunkInfo {
-                chunk_hash: "cb".to_string(),
+                chunk_hash: b.clone(),
                 chunk_order: 1,
                 chunk_size: 12,
             },
         ];
 
-        persist_chunk_manifest(&conn, "file-b", &chunks).expect("persist manifest");
+        persist_chunk_manifest(&conn, &file, &chunks).expect("persist manifest");
 
-        let temp = tempfile::tempdir().expect("tempdir");
-        let chunks_path = temp.path().join("chunks");
-
-        store_chunk_file(&chunks_path, "ca", b"1234567890").expect("write chunk a");
-        let complete =
-            evaluate_file_completion(&conn, &chunks_path, "file-b").expect("completion check a");
+        store_chunk_file(&conn, &a, b"1234567890").expect("write chunk a");
+        let complete = evaluate_file_completion(&conn, &file).expect("completion check a");
         assert!(!complete);
 
-        store_chunk_file(&chunks_path, "cb", b"123456789012").expect("write chunk b");
-        let complete =
-            evaluate_file_completion(&conn, &chunks_path, "file-b").expect("completion check b");
+        store_chunk_file(&conn, &b, b"123456789012").expect("write chunk b");
+        let complete = evaluate_file_completion(&conn, &file).expect("completion check b");
         assert!(complete);
 
         let is_complete: i64 = conn
             .query_row(
                 "SELECT is_complete FROM files WHERE file_hash = ?1",
-                ["file-b"],
+                [&file],
                 |row| row.get(0),
             )
             .expect("query file completion");

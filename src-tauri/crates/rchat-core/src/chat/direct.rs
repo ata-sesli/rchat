@@ -567,7 +567,7 @@ fn direct_summary_from_item(
 }
 
 fn existing_direct_chat_id_for_chat(
-    conn: &rusqlite::Connection,
+    conn: &rchat_storage::Connection,
     chat_id: &str,
 ) -> Result<Option<String>> {
     let Some(peer_id) = resolve_peer_id_for_chat(chat_id) else {
@@ -658,7 +658,7 @@ pub(crate) fn resolve_peer_id_for_chat(chat_id: &str) -> Option<String> {
 }
 
 pub(crate) fn ensure_direct_chat_rows(
-    conn: &rusqlite::Connection,
+    conn: &rchat_storage::Connection,
     chat_id: &str,
     resolved_peer_id: &str,
 ) -> Result<()> {
@@ -756,7 +756,7 @@ mod tests {
 
     #[test]
     fn scoped_chat_id_resolves_existing_raw_chat_history() {
-        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        let conn = rchat_storage::Connection::open_in_memory().expect("in-memory db");
         conn.execute(
             "CREATE TABLE chats (
                 id TEXT PRIMARY KEY,

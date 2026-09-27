@@ -170,7 +170,7 @@ pub(super) fn start_persistence_workers(
 
 fn with_db_conn<T>(
     app_state: &crate::AppState,
-    op: impl FnOnce(&rusqlite::Connection) -> Result<T, String>,
+    op: impl FnOnce(&rchat_storage::Connection) -> Result<T, String>,
 ) -> Result<T, String> {
     let conn = app_state
         .db_conn

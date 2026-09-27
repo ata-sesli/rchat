@@ -894,7 +894,7 @@ pub fn apply_signed_record(
             let pending_for_author: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM group_records
                  WHERE group_id = ?1 AND author_peer_id = ?2 AND pending = 1",
-                rusqlite::params![record.group_id(), record.author_peer_id()],
+                rchat_storage::params![record.group_id(), record.author_peer_id()],
                 |row| row.get(0),
             )?;
             if pending_for_group >= crate::chat::group_state::MAX_PENDING_RECORDS_PER_GROUP
@@ -919,7 +919,7 @@ pub fn apply_signed_record(
             );
             transaction.execute(
                 "UPDATE group_records SET pending = ?2 WHERE id = ?1",
-                rusqlite::params![record_id, i64::from(pending)],
+                rchat_storage::params![record_id, i64::from(pending)],
             )?;
         }
         reconcile_group_projection(
@@ -975,7 +975,7 @@ pub fn apply_signed_record(
 }
 
 fn reconcile_group_projection(
-    conn: &rusqlite::Connection,
+    conn: &rchat_storage::Connection,
     group_id: &str,
     records: &[SignedGroupRecord],
     evaluation: &crate::chat::group_state::GroupEvaluation,
@@ -1444,14 +1444,14 @@ async fn send_network_command(
         .map_err(|_| anyhow!("network command channel is closed"))
 }
 
-fn ensure_peer(conn: &rusqlite::Connection, peer_id: &str, method: &str) -> anyhow::Result<()> {
+fn ensure_peer(conn: &rchat_storage::Connection, peer_id: &str, method: &str) -> anyhow::Result<()> {
     if !db::is_peer(conn, peer_id) {
         db::add_peer(conn, peer_id, None, None, method)?;
     }
     Ok(())
 }
 
-fn ensure_incomplete_file_row(conn: &rusqlite::Connection, file_hash: &str) -> anyhow::Result<()> {
+fn ensure_incomplete_file_row(conn: &rchat_storage::Connection, file_hash: &str) -> anyhow::Result<()> {
     let exists: bool = conn
         .query_row(
             "SELECT 1 FROM files WHERE file_hash = ?1",
@@ -1472,7 +1472,7 @@ fn ensure_incomplete_file_row(conn: &rusqlite::Connection, file_hash: &str) -> a
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::OptionalExtension;
+    use rchat_storage::OptionalExtension;
     use std::cell::RefCell;
 
     thread_local! {
@@ -1485,7 +1485,7 @@ mod tests {
         use tokio::sync::Mutex;
 
         let app_dir = tempfile::tempdir_in("/tmp").expect("temp").keep();
-        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        let conn = rchat_storage::Connection::open_in_memory().expect("in-memory db");
         db::create_tables(&conn).expect("schema");
         AppState {
             config_manager: Arc::new(Mutex::new(ConfigManager::new(app_dir.clone()))),
@@ -1581,7 +1581,7 @@ mod tests {
     }
 
     fn group_record_state(
-        conn: &rusqlite::Connection,
+        conn: &rchat_storage::Connection,
         record_id: &str,
     ) -> anyhow::Result<Option<(bool, bool)>> {
         conn.query_row(

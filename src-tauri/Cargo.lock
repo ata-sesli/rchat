@@ -7318,7 +7318,6 @@ dependencies = [
  "rchat-core",
  "rchat-screen-capture",
  "rchat-video-capture",
- "rusqlite",
  "rvault-core",
  "serde",
  "serde_json",
@@ -7365,10 +7364,10 @@ dependencies = [
  "rchat-audio-processing",
  "rchat-libvpx",
  "rchat-screen-capture",
+ "rchat-storage",
  "rchat-video-capture",
  "reqwest 0.12.26",
  "rubato",
- "rusqlite",
  "rvault-core",
  "serde",
  "serde_json",
@@ -7400,6 +7399,16 @@ dependencies = [
  "screencapturekit",
  "thiserror 2.0.17",
  "x11rb",
+]
+
+[[package]]
+name = "rchat-storage"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2",
+ "tempfile",
+ "zova",
 ]
 
 [[package]]
@@ -7858,7 +7867,6 @@ dependencies = [
 [[package]]
 name = "rvault-core"
 version = "0.0.5"
-source = "git+https://github.com/ata-sesli/rvault?rev=7dda2de45ac31eccb17dad7d1a4f1ebdd893e99c#7dda2de45ac31eccb17dad7d1a4f1ebdd893e99c"
 dependencies = [
  "arboard",
  "argon2",
@@ -11579,6 +11587,59 @@ dependencies = [
  "quote",
  "syn 2.0.111",
 ]
+
+[[package]]
+name = "zova"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8597002748788049902d91b4f90c08b679ad38504b9440c739c2915cf6a04dd8"
+dependencies = [
+ "zova-sys",
+]
+
+[[package]]
+name = "zova-sys"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d081fee8912540e742b656a6868334ad1f25e12e38ec394a806e1bd4897fa04f"
+dependencies = [
+ "cc",
+ "zova-sys-darwin-arm64",
+ "zova-sys-darwin-x64",
+ "zova-sys-linux-arm64",
+ "zova-sys-linux-x64",
+ "zova-sys-windows-x64",
+]
+
+[[package]]
+name = "zova-sys-darwin-arm64"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3af0ce1b9874123b35c7144f2d595bf821ed1751e2e8e66d3263d4c2584840f5"
+
+[[package]]
+name = "zova-sys-darwin-x64"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb384de4c8314b97f0032b61c6f8e75125684504724a57c834377ea34ec76da1"
+
+[[package]]
+name = "zova-sys-linux-arm64"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0e74a56d1de661dd55a3b4974dd2de9338b4aabf3ec763b95a81006d298fa29"
+
+[[package]]
+name = "zova-sys-linux-x64"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78948f975054efb9351f4b5507ff0bca7a5c0b971ac7764072c9fb930733adee"
+
+[[package]]
+name = "zova-sys-windows-x64"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4a082ba82e3d113731901ff060480518ef7872d5beb3558505e5efb2cd707f2"
 
 [[package]]
 name = "zune-core"

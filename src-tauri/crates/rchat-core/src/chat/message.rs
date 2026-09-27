@@ -241,7 +241,7 @@ impl Message {
 
     /// Hydrate metadata by computing from file and caching in DB.
     /// Returns true if metadata was updated and should be cached.
-    pub fn hydrate(&mut self, conn: &rusqlite::Connection) -> bool {
+    pub fn hydrate(&mut self, conn: &rchat_storage::Connection) -> bool {
         // Only hydrate if needed
         if !self.needs_hydration() {
             return false;

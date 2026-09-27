@@ -49,7 +49,7 @@ jobs:
       - name: Compile core and TUI
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml -p rchat-core -p rchat-tui
       - name: Core and TUI tests
-        run: cargo nextest run --locked --manifest-path src-tauri/Cargo.toml -p rchat-core -p rchat-tui
+        run: cargo nextest run --locked --manifest-path src-tauri/Cargo.toml -p rchat-core -p rchat-tui -p rchat-storage
 
   macos:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
@@ -68,3 +68,20 @@ jobs:
         run: scripts/dist/doctor.sh --check-core-tui
       - name: Compile core and TUI
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml -p rchat-core -p rchat-tui
+      - uses: taiki-e/install-action@nextest
+      - name: Zova migration and transaction tests
+        run: cargo nextest run --locked --manifest-path src-tauri/Cargo.toml -p rchat-storage
+
+  windows-storage:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+      - uses: taiki-e/install-action@nextest
+      - name: Install migration-test CLI
+        run: choco install sqlite --no-progress -y
+      - name: Zova storage integration (not a full Windows app build)
+        run: cargo nextest run --locked --manifest-path src-tauri/Cargo.toml -p rchat-storage

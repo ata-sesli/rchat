@@ -50,7 +50,7 @@ pub(crate) async fn test_app_state() -> (tempfile::TempDir, AppState) {
     std::fs::create_dir_all(&app_dir).expect("app dir");
     let mut manager = ConfigManager::new(app_dir.clone());
     manager.init("password").await.expect("init config");
-        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        let conn = rchat_storage::Connection::open_in_memory().expect("in-memory db");
         crate::storage::db::create_tables(&conn).expect("schema");
 
     (

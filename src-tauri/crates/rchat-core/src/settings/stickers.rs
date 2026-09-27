@@ -112,7 +112,7 @@ pub fn save_sticker_from_message(app_state: &AppState, file_hash: &str) -> Resul
     let name: String = conn
         .query_row(
             "SELECT COALESCE(file_name, ?2) FROM files WHERE file_hash = ?1",
-            rusqlite::params![file_hash, &fallback],
+            rchat_storage::params![file_hash, &fallback],
             |row| row.get(0),
         )
         .unwrap_or(fallback);

@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension};
+use rchat_storage::{Connection, OptionalExtension};
 // use std::path::Path; // Unused
 use anyhow::Context;
 use directories::ProjectDirs;
@@ -148,34 +148,24 @@ pub struct ChatFileRow {
 pub fn connect_to_db() -> anyhow::Result<Connection> {
     if let Some(project_dirs) = ProjectDirs::from("io.github", "ata-sesli", "RChat") {
         let project_dirs = project_dirs.data_dir();
-        let database_dir = project_dirs.join("databases");
-        std::fs::create_dir_all(&database_dir).context("Failed to create database directory")?;
-        let final_path = database_dir.join("rchat.sqlite");
-        let db_exists = final_path.exists();
-        let connection =
-            Connection::open(&final_path).context("Failed to open database connection")?;
-
-        // Always ensure schema exists!
-        create_tables(&connection)?;
-
-        // Enable Foreign Keys explicitly (SQLite default is OFF)
-        connection
-            .pragma_update(None, "foreign_keys", "ON")
-            .context("Failed to enable foreign keys")?;
-
-        // Set busy timeout to 5 seconds to avoid 'database is locked' errors
-        connection
-            .pragma_update(None, "busy_timeout", 5000)
-            .context("Failed to set busy timeout")?;
-
-        if !db_exists {
-            // Only verify or notify if needed, but creates happened above
-            println!("Successfully initialized database schema!");
-        }
-        Ok(connection)
+        connect_to_storage_root(project_dirs)
     } else {
         anyhow::bail!("Failed to determine project directories")
     }
+}
+
+pub(crate) fn connect_to_storage_root(root: &std::path::Path) -> anyhow::Result<Connection> {
+    let connection = rchat_storage::open_rchat(&root.join("databases"), |conn| {
+        create_tables(conn)
+            .and_then(|_| super::object::import_legacy_chunks(conn, root))
+            .map_err(|e| {
+                rchat_storage::Error::InvalidValue(format!("storage migration failed: {e:#}"))
+            })
+    })
+    .context("Failed to open/migrate RChat storage; legacy files were retained")?;
+    create_tables(&connection)?;
+    connection.pragma_update(None, "busy_timeout", 5000)?;
+    Ok(connection)
 }
 
 // Private helper to ensure tables exist
@@ -533,7 +523,7 @@ fn remove_legacy_general_data(conn: &Connection) -> anyhow::Result<()> {
 }
 
 fn merge_chat_connection_stats(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rchat_storage::Transaction<'_>,
     from_chat_id: &str,
     to_chat_id: &str,
 ) -> anyhow::Result<()> {
@@ -563,7 +553,7 @@ fn merge_chat_connection_stats(
              first_connected_at = excluded.first_connected_at,
              last_connected_at = excluded.last_connected_at,
              reconnect_count = excluded.reconnect_count",
-        rusqlite::params![
+        rchat_storage::params![
             to_chat_id,
             first_connected_at,
             last_connected_at,
@@ -582,7 +572,7 @@ fn merge_chat_connection_stats(
 }
 
 fn migrate_chat_id_references(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rchat_storage::Transaction<'_>,
     old_chat_id: &str,
     new_chat_id: &str,
 ) -> anyhow::Result<()> {
@@ -668,7 +658,7 @@ fn migrate_chat_id_references(
 }
 
 fn migrate_peer_id_reference(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rchat_storage::Transaction<'_>,
     old_peer_id: &str,
     new_peer_id: &str,
 ) -> anyhow::Result<()> {
@@ -719,7 +709,7 @@ fn migrate_peer_id_reference(
 }
 
 fn migrate_legacy_github_chat_id_inner(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rchat_storage::Transaction<'_>,
     github_username: &str,
     peer_id: &str,
 ) -> anyhow::Result<()> {
@@ -913,7 +903,7 @@ pub fn update_chat_image_hash(
 ) -> anyhow::Result<()> {
     conn.execute(
         "UPDATE chats SET image_hash = ?2 WHERE id = ?1",
-        rusqlite::params![chat_id, image_hash],
+        rchat_storage::params![chat_id, image_hash],
     )?;
     Ok(())
 }
@@ -979,7 +969,7 @@ pub fn remove_chat_member(conn: &Connection, chat_id: &str, peer_id: &str) -> an
 pub fn revoke_group_invites(conn: &Connection, group_id: &str) -> anyhow::Result<()> {
     conn.execute(
         "UPDATE group_invites SET status = 'revoked', updated_at = ?2 WHERE group_id = ?1 AND status IN ('sent', 'pending', 'ready')",
-        rusqlite::params![group_id, unix_now()],
+        rchat_storage::params![group_id, unix_now()],
     )?;
     Ok(())
 }
@@ -1532,13 +1522,9 @@ pub fn get_joined_group_chat_ids(
     Ok(out)
 }
 
-pub fn get_group_member_peer_ids(
-    conn: &Connection,
-    group_id: &str,
-) -> anyhow::Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT peer_id FROM chat_peers WHERE chat_id = ?1 AND peer_id != 'Me'",
-    )?;
+pub fn get_group_member_peer_ids(conn: &Connection, group_id: &str) -> anyhow::Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT peer_id FROM chat_peers WHERE chat_id = ?1 AND peer_id != 'Me'")?;
     let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
@@ -2016,7 +2002,7 @@ pub fn list_chat_files(
     )?;
 
     let rows = stmt.query_map(
-        rusqlite::params![chat_id, filter_lower, safe_limit, safe_offset],
+        rchat_storage::params![chat_id, filter_lower, safe_limit, safe_offset],
         |row| {
             Ok(ChatFileRow {
                 message_id: row.get(0)?,
@@ -2196,6 +2182,81 @@ pub fn delete_sticker(conn: &Connection, file_hash: &str) -> anyhow::Result<()> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_sqlite_fixture_preserves_history_groups_archives_and_media() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("databases")).unwrap();
+        std::fs::create_dir(root.path().join("chunks")).unwrap();
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        std::fs::write(root.path().join("chunks").join(hash), b"abc").unwrap();
+        let source = root.path().join("databases/rchat.sqlite");
+        let mut child = Command::new("sqlite3")
+            .arg(&source)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(include_bytes!("legacy-fixture.sql"))
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let source_bytes = std::fs::read(&source).unwrap();
+        let conn = super::connect_to_storage_root(root.path()).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row("SELECT sender_alias FROM messages WHERE id='am'", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "Historical Alice"
+        );
+        assert_eq!(
+            conn.query_row("SELECT public_key FROM peers WHERE id='peer-a'", [], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .unwrap(),
+            [0, 1, 255]
+        );
+        for (table, column, expected) in [
+            (
+                "group_records",
+                "payload_json",
+                "{\"preserve\":\"signed bytes\"}",
+            ),
+            ("group_message_receipts", "status", "read"),
+            ("group_invites", "status", "pending"),
+            ("chat_envelopes", "envelope_id", "archive"),
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT {column} FROM {table}"), [], |r| r
+                    .get::<_, String>(0))
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            super::super::object::load(&conn, hash, None).unwrap(),
+            b"abc"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+        drop(conn);
+        let reopened = super::connect_to_storage_root(root.path()).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+    }
     use super::*;
     use crate::network::gossip::{GroupRecordBody, SignedGroupRecord};
     use libp2p::identity;
@@ -2337,13 +2398,13 @@ mod tests {
                  (invite_id, group_id, group_name, inviter_peer_id, invitee_peer_id,
                   status, payload_json, created_at, updated_at)
                  VALUES (?1, 'group:test', 'Test', 'peer-admin', ?2, ?3, '{}', 1, 1)",
-                rusqlite::params![invite_id, invitee_peer_id, status],
+                rchat_storage::params![invite_id, invitee_peer_id, status],
             )
             .expect("insert invite");
         }
 
-        let invites = get_open_group_invites_for_peer(&conn, "peer-local")
-            .expect("query open local invites");
+        let invites =
+            get_open_group_invites_for_peer(&conn, "peer-local").expect("query open local invites");
         assert_eq!(
             invites
                 .iter()
@@ -2406,14 +2467,19 @@ mod tests {
         );
         assert_eq!(
             next_cursor,
-            Some(crate::network::gossip::GroupSyncCursor::from_record(&second))
+            Some(crate::network::gossip::GroupSyncCursor::from_record(
+                &second
+            ))
         );
         assert!(has_more);
 
         let (records, next_cursor, has_more) =
             get_group_records_for_sync(&conn, group_id, next_cursor.as_ref(), &[], 2)
                 .expect("final sync page");
-        assert_eq!(records.iter().map(|record| record.id()).collect::<Vec<_>>(), vec![third.id()]);
+        assert_eq!(
+            records.iter().map(|record| record.id()).collect::<Vec<_>>(),
+            vec![third.id()]
+        );
         assert_eq!(
             next_cursor,
             Some(crate::network::gossip::GroupSyncCursor::from_record(&third))
@@ -2428,12 +2494,8 @@ mod tests {
         let keypair = identity::Keypair::generate_ed25519();
         let group_id = "group:550e8400-e29b-41d4-a716-446655440000";
         for counter in 1..=300 {
-            let record = signed_group_record(
-                &keypair,
-                group_id,
-                &format!("record-{counter}"),
-                counter,
-            );
+            let record =
+                signed_group_record(&keypair, group_id, &format!("record-{counter}"), counter);
             insert_group_record(&conn, &record, true, false).expect("insert record");
         }
 
@@ -2533,24 +2595,10 @@ mod tests {
         )
         .expect("admin member");
 
-        upsert_group_message_receipt(
-            &conn,
-            group_id,
-            "message-1",
-            "peer-member",
-            "delivered",
-            20,
-        )
-        .expect("member receipt");
-        upsert_group_message_receipt(
-            &conn,
-            group_id,
-            "message-1",
-            "peer-admin",
-            "read",
-            10,
-        )
-        .expect("admin receipt");
+        upsert_group_message_receipt(&conn, group_id, "message-1", "peer-member", "delivered", 20)
+            .expect("member receipt");
+        upsert_group_message_receipt(&conn, group_id, "message-1", "peer-admin", "read", 10)
+            .expect("admin receipt");
         conn.execute(
             "INSERT INTO group_records
              (id, group_id, record_type, author_peer_id, timestamp, payload_json, public_key_b64, signature_b64, verified, pending, received_at)
@@ -2572,10 +2620,13 @@ mod tests {
         assert_eq!(roster[0].role, "admin");
         assert_eq!(roster[2].membership_state, "invited");
         assert_eq!(roster[2].invited_by.as_deref(), Some("peer-admin"));
-        assert_eq!(get_group_image_hash(&conn, group_id).expect("group image"), Some("group-image".to_string()));
+        assert_eq!(
+            get_group_image_hash(&conn, group_id).expect("group image"),
+            Some("group-image".to_string())
+        );
 
-        let receipts = get_group_message_receipts(&conn, group_id, "message-1")
-            .expect("message receipts");
+        let receipts =
+            get_group_message_receipts(&conn, group_id, "message-1").expect("message receipts");
         assert_eq!(
             receipts
                 .iter()
@@ -2601,9 +2652,11 @@ mod tests {
         assert!(get_group_roster(&conn, "group:missing")
             .expect("roster")
             .is_empty());
-        assert!(get_group_message_receipts(&conn, "group:missing", "message")
-            .expect("receipts")
-            .is_empty());
+        assert!(
+            get_group_message_receipts(&conn, "group:missing", "message")
+                .expect("receipts")
+                .is_empty()
+        );
         assert_eq!(
             get_group_image_hash(&conn, "group:missing").expect("image"),
             None
