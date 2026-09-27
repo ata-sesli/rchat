@@ -1,0 +1,56 @@
+#badbox 1
+
+rule rchat/std-unbounded-channel for rust {
+  summary "Unbounded standard-library channel"
+  find code(callee) `callee()`
+  where text(callee) matches "^(std::sync::)?mpsc::channel(::<.*>)?$"
+  group by nearest callable
+  when count > 0
+  report {
+    severity warning
+    message "Zero-argument std mpsc channels are unbounded; review slow-consumer retention and prefer bounded nonblocking media queues"
+    evidence "std mpsc channel constructors"
+  }
+}
+
+rule rchat/unbounded-queue for rust {
+  summary "Unbounded queue in a media or networking callable"
+  find code(callee, args...) `callee(args)`
+  where text(callee) matches "(^|::)(unbounded_channel|unbounded)(::<.*>)?$"
+  group by nearest callable
+  when count > 0
+  report {
+    severity warning
+    message "Review queue growth under a slow consumer; media frames usually need a bounded queue and an explicit drop/backpressure policy"
+    evidence "unbounded queue constructors"
+  }
+}
+
+rule rchat/blocking-in-awaiting-callable for rust {
+  summary "Synchronous sleep in a callable that also awaits"
+  find code(callee, args...) `callee(args)`
+  where text(callee) in ["std::thread::sleep", "thread::sleep"]
+  where group has any {
+    node await_expression
+  }
+  group by nearest callable
+  when count > 0
+  report {
+    severity warning
+    message "Thread sleep can stall an async worker and delay media/network events; use an async timer or isolate blocking work on a dedicated thread"
+    evidence "blocking sleep sites"
+  }
+}
+
+rule rchat/unfinished-code for rust {
+  summary "Unfinished implementation panics at runtime"
+  find code(name, args...) `name!(args)`
+  where text(name) in ["todo", "unimplemented"]
+  group by nearest callable
+  when count > 0
+  report {
+    severity warning
+    message "Implement this path or return an explicit unsupported-operation error instead of panicking during a chat or call"
+    evidence "unfinished-code macros"
+  }
+}

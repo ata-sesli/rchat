@@ -9,6 +9,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "check:commands": "bun ./scripts/check-command-parity.mjs",
+    "check:patterns": "badbox check src-tauri/crates/rchat-core/src src-tauri/crates/rchat-tui/src src-tauri/crates/rchat-screen-capture/src src-tauri/crates/rchat-video-capture/src src-tauri/crates/rchat-audio-processing/src src-tauri/src",
+    "test:patterns": "node scripts/test-badbox.mjs",
     "check": "bun run check:commands && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri"

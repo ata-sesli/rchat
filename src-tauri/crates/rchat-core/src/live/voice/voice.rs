@@ -1,5 +1,5 @@
 use super::codec::{VOICE_FRAME_SAMPLES, VOICE_SAMPLE_RATE};
-use super::queue::{voice_queue, VoiceReceiver, VoiceSender};
+use super::queue::{voice_queue, QueueStats, VoiceReceiver, VoiceSender, VOICE_MAX_AGE};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig,
@@ -127,6 +127,7 @@ struct VoiceAudioStats {
     playback_frames_received: u64,
     playback_samples_consumed: u64,
     playback_samples_dropped: u64,
+    playback_ingress_dropped_frames: u64,
     playback_queue_trim_events: u64,
     playback_concealed_samples: u64,
     playback_underruns: u64,
@@ -195,7 +196,8 @@ fn with_audio_stats(
     stats: &Arc<Mutex<VoiceAudioStats>>,
     update: impl FnOnce(&mut VoiceAudioStats),
 ) {
-    if let Ok(mut guard) = stats.lock() {
+    // Diagnostics must never stall capture or playback behind a reporting thread.
+    if let Ok(mut guard) = stats.try_lock() {
         update(&mut guard);
     }
 }
@@ -314,7 +316,8 @@ impl VoiceAecProcessor {
 type SharedVoiceAecProcessor = Arc<Mutex<VoiceAecProcessor>>;
 
 pub struct VoiceAudioEngine {
-    playback_tx: mpsc::Sender<Vec<i16>>,
+    playback_tx: VoiceSender<[i16; FRAME_SAMPLES]>,
+    stats: Arc<Mutex<VoiceAudioStats>>,
     shutdown_tx: mpsc::Sender<()>,
     thread_handle: Option<thread::JoinHandle<()>>,
 }
@@ -322,7 +325,7 @@ pub struct VoiceAudioEngine {
 impl VoiceAudioEngine {
     pub(crate) fn start() -> Result<(Self, VoiceReceiver<Vec<i16>>), String> {
         let (capture_tx, capture_rx) = voice_queue::<Vec<i16>>();
-        let (playback_tx, playback_rx) = mpsc::channel::<Vec<i16>>();
+        let (playback_tx, playback_rx) = voice_queue::<[i16; FRAME_SAMPLES]>();
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
         let stats = Arc::new(Mutex::new(VoiceAudioStats {
             started_at: Some(Instant::now()),
@@ -340,6 +343,7 @@ impl VoiceAudioEngine {
         Ok((
             Self {
                 playback_tx,
+                stats,
                 shutdown_tx,
                 thread_handle: Some(thread_handle),
             },
@@ -348,12 +352,22 @@ impl VoiceAudioEngine {
     }
 
     pub fn push_remote_frame(&self, samples: Vec<i16>) {
-        let _ = self.playback_tx.send(samples);
+        // Only one 20ms mono frame may enter the queue: cap bytes as well as entries.
+        let Ok(frame) = <[i16; FRAME_SAMPLES]>::try_from(samples.as_slice()) else {
+            with_audio_stats(&self.stats, |s| {
+                s.playback_samples_dropped = s
+                    .playback_samples_dropped
+                    .saturating_add(samples.len() as u64);
+            });
+            return;
+        };
+        let _ = self.playback_tx.push(frame);
     }
 }
 
 impl Drop for VoiceAudioEngine {
     fn drop(&mut self) {
+        record_playback_ingress_drops(&self.stats, self.playback_tx.stats());
         let _ = self.shutdown_tx.send(());
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
@@ -494,7 +508,7 @@ pub(crate) fn start_microphone_diagnostic_session(
 
 fn run_audio_thread(
     capture_tx: VoiceSender<Vec<i16>>,
-    playback_rx: mpsc::Receiver<Vec<i16>>,
+    playback_rx: VoiceReceiver<[i16; FRAME_SAMPLES]>,
     shutdown_rx: mpsc::Receiver<()>,
     stats: Arc<Mutex<VoiceAudioStats>>,
 ) {
@@ -912,7 +926,7 @@ fn build_output_stream(
     output_device: &cpal::Device,
     sample_format: &SampleFormat,
     config: &StreamConfig,
-    playback_rx: mpsc::Receiver<Vec<i16>>,
+    mut playback_rx: VoiceReceiver<[i16; FRAME_SAMPLES]>,
     stats: Arc<Mutex<VoiceAudioStats>>,
     echo_guard: Arc<EchoGuard>,
     aec_processor: Option<SharedVoiceAecProcessor>,
@@ -921,22 +935,27 @@ fn build_output_stream(
     let out_rate = config.sample_rate.0;
     let mut queue = VecDeque::<i16>::new();
     let mut playback_state = PlaybackState::new(out_rate);
+    playback_state.aec_render = aec_processor.map(|processor| PlaybackAecRender {
+        frame: [0; FRAME_SAMPLES],
+        used: 0,
+        processor,
+        stats: stats.clone(),
+    });
     let err_fn = |err| eprintln!("[Voice] Output stream error: {}", err);
 
     match sample_format {
         SampleFormat::F32 => {
             let mut mono = Vec::<i16>::new();
             let echo_guard = echo_guard.clone();
-            let aec_processor = aec_processor.clone();
             output_device
                 .build_output_stream(
                     config,
                     move |data: &mut [f32], _| {
                         drain_playback_frames(
-                            &playback_rx,
+                            &mut playback_rx,
                             &mut queue,
                             &stats,
-                            aec_processor.as_ref(),
+                            &mut playback_state,
                         );
                         write_output_frames_f32(
                             data,
@@ -956,16 +975,15 @@ fn build_output_stream(
         SampleFormat::I16 => {
             let mut mono = Vec::<i16>::new();
             let echo_guard = echo_guard.clone();
-            let aec_processor = aec_processor.clone();
             output_device
                 .build_output_stream(
                     config,
                     move |data: &mut [i16], _| {
                         drain_playback_frames(
-                            &playback_rx,
+                            &mut playback_rx,
                             &mut queue,
                             &stats,
-                            aec_processor.as_ref(),
+                            &mut playback_state,
                         );
                         write_output_frames_i16(
                             data,
@@ -985,16 +1003,15 @@ fn build_output_stream(
         SampleFormat::U16 => {
             let mut mono = Vec::<i16>::new();
             let echo_guard = echo_guard.clone();
-            let aec_processor = aec_processor.clone();
             output_device
                 .build_output_stream(
                     config,
                     move |data: &mut [u16], _| {
                         drain_playback_frames(
-                            &playback_rx,
+                            &mut playback_rx,
                             &mut queue,
                             &stats,
-                            aec_processor.as_ref(),
+                            &mut playback_state,
                         );
                         write_output_frames_u16(
                             data,
@@ -1357,18 +1374,33 @@ fn input_to_mono_i16_u16(data: &[u16], channels: usize) -> Vec<i16> {
 }
 
 fn drain_playback_frames(
-    playback_rx: &mpsc::Receiver<Vec<i16>>,
+    playback_rx: &mut VoiceReceiver<[i16; FRAME_SAMPLES]>,
     queue: &mut VecDeque<i16>,
     stats: &Arc<Mutex<VoiceAudioStats>>,
-    aec_processor: Option<&SharedVoiceAecProcessor>,
+    state: &mut PlaybackState,
 ) {
-    let mut received = 0u64;
-    while let Ok(frame) = playback_rx.try_recv() {
-        process_aec_render_frame(aec_processor, &frame, stats);
-        received += 1;
-        queue.extend(frame);
+    let now = Instant::now();
+    let mut dropped = 0;
+    if now.duration_since(state.last_drain_at) >= VOICE_MAX_AGE {
+        // A paused device must not replay its old local backlog or concealment.
+        dropped = queue.len();
+        queue.clear();
+        state.src_cursor = 0.0;
+        state.last_sample = 0;
+        state.consecutive_underrun_samples = 0;
+        if let Some(aec) = state.aec_render.as_mut() {
+            aec.used = 0;
+        }
     }
-    let dropped = trim_playback_queue_to_cap(queue);
+    state.last_drain_at = now;
+    let mut received = 0u64;
+    // One bounded snapshot: at most three frames, even while producers refill.
+    for frame in playback_rx.capture_tick(true) {
+        received += 1;
+        queue.extend(frame.value);
+    }
+    dropped += trim_playback_queue_to_cap(queue);
+    record_playback_ingress_drops(stats, playback_rx.stats());
     if received > 0 {
         let queue_len = queue.len();
         with_audio_stats(stats, |s| {
@@ -1386,19 +1418,55 @@ fn drain_playback_frames(
     }
 }
 
+fn record_playback_ingress_drops(stats: &Arc<Mutex<VoiceAudioStats>>, drops: QueueStats) {
+    let total = drops
+        .overflow
+        .saturating_add(drops.stale)
+        .saturating_add(drops.contention)
+        .saturating_add(drops.discarded);
+    with_audio_stats(stats, |s| {
+        let additional = total.saturating_sub(s.playback_ingress_dropped_frames);
+        s.playback_ingress_dropped_frames = total;
+        s.playback_samples_dropped = s
+            .playback_samples_dropped
+            .saturating_add(additional.saturating_mul(FRAME_SAMPLES as u64));
+    });
+}
+
 fn trim_playback_queue_to_cap(queue: &mut VecDeque<i16>) -> usize {
     if queue.len() <= MAX_PLAYBACK_QUEUE_SAMPLES {
         return 0;
     }
 
-    let drop_count = FRAME_SAMPLES.min(queue.len());
-    for _ in 0..drop_count {
-        let _ = queue.pop_front();
-    }
+    let excess = queue.len() - MAX_PLAYBACK_QUEUE_SAMPLES;
+    let drop_count = excess.div_ceil(FRAME_SAMPLES) * FRAME_SAMPLES;
+    queue.drain(..drop_count);
     drop_count
 }
 
+/// Accumulate only source samples actually consumed by playback, never samples
+/// evicted by ingress/stale/cap policy. Partial AEC frames stay bounded to 20ms.
+struct PlaybackAecRender {
+    frame: [i16; FRAME_SAMPLES],
+    used: usize,
+    processor: SharedVoiceAecProcessor,
+    stats: Arc<Mutex<VoiceAudioStats>>,
+}
+
+impl PlaybackAecRender {
+    fn push(&mut self, sample: i16) {
+        self.frame[self.used] = sample;
+        self.used += 1;
+        if self.used == FRAME_SAMPLES {
+            process_aec_render_frame(Some(&self.processor), &self.frame, &self.stats);
+            self.used = 0;
+        }
+    }
+}
+
 struct PlaybackState {
+    last_drain_at: Instant,
+    aec_render: Option<PlaybackAecRender>,
     src_cursor: f32,
     last_sample: i16,
     consecutive_underrun_samples: usize,
@@ -1414,6 +1482,8 @@ impl PlaybackState {
     fn new(declared_output_rate_hz: u32) -> Self {
         let declared_output_rate_hz = declared_output_rate_hz as f64;
         Self {
+            last_drain_at: Instant::now(),
+            aec_render: None,
             src_cursor: 0.0,
             last_sample: 0,
             consecutive_underrun_samples: 0,
@@ -1546,7 +1616,11 @@ fn render_playback_mono_samples(
     let desired_consumed = state.src_cursor.floor() as usize;
     let actual_consumed = desired_consumed.min(queue.len());
     for _ in 0..actual_consumed {
-        let _ = queue.pop_front();
+        if let Some(sample) = queue.pop_front() {
+            if let Some(aec) = state.aec_render.as_mut() {
+                aec.push(sample);
+            }
+        }
     }
     state.src_cursor -= desired_consumed as f32;
     PlaybackRenderStats {
@@ -1759,13 +1833,133 @@ mod tests {
     }
 
     #[test]
-    fn playback_queue_drops_one_frame_at_a_time() {
+    fn playback_queue_enforces_cap_in_one_trim() {
         let mut queue: VecDeque<i16> = (0..(FRAME_SAMPLES * 40)).map(|idx| idx as i16).collect();
 
         let dropped = trim_playback_queue_to_cap(&mut queue);
 
-        assert_eq!(dropped, FRAME_SAMPLES);
-        assert_eq!(queue.len(), FRAME_SAMPLES * 39);
+        assert_eq!(dropped, FRAME_SAMPLES * 24);
+        assert_eq!(queue.len(), MAX_PLAYBACK_QUEUE_SAMPLES);
+        assert_eq!(queue.front().copied(), Some((FRAME_SAMPLES * 24) as i16));
+        queue.push_back(1);
+        assert_eq!(trim_playback_queue_to_cap(&mut queue), FRAME_SAMPLES);
+        assert!(queue.len() <= MAX_PLAYBACK_QUEUE_SAMPLES);
+    }
+
+    #[test]
+    fn playback_ingress_burst_is_bounded_and_drain_work_is_capped() {
+        let (tx, mut rx) = voice_queue();
+        for n in 0..1000 {
+            tx.push([n as i16; FRAME_SAMPLES]).unwrap();
+        }
+        let stats = Arc::new(Mutex::new(VoiceAudioStats::default()));
+        let mut queue = VecDeque::new();
+        let mut state = PlaybackState::new(48_000);
+        drain_playback_frames(&mut rx, &mut queue, &stats, &mut state);
+        assert_eq!(queue.len(), 3 * FRAME_SAMPLES);
+        assert_eq!(queue.front(), Some(&997));
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.playback_frames_received, 3);
+        assert_eq!(stats.playback_samples_dropped, 997 * FRAME_SAMPLES as u64);
+    }
+
+    #[test]
+    fn playback_rejects_oversized_frames_and_teardown_releases_pending_audio() {
+        let (playback_tx, mut rx) = voice_queue();
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel();
+        let stats = Arc::new(Mutex::new(VoiceAudioStats::default()));
+        let engine = VoiceAudioEngine {
+            playback_tx,
+            stats: stats.clone(),
+            shutdown_tx,
+            thread_handle: None,
+        };
+        engine.push_remote_frame(vec![42; FRAME_SAMPLES * 100]);
+        assert!(rx.capture_tick(true).is_empty());
+        assert_eq!(
+            stats.lock().unwrap().playback_samples_dropped,
+            (FRAME_SAMPLES * 100) as u64
+        );
+        engine.push_remote_frame(vec![42; FRAME_SAMPLES]);
+        drop(rx);
+        assert!(engine.playback_tx.push([0; FRAME_SAMPLES]).is_err());
+        drop(engine);
+    }
+
+    #[test]
+    fn playback_aec_sees_consumed_audio_not_trimmed_or_pending_audio() {
+        let processor = Arc::new(Mutex::new(VoiceAecProcessor::new(
+            rchat_audio_processing::RchatEchoCanceller::new_48khz_mono().unwrap(),
+        )));
+        let stats = Arc::new(Mutex::new(VoiceAudioStats::default()));
+        let mut state = PlaybackState::new(48_000);
+        state.aec_render = Some(PlaybackAecRender {
+            frame: [0; FRAME_SAMPLES],
+            used: 0,
+            processor: processor.clone(),
+            stats: stats.clone(),
+        });
+        let (tx, mut rx) = voice_queue();
+        let mut queue = VecDeque::from(vec![123; MAX_PLAYBACK_QUEUE_SAMPLES]);
+        tx.push([456; FRAME_SAMPLES]).unwrap();
+        drain_playback_frames(&mut rx, &mut queue, &stats, &mut state);
+        assert_eq!(processor.lock().unwrap().stats().render_frames, 0);
+        assert_eq!(
+            stats.lock().unwrap().playback_samples_dropped,
+            FRAME_SAMPLES as u64
+        );
+        let mut output = Vec::new();
+        let rendered =
+            render_playback_mono_samples(FRAME_SAMPLES, &mut queue, &mut state, &mut output);
+        assert_eq!(
+            processor.lock().unwrap().stats().render_frames,
+            (rendered.consumed_samples / FRAME_SAMPLES) as u64
+        );
+        assert_eq!(
+            state.aec_render.as_ref().unwrap().used,
+            rendered.consumed_samples % FRAME_SAMPLES
+        );
+        assert!(output.iter().all(|sample| *sample == 123));
+    }
+
+    #[test]
+    fn playback_stats_never_block_the_audio_callback() {
+        let stats = Arc::new(Mutex::new(VoiceAudioStats::default()));
+        let guard = stats.lock().unwrap();
+        let callback_stats = stats.clone();
+        let (done, result) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            with_audio_stats(&callback_stats, |_| {});
+            done.send(()).unwrap();
+        });
+        let completed = result.recv_timeout(Duration::from_millis(100)).is_ok();
+        drop(guard);
+        worker.join().unwrap();
+        assert!(completed, "stats contention must not block audio callbacks");
+    }
+
+    #[test]
+    fn paused_playback_discards_old_ingress_and_local_audio() {
+        let (tx, mut rx) = voice_queue();
+        tx.push_frame(super::super::queue::TimedFrame {
+            value: [123; FRAME_SAMPLES],
+            captured_at: Instant::now() - super::super::queue::VOICE_MAX_AGE,
+        })
+        .unwrap();
+        let stats = Arc::new(Mutex::new(VoiceAudioStats::default()));
+        let mut queue = VecDeque::from(vec![123; FRAME_SAMPLES]);
+        let mut state = PlaybackState::new(48_000);
+        state.last_drain_at -= super::super::queue::VOICE_MAX_AGE;
+        state.last_sample = 123;
+        drain_playback_frames(&mut rx, &mut queue, &stats, &mut state);
+        assert!(queue.is_empty());
+        assert_eq!(state.last_sample, 0);
+        assert_eq!(
+            stats.lock().unwrap().playback_samples_dropped,
+            2 * FRAME_SAMPLES as u64
+        );
+        drop(rx);
+        assert!(tx.push([0; FRAME_SAMPLES]).is_err());
     }
 
     #[test]

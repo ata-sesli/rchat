@@ -1,4 +1,4 @@
-//! Short, latest-audio-first queues shared by capture and the outbound writer.
+//! Short, latest-audio-first queues shared by capture, playback and the outbound writer.
 //! Five 20 ms frames (100 ms) per queue; original capture age survives encoding.
 //! Producers never wait for capacity or a lock: contention drops the incoming
 //! frame, overflow evicts the oldest. Consumers never return expired audio.
@@ -99,7 +99,7 @@ impl<T> VoiceSender<T> {
 }
 
 impl<T> VoiceReceiver<T> {
-    /// Snapshot at most three recent frames for one manager tick. Muted or
+    /// Snapshot at most three recent frames for one manager tick/output callback. Muted or
     /// disconnected calls discard the snapshot; no backlog survives recovery.
     pub fn capture_tick(&mut self, enabled: bool) -> Vec<TimedFrame<T>> {
         let Ok(mut frames) = self.0.frames.try_lock() else {
