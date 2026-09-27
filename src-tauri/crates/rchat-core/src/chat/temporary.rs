@@ -1214,30 +1214,7 @@ fn extract_temporary_payload_token(input: &str) -> Result<String> {
 }
 
 async fn resolve_current_public_address(net_state: &NetworkState) -> Result<String> {
-    let v4_stun = net_state.public_address_v4.lock().await.clone();
-    let stun_port = *net_state.stun_external_port.lock().await;
-
-    if let (Some(ip), Some(port)) = (v4_stun, stun_port) {
-        return Ok(format!("/ip4/{ip}/udp/{port}/quic-v1"));
-    }
-
-    let addrs = net_state.listening_addresses.lock().await;
-    addrs
-        .iter()
-        .find(|addr| {
-            addr.contains("/udp/")
-                && addr.contains("/quic-v1")
-                && !addr.contains("127.0.0.1")
-                && !addr.contains("::1")
-        })
-        .or_else(|| {
-            addrs.iter().find(|addr| {
-                addr.contains("/tcp/") && !addr.contains("127.0.0.1") && !addr.contains("::1")
-            })
-        })
-        .or_else(|| addrs.first())
-        .cloned()
-        .ok_or_else(|| anyhow!("No listening address available. Is the network started?"))
+    crate::network::endpoint::resolve_address(net_state).await
 }
 
 #[cfg(test)]
@@ -1285,9 +1262,7 @@ mod tests {
                 listening_addresses: Arc::new(Mutex::new(vec![
                     "/ip4/192.168.1.10/udp/5000/quic-v1".to_string(),
                 ])),
-                public_address_v6: Arc::new(Mutex::new(None)),
-                public_address_v4: Arc::new(Mutex::new(None)),
-                stun_external_port: Arc::new(Mutex::new(None)),
+                public_endpoint: Default::default(),
                 temporary_state: Arc::new(Mutex::new(TemporaryRuntimeState::default())),
                 connected_chat_ids: Arc::new(Mutex::new(HashSet::new())),
                 chat_connections: Arc::new(Mutex::new(

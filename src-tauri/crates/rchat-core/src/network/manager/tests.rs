@@ -43,6 +43,24 @@ async fn voice_lifecycle_manager() -> (tempfile::TempDir, super::NetworkManager)
 }
 
 #[tokio::test]
+async fn punches_wait_for_endpoint_refresh_and_pending_work_is_bounded() {
+    let (_dir, mut manager) = voice_lifecycle_manager().await;
+    manager.endpoint_refresh_task = Some(tokio::spawn(async { Err("offline".to_string()) }));
+    for n in 0..40 {
+        manager.dispatch_command(NetworkCommand::StartPunch {
+            multiaddr: "/ip4/192.168.1.4/udp/8000/quic-v1".into(),
+            target_username: format!("peer{n}"), target_peer_id: None, my_username: "me".into(),
+        }).await;
+    }
+    assert!(manager.active_punch_targets.is_empty());
+    assert_eq!(manager.endpoint_pending_commands.len(), 32);
+    manager.endpoint_refresh_task.take().unwrap().await.unwrap().unwrap_err();
+    manager.finish_endpoint_refresh().await;
+    assert_eq!(manager.active_punch_targets.len(), 32);
+    assert!(manager.endpoint_pending_commands.is_empty());
+}
+
+#[tokio::test]
 async fn media_readers_follow_ringing_active_end_and_manager_lifetimes() {
     use crate::app_state::VoiceCallPhase;
     use crate::network::media_admission::MediaKind;

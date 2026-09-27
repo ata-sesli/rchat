@@ -1061,9 +1061,7 @@ pub struct NetworkState {
     pub sender: Arc<Mutex<mpsc::Sender<NetworkCommand>>>,
     pub local_peer_id: Arc<Mutex<Option<String>>>, // Local libp2p peer id
     pub listening_addresses: Arc<Mutex<Vec<String>>>, // Current libp2p listening addresses
-    pub public_address_v6: Arc<Mutex<Option<String>>>, // STUN-discovered IPv6
-    pub public_address_v4: Arc<Mutex<Option<String>>>, // STUN-discovered IPv4
-    pub stun_external_port: Arc<Mutex<Option<u16>>>, // NAT-mapped UDP port for QUIC invites
+    pub public_endpoint: crate::network::endpoint::EndpointObserver,
     pub temporary_state: Arc<Mutex<TemporaryRuntimeState>>, // In-memory temporary chat sessions/invites
     pub connected_chat_ids: Arc<Mutex<HashSet<String>>>, // Currently connected chats/peers
     pub chat_connections: Arc<Mutex<HashMap<String, ChatConnectionRuntime>>>, // Runtime connection metadata by chat id

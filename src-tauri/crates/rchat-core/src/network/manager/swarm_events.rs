@@ -59,7 +59,20 @@ impl NetworkManager {
                     .await;
             }
             SwarmEvent::NewListenAddr { address, .. } => {
-                self.handle_new_listen_addr(address);
+                self.network_state.public_endpoint.invalidate();
+                self.handle_new_listen_addr(address).await;
+                self.sync_public_endpoint().await;
+                self.start_endpoint_refresh();
+            }
+            SwarmEvent::ExpiredListenAddr { address, .. } => {
+                self.network_state.public_endpoint.invalidate();
+                self.network_state
+                    .listening_addresses
+                    .lock()
+                    .await
+                    .retain(|a| a != &address.to_string());
+                self.sync_public_endpoint().await;
+                self.start_endpoint_refresh();
             }
             SwarmEvent::IncomingConnection {
                 local_addr,
@@ -182,7 +195,7 @@ impl NetworkManager {
                     .filter(|v| !v.is_empty())
                     .unwrap_or_else(|| "peer".to_string());
 
-                                if let Ok(conn) = &self.app_state.db_conn.lock() {
+                if let Ok(conn) = &self.app_state.db_conn.lock() {
                     let _ = crate::storage::db::add_peer(
                         &conn,
                         &peer.peer_id,

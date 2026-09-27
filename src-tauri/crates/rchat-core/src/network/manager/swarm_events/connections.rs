@@ -418,19 +418,13 @@ impl NetworkManager {
         }
     }
 
-    pub(super) fn handle_new_listen_addr(&mut self, address: Multiaddr) {
+    pub(super) async fn handle_new_listen_addr(&mut self, address: Multiaddr) {
         println!("[Swarm] Listening on: {}", address);
 
         let addr_str = address.to_string();
         if !addr_str.contains("127.0.0.1") && !addr_str.contains("::1") {
-            let network_state = self.network_state.clone();
-            let addr_clone = addr_str.clone();
-            tokio::spawn(async move {
-                let mut addrs = network_state.listening_addresses.lock().await;
-                if !addrs.contains(&addr_clone) {
-                    addrs.push(addr_clone);
-                }
-            });
+            let mut addrs = self.network_state.listening_addresses.lock().await;
+            if !addrs.contains(&addr_str) { addrs.push(addr_str.clone()); }
         }
 
         if self.is_mdns_enabled()

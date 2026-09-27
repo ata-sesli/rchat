@@ -19,6 +19,7 @@ use tokio::sync::mpsc::Receiver;
 #[path = "../../live/broadcast/manager.rs"]
 mod broadcast;
 mod persistence;
+mod endpoint_refresh;
 mod punching;
 mod run_loop;
 mod swarm_events;
@@ -492,6 +493,9 @@ pub struct NetworkManager {
     // Shared UI-agnostic app/runtime state.
     app_state: AppState,
     network_state: NetworkState,
+    endpoint_refresh_task: Option<tokio::task::JoinHandle<Result<std::net::SocketAddr, String>>>,
+    endpoint_pending_commands: std::collections::VecDeque<NetworkCommand>,
+    advertised_public_endpoint: Option<Multiaddr>,
     // The boundary used to send events to the adapter.
     event_sink: SharedCoreEventSink,
     disc_rx: Receiver<Multiaddr>,
@@ -921,6 +925,9 @@ impl NetworkManager {
             mdns_handle: None,
             app_state,
             network_state,
+            endpoint_refresh_task: None,
+            endpoint_pending_commands: Default::default(),
+            advertised_public_endpoint: None,
             event_sink,
             local_peers: HashMap::new(),
             mdns_dial_inflight: HashMap::new(),
@@ -1708,6 +1715,7 @@ impl NetworkManager {
 
 impl Drop for NetworkManager {
     fn drop(&mut self) {
+        if let Some(task) = self.endpoint_refresh_task.take() { task.abort(); }
         self.media_admission.shutdown();
         for handle in self.media_accept_handles.drain(..) {
             handle.abort();

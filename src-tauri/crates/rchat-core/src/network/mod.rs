@@ -2,6 +2,9 @@ mod behaviour;
 pub mod command;
 pub mod direct_message;
 pub mod discovery;
+pub mod endpoint;
+#[cfg(test)]
+mod endpoint_tests;
 pub mod gist;
 pub mod gossip;
 pub mod hks;
@@ -9,7 +12,6 @@ pub mod invite;
 mod manager;
 pub mod mdns;
 pub(crate) mod media_admission;
-pub mod stun;
 pub(crate) mod voice_stream;
 use anyhow::Result;
 use libp2p::{identity, PeerId, SwarmBuilder};
@@ -81,12 +83,17 @@ pub async fn start(
     println!("[Backend] Local Peer ID: {local_peer_id}");
 
     println!("[Backend] Building swarm...");
+    let public_endpoint = endpoint::EndpointObserver::default();
+    let runtime = public_endpoint.runtime();
     let mut swarm = SwarmBuilder::with_existing_identity(local_key.clone())
         .with_tokio()
         .with_tcp(libp2p::tcp::Config::default(), configure_noise, || {
             libp2p::yamux::Config::default()
         })?
-        .with_quic()
+        .with_quic_config(|mut config| {
+            config.runtime = Some(runtime);
+            config
+        })
         .with_dns()?
         .with_relay_client(configure_noise, || libp2p::yamux::Config::default())?
         .with_behaviour(|key, relay_client| RChatBehaviour::new(key.clone(), relay_client))?
@@ -111,21 +118,7 @@ pub async fn start(
         tcp_port, udp_port
     );
 
-    // Do STUN discovery (socket closes after discovery)
-    let stun_result = stun::discover_on_port(udp_port).await;
-    let stun_external_port = stun_result.external_port;
-    let stun_public_ip_v6 = stun_result.ipv6.map(|a| a.ip().to_string());
-    let stun_public_ip = stun_result.ipv4.map(|a| a.ip().to_string());
-
-    if let Some(ext_port) = stun_external_port {
-        println!(
-            "[Backend] STUN external port: {} (local: {})",
-            ext_port, udp_port
-        );
-    }
-
-    // Bind QUIC to the SAME port (socket was closed after STUN discovery)
-    // On most NATs, binding to the same local port gets the same external mapping
+    // Observe STUN on these live QUIC sockets; never close and rebind the port.
     swarm.listen_on(format!("/ip6/::/udp/{}/quic-v1", udp_port).parse()?)?;
     swarm.listen_on(format!("/ip6/::/tcp/{}", tcp_port).parse()?)?;
     swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", udp_port).parse()?)?;
@@ -135,25 +128,6 @@ pub async fn start(
         "[Backend] Swarm listeners started (QUIC on port {}, TCP on port {})",
         udp_port, tcp_port
     );
-
-    let listener_snapshot: Vec<String> = swarm.listeners().map(|l| l.to_string()).collect();
-    let quic_port_bound = is_quic_udp_port_bound(&listener_snapshot, udp_port);
-    let effective_stun_external_port = if quic_port_bound {
-        stun_external_port
-    } else {
-        eprintln!(
-            "[Backend] ⚠️ QUIC listener verification mismatch for expected UDP port {}. \
-             Marking STUN external port unreliable (degraded invite mode). listeners={:?}",
-            udp_port, listener_snapshot
-        );
-        None
-    };
-
-    // The STUN socket is now closed and QUIC owns the same local port. Reachable mode
-    // keeps the mapping active and coordinates bidirectional punching through shadow
-    // invites. The discovered public endpoint is not periodically revalidated, so a
-    // NAT that changes or assigns destination-specific mappings can still prevent a
-    // direct connection; RChat intentionally has no relay fallback.
 
     let (ctx, crx) = mpsc::channel(32);
     let connectivity_settings = {
@@ -169,9 +143,7 @@ pub async fn start(
         sender: Arc::new(tokio::sync::Mutex::new(ctx)),
         local_peer_id: Arc::new(tokio::sync::Mutex::new(Some(local_peer_id.to_string()))),
         listening_addresses: Arc::new(tokio::sync::Mutex::new(vec![])),
-        public_address_v6: Arc::new(tokio::sync::Mutex::new(stun_public_ip_v6)),
-        public_address_v4: Arc::new(tokio::sync::Mutex::new(stun_public_ip)),
-        stun_external_port: Arc::new(tokio::sync::Mutex::new(effective_stun_external_port)),
+        public_endpoint,
         temporary_state: Arc::new(tokio::sync::Mutex::new(
             crate::app_state::TemporaryRuntimeState::default(),
         )),
@@ -234,39 +206,4 @@ fn get_port_from_multiaddr(addr: &libp2p::Multiaddr) -> Option<u16> {
         }
     }
     None
-}
-
-fn is_quic_udp_port_bound(listeners: &[String], expected_udp_port: u16) -> bool {
-    listeners.iter().any(|raw| {
-        if !raw.contains("/udp/") || !raw.contains("quic") {
-            return false;
-        }
-        raw.parse::<libp2p::Multiaddr>()
-            .ok()
-            .and_then(|addr| get_port_from_multiaddr(&addr))
-            == Some(expected_udp_port)
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_quic_udp_port_bound;
-
-    #[test]
-    fn quic_udp_port_bound_matches_expected_port() {
-        let listeners = vec![
-            "/ip4/0.0.0.0/tcp/45667".to_string(),
-            "/ip4/0.0.0.0/udp/43386/quic-v1".to_string(),
-        ];
-        assert!(is_quic_udp_port_bound(&listeners, 43386));
-    }
-
-    #[test]
-    fn quic_udp_port_bound_detects_mismatch() {
-        let listeners = vec![
-            "/ip4/0.0.0.0/tcp/45667".to_string(),
-            "/ip4/0.0.0.0/udp/43387/quic-v1".to_string(),
-        ];
-        assert!(!is_quic_udp_port_bound(&listeners, 43386));
-    }
 }

@@ -20,6 +20,7 @@ members = [
 resolver = "2"
 
 [patch.crates-io]
+libp2p-quic = { path = "vendor/libp2p-quic" }
 apple-metal = { path = "crates/apple-metal-shim" }
 sonora-aec3 = { path = "crates/sonora-aec3" }
 
