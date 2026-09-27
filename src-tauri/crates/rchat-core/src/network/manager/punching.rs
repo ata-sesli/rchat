@@ -84,13 +84,22 @@ impl NetworkManager {
     }
 
     /// Punch active targets with bounded attempts and exponential backoff.
-    pub(super) fn punch_active_targets(&mut self) {
+    pub(super) async fn punch_active_targets(&mut self) {
         if self.active_punch_targets.is_empty() {
             return;
         }
+        self.start_endpoint_refresh();
+        if self.endpoint_refresh_task.is_some() {
+            return;
+        }
+        self.sync_public_endpoint().await;
 
         let now = std::time::Instant::now();
-        let names = self.active_punch_targets.keys().cloned().collect::<Vec<_>>();
+        let names = self
+            .active_punch_targets
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
 
         for name in names {
             let Some(target) = self.active_punch_targets.get(&name).cloned() else {

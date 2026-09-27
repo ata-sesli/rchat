@@ -6,7 +6,7 @@ mod dm;
 mod group;
 
 impl NetworkManager {
-    pub async fn dispatch_command(&mut self, command: NetworkCommand) {
+    pub(super) async fn dispatch_ready_command(&mut self, command: NetworkCommand) {
         match command {
             NetworkCommand::StartPunch {
                 multiaddr,

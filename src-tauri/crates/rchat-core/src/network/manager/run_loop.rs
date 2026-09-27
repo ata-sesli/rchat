@@ -48,8 +48,8 @@ impl NetworkManager {
             }
         }
 
-        // NOTE: STUN discovery is now done in mod.rs during init with the correct UDP port
-        // This ensures the STUN external port matches the QUIC listener port
+        // Refresh the live transport asynchronously; never bind a second STUN socket.
+        let mut endpoint_interval = tokio::time::interval(std::time::Duration::from_secs(5));
 
         // Publish every 5 minutes
         let mut publish_interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -77,6 +77,20 @@ impl NetworkManager {
 
         loop {
             tokio::select! {
+                _ = endpoint_interval.tick() => {
+                    self.sync_public_endpoint().await;
+                    self.start_endpoint_refresh();
+                }
+                result = async {
+                    match self.endpoint_refresh_task.as_mut() {
+                        Some(task) => task.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.endpoint_refresh_task.take();
+                    if let Ok(Err(error)) = result { eprintln!("[STUN] {error}"); }
+                    self.finish_endpoint_refresh().await;
+                }
                 _ = publish_interval.tick() => {
                     self.publish_listeners().await;
                 }
@@ -106,7 +120,7 @@ impl NetworkManager {
                 _ = punch_interval.tick() => {
                     // Continuously punch all active targets
                     if self.is_punch_assist_enabled() {
-                        self.punch_active_targets();
+                        self.punch_active_targets().await;
                     }
                 }
                 _ = transfer_cleanup_interval.tick() => {
@@ -160,15 +174,17 @@ impl NetworkManager {
             }
         }
     }
-    async fn publish_listeners(&mut self) {
+    pub(super) async fn publish_listeners(&mut self) {
         if !self.is_github_sync_enabled() {
             return;
         }
 
-        let listeners: Vec<String> = self.swarm.listeners().map(|l| l.to_string()).collect();
-        if listeners.is_empty() {
-            return;
-        }
+        let local: Vec<String> = self.swarm.listeners().map(|l| l.to_string()).collect();
+        let listeners = crate::network::endpoint::advertised_addresses(
+            &self.network_state.public_endpoint.observation(),
+            &local,
+            std::time::Instant::now(),
+        );
 
         let state = &self.app_state;
         let (token, is_online) = {
@@ -189,12 +205,10 @@ impl NetworkManager {
 
         if let Some(token) = token {
             println!("Publishing listeners to Gist...");
-            if !listeners.is_empty() {
-                if let Err(e) =
-                    crate::network::discovery::publish_peer_info(&token, listeners, state).await
-                {
-                    eprintln!("Failed to publish peer info: {}", e);
-                }
+            if let Err(e) =
+                crate::network::discovery::publish_peer_info(&token, listeners, state).await
+            {
+                eprintln!("Failed to publish peer info: {}", e);
             }
         }
     }

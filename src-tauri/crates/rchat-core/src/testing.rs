@@ -51,9 +51,7 @@ pub fn test_network_state() -> (NetworkState, mpsc::Receiver<NetworkCommand>) {
             listening_addresses: Arc::new(Mutex::new(vec![
                 "/ip4/127.0.0.1/udp/5000/quic-v1".to_string(),
             ])),
-            public_address_v6: Arc::new(Mutex::new(None)),
-            public_address_v4: Arc::new(Mutex::new(None)),
-            stun_external_port: Arc::new(Mutex::new(None)),
+            public_endpoint: Default::default(),
             temporary_state: Arc::new(Mutex::new(TemporaryRuntimeState::default())),
             connected_chat_ids: Arc::new(Mutex::new(HashSet::new())),
             chat_connections: Arc::new(Mutex::new(

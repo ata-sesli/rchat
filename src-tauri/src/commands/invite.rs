@@ -65,34 +65,9 @@ pub async fn create_invite(
         .await
         .clone()
         .ok_or("Network peer id not available. Is the network started?")?;
-    let my_address = {
-        let v4_stun = net_state.public_address_v4.lock().await.clone();
-        let stun_port = net_state.stun_external_port.lock().await.clone();
-
-        if let (Some(ref ip), Some(port)) = (&v4_stun, stun_port) {
-            let addr = format!("/ip4/{}/udp/{}/quic-v1", ip, port);
-            println!("[Invite] Using QUIC STUN: {}", addr);
-            addr
-        } else {
-            let addrs = net_state.listening_addresses.lock().await;
-            addrs
-                .iter()
-                .find(|a| {
-                    a.contains("/udp/")
-                        && a.contains("/quic-v1")
-                        && !a.contains("127.0.0.1")
-                        && !a.contains("::1")
-                })
-                .or_else(|| {
-                    addrs.iter().find(|a| {
-                        a.contains("/tcp/") && !a.contains("127.0.0.1") && !a.contains("::1")
-                    })
-                })
-                .or_else(|| addrs.first())
-                .cloned()
-                .ok_or("No listening address available. Is the network started?")?
-        }
-    };
+    let my_address = rchat_core::network::endpoint::resolve_address(&net_state)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let encrypted_invite = invite::generate_invite(
         &password,
@@ -124,9 +99,13 @@ pub async fn create_invite(
     }
 
     println!("[Backend] Publishing invite to Gist immediately...");
-    discovery::publish_peer_info(&token, vec![], &app_state)
-        .await
-        .map_err(|e| format!("Failed to publish invite: {}", e))?;
+    discovery::publish_peer_info(
+        &token,
+        rchat_core::network::endpoint::current_addresses(&net_state).await,
+        &app_state,
+    )
+    .await
+    .map_err(|e| format!("Failed to publish invite: {}", e))?;
 
     println!("[Backend] Published invite to Gist");
 
@@ -275,25 +254,9 @@ pub async fn redeem_and_connect(
             }
 
             {
-                let my_address = {
-                    let v4_stun = net_state.public_address_v4.lock().await.clone();
-                    let stun_port = net_state.stun_external_port.lock().await.clone();
-
-                    if let (Some(ip), Some(port)) = (v4_stun, stun_port) {
-                        format!("/ip4/{}/udp/{}/quic-v1", ip, port)
-                    } else {
-                        let addrs = net_state.listening_addresses.lock().await;
-                        addrs
-                            .iter()
-                            .find(|a| {
-                                a.contains("/udp/")
-                                    && a.contains("/quic-v1")
-                                    && !a.contains("127.0.0.1")
-                            })
-                            .cloned()
-                            .unwrap_or_else(|| "unknown".to_string())
-                    }
-                };
+                let my_address = rchat_core::network::endpoint::resolve_address(&net_state)
+                    .await
+                    .map_err(|e| e.to_string())?;
 
                 let github_token = {
                     let mgr = app_state.config_manager.lock().await;
