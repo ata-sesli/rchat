@@ -783,6 +783,21 @@ mod tests {
 
     #[test]
     fn evaluate_completion_requires_all_chunks() {
+        check_completion_size(22, true);
+    }
+
+    #[test]
+    fn evaluate_completion_resolves_unknown_incoming_size() {
+        check_completion_size(0, true);
+    }
+
+    #[test]
+    fn evaluate_completion_rejects_incorrect_known_size() {
+        check_completion_size(23, false);
+        check_completion_size(-1, false);
+    }
+
+    fn check_completion_size(size: i64, expected_complete: bool) {
         use sha2::{Digest, Sha256};
         let a = hex::encode(Sha256::digest(b"1234567890"));
         let b = hex::encode(Sha256::digest(b"123456789012"));
@@ -792,7 +807,7 @@ mod tests {
 
         conn.execute(
             "INSERT INTO files (file_hash, file_name, mime_type, size_bytes, is_complete) VALUES (?1, ?2, ?3, ?4, 0)",
-            rchat_storage::params![file, "f", "application/octet-stream", 22_i64],
+            rchat_storage::params![file, "f", "application/octet-stream", size],
         )
         .expect("insert file");
 
@@ -817,7 +832,7 @@ mod tests {
 
         store_chunk_file(&conn, &b, b"123456789012").expect("write chunk b");
         let complete = evaluate_file_completion(&conn, &file).expect("completion check b");
-        assert!(complete);
+        assert_eq!(complete, expected_complete);
 
         let is_complete: i64 = conn
             .query_row(
@@ -826,7 +841,21 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("query file completion");
-        assert_eq!(is_complete, 1);
+        assert_eq!(is_complete, i64::from(expected_complete));
+        let stored_size: i64 = conn
+            .query_row(
+                "SELECT size_bytes FROM files WHERE file_hash=?1",
+                [&file],
+                |row| row.get(0),
+            )
+            .expect("query resolved size");
+        assert_eq!(stored_size, if expected_complete { 22 } else { size });
+        if expected_complete {
+            assert_eq!(
+                conn.get_object(&file).expect("assembled object"),
+                b"1234567890123456789012"
+            );
+        }
     }
 
     #[test]
