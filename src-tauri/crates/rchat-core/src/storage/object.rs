@@ -152,13 +152,16 @@ pub(crate) fn assemble_received(conn: &Connection, file_hash: &str) -> Result<bo
         hasher.update(&bytes);
         chunks.push((hash, length as u64));
     }
-    if total != size || hex::encode(hasher.finalize()) != file_hash {
+    // Incoming references use zero until the complete manifest is verified.
+    // Nonzero sizes remain authoritative; never publish a guessed size before
+    // validating the whole-file hash.
+    if (size != 0 && total != size) || hex::encode(hasher.finalize()) != file_hash {
         return Ok(false);
     }
     conn.assemble_object(file_hash, &chunks)?;
     conn.execute(
-        "UPDATE files SET is_complete=1 WHERE file_hash=?1",
-        [file_hash],
+        "UPDATE files SET size_bytes=?2, is_complete=1 WHERE file_hash=?1",
+        params![file_hash, total],
     )?;
     Ok(true)
 }
@@ -244,7 +247,7 @@ mod tests {
         for (id, size) in [(&hash, data.len()), (&missing, 7), (&corrupt, 7)] {
             conn.execute(
                 "INSERT INTO files VALUES(?1,'file','application/octet-stream',?2,1)",
-                params![id, size],
+                params![id, if id == &hash { 0 } else { size }],
             )
             .unwrap();
             conn.execute(
@@ -257,6 +260,15 @@ mod tests {
         fs::write(root.path().join("chunks").join(&corrupt), b"WRONG!!").unwrap();
         import_legacy_chunks(&conn, root.path()).unwrap();
         assert_eq!(load(&conn, &hash, None).unwrap(), data);
+        assert_eq!(
+            conn.query_row(
+                "SELECT size_bytes FROM files WHERE file_hash=?1",
+                [&hash],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            data.len() as i64
+        );
         assert!(load(&conn, &missing, None).is_err());
         assert!(load(&conn, &corrupt, None).is_err());
         assert_eq!(
